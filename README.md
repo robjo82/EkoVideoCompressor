@@ -26,6 +26,15 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+## Auto-update in-app
+
+Un bouton `Vérifier mise à jour` est disponible dans le header de l'application.
+
+Flux:
+1. L'app vérifie la dernière release GitHub.
+2. Si une version plus récente existe, elle télécharge l'archive macOS arm64.
+3. L'app installe la nouvelle version et se relance.
+
 ## Build local macOS
 
 ```bash

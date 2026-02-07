@@ -1,9 +1,14 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import urllib.error
+import urllib.request
+import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -28,7 +33,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
     QSlider,
     QSpinBox,
     QTimeEdit,
@@ -46,6 +50,9 @@ VIDEO_FILTER = "Vidéos (*.mp4 *.mov *.mkv *.m4v *.avi *.webm);;Tous les fichier
 APP_ICON_FILE = "ekovideo_icon.png"
 APP_LOGO_FILE = "ekovideo_logo.png"
 BUNDLE_IDENTIFIER = "com.ekonum.ekovideocompressor"
+GITHUB_OWNER = "robjo82"
+GITHUB_REPO = "EkoVideoCompressor"
+GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 PROFILE_PRESETS = {
     "Réunion rapide": {
@@ -85,6 +92,7 @@ PROFILE_SUFFIX = {
 }
 
 DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
 @dataclass
@@ -325,6 +333,22 @@ def apply_profile_to_job(job: QueueJob, profile_name: str) -> QueueJob:
     )
 
 
+def parse_semver(version_text: str) -> tuple[int, int, int] | None:
+    match = SEMVER_RE.match((version_text or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def choose_release_asset(assets: list[dict]) -> dict | None:
+    zip_assets = [a for a in assets if str(a.get("name", "")).endswith(".zip")]
+    if not zip_assets:
+        return None
+
+    arm_assets = [a for a in zip_assets if "macos-arm64" in str(a.get("name", "")).lower()]
+    return arm_assets[0] if arm_assets else zip_assets[0]
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: QWidget, ffmpeg_path: str, ffprobe_path: str):
         super().__init__(parent)
@@ -491,6 +515,98 @@ class EncodeWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class UpdateWorker(QThread):
+    check_finished = Signal(object)
+    download_progress = Signal(int)
+    download_finished = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, mode: str, current_version: str = "", release_info: dict | None = None):
+        super().__init__()
+        self.mode = mode
+        self.current_version = current_version
+        self.release_info = release_info or {}
+
+    def run(self):
+        try:
+            if self.mode == "check":
+                self._run_check()
+            elif self.mode == "download":
+                self._run_download()
+            else:
+                self.failed.emit("Mode de mise à jour invalide.")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _run_check(self):
+        req = urllib.request.Request(
+            GITHUB_LATEST_RELEASE_API,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        assets = payload.get("assets") or []
+        chosen = choose_release_asset(assets)
+        if not chosen:
+            self.check_finished.emit({"state": "no_asset"})
+            return
+
+        info = {
+            "tag_name": str(payload.get("tag_name", "")),
+            "name": str(payload.get("name", "")),
+            "html_url": str(payload.get("html_url", "")),
+            "body": str(payload.get("body", "")),
+            "asset_name": str(chosen.get("name", "")),
+            "asset_url": str(chosen.get("browser_download_url", "")),
+        }
+
+        latest = parse_semver(info["tag_name"])
+        current = parse_semver(self.current_version)
+
+        if latest is None:
+            self.check_finished.emit({"state": "unknown_remote", "info": info})
+            return
+
+        if current is None:
+            self.check_finished.emit({"state": "available", "info": info, "current_unknown": True})
+            return
+
+        if latest > current:
+            self.check_finished.emit({"state": "available", "info": info, "current_unknown": False})
+            return
+
+        self.check_finished.emit({"state": "up_to_date", "info": info})
+
+    def _run_download(self):
+        if not self.release_info.get("asset_url"):
+            self.failed.emit("URL de téléchargement manquante.")
+            return
+
+        request = urllib.request.Request(
+            self.release_info["asset_url"],
+            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            fd, zip_path = tempfile.mkstemp(prefix="ekovideo-update-", suffix=".zip")
+            os.close(fd)
+            read_size = 0
+            with open(zip_path, "wb") as out_file:
+                while True:
+                    chunk = response.read(1024 * 128)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    read_size += len(chunk)
+                    if total > 0:
+                        pct = int(min(100, (read_size / total) * 100))
+                        self.download_progress.emit(pct)
+
+        self.download_progress.emit(100)
+        self.download_finished.emit(zip_path, self.release_info)
+
+
 class DropZone(QFrame):
     files_dropped = Signal(list)
 
@@ -541,7 +657,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setMinimumSize(1080, 660)
+        self.setMinimumSize(980, 640)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
         icon_path = resource_path(APP_ICON_FILE)
@@ -558,6 +674,8 @@ class MainWindow(QWidget):
         self.running_index: int | None = None
         self.current_index: int = -1
         self.worker: EncodeWorker | None = None
+        self.update_worker: UpdateWorker | None = None
+        self._last_update_info: dict | None = None
         self.is_batch_running = False
         self._syncing_job = False
 
@@ -569,8 +687,8 @@ class MainWindow(QWidget):
 
     def _build_ui(self, icon_path: str):
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 22, 22, 22)
-        root.setSpacing(14)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
 
         header = QFrame()
         header.setObjectName("header")
@@ -598,9 +716,13 @@ class MainWindow(QWidget):
         self.btn_settings.setObjectName("gear")
         self.btn_settings.setText("⚙")
         self.btn_settings.clicked.connect(self.open_settings)
+        self.btn_update = QPushButton("Vérifier mise à jour")
+        self.btn_update.setObjectName("secondaryButton")
+        self.btn_update.clicked.connect(self.check_updates)
 
         header_layout.addWidget(logo)
         header_layout.addLayout(title_box, 1)
+        header_layout.addWidget(self.btn_update)
         header_layout.addWidget(self.btn_settings)
         root.addWidget(header)
 
@@ -631,6 +753,7 @@ class MainWindow(QWidget):
 
         self.queue_list = QListWidget()
         self.queue_list.setObjectName("queueList")
+        self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.queue_list.currentRowChanged.connect(self.on_queue_selection_changed)
         left_col.addWidget(self.queue_list, 1)
 
@@ -643,19 +766,18 @@ class MainWindow(QWidget):
 
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
+        right_col.setMinimumWidth(360)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(14, 14, 14, 14)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-
-        content = QWidget()
-        scroll_layout = QVBoxLayout(content)
-        scroll_layout.setSpacing(14)
+        right_layout.setSpacing(10)
+        right_content = QVBoxLayout()
+        right_content.setSpacing(10)
+        right_layout.addLayout(right_content, 1)
 
         workflow_group = QGroupBox("Workflow")
         workflow_form = QFormLayout(workflow_group)
+        workflow_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        workflow_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.combo_profile = QComboBox()
         self.combo_profile.addItems(["Personnalisé", *PROFILE_PRESETS.keys()])
@@ -678,7 +800,7 @@ class MainWindow(QWidget):
         self.check_continue_on_error.setChecked(self.settings.value("continue_on_error", True, type=bool))
         workflow_form.addRow("", self.check_continue_on_error)
 
-        btn_row = QHBoxLayout()
+        btn_row = QVBoxLayout()
         self.btn_apply_to_all = QPushButton("Appliquer ces réglages à tous")
         self.btn_apply_to_all.setObjectName("secondaryButton")
         self.btn_apply_to_all.clicked.connect(self.apply_current_settings_to_all)
@@ -689,10 +811,12 @@ class MainWindow(QWidget):
         btn_row.addWidget(self.btn_reset_preset)
         workflow_form.addRow("", btn_row)
 
-        scroll_layout.addWidget(workflow_group)
+        right_content.addWidget(workflow_group)
 
         comp_group = QGroupBox("Compression vidéo")
         comp_form = QFormLayout(comp_group)
+        comp_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        comp_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.combo_res = QComboBox()
         self.combo_res.addItems(["Original", "1080p", "720p", "480p"])
@@ -716,10 +840,12 @@ class MainWindow(QWidget):
         self.combo_preset.currentTextChanged.connect(self.on_control_changed)
         comp_form.addRow("Vitesse encodage", self.combo_preset)
 
-        scroll_layout.addWidget(comp_group)
+        right_content.addWidget(comp_group)
 
         audio_group = QGroupBox("Audio / voix")
         audio_form = QFormLayout(audio_group)
+        audio_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        audio_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.combo_audio_bitrate = QComboBox()
         self.combo_audio_bitrate.addItems(["64k", "96k", "128k", "160k", "192k"])
@@ -734,10 +860,12 @@ class MainWindow(QWidget):
         self.check_mono.toggled.connect(self.on_control_changed)
         audio_form.addRow("", self.check_mono)
 
-        scroll_layout.addWidget(audio_group)
+        right_content.addWidget(audio_group)
 
         trim_group = QGroupBox("Rognage")
         trim_form = QFormLayout(trim_group)
+        trim_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        trim_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         self.check_trim = QPushButton("Activer le rognage")
         self.check_trim.setObjectName("trimToggle")
@@ -755,17 +883,13 @@ class MainWindow(QWidget):
         self.time_end.timeChanged.connect(self.on_control_changed)
         trim_form.addRow("Fin", self.time_end)
 
-        scroll_layout.addWidget(trim_group)
+        right_content.addWidget(trim_group)
 
         self.lbl_estimation = QLabel("Estimation: sélectionnez une vidéo.")
         self.lbl_estimation.setObjectName("metaLabel")
         self.lbl_estimation.setWordWrap(True)
-        scroll_layout.addWidget(self.lbl_estimation)
-
-        scroll_layout.addStretch()
-
-        scroll.setWidget(content)
-        right_layout.addWidget(scroll)
+        right_content.addWidget(self.lbl_estimation)
+        right_content.addStretch()
         main_content.addWidget(right_col, 2)
 
         root.addLayout(main_content, 1)
@@ -856,6 +980,156 @@ class MainWindow(QWidget):
         self.settings.setValue("output_dir", self.edit_output_dir.text().strip())
         self.settings.setValue("suffix", self.edit_suffix.text().strip())
         self.settings.setValue("continue_on_error", self.check_continue_on_error.isChecked())
+
+    def check_updates(self):
+        if self.update_worker is not None:
+            return
+        self.btn_update.setEnabled(False)
+        self.status.setText("Recherche de mise à jour…")
+        self.update_worker = UpdateWorker(mode="check", current_version=APP_VERSION)
+        self.update_worker.check_finished.connect(self.on_update_check_finished)
+        self.update_worker.failed.connect(self.on_update_failed)
+        self.update_worker.start()
+
+    def on_update_check_finished(self, payload: dict):
+        self.update_worker = None
+        self.btn_update.setEnabled(not self.is_batch_running)
+        state = payload.get("state")
+        info = payload.get("info", {})
+        self._last_update_info = info if info else None
+
+        if state == "up_to_date":
+            self.status.setText("Aucune mise à jour disponible.")
+            QMessageBox.information(self, "Mise à jour", "Vous utilisez déjà la dernière version.")
+            return
+
+        if state in {"no_asset", "unknown_remote"}:
+            self.status.setText("Impossible de déterminer une mise à jour compatible.")
+            QMessageBox.warning(
+                self,
+                "Mise à jour",
+                "Aucune archive macOS compatible trouvée dans la dernière release.",
+            )
+            return
+
+        if state != "available" or not info.get("asset_url"):
+            self.status.setText("Vérification de mise à jour incomplète.")
+            return
+
+        current_label = APP_VERSION if parse_semver(APP_VERSION) else "dev/local"
+        target_label = info.get("tag_name", "nouvelle version")
+        answer = QMessageBox.question(
+            self,
+            "Mise à jour disponible",
+            (
+                f"Version actuelle: {current_label}\n"
+                f"Dernière version: {target_label}\n\n"
+                "Télécharger et installer automatiquement maintenant ?"
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.status.setText("Mise à jour reportée.")
+            return
+
+        self.status.setText("Téléchargement de la mise à jour…")
+        self.progress_global.setRange(0, 100)
+        self.progress_global.setValue(0)
+        self.btn_update.setEnabled(False)
+        self.update_worker = UpdateWorker(mode="download", release_info=info)
+        self.update_worker.download_progress.connect(self.on_update_download_progress)
+        self.update_worker.download_finished.connect(self.on_update_download_finished)
+        self.update_worker.failed.connect(self.on_update_failed)
+        self.update_worker.start()
+
+    def on_update_download_progress(self, pct: int):
+        self.progress_global.setRange(0, 100)
+        self.progress_global.setValue(pct)
+        self.status.setText(f"Téléchargement mise à jour… {pct}%")
+
+    def on_update_download_finished(self, zip_path: str, info: dict):
+        self.update_worker = None
+        self.btn_update.setEnabled(not self.is_batch_running)
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="ekovideo-update-"))
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                archive.extractall(tmp_dir)
+
+            candidates = list(tmp_dir.rglob("EkoVideoCompressor.app"))
+            if not candidates:
+                candidates = list(tmp_dir.rglob("*.app"))
+            if not candidates:
+                raise RuntimeError("Archive de mise à jour invalide: app introuvable.")
+
+            new_app_path = candidates[0].resolve()
+            target_app_path = self._target_app_bundle_path()
+            script_path = (tmp_dir / "apply_update.sh").resolve()
+            pid = os.getpid()
+
+            script_content = "\n".join(
+                [
+                    "#!/bin/bash",
+                    "set -e",
+                    f"PID={pid}",
+                    f"NEW_APP={shlex.quote(str(new_app_path))}",
+                    f"TARGET_APP={shlex.quote(str(target_app_path))}",
+                    "for i in {1..120}; do",
+                    "  if ! kill -0 \"$PID\" 2>/dev/null; then",
+                    "    break",
+                    "  fi",
+                    "  sleep 0.25",
+                    "done",
+                    "rm -rf \"${TARGET_APP}.new\"",
+                    "cp -R \"$NEW_APP\" \"${TARGET_APP}.new\"",
+                    "rm -rf \"$TARGET_APP\"",
+                    "mv \"${TARGET_APP}.new\" \"$TARGET_APP\"",
+                    "xattr -dr com.apple.quarantine \"$TARGET_APP\" || true",
+                    "open \"$TARGET_APP\"",
+                    "",
+                ]
+            )
+            script_path.write_text(script_content, encoding="utf-8")
+            script_path.chmod(0o755)
+
+            release_label = str(info.get("tag_name", "nouvelle version"))
+            QMessageBox.information(
+                self,
+                "Installation de mise à jour",
+                f"La version {release_label} va s'installer puis l'app sera relancée.",
+            )
+            subprocess.Popen(["/bin/bash", str(script_path)], start_new_session=True)
+            QApplication.quit()
+        except Exception as exc:
+            self.status.setText("Mise à jour échouée.")
+            QMessageBox.warning(
+                self,
+                "Mise à jour",
+                (
+                    "Échec de l'installation automatique.\n"
+                    f"Détail: {exc}\n\n"
+                    "Vous pouvez installer manuellement depuis la page Releases."
+                ),
+            )
+
+    def on_update_failed(self, message: str):
+        self.update_worker = None
+        self.btn_update.setEnabled(not self.is_batch_running)
+        self.status.setText("Mise à jour indisponible.")
+        QMessageBox.warning(
+            self,
+            "Mise à jour",
+            (
+                "Impossible de vérifier/télécharger la mise à jour.\n"
+                f"Détail: {message}"
+            ),
+        )
+
+    def _target_app_bundle_path(self) -> Path:
+        exe = Path(sys.executable).resolve()
+        for parent in [exe, *exe.parents]:
+            if parent.name.endswith(".app"):
+                return parent
+        default_target = Path("/Applications/EkoVideoCompressor.app")
+        return default_target
 
     def pick_output_dir(self):
         start = self.edit_output_dir.text().strip() or str(Path.home())
@@ -1139,6 +1413,7 @@ class MainWindow(QWidget):
         self.btn_start.setEnabled(bool(self.queue_jobs) and not running)
         self.btn_cancel.setEnabled(running)
         self.btn_settings.setEnabled(not running)
+        self.btn_update.setEnabled(not running and self.update_worker is None)
         self.btn_apply_to_all.setEnabled(not running)
         self.btn_reset_preset.setEnabled(not running)
 
