@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
-project_dir = Path(__file__).resolve().parent
+# `__file__` is not defined when PyInstaller executes spec files in CI.
+# The build script/workflow runs from repository root, so cwd is reliable here.
+project_dir = Path.cwd().resolve()
 
 binaries = []
 for name in ("ffmpeg", "ffprobe"):
