@@ -1432,26 +1432,51 @@ class MainWindow(QWidget):
             target_app_path = self._target_app_bundle_path()
             script_path = (tmp_dir / "apply_update.sh").resolve()
             pid = os.getpid()
+            fallback_app = (Path.home() / "Applications" / "EkoVideoCompressor.app").resolve()
+            log_path = (Path(tempfile.gettempdir()) / "ekovideo-updater.log").resolve()
 
             script_content = "\n".join(
                 [
                     "#!/bin/bash",
-                    "set -e",
+                    "set -u",
+                    f"LOG_PATH={shlex.quote(str(log_path))}",
+                    "exec >> \"$LOG_PATH\" 2>&1",
+                    "echo \"=== EkoVideo updater $(date) ===\"",
                     f"PID={pid}",
                     f"NEW_APP={shlex.quote(str(new_app_path))}",
                     f"TARGET_APP={shlex.quote(str(target_app_path))}",
+                    f"FALLBACK_APP={shlex.quote(str(fallback_app))}",
+                    "install_app() {",
+                    "  local src=\"$1\"",
+                    "  local dst=\"$2\"",
+                    "  local parent",
+                    "  parent=\"$(dirname \"$dst\")\"",
+                    "  mkdir -p \"$parent\" || return 1",
+                    "  rm -rf \"${dst}.new\" || return 1",
+                    "  cp -R \"$src\" \"${dst}.new\" || return 1",
+                    "  xattr -dr com.apple.quarantine \"${dst}.new\" || true",
+                    "  rm -rf \"$dst\" || return 1",
+                    "  mv \"${dst}.new\" \"$dst\" || return 1",
+                    "  return 0",
+                    "}",
                     "for i in {1..120}; do",
                     "  if ! kill -0 \"$PID\" 2>/dev/null; then",
                     "    break",
                     "  fi",
                     "  sleep 0.25",
                     "done",
-                    "rm -rf \"${TARGET_APP}.new\"",
-                    "cp -R \"$NEW_APP\" \"${TARGET_APP}.new\"",
-                    "rm -rf \"$TARGET_APP\"",
-                    "mv \"${TARGET_APP}.new\" \"$TARGET_APP\"",
-                    "xattr -dr com.apple.quarantine \"$TARGET_APP\" || true",
-                    "open \"$TARGET_APP\"",
+                    "if install_app \"$NEW_APP\" \"$TARGET_APP\"; then",
+                    "  echo \"Installed update to: $TARGET_APP\"",
+                    "  open \"$TARGET_APP\" && exit 0",
+                    "fi",
+                    "echo \"Primary target failed, trying fallback: $FALLBACK_APP\"",
+                    "if install_app \"$NEW_APP\" \"$FALLBACK_APP\"; then",
+                    "  echo \"Installed update to fallback: $FALLBACK_APP\"",
+                    "  open \"$FALLBACK_APP\" && exit 0",
+                    "fi",
+                    "echo \"Install failed, opening extracted app directly\"",
+                    "open \"$NEW_APP\" && exit 0",
+                    "echo \"Updater failed to relaunch app\"",
                     "",
                 ]
             )
@@ -1504,6 +1529,10 @@ class MainWindow(QWidget):
         exe = Path(sys.executable).resolve()
         for parent in [exe, *exe.parents]:
             if parent.name.endswith(".app"):
+                p = str(parent)
+                # App translocation paths are read-only/ephemeral; install to stable location instead.
+                if "/AppTranslocation/" in p or p.startswith("/private/var/folders/"):
+                    break
                 return parent
         user_apps = Path.home() / "Applications"
         user_apps.mkdir(parents=True, exist_ok=True)
