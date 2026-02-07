@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import certifi
 from ffmpeg_utils import build_ffmpeg_cmd
 from PySide6.QtCore import QSettings, QThread, QTime, Qt, Signal
 from PySide6.QtGui import QIcon
@@ -33,6 +35,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSplitter,
     QSlider,
     QSpinBox,
     QTimeEdit,
@@ -349,6 +354,12 @@ def choose_release_asset(assets: list[dict]) -> dict | None:
     return arm_assets[0] if arm_assets else zip_assets[0]
 
 
+def open_https_url(url: str, user_agent: str, timeout: int):
+    context = ssl.create_default_context(cafile=certifi.where())
+    request = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    return urllib.request.urlopen(request, timeout=timeout, context=context)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent: QWidget, ffmpeg_path: str, ffprobe_path: str):
         super().__init__(parent)
@@ -389,6 +400,32 @@ class SettingsDialog(QDialog):
         form.addRow(buttons)
 
         self.setMinimumWidth(580)
+        self.setStyleSheet(
+            """
+        QDialog {
+            background: #f7fbff;
+            color: #1c3042;
+            font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+            font-size: 14px;
+        }
+        QLineEdit {
+            background: #ffffff;
+            border: 1px solid #bfd2e3;
+            border-radius: 9px;
+            padding: 8px 10px;
+            min-height: 24px;
+        }
+        QPushButton {
+            background: #ffffff;
+            border: 1px solid #bdd1e3;
+            border-radius: 10px;
+            padding: 8px 14px;
+            font-weight: 600;
+            color: #203347;
+        }
+        QPushButton:hover { background: #f1f7fc; }
+        """
+        )
 
     def pick_ffmpeg(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choisir ffmpeg", str(Path.home()), "Tous (*.*)")
@@ -539,11 +576,15 @@ class UpdateWorker(QThread):
             self.failed.emit(str(exc))
 
     def _run_check(self):
-        req = urllib.request.Request(
+        request = urllib.request.Request(
             GITHUB_LATEST_RELEASE_API,
-            headers={"Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            },
         )
-        with urllib.request.urlopen(req, timeout=20) as response:
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=20, context=context) as response:
             payload = json.loads(response.read().decode("utf-8"))
 
         assets = payload.get("assets") or []
@@ -583,11 +624,11 @@ class UpdateWorker(QThread):
             self.failed.emit("URL de téléchargement manquante.")
             return
 
-        request = urllib.request.Request(
+        with open_https_url(
             self.release_info["asset_url"],
-            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
-        )
-        with urllib.request.urlopen(request, timeout=60) as response:
+            user_agent=f"{APP_NAME}/{APP_VERSION}",
+            timeout=60,
+        ) as response:
             total = int(response.headers.get("Content-Length") or 0)
             fd, zip_path = tempfile.mkstemp(prefix="ekovideo-update-", suffix=".zip")
             os.close(fd)
@@ -729,7 +770,12 @@ class MainWindow(QWidget):
         main_content = QHBoxLayout()
         main_content.setSpacing(18)
 
-        left_col = QVBoxLayout()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        left_panel = QWidget()
+        left_col = QVBoxLayout(left_panel)
+        left_col.setContentsMargins(0, 0, 0, 0)
         left_col.setSpacing(10)
 
         self.drop = DropZone()
@@ -737,6 +783,7 @@ class MainWindow(QWidget):
         left_col.addWidget(self.drop, 1)
 
         queue_actions = QHBoxLayout()
+        queue_actions.setSpacing(8)
         self.btn_pick = QPushButton("Ajouter des vidéos…")
         self.btn_pick.setObjectName("primaryButton")
         self.btn_pick.clicked.connect(self.pick_files)
@@ -747,8 +794,8 @@ class MainWindow(QWidget):
         self.btn_clear.setObjectName("secondaryButton")
         self.btn_clear.clicked.connect(self.clear_queue)
         queue_actions.addWidget(self.btn_pick, 1)
-        queue_actions.addWidget(self.btn_remove)
-        queue_actions.addWidget(self.btn_clear)
+        queue_actions.addWidget(self.btn_remove, 0)
+        queue_actions.addWidget(self.btn_clear, 0)
         left_col.addLayout(queue_actions)
 
         self.queue_list = QListWidget()
@@ -762,17 +809,21 @@ class MainWindow(QWidget):
         self.lbl_input_meta.setWordWrap(True)
         left_col.addWidget(self.lbl_input_meta)
 
-        main_content.addLayout(left_col, 3)
-
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
-        right_col.setMinimumWidth(360)
         right_layout = QVBoxLayout(right_col)
-        right_layout.setContentsMargins(14, 14, 14, 14)
-        right_layout.setSpacing(10)
-        right_content = QVBoxLayout()
+        right_layout.setContentsMargins(8, 8, 8, 8)
+
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        right_scroll_content = QWidget()
+        right_content = QVBoxLayout(right_scroll_content)
+        right_content.setContentsMargins(8, 6, 8, 8)
         right_content.setSpacing(10)
-        right_layout.addLayout(right_content, 1)
 
         workflow_group = QGroupBox("Workflow")
         workflow_form = QFormLayout(workflow_group)
@@ -803,9 +854,11 @@ class MainWindow(QWidget):
         btn_row = QVBoxLayout()
         self.btn_apply_to_all = QPushButton("Appliquer ces réglages à tous")
         self.btn_apply_to_all.setObjectName("secondaryButton")
+        self.btn_apply_to_all.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.btn_apply_to_all.clicked.connect(self.apply_current_settings_to_all)
         self.btn_reset_preset = QPushButton("Réinitialiser au preset")
         self.btn_reset_preset.setObjectName("secondaryButton")
+        self.btn_reset_preset.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.btn_reset_preset.clicked.connect(self.reset_current_job_to_preset)
         btn_row.addWidget(self.btn_apply_to_all)
         btn_row.addWidget(self.btn_reset_preset)
@@ -890,7 +943,16 @@ class MainWindow(QWidget):
         self.lbl_estimation.setWordWrap(True)
         right_content.addWidget(self.lbl_estimation)
         right_content.addStretch()
-        main_content.addWidget(right_col, 2)
+
+        right_scroll.setWidget(right_scroll_content)
+        right_layout.addWidget(right_scroll, 1)
+
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_col)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([740, 440])
+        main_content.addWidget(splitter)
 
         root.addLayout(main_content, 1)
 
@@ -932,31 +994,206 @@ class MainWindow(QWidget):
     def apply_style(self):
         self.setStyleSheet(
             """
-        QWidget { background: #f3f6f9; color: #14212b; font-family: "Avenir Next", "Trebuchet MS", sans-serif; }
-        QFrame#header { background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #0d3b66, stop:1 #1b6ca8); border-radius: 14px; }
-        QLabel#h1 { font-size: 23px; font-weight: 800; color: #fff; }
-        QLabel#h2 { color: #d9ecff; }
-        QToolButton#gear { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.45); border-radius: 10px; padding: 8px; color: #fff; }
-        QFrame#dropZone { background: #fff; border: 2px dashed #7ea3c4; border-radius: 16px; }
-        QLabel#dropTitle { font-size: 18px; font-weight: 700; color: #0d3b66; }
-        QLabel#dropSubtitle, QLabel#dropDetails { color: #49657d; }
-        QFrame#settingsPanel { background: #fff; border: 1px solid #d9e4ee; border-radius: 14px; }
-        QListWidget#queueList { background: #fff; border: 1px solid #d9e4ee; border-radius: 10px; padding: 6px; }
-        QListWidget#queueList::item:selected { background: #d5ebff; color: #0d3b66; border-radius: 6px; }
-        QGroupBox { border: 1px solid #e8eff6; border-radius: 10px; margin-top: 12px; padding: 8px; background: #fcfdff; font-weight: 700; }
-        QGroupBox::title { left: 8px; top: -8px; background: #fff; color: #0d3b66; }
-        QPushButton#primaryButton { background: #1b6ca8; color: #fff; border: none; border-radius: 10px; padding: 10px 16px; font-weight: 700; }
-        QPushButton#accentButton { background: #f4a261; color: #2f1f11; border: none; border-radius: 12px; padding: 12px 26px; font-weight: 800; }
-        QPushButton#secondaryButton { background: #fff; border: 1px solid #c9d7e5; border-radius: 10px; padding: 9px 12px; }
-        QPushButton#trimToggle { background: #fff7ef; border: 1px solid #f4a261; color: #a15d22; border-radius: 8px; padding: 8px; font-weight: 700; }
-        QPushButton#trimToggle:checked { background: #f4a261; color: #2f1f11; }
-        QComboBox, QSpinBox, QTimeEdit, QLineEdit { background: #fff; border: 1px solid #cbd9e6; border-radius: 8px; padding: 6px 10px; }
-        QSlider::groove:horizontal { height: 6px; background: #dbe7f2; border-radius: 3px; }
-        QSlider::handle:horizontal { background: #1b6ca8; border: 2px solid white; width: 14px; margin: -5px 0; border-radius: 7px; }
-        QSlider::sub-page:horizontal { background: #1b6ca8; border-radius: 3px; }
-        QProgressBar { background: #eef4fa; border: 1px solid #d2e0ed; border-radius: 8px; text-align: center; }
-        QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #1b6ca8, stop:1 #f4a261); border-radius: 8px; }
-        QLabel#metaLabel { color: #4a647c; background: #f6faff; border: 1px solid #d6e6f5; border-radius: 8px; padding: 8px; }
+        QWidget {
+            background: #f2f5f9;
+            color: #162534;
+            font-family: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+            font-size: 13px;
+        }
+        QFrame#header {
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #114b7a, stop:1 #0b6aa8);
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.22);
+        }
+        QLabel#h1 {
+            font-size: 28px;
+            font-weight: 800;
+            color: #ffffff;
+            letter-spacing: 0.4px;
+        }
+        QLabel#h2 {
+            color: #d9f2ff;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        QToolButton#gear {
+            background: rgba(255,255,255,0.16);
+            border: 1px solid rgba(255,255,255,0.38);
+            border-radius: 11px;
+            padding: 8px;
+            color: #ffffff;
+        }
+        QToolButton#gear:hover {
+            background: rgba(255,255,255,0.25);
+        }
+        QFrame#dropZone {
+            background: #ffffff;
+            border: 2px dashed #78a9cc;
+            border-radius: 18px;
+        }
+        QFrame#dropZone:hover {
+            border-color: #0b6aa8;
+            background: #f9fcff;
+        }
+        QLabel#dropTitle {
+            font-size: 20px;
+            font-weight: 800;
+            color: #104a79;
+        }
+        QLabel#dropSubtitle, QLabel#dropDetails {
+            color: #45617a;
+            font-size: 14px;
+        }
+        QFrame#settingsPanel {
+            background: #ffffff;
+            border: 1px solid #d4e1ec;
+            border-radius: 16px;
+        }
+        QListWidget#queueList {
+            background: #ffffff;
+            border: 1px solid #d2e1ee;
+            border-radius: 10px;
+            padding: 8px;
+        }
+        QListWidget#queueList::item {
+            padding: 7px 8px;
+            margin: 2px 0;
+            border-radius: 7px;
+            color: #17324a;
+        }
+        QListWidget#queueList::item:selected {
+            background: #d8ebf9;
+            color: #0c3f67;
+        }
+        QGroupBox {
+            border: 1px solid #dce8f2;
+            border-radius: 12px;
+            margin-top: 14px;
+            padding: 12px 10px 10px 10px;
+            background: #fbfdff;
+            font-weight: 800;
+            color: #0f4874;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 6px;
+            color: #0f4874;
+            background: #fbfdff;
+        }
+        QPushButton#primaryButton {
+            background: #0f79bc;
+            color: #ffffff;
+            border: none;
+            border-radius: 11px;
+            padding: 11px 16px;
+            font-size: 16px;
+            font-weight: 800;
+        }
+        QPushButton#primaryButton:hover { background: #0c6ca8; }
+        QPushButton#accentButton {
+            background: #f19a52;
+            color: #2f1d10;
+            border: none;
+            border-radius: 13px;
+            padding: 12px 24px;
+            font-size: 18px;
+            font-weight: 900;
+        }
+        QPushButton#accentButton:hover {
+            background: #f4ac72;
+        }
+        QPushButton#accentButton:disabled {
+            background: #d7e0e8;
+            color: #738292;
+        }
+        QPushButton#secondaryButton {
+            background: #ffffff;
+            border: 1px solid #bdd1e3;
+            border-radius: 10px;
+            padding: 9px 12px;
+            color: #203347;
+            font-weight: 600;
+        }
+        QPushButton#secondaryButton:hover {
+            background: #f1f7fc;
+        }
+        QPushButton#trimToggle {
+            background: #fff6ee;
+            border: 1px solid #f4a261;
+            color: #9b5a20;
+            border-radius: 9px;
+            padding: 8px;
+            font-weight: 700;
+        }
+        QPushButton#trimToggle:checked {
+            background: #f4a261;
+            color: #2f1f11;
+        }
+        QComboBox, QSpinBox, QTimeEdit, QLineEdit {
+            background: #ffffff;
+            border: 1px solid #bfd2e3;
+            border-radius: 9px;
+            padding: 7px 10px;
+            min-height: 22px;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 18px;
+        }
+        QSlider::groove:horizontal {
+            height: 6px;
+            background: #d9e7f3;
+            border-radius: 3px;
+        }
+        QSlider::handle:horizontal {
+            background: #0f79bc;
+            border: 2px solid #ffffff;
+            width: 15px;
+            margin: -6px 0;
+            border-radius: 7px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #0f79bc;
+            border-radius: 3px;
+        }
+        QProgressBar {
+            background: #ebf2f8;
+            border: 1px solid #cfdde9;
+            border-radius: 8px;
+            text-align: center;
+            min-height: 18px;
+            color: #24465f;
+            font-weight: 700;
+        }
+        QProgressBar::chunk {
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0f79bc, stop:1 #f19a52);
+            border-radius: 8px;
+        }
+        QLabel#metaLabel {
+            color: #365872;
+            background: #f6fbff;
+            border: 1px solid #d4e6f5;
+            border-radius: 10px;
+            padding: 10px;
+            font-size: 14px;
+        }
+        QScrollBar:vertical {
+            width: 9px;
+            background: transparent;
+            margin: 2px;
+        }
+        QScrollBar::handle:vertical {
+            border-radius: 4px;
+            background: #bfd4e6;
+            min-height: 30px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #aac8df;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
         """
         )
 
@@ -1114,12 +1351,19 @@ class MainWindow(QWidget):
         self.update_worker = None
         self.btn_update.setEnabled(not self.is_batch_running)
         self.status.setText("Mise à jour indisponible.")
+        hint = ""
+        if "CERTIFICATE_VERIFY_FAILED" in (message or ""):
+            hint = (
+                "\n\nConseil: vérifiez la date/heure Mac et les certificats système."
+                "\nSi votre réseau d'entreprise inspecte SSL, autorisez github.com"
+                " ou testez depuis un autre réseau."
+            )
         QMessageBox.warning(
             self,
             "Mise à jour",
             (
                 "Impossible de vérifier/télécharger la mise à jour.\n"
-                f"Détail: {message}"
+                f"Détail: {message}{hint}"
             ),
         )
 
@@ -1128,8 +1372,9 @@ class MainWindow(QWidget):
         for parent in [exe, *exe.parents]:
             if parent.name.endswith(".app"):
                 return parent
-        default_target = Path("/Applications/EkoVideoCompressor.app")
-        return default_target
+        user_apps = Path.home() / "Applications"
+        user_apps.mkdir(parents=True, exist_ok=True)
+        return user_apps / "EkoVideoCompressor.app"
 
     def pick_output_dir(self):
         start = self.edit_output_dir.text().strip() or str(Path.home())

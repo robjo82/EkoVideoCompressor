@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import certifi
+
 # `__file__` is not defined when PyInstaller executes spec files in CI.
 # The build script/workflow runs from repository root, so cwd is reliable here.
 project_dir = Path.cwd().resolve()
@@ -17,13 +19,14 @@ for asset in ("ekovideo_icon.png", "ekovideo_logo.png"):
     asset_path = project_dir / asset
     if asset_path.exists():
         datas.append((str(asset_path), "."))
+datas.append((certifi.where(), "certifi"))
 
 a = Analysis(
     ['video_compactor.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=["certifi"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
