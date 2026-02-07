@@ -403,27 +403,27 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(
             """
         QDialog {
-            background: #f7fbff;
-            color: #1c3042;
-            font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+            background: #f4faf6;
+            color: #1f3529;
+            font-family: "SF Pro Text", "Avenir Next", "Trebuchet MS", sans-serif;
             font-size: 14px;
         }
         QLineEdit {
             background: #ffffff;
-            border: 1px solid #bfd2e3;
+            border: 1px solid #bdd6c7;
             border-radius: 9px;
             padding: 8px 10px;
             min-height: 24px;
         }
         QPushButton {
             background: #ffffff;
-            border: 1px solid #bdd1e3;
+            border: 1px solid #bcd6c8;
             border-radius: 10px;
             padding: 8px 14px;
             font-weight: 600;
-            color: #203347;
+            color: #244238;
         }
-        QPushButton:hover { background: #f1f7fc; }
+        QPushButton:hover { background: #eef7f1; }
         """
         )
 
@@ -717,6 +717,10 @@ class MainWindow(QWidget):
         self.worker: EncodeWorker | None = None
         self.update_worker: UpdateWorker | None = None
         self._last_update_info: dict | None = None
+        self._update_phase: str = ""
+        self._update_check_payload: dict | None = None
+        self._update_download_payload: tuple[str, dict] | None = None
+        self._update_error_message: str | None = None
         self.is_batch_running = False
         self._syncing_job = False
 
@@ -737,13 +741,12 @@ class MainWindow(QWidget):
         header_layout.setContentsMargins(16, 14, 16, 14)
 
         logo = QLabel()
-        logo_path = resource_path(APP_LOGO_FILE)
-        if Path(logo_path).exists():
-            logo.setPixmap(QIcon(logo_path).pixmap(56, 56))
-        elif Path(icon_path).exists():
-            logo.setPixmap(QIcon(icon_path).pixmap(56, 56))
+        logo.setObjectName("logoMark")
+        if Path(icon_path).exists():
+            logo.setPixmap(QIcon(icon_path).pixmap(44, 44))
         else:
             logo.setText("🎬")
+            logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         title_box = QVBoxLayout()
         self.h1 = QLabel(APP_NAME)
@@ -995,24 +998,34 @@ class MainWindow(QWidget):
         self.setStyleSheet(
             """
         QWidget {
-            background: #f2f5f9;
-            color: #162534;
-            font-family: "Avenir Next", "Gill Sans", "Trebuchet MS", sans-serif;
+            background: #f3f8f4;
+            color: #1d2c23;
+            font-family: "SF Pro Text", "Avenir Next", "Trebuchet MS", sans-serif;
             font-size: 13px;
         }
         QFrame#header {
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #114b7a, stop:1 #0b6aa8);
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #1f6b4f, stop:1 #2f8f69);
             border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.25);
+        }
+        QLabel#logoMark {
+            min-width: 52px;
+            max-width: 52px;
+            min-height: 52px;
+            max-height: 52px;
+            background: rgba(255,255,255,0.12);
             border: 1px solid rgba(255,255,255,0.22);
+            border-radius: 12px;
+            padding: 4px;
         }
         QLabel#h1 {
-            font-size: 28px;
+            font-size: 30px;
             font-weight: 800;
             color: #ffffff;
-            letter-spacing: 0.4px;
+            letter-spacing: 0.2px;
         }
         QLabel#h2 {
-            color: #d9f2ff;
+            color: #d6f4e3;
             font-size: 14px;
             font-weight: 500;
         }
@@ -1028,30 +1041,30 @@ class MainWindow(QWidget):
         }
         QFrame#dropZone {
             background: #ffffff;
-            border: 2px dashed #78a9cc;
+            border: 2px dashed #84c4a0;
             border-radius: 18px;
         }
         QFrame#dropZone:hover {
-            border-color: #0b6aa8;
-            background: #f9fcff;
+            border-color: #2f8f69;
+            background: #f7fdf9;
         }
         QLabel#dropTitle {
             font-size: 20px;
             font-weight: 800;
-            color: #104a79;
+            color: #205842;
         }
         QLabel#dropSubtitle, QLabel#dropDetails {
-            color: #45617a;
+            color: #4d6a5a;
             font-size: 14px;
         }
         QFrame#settingsPanel {
             background: #ffffff;
-            border: 1px solid #d4e1ec;
+            border: 1px solid #d5e8dc;
             border-radius: 16px;
         }
         QListWidget#queueList {
             background: #ffffff;
-            border: 1px solid #d2e1ee;
+            border: 1px solid #d3e5d9;
             border-radius: 10px;
             padding: 8px;
         }
@@ -1059,30 +1072,30 @@ class MainWindow(QWidget):
             padding: 7px 8px;
             margin: 2px 0;
             border-radius: 7px;
-            color: #17324a;
+            color: #254237;
         }
         QListWidget#queueList::item:selected {
-            background: #d8ebf9;
-            color: #0c3f67;
+            background: #ddf1e6;
+            color: #1c5a42;
         }
         QGroupBox {
-            border: 1px solid #dce8f2;
+            border: 1px solid #dcebe1;
             border-radius: 12px;
-            margin-top: 14px;
-            padding: 12px 10px 10px 10px;
-            background: #fbfdff;
+            margin-top: 10px;
+            padding: 8px 8px 8px 8px;
+            background: #fbfefc;
             font-weight: 800;
-            color: #0f4874;
+            color: #2a664d;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             left: 12px;
             padding: 0 6px;
-            color: #0f4874;
-            background: #fbfdff;
+            color: #2a664d;
+            background: #fbfefc;
         }
         QPushButton#primaryButton {
-            background: #0f79bc;
+            background: #2f8f69;
             color: #ffffff;
             border: none;
             border-radius: 11px;
@@ -1090,10 +1103,10 @@ class MainWindow(QWidget):
             font-size: 16px;
             font-weight: 800;
         }
-        QPushButton#primaryButton:hover { background: #0c6ca8; }
+        QPushButton#primaryButton:hover { background: #277d5b; }
         QPushButton#accentButton {
-            background: #f19a52;
-            color: #2f1d10;
+            background: #3fa77a;
+            color: #ffffff;
             border: none;
             border-radius: 13px;
             padding: 12px 24px;
@@ -1101,41 +1114,41 @@ class MainWindow(QWidget):
             font-weight: 900;
         }
         QPushButton#accentButton:hover {
-            background: #f4ac72;
+            background: #37956d;
         }
         QPushButton#accentButton:disabled {
-            background: #d7e0e8;
-            color: #738292;
+            background: #d5e1d9;
+            color: #6d7e74;
         }
         QPushButton#secondaryButton {
             background: #ffffff;
-            border: 1px solid #bdd1e3;
+            border: 1px solid #bcd6c8;
             border-radius: 10px;
             padding: 9px 12px;
-            color: #203347;
+            color: #2c4338;
             font-weight: 600;
         }
         QPushButton#secondaryButton:hover {
-            background: #f1f7fc;
+            background: #eef7f1;
         }
         QPushButton#trimToggle {
-            background: #fff6ee;
-            border: 1px solid #f4a261;
-            color: #9b5a20;
+            background: #edf8f1;
+            border: 1px solid #74b895;
+            color: #2a664d;
             border-radius: 9px;
             padding: 8px;
             font-weight: 700;
         }
         QPushButton#trimToggle:checked {
-            background: #f4a261;
-            color: #2f1f11;
+            background: #2f8f69;
+            color: #ffffff;
         }
         QComboBox, QSpinBox, QTimeEdit, QLineEdit {
             background: #ffffff;
-            border: 1px solid #bfd2e3;
+            border: 1px solid #bdd6c7;
             border-radius: 9px;
-            padding: 7px 10px;
-            min-height: 22px;
+            padding: 6px 9px;
+            min-height: 20px;
         }
         QComboBox::drop-down {
             border: none;
@@ -1143,40 +1156,44 @@ class MainWindow(QWidget):
         }
         QSlider::groove:horizontal {
             height: 6px;
-            background: #d9e7f3;
+            background: #d8e9de;
             border-radius: 3px;
         }
         QSlider::handle:horizontal {
-            background: #0f79bc;
+            background: #2f8f69;
             border: 2px solid #ffffff;
             width: 15px;
             margin: -6px 0;
             border-radius: 7px;
         }
         QSlider::sub-page:horizontal {
-            background: #0f79bc;
+            background: #2f8f69;
             border-radius: 3px;
         }
         QProgressBar {
-            background: #ebf2f8;
-            border: 1px solid #cfdde9;
+            background: #eaf2ed;
+            border: 1px solid #cfddd5;
             border-radius: 8px;
             text-align: center;
             min-height: 18px;
-            color: #24465f;
+            color: #305144;
             font-weight: 700;
         }
         QProgressBar::chunk {
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0f79bc, stop:1 #f19a52);
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #2f8f69, stop:1 #66b990);
             border-radius: 8px;
         }
         QLabel#metaLabel {
-            color: #365872;
-            background: #f6fbff;
-            border: 1px solid #d4e6f5;
+            color: #3b5d4d;
+            background: #f6fbf8;
+            border: 1px solid #d4e7dc;
             border-radius: 10px;
             padding: 10px;
             font-size: 14px;
+        }
+        QSplitter::handle {
+            background: transparent;
+            width: 8px;
         }
         QScrollBar:vertical {
             width: 9px;
@@ -1185,11 +1202,11 @@ class MainWindow(QWidget):
         }
         QScrollBar::handle:vertical {
             border-radius: 4px;
-            background: #bfd4e6;
+            background: #b9d9c7;
             min-height: 30px;
         }
         QScrollBar::handle:vertical:hover {
-            background: #aac8df;
+            background: #a3ccb6;
         }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0px;
@@ -1223,14 +1240,50 @@ class MainWindow(QWidget):
             return
         self.btn_update.setEnabled(False)
         self.status.setText("Recherche de mise à jour…")
-        self.update_worker = UpdateWorker(mode="check", current_version=APP_VERSION)
-        self.update_worker.check_finished.connect(self.on_update_check_finished)
-        self.update_worker.failed.connect(self.on_update_failed)
-        self.update_worker.start()
+        self._start_update_worker(mode="check", current_version=APP_VERSION)
+
+    def _start_update_worker(self, mode: str, current_version: str = "", release_info: dict | None = None):
+        self._update_phase = mode
+        self._update_check_payload = None
+        self._update_download_payload = None
+        self._update_error_message = None
+
+        worker = UpdateWorker(mode=mode, current_version=current_version, release_info=release_info)
+        self.update_worker = worker
+        worker.failed.connect(self.on_update_failed)
+        if mode == "check":
+            worker.check_finished.connect(self.on_update_check_finished)
+        else:
+            worker.download_progress.connect(self.on_update_download_progress)
+            worker.download_finished.connect(self.on_update_download_finished)
+        worker.finished.connect(self.on_update_worker_finished)
+        worker.start()
 
     def on_update_check_finished(self, payload: dict):
+        self._update_check_payload = payload
+
+    def on_update_download_finished(self, zip_path: str, info: dict):
+        self._update_download_payload = (zip_path, info)
+
+    def on_update_worker_finished(self):
+        phase = self._update_phase
         self.update_worker = None
+        self._update_phase = ""
+        if phase == "check":
+            self._handle_update_check_completion()
+            return
+        if phase == "download":
+            self._handle_update_download_completion()
+            return
         self.btn_update.setEnabled(not self.is_batch_running)
+
+    def _handle_update_check_completion(self):
+        self.btn_update.setEnabled(not self.is_batch_running)
+        if self._update_error_message:
+            self._show_update_error(self._update_error_message)
+            return
+
+        payload = self._update_check_payload or {}
         state = payload.get("state")
         info = payload.get("info", {})
         self._last_update_info = info if info else None
@@ -1272,20 +1325,25 @@ class MainWindow(QWidget):
         self.progress_global.setRange(0, 100)
         self.progress_global.setValue(0)
         self.btn_update.setEnabled(False)
-        self.update_worker = UpdateWorker(mode="download", release_info=info)
-        self.update_worker.download_progress.connect(self.on_update_download_progress)
-        self.update_worker.download_finished.connect(self.on_update_download_finished)
-        self.update_worker.failed.connect(self.on_update_failed)
-        self.update_worker.start()
+        self._start_update_worker(mode="download", release_info=info)
 
     def on_update_download_progress(self, pct: int):
         self.progress_global.setRange(0, 100)
         self.progress_global.setValue(pct)
         self.status.setText(f"Téléchargement mise à jour… {pct}%")
 
-    def on_update_download_finished(self, zip_path: str, info: dict):
-        self.update_worker = None
+    def _handle_update_download_completion(self):
         self.btn_update.setEnabled(not self.is_batch_running)
+        if self._update_error_message:
+            self._show_update_error(self._update_error_message)
+            return
+
+        if not self._update_download_payload:
+            self.status.setText("Mise à jour échouée.")
+            QMessageBox.warning(self, "Mise à jour", "Téléchargement de mise à jour incomplet.")
+            return
+
+        zip_path, info = self._update_download_payload
         try:
             tmp_dir = Path(tempfile.mkdtemp(prefix="ekovideo-update-"))
             with zipfile.ZipFile(zip_path, "r") as archive:
@@ -1348,7 +1406,9 @@ class MainWindow(QWidget):
             )
 
     def on_update_failed(self, message: str):
-        self.update_worker = None
+        self._update_error_message = message
+
+    def _show_update_error(self, message: str):
         self.btn_update.setEnabled(not self.is_batch_running)
         self.status.setText("Mise à jour indisponible.")
         hint = ""
