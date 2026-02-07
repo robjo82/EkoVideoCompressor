@@ -35,11 +35,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSplitter,
     QSlider,
     QSpinBox,
+    QTabWidget,
     QTimeEdit,
     QToolButton,
     QVBoxLayout,
@@ -354,14 +354,8 @@ def choose_release_asset(assets: list[dict]) -> dict | None:
     return arm_assets[0] if arm_assets else zip_assets[0]
 
 
-def open_https_url(url: str, user_agent: str, timeout: int):
-    context = ssl.create_default_context(cafile=certifi.where())
-    request = urllib.request.Request(url, headers={"User-Agent": user_agent})
-    return urllib.request.urlopen(request, timeout=timeout, context=context)
-
-
 class SettingsDialog(QDialog):
-    def __init__(self, parent: QWidget, ffmpeg_path: str, ffprobe_path: str):
+    def __init__(self, parent: QWidget, ffmpeg_path: str, ffprobe_path: str, github_token: str):
         super().__init__(parent)
         self.setWindowTitle("Paramètres")
         self.setModal(True)
@@ -386,6 +380,11 @@ class SettingsDialog(QDialog):
 
         form.addRow("ffmpeg", row1)
         form.addRow("ffprobe", row2)
+
+        self.token_edit = QLineEdit(github_token or "")
+        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_edit.setPlaceholderText("GitHub token (optionnel, requis si repo privé)")
+        form.addRow("Token update", self.token_edit)
 
         hint = QLabel(
             "Si ffmpeg est bloqué par macOS, ouvrez Terminal puis:\n"
@@ -437,8 +436,12 @@ class SettingsDialog(QDialog):
         if path:
             self.ffprobe_edit.setText(path)
 
-    def values(self) -> tuple[str, str]:
-        return self.ffmpeg_edit.text().strip(), self.ffprobe_edit.text().strip()
+    def values(self) -> tuple[str, str, str]:
+        return (
+            self.ffmpeg_edit.text().strip(),
+            self.ffprobe_edit.text().strip(),
+            self.token_edit.text().strip(),
+        )
 
 
 class EncodeWorker(QThread):
@@ -558,11 +561,18 @@ class UpdateWorker(QThread):
     download_finished = Signal(str, object)
     failed = Signal(str)
 
-    def __init__(self, mode: str, current_version: str = "", release_info: dict | None = None):
+    def __init__(
+        self,
+        mode: str,
+        current_version: str = "",
+        release_info: dict | None = None,
+        github_token: str = "",
+    ):
         super().__init__()
         self.mode = mode
         self.current_version = current_version
         self.release_info = release_info or {}
+        self.github_token = github_token
 
     def run(self):
         try:
@@ -576,16 +586,24 @@ class UpdateWorker(QThread):
             self.failed.emit(str(exc))
 
     def _run_check(self):
-        request = urllib.request.Request(
-            GITHUB_LATEST_RELEASE_API,
-            headers={
+        try:
+            context = ssl.create_default_context(cafile=certifi.where())
+            headers = {
                 "Accept": "application/vnd.github+json",
                 "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-            },
-        )
-        context = ssl.create_default_context(cafile=certifi.where())
-        with urllib.request.urlopen(request, timeout=20, context=context) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            }
+            if self.github_token:
+                headers["Authorization"] = f"Bearer {self.github_token}"
+            request = urllib.request.Request(GITHUB_LATEST_RELEASE_API, headers=headers)
+            with urllib.request.urlopen(request, timeout=20, context=context) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as http_err:
+            if http_err.code == 404:
+                raise RuntimeError(
+                    "Release introuvable (404). "
+                    "Si le dépôt est privé, renseignez un GitHub token dans Paramètres."
+                ) from http_err
+            raise RuntimeError(f"Erreur HTTP update: {http_err.code}") from http_err
 
         assets = payload.get("assets") or []
         chosen = choose_release_asset(assets)
@@ -624,25 +642,34 @@ class UpdateWorker(QThread):
             self.failed.emit("URL de téléchargement manquante.")
             return
 
-        with open_https_url(
-            self.release_info["asset_url"],
-            user_agent=f"{APP_NAME}/{APP_VERSION}",
-            timeout=60,
-        ) as response:
-            total = int(response.headers.get("Content-Length") or 0)
-            fd, zip_path = tempfile.mkstemp(prefix="ekovideo-update-", suffix=".zip")
-            os.close(fd)
-            read_size = 0
-            with open(zip_path, "wb") as out_file:
-                while True:
-                    chunk = response.read(1024 * 128)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
-                    read_size += len(chunk)
-                    if total > 0:
-                        pct = int(min(100, (read_size / total) * 100))
-                        self.download_progress.emit(pct)
+        try:
+            context = ssl.create_default_context(cafile=certifi.where())
+            headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+            if self.github_token:
+                headers["Authorization"] = f"Bearer {self.github_token}"
+            request = urllib.request.Request(self.release_info["asset_url"], headers=headers)
+            with urllib.request.urlopen(request, timeout=60, context=context) as response:
+                total = int(response.headers.get("Content-Length") or 0)
+                fd, zip_path = tempfile.mkstemp(prefix="ekovideo-update-", suffix=".zip")
+                os.close(fd)
+                read_size = 0
+                with open(zip_path, "wb") as out_file:
+                    while True:
+                        chunk = response.read(1024 * 128)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        read_size += len(chunk)
+                        if total > 0:
+                            pct = int(min(100, (read_size / total) * 100))
+                            self.download_progress.emit(pct)
+        except urllib.error.HTTPError as http_err:
+            if http_err.code == 404:
+                raise RuntimeError(
+                    "Asset introuvable (404). "
+                    "Si le dépôt est privé, renseignez un GitHub token dans Paramètres."
+                ) from http_err
+            raise RuntimeError(f"Erreur HTTP téléchargement: {http_err.code}") from http_err
 
         self.download_progress.emit(100)
         self.download_finished.emit(zip_path, self.release_info)
@@ -707,6 +734,10 @@ class MainWindow(QWidget):
 
         self.ffmpeg_path = self.settings.value("ffmpeg_path", "", type=str).strip() or find_binary("ffmpeg") or ""
         self.ffprobe_path = self.settings.value("ffprobe_path", "", type=str).strip() or find_binary("ffprobe") or ""
+        self.github_token = (
+            self.settings.value("github_token", "", type=str).strip()
+            or os.getenv("EKO_UPDATER_GITHUB_TOKEN", "").strip()
+        )
 
         self.queue_jobs: list[QueueJob] = []
         self.pending_indices: list[int] = []
@@ -816,17 +847,24 @@ class MainWindow(QWidget):
         right_col.setObjectName("settingsPanel")
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(8, 8, 8, 8)
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("controlTabs")
+        right_layout.addWidget(self.tabs, 1)
 
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        workflow_tab = QWidget()
+        workflow_layout = QVBoxLayout(workflow_tab)
+        workflow_layout.setContentsMargins(6, 6, 6, 6)
+        workflow_layout.setSpacing(8)
 
-        right_scroll_content = QWidget()
-        right_content = QVBoxLayout(right_scroll_content)
-        right_content.setContentsMargins(8, 6, 8, 8)
-        right_content.setSpacing(10)
+        video_tab = QWidget()
+        video_layout = QVBoxLayout(video_tab)
+        video_layout.setContentsMargins(6, 6, 6, 6)
+        video_layout.setSpacing(8)
+
+        audio_tab = QWidget()
+        audio_layout = QVBoxLayout(audio_tab)
+        audio_layout.setContentsMargins(6, 6, 6, 6)
+        audio_layout.setSpacing(8)
 
         workflow_group = QGroupBox("Workflow")
         workflow_form = QFormLayout(workflow_group)
@@ -867,7 +905,7 @@ class MainWindow(QWidget):
         btn_row.addWidget(self.btn_reset_preset)
         workflow_form.addRow("", btn_row)
 
-        right_content.addWidget(workflow_group)
+        workflow_layout.addWidget(workflow_group)
 
         comp_group = QGroupBox("Compression vidéo")
         comp_form = QFormLayout(comp_group)
@@ -896,7 +934,7 @@ class MainWindow(QWidget):
         self.combo_preset.currentTextChanged.connect(self.on_control_changed)
         comp_form.addRow("Vitesse encodage", self.combo_preset)
 
-        right_content.addWidget(comp_group)
+        video_layout.addWidget(comp_group)
 
         audio_group = QGroupBox("Audio / voix")
         audio_form = QFormLayout(audio_group)
@@ -916,7 +954,7 @@ class MainWindow(QWidget):
         self.check_mono.toggled.connect(self.on_control_changed)
         audio_form.addRow("", self.check_mono)
 
-        right_content.addWidget(audio_group)
+        audio_layout.addWidget(audio_group)
 
         trim_group = QGroupBox("Rognage")
         trim_form = QFormLayout(trim_group)
@@ -939,16 +977,19 @@ class MainWindow(QWidget):
         self.time_end.timeChanged.connect(self.on_control_changed)
         trim_form.addRow("Fin", self.time_end)
 
-        right_content.addWidget(trim_group)
+        video_layout.addWidget(trim_group)
 
         self.lbl_estimation = QLabel("Estimation: sélectionnez une vidéo.")
         self.lbl_estimation.setObjectName("metaLabel")
         self.lbl_estimation.setWordWrap(True)
-        right_content.addWidget(self.lbl_estimation)
-        right_content.addStretch()
+        workflow_layout.addWidget(self.lbl_estimation)
+        workflow_layout.addStretch(1)
+        video_layout.addStretch(1)
+        audio_layout.addStretch(1)
 
-        right_scroll.setWidget(right_scroll_content)
-        right_layout.addWidget(right_scroll, 1)
+        self.tabs.addTab(workflow_tab, "Workflow")
+        self.tabs.addTab(video_tab, "Vidéo")
+        self.tabs.addTab(audio_tab, "Audio")
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_col)
@@ -1003,6 +1044,7 @@ class MainWindow(QWidget):
             font-family: "SF Pro Text", "Avenir Next", "Trebuchet MS", sans-serif;
             font-size: 13px;
         }
+        QLabel { color: #20382c; }
         QFrame#header {
             background: qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #1f6b4f, stop:1 #2f8f69);
             border-radius: 16px;
@@ -1093,6 +1135,30 @@ class MainWindow(QWidget):
             padding: 0 6px;
             color: #2a664d;
             background: #fbfefc;
+        }
+        QTabWidget#controlTabs::pane {
+            border: none;
+            background: transparent;
+            margin-top: 2px;
+        }
+        QTabBar::tab {
+            background: #e7f2eb;
+            border: 1px solid #c8ded1;
+            border-bottom: none;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            color: #2f5444;
+            padding: 7px 14px;
+            margin-right: 6px;
+            font-weight: 700;
+        }
+        QTabBar::tab:selected {
+            background: #ffffff;
+            color: #215c43;
+            border-color: #b3d2bf;
+        }
+        QTabBar::tab:!selected {
+            margin-top: 3px;
         }
         QPushButton#primaryButton {
             background: #2f8f69;
@@ -1215,15 +1281,17 @@ class MainWindow(QWidget):
         )
 
     def open_settings(self):
-        dlg = SettingsDialog(self, self.ffmpeg_path, self.ffprobe_path)
+        dlg = SettingsDialog(self, self.ffmpeg_path, self.ffprobe_path, self.github_token)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        ffmpeg_path, ffprobe_path = dlg.values()
+        ffmpeg_path, ffprobe_path, github_token = dlg.values()
         self.ffmpeg_path = ffmpeg_path or find_binary("ffmpeg") or ""
         self.ffprobe_path = ffprobe_path or find_binary("ffprobe") or ""
+        self.github_token = github_token
         self.settings.setValue("ffmpeg_path", self.ffmpeg_path)
         self.settings.setValue("ffprobe_path", self.ffprobe_path)
+        self.settings.setValue("github_token", self.github_token)
 
         if self.ffmpeg_path:
             self.status.setText("Paramètres enregistrés.")
@@ -1248,7 +1316,12 @@ class MainWindow(QWidget):
         self._update_download_payload = None
         self._update_error_message = None
 
-        worker = UpdateWorker(mode=mode, current_version=current_version, release_info=release_info)
+        worker = UpdateWorker(
+            mode=mode,
+            current_version=current_version,
+            release_info=release_info,
+            github_token=self.github_token,
+        )
         self.update_worker = worker
         worker.failed.connect(self.on_update_failed)
         if mode == "check":

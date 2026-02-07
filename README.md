@@ -35,6 +35,9 @@ Flux:
 2. Si une version plus récente existe, elle télécharge l'archive macOS arm64.
 3. L'app installe la nouvelle version et se relance.
 
+Si le dépôt est privé, renseignez un token GitHub (lecture du repo) dans:
+`Paramètres` → `Token update`.
+
 ## Build local macOS
 
 ```bash
