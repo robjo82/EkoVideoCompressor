@@ -1,0 +1,65 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  build-release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Homebrew ffmpeg
+        run: |
+          brew update
+          brew install ffmpeg
+
+      - name: Build app bundle
+        env:
+          APP_VERSION: ${{ github.ref_name }}
+        run: |
+          chmod +x scripts/build_macos.sh
+          scripts/build_macos.sh "${APP_VERSION#v}"
+
+      - name: Prepare release notes
+        run: |
+          cat > RELEASE_NOTES.md <<EOF
+          ## EkoVideo Compressor ${{ github.ref_name }}
+
+          - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
+          - Commit: ${{ github.sha }}
+          - Plateforme: macOS Apple Silicon (arm64)
+
+          ### Installation rapide
+          1. Téléchargez le zip de cette Release.
+          2. Décompressez et déplacez \\`EkoVideoCompressor.app\\` dans \\`/Applications\\`.
+          3. Premier lancement: clic droit sur l'app > Open.
+
+          ### Si macOS bloque le lancement
+          Exécutez:
+          \\`xattr -dr com.apple.quarantine /Applications/EkoVideoCompressor.app\\`
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: dist/release/*.zip
+
+      - name: Future notarization secrets (placeholder)
+        run: |
+          echo "APPLE_CERTIFICATE_BASE64 configured: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}"
+          echo "APPLE_CERT_PASSWORD configured: ${{ secrets.APPLE_CERT_PASSWORD != '' }}"
+          echo "APPLE_ID configured: ${{ secrets.APPLE_ID != '' }}"
+          echo "APPLE_APP_PASSWORD configured: ${{ secrets.APPLE_APP_PASSWORD != '' }}"
+          echo "TEAM_ID configured: ${{ secrets.TEAM_ID != '' }}"
