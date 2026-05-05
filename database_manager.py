@@ -10,7 +10,13 @@ class DatabaseManager:
         self._init_db()
 
     def _get_connection(self):
-        return sqlite3.connect(self.db_path)
+        # SQLite disables foreign-key enforcement by default for backwards
+        # compat — without this PRAGMA, `delete_job` would leave orphaned
+        # transcription_segments rows even though the schema declares
+        # ON DELETE CASCADE.
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
 
     def _init_db(self):
         with self._get_connection() as conn:

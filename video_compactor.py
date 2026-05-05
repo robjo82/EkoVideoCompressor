@@ -146,7 +146,7 @@ from database_manager import DatabaseManager
 @dataclass
 class QueueJob:
     input_path: str
-    db_id: Optional[int] = None
+    db_id: int | None = None
     workspace_dir: str = ""
     output_path: str = ""
     profile_name: str = "Réunion équilibrée"
@@ -1588,69 +1588,75 @@ class LibraryView(QWidget):
         self.refresh()
         
     def refresh(self):
-        # ... (unchanged refresh logic)
-        
-    def restart_job(self):
-        item = self.list.currentItem()
-        if not item: return
-        job_id = item.data(Qt.UserRole)
-        self.db.update_job_status(job_id, "PENDING", "")
-        # Signal MainWindow to reload from DB (simplified via a custom signal or direct call if parent is MW)
-        main_win = self.window()
-        if hasattr(main_win, "queue_jobs"):
-            main_win.queue_jobs.clear()
-            main_win.queue_list.clear()
-            main_win.load_jobs_from_db()
-            QMessageBox.information(self, "Restart", "La vidéo a été remise en file d'attente.")
-
-    def delete_entry(self):
-        item = self.list.currentItem()
-        if not item: return
-        job_id = item.data(Qt.UserRole)
-        confirm = QMessageBox.question(self, "Confirmer", "Supprimer cette entrée de la bibliothèque ? (Le fichier de transcription ne sera pas supprimé)")
-        if confirm == QMessageBox.StandardButton.Yes:
-            job = self.db.get_job(job_id)
-            if job and job['workspace_dir'] and Path(job['workspace_dir']).exists():
-                try:
-                    shutil.rmtree(job['workspace_dir'])
-                except Exception:
-                    pass
-            self.db.delete_job(job_id)
-            self.refresh()
-            # Also sync main queue
-            main_win = self.window()
-            if hasattr(main_win, "queue_jobs"):
-                main_win.queue_jobs.clear()
-                main_win.queue_list.clear()
-                main_win.load_jobs_from_db()
+        # Rebuild the list from the DB. Either a free-text search across
+        # transcript segments, or a chronological listing of recent jobs.
         query = self.search_input.text().strip()
         self.list.clear()
-        
+
         if query:
             results = self.db.search_segments(query_text=query)
-            seen_jobs = {} # db_id -> list of snippets
+            seen_jobs: dict[int, list[str]] = {}
             for s in results:
                 job_id = s['job_id']
-                if job_id not in seen_jobs:
-                    seen_jobs[job_id] = []
+                seen_jobs.setdefault(job_id, [])
                 if len(seen_jobs[job_id]) < 2:
                     seen_jobs[job_id].append(s['text'])
-            
+
             for job_id, snippets in seen_jobs.items():
                 job = self.db.get_job(job_id)
-                if not job: continue
+                if not job:
+                    continue
                 title = Path(job['source_path']).name
                 item = QListWidgetItem(f"📄 {title}\n   \"{snippets[0][:80]}…\"")
                 item.setData(Qt.UserRole, job_id)
                 self.list.addItem(item)
         else:
-            jobs = self.db.list_jobs(limit=100)
-            for job in jobs:
+            for job in self.db.list_jobs(limit=100):
                 title = Path(job['source_path']).name
-                status_emoji = "✅" if job['status'] == "COMPLETED" else "⏳" if job['status'] == "PENDING" else "❌"
-                item = QListWidgetItem(f"{status_emoji} {title}\n   Statut: {job['status']}")
+                status = job['status']
+                emoji = "✅" if status == "COMPLETED" else "⏳" if status == "PENDING" else "❌"
+                item = QListWidgetItem(f"{emoji} {title}\n   Statut: {status}")
                 item.setData(Qt.UserRole, job['id'])
                 self.list.addItem(item)
+
+    def _reload_main_queue(self):
+        main_win = self.window()
+        if hasattr(main_win, "queue_jobs"):
+            main_win.queue_jobs.clear()
+            main_win.queue_list.clear()
+            main_win.load_jobs_from_db()
+
+    def restart_job(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        job_id = item.data(Qt.UserRole)
+        self.db.update_job_status(job_id, "PENDING", "")
+        self._reload_main_queue()
+        QMessageBox.information(self, "Relance", "La vidéo a été remise en file d'attente.")
+
+    def delete_entry(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        job_id = item.data(Qt.UserRole)
+        confirm = QMessageBox.question(
+            self,
+            "Confirmer",
+            "Supprimer cette entrée de la bibliothèque ? (Le fichier de transcription ne sera pas supprimé)",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        job = self.db.get_job(job_id)
+        if job and job['workspace_dir'] and Path(job['workspace_dir']).exists():
+            try:
+                shutil.rmtree(job['workspace_dir'])
+            except Exception:
+                pass
+        self.db.delete_job(job_id)
+        self.refresh()
+        self._reload_main_queue()
 
     def open_result(self):
         item = self.list.currentItem()
@@ -2971,10 +2977,6 @@ class MainWindow(QWidget):
             job.error_message = row['error_message'] or ""
             job.workspace_dir = row['workspace_dir'] or ""
             job.output_path = row['output_path'] or ""
-            
-            # INDUSTRIAL CLEANUP: If job failed/cancelled and has workspace, 
-            # we could clean it, but keeping for now for manual restart.
-            # Instead, let's just make sure we don't leak temp dirs.
 
             self.queue_jobs.append(job)
             self.queue_list.addItem(QListWidgetItem())
@@ -3555,6 +3557,19 @@ class MainWindow(QWidget):
             self.worker.request_stop()
             self.btn_cancel.setEnabled(False)
 
+    def _cleanup_workspace_wav(self, job: QueueJob):
+        # The audio.wav we extract for transcription is the bulky leftover
+        # in the workspace once the job is done. Drop it; keep everything
+        # else so a re-run with a different model is still possible.
+        if not job.workspace_dir:
+            return
+        wav_path = Path(job.workspace_dir) / "audio.wav"
+        if wav_path.exists():
+            try:
+                wav_path.unlink()
+            except Exception:
+                pass
+
     def on_done(self, out_path: str):
         if self.running_index is None:
             return
@@ -3576,19 +3591,19 @@ class MainWindow(QWidget):
         self.completed_count += 1
         self.running_index = None
 
+        # EncodeWorker doesn't talk to the DB itself, so update from here.
+        # TranscribeWorker updates the DB during run(); this is the
+        # compression-only path.
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "COMPLETED")
+            self.db.update_job_output(job.db_id, out_path)
+
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.library_view.refresh()
-        
-        # INDUSTRIAL CLEANUP: Remove bulky intermediate WAV to save space
-        if job.workspace_dir:
-            wav_path = Path(job.workspace_dir) / "audio.wav"
-            if wav_path.exists():
-                try:
-                    wav_path.unlink()
-                except Exception:
-                    pass
+
+        self._cleanup_workspace_wav(job)
 
         total = max(1, len(self.queue_jobs))
         self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
@@ -3610,14 +3625,7 @@ class MainWindow(QWidget):
         self.progress.setValue(100)
         self.library_view.refresh()
         
-        # INDUSTRIAL CLEANUP: Remove bulky intermediate WAV to save space
-        if job.workspace_dir:
-            wav_path = Path(job.workspace_dir) / "audio.wav"
-            if wav_path.exists():
-                try:
-                    wav_path.unlink()
-                except Exception:
-                    pass
+        self._cleanup_workspace_wav(job)
 
         total = max(1, len(self.queue_jobs))
         self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
@@ -3635,6 +3643,8 @@ class MainWindow(QWidget):
         if msg == "Annulé.":
             job.status = "failed"
             job.error_message = "Annulé"
+            if job.db_id:
+                self.db.update_job_status(job.db_id, "CANCELLED", "Annulé")
             self.refresh_queue_item(idx)
             self.progress.setRange(0, 100)
             self._finish_batch(cancelled=True)
@@ -3643,6 +3653,11 @@ class MainWindow(QWidget):
         job.status = "failed"
         job.error_message = msg
         self.failed_count += 1
+        # TranscribeWorker may already have set FAILED with a richer message,
+        # but EncodeWorker never touches the DB. Update unconditionally —
+        # update_job_status overwrites with the latest, so this is safe.
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "FAILED", msg)
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
         self.library_view.refresh()
