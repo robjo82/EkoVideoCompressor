@@ -15,7 +15,18 @@ from pathlib import Path
 
 import certifi
 from ffmpeg_utils import build_ffmpeg_cmd
-from transcription_utils import build_audio_extract_cmd, build_mlx_whisper_cmd, default_transcript_path
+from transcription_utils import (
+    assign_speakers_to_segments,
+    build_audio_extract_cmd,
+    build_diarization_cmd,
+    build_mlx_whisper_cmd,
+    default_transcript_path,
+    parse_diarization_output,
+    parse_whisper_json_segments,
+    render_segments_with_speakers,
+    structured_initial_prompt,
+    transcript_output_ext,
+)
 from PySide6.QtCore import QSettings, QThread, QTime, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
@@ -80,6 +91,9 @@ GITHUB_REPO = "EkoVideoCompressor"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 MLX_WHISPER_PACKAGE = "mlx-whisper"
 MANAGED_TRANSCRIPTION_ENV = "mlx-whisper-venv"
+# pyannote 3.1 needs torch>=2.0; on Apple Silicon we use the standard wheels
+# (MPS support is built in). torchaudio is required for audio I/O.
+DIARIZATION_PIP_PACKAGES = ["torch", "torchaudio", "pyannote.audio>=3.1"]
 
 PROFILE_PRESETS = {
     "Réunion rapide": {
@@ -168,6 +182,13 @@ def managed_mlx_whisper_path() -> Path:
     if sys.platform.startswith("win"):
         return managed_transcription_venv_dir() / "Scripts" / "mlx_whisper.exe"
     return managed_transcription_venv_dir() / "bin" / "mlx_whisper"
+
+
+def managed_venv_python_path() -> Path:
+    """Path to the Python interpreter inside the managed transcription venv."""
+    if sys.platform.startswith("win"):
+        return managed_transcription_venv_dir() / "Scripts" / "python.exe"
+    return managed_transcription_venv_dir() / "bin" / "python"
 
 
 def candidate_bin_paths() -> list[Path]:
@@ -541,6 +562,34 @@ class SettingsDialog(QDialog):
         self.transcription_enhance_check.setChecked(bool(transcription_settings.get("enhance_audio", True)))
         transcription_form.addRow("", self.transcription_enhance_check)
 
+        self.transcription_diarization_check = QCheckBox(
+            "Détection des locuteurs (pyannote)"
+        )
+        self.transcription_diarization_check.setChecked(
+            bool(transcription_settings.get("diarization_enabled", False))
+        )
+        transcription_form.addRow("", self.transcription_diarization_check)
+
+        self.transcription_hf_token_edit = QLineEdit(
+            str(transcription_settings.get("hf_token", ""))
+        )
+        self.transcription_hf_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.transcription_hf_token_edit.setPlaceholderText(
+            "hf_xxxxxxxx (Hugging Face, requis pour la détection des locuteurs)"
+        )
+        transcription_form.addRow("Token Hugging Face", self.transcription_hf_token_edit)
+
+        hf_hint = QLabel(
+            "Token requis pour la détection des locuteurs. Créez-le sur "
+            "huggingface.co/settings/tokens (Read access) APRÈS avoir accepté "
+            "les licences :\n"
+            "• huggingface.co/pyannote/segmentation-3.0\n"
+            "• huggingface.co/pyannote/speaker-diarization-3.1"
+        )
+        hf_hint.setWordWrap(True)
+        hf_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", hf_hint)
+
         tabs.addTab(tools_tab, "Outils")
         tabs.addTab(transcription_tab, "Transcription")
 
@@ -623,6 +672,8 @@ class SettingsDialog(QDialog):
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_edit.text().strip(),
                 "enhance_audio": self.transcription_enhance_check.isChecked(),
+                "diarization_enabled": self.transcription_diarization_check.isChecked(),
+                "hf_token": self.transcription_hf_token_edit.text().strip(),
             },
         )
 
@@ -756,6 +807,9 @@ class TranscribeWorker(QThread):
         output_format: str,
         initial_prompt: str,
         enhance_audio: bool,
+        diarization_enabled: bool = False,
+        hf_token: str = "",
+        venv_python_path: str = "",
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -765,8 +819,13 @@ class TranscribeWorker(QThread):
         self.model = model
         self.language = language
         self.output_format = output_format
-        self.initial_prompt = initial_prompt
+        # Wrap the user's "Contexte" in a French priming sentence so Whisper
+        # treats the listed terms as expected vocabulary, not a token salad.
+        self.initial_prompt = structured_initial_prompt(initial_prompt)
         self.enhance_audio = enhance_audio
+        self.diarization_enabled = diarization_enabled
+        self.hf_token = hf_token
+        self.venv_python_path = venv_python_path
         self._stop_requested = False
         self._proc: subprocess.Popen | None = None
 
@@ -866,13 +925,27 @@ class TranscribeWorker(QThread):
 
             out_path = Path(self.job.transcript_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # When diarisation is on, we always need Whisper's JSON output
+            # (segments with timestamps) — we'll fuse it with pyannote turns
+            # and re-render to the user's chosen format ourselves.
+            run_diarization = bool(self.diarization_enabled and self.hf_token and self.venv_python_path)
+            if self.diarization_enabled and not run_diarization:
+                self.status.emit(
+                    "Détection des locuteurs ignorée (token Hugging Face ou installation manquante)."
+                )
+
+            whisper_target_dir = tmp_dir if run_diarization else out_path.parent
+            whisper_target_stem = "whisper" if run_diarization else out_path.stem
+            whisper_format = "json" if run_diarization else self.output_format
+            whisper_target = whisper_target_dir / f"{whisper_target_stem}.{transcript_output_ext(whisper_format)}"
             cmd = build_mlx_whisper_cmd(
                 mlx_whisper_path=self.mlx_whisper_path,
                 audio_path=str(wav_path),
-                output_path=str(out_path),
+                output_path=str(whisper_target),
                 model=self.model,
                 language=self.language,
-                output_format=self.output_format,
+                output_format=whisper_format,
                 initial_prompt=self.initial_prompt,
             )
 
@@ -896,6 +969,43 @@ class TranscribeWorker(QThread):
                 self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
                 return
 
+            if run_diarization:
+                self.progress.emit(75)
+                self.status.emit("Détection des locuteurs (pyannote)…")
+                diar_cmd = build_diarization_cmd(self.venv_python_path, str(wav_path))
+                env = os.environ.copy()
+                env["HF_TOKEN"] = self.hf_token
+                self._proc = subprocess.Popen(
+                    diar_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
+                d_stdout, d_stderr = self._proc.communicate()
+
+                if self._stop_requested:
+                    self.failed.emit("Annulé.")
+                    return
+
+                if self._proc.returncode != 0:
+                    detail = (d_stderr or d_stdout or "").strip()
+                    self.failed.emit(
+                        f"Détection des locuteurs échouée (code {self._proc.returncode}). {detail}"
+                    )
+                    return
+
+                try:
+                    turns = parse_diarization_output(d_stdout)
+                    whisper_segments = parse_whisper_json_segments(str(whisper_target))
+                    fused = assign_speakers_to_segments(whisper_segments, turns)
+                    rendered = render_segments_with_speakers(fused, self.output_format)
+                except Exception as exc:
+                    self.failed.emit(f"Fusion transcription/locuteurs échouée: {exc}")
+                    return
+
+                out_path.write_text(rendered, encoding="utf-8")
+
             self.duration_unknown.emit(False)
             self.progress.emit(100)
             self.status.emit("Transcription terminée.")
@@ -912,10 +1022,11 @@ class MlxWhisperInstallWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, python_path: str, venv_dir: Path):
+    def __init__(self, python_path: str, venv_dir: Path, install_diarization: bool = True):
         super().__init__()
         self.python_path = python_path
         self.venv_dir = venv_dir
+        self.install_diarization = install_diarization
 
     def _run_cmd(self, cmd: list[str], label: str):
         self.status.emit(label)
@@ -948,6 +1059,24 @@ class MlxWhisperInstallWorker(QThread):
             mlx_path = managed_mlx_whisper_path()
             if not is_executable(mlx_path):
                 raise RuntimeError("Installation terminée, mais la commande mlx_whisper est introuvable.")
+
+            if self.install_diarization:
+                self._run_cmd(
+                    [str(venv_python), "-m", "pip", "install", "--upgrade", *DIARIZATION_PIP_PACKAGES],
+                    "Installation détection des locuteurs (~2 Go, peut prendre 5-10 min)…",
+                )
+                # Probe the import chain so the user discovers a broken install
+                # here, not the first time they hit "Transcrire".
+                probe = subprocess.run(
+                    [str(venv_python), "-c", "import torch, pyannote.audio"],
+                    capture_output=True,
+                    text=True,
+                )
+                if probe.returncode != 0:
+                    raise RuntimeError(
+                        "Installation détection des locuteurs OK mais l'import échoue: "
+                        + (probe.stderr or probe.stdout or "").strip()
+                    )
 
             self.status.emit("MLX Whisper installé.")
             self.finished_ok.emit(str(mlx_path))
@@ -1161,6 +1290,14 @@ class MainWindow(QWidget):
             or "_transcription"
         )
         self.transcription_enhance_audio = self.settings.value("transcription_enhance_audio", True, type=bool)
+        # Diarisation (séparation des locuteurs) — opt-in, requires HF token.
+        self.transcription_diarization_enabled = self.settings.value(
+            "transcription_diarization_enabled", False, type=bool
+        )
+        self.transcription_hf_token = (
+            self.settings.value("transcription_hf_token", "", type=str).strip()
+            or os.getenv("HF_TOKEN", "").strip()
+        )
 
         self.queue_jobs: list[QueueJob] = []
         self.pending_indices: list[int] = []
@@ -1814,14 +1951,24 @@ class MainWindow(QWidget):
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
             "enhance_audio": self.transcription_enhance_audio,
+            "diarization_enabled": self.transcription_diarization_enabled,
+            "hf_token": self.transcription_hf_token,
         }
 
     def _refresh_transcription_summary(self):
         mlx_status = "installé" if self._mlx_whisper_path() and Path(self._mlx_whisper_path()).exists() else "à installer"
+        if self.transcription_diarization_enabled:
+            if self.transcription_hf_token:
+                diar_status = "ON"
+            else:
+                diar_status = "ON (token HF manquant)"
+        else:
+            diar_status = "OFF"
         self.lbl_transcription_config.setText(
             f"MLX Whisper: {mlx_status}\n"
             f"Modèle: {self.transcription_model or 'mlx-community/whisper-large-v3-turbo'}\n"
-            f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}"
+            f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}\n"
+            f"Détection des locuteurs: {diar_status}"
         )
 
     def _transcription_glossary(self) -> str:
@@ -1855,6 +2002,10 @@ class MainWindow(QWidget):
             str(transcription_settings.get("suffix", "_transcription")).strip() or "_transcription"
         )
         self.transcription_enhance_audio = bool(transcription_settings.get("enhance_audio", True))
+        self.transcription_diarization_enabled = bool(
+            transcription_settings.get("diarization_enabled", False)
+        )
+        self.transcription_hf_token = str(transcription_settings.get("hf_token", "")).strip()
         self.settings.setValue("ffmpeg_path", self.ffmpeg_path)
         self.settings.setValue("ffprobe_path", self.ffprobe_path)
         self.settings.setValue("github_token", self.github_token)
@@ -1864,6 +2015,10 @@ class MainWindow(QWidget):
         self.settings.setValue("transcription_format", self.transcription_format)
         self.settings.setValue("transcription_suffix", self.transcription_suffix)
         self.settings.setValue("transcription_enhance_audio", self.transcription_enhance_audio)
+        self.settings.setValue(
+            "transcription_diarization_enabled", self.transcription_diarization_enabled
+        )
+        self.settings.setValue("transcription_hf_token", self.transcription_hf_token)
         self._refresh_transcription_summary()
 
         if self.ffmpeg_path:
@@ -2716,6 +2871,7 @@ class MainWindow(QWidget):
 
     def _start_transcribe_worker(self, idx: int):
         job = self.queue_jobs[idx]
+        venv_python = managed_venv_python_path()
         self.worker = TranscribeWorker(
             self.ffmpeg_path,
             self.ffprobe_path,
@@ -2726,6 +2882,9 @@ class MainWindow(QWidget):
             self.transcription_format,
             self._transcription_glossary(),
             self.transcription_enhance_audio,
+            diarization_enabled=self.transcription_diarization_enabled,
+            hf_token=self.transcription_hf_token,
+            venv_python_path=str(venv_python) if venv_python.exists() else "",
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.status.connect(self.on_status)
