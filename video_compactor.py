@@ -15,6 +15,7 @@ from pathlib import Path
 
 import certifi
 from ffmpeg_utils import build_ffmpeg_cmd
+from transcription_utils import build_audio_extract_cmd, build_mlx_whisper_cmd, default_transcript_path
 from PySide6.QtCore import QSettings, QThread, QTime, Qt, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QTabWidget,
+    QTextEdit,
     QTimeEdit,
     QToolButton,
     QVBoxLayout,
@@ -47,7 +49,25 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "EkoVideo Compressor"
-APP_VERSION = os.getenv("APP_VERSION", "dev")
+
+try:
+    from _build_version import APP_VERSION as BUILT_APP_VERSION
+except Exception:
+    BUILT_APP_VERSION = ""
+
+
+def normalize_app_version(version_text: str | None) -> str:
+    value = (version_text or "").strip()
+    if not value:
+        return "dev"
+    if value.startswith("v"):
+        value = value[1:]
+    if value.startswith("."):
+        value = value[1:]
+    return value or "dev"
+
+
+APP_VERSION = normalize_app_version(BUILT_APP_VERSION or os.getenv("APP_VERSION", "dev"))
 ORG_NAME = "Ekonum"
 ORG_DOMAIN = "ekonum"
 
@@ -97,7 +117,7 @@ PROFILE_SUFFIX = {
 }
 
 DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
-SEMVER_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+SEMVER_RE = re.compile(r"^v?\.?(\d+)\.(\d+)\.(\d+)$")
 
 
 @dataclass
@@ -115,6 +135,7 @@ class QueueJob:
     trim_enabled: bool = False
     trim_start: str = "00:00:00"
     trim_end: str = "00:00:00"
+    transcript_path: str = ""
     status: str = "pending"
     error_message: str = ""
 
@@ -136,16 +157,28 @@ def candidate_bin_paths() -> list[Path]:
     return [
         base / "ffmpeg",
         base / "ffprobe",
+        base / "mlx_whisper",
+        base / "whisper-cli",
         base / "bin" / "ffmpeg",
         base / "bin" / "ffprobe",
+        base / "bin" / "mlx_whisper",
+        base / "bin" / "whisper-cli",
         base / "Resources" / "ffmpeg",
         base / "Resources" / "ffprobe",
+        base / "Resources" / "mlx_whisper",
+        base / "Resources" / "whisper-cli",
         base / "Resources" / "bin" / "ffmpeg",
         base / "Resources" / "bin" / "ffprobe",
+        base / "Resources" / "bin" / "mlx_whisper",
+        base / "Resources" / "bin" / "whisper-cli",
         Path("/opt/homebrew/bin/ffmpeg"),
         Path("/opt/homebrew/bin/ffprobe"),
+        Path("/opt/homebrew/bin/mlx_whisper"),
+        Path("/opt/homebrew/bin/whisper-cli"),
         Path("/usr/local/bin/ffmpeg"),
         Path("/usr/local/bin/ffprobe"),
+        Path("/usr/local/bin/mlx_whisper"),
+        Path("/usr/local/bin/whisper-cli"),
     ]
 
 
@@ -555,6 +588,175 @@ class EncodeWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class TranscribeWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+    duration_unknown = Signal(bool)
+
+    def __init__(
+        self,
+        ffmpeg_path: str,
+        ffprobe_path: str | None,
+        job: QueueJob,
+        mlx_whisper_path: str,
+        model: str,
+        language: str,
+        output_format: str,
+        initial_prompt: str,
+        enhance_audio: bool,
+    ):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path
+        self.ffprobe_path = ffprobe_path
+        self.job = job
+        self.mlx_whisper_path = mlx_whisper_path
+        self.model = model
+        self.language = language
+        self.output_format = output_format
+        self.initial_prompt = initial_prompt
+        self.enhance_audio = enhance_audio
+        self._stop_requested = False
+        self._proc: subprocess.Popen | None = None
+
+    def request_stop(self):
+        self._stop_requested = True
+        if self._proc:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        if not self.ffmpeg_path or not Path(self.ffmpeg_path).exists():
+            self.failed.emit("ffmpeg introuvable. Vérifiez les paramètres.")
+            return
+        if not self.mlx_whisper_path or not Path(self.mlx_whisper_path).exists():
+            self.failed.emit(
+                "mlx_whisper introuvable. Installez-le avec: python3 -m pip install mlx-whisper"
+            )
+            return
+        if not Path(self.job.input_path).exists():
+            self.failed.emit("Fichier d'entrée introuvable.")
+            return
+        if not self.job.transcript_path:
+            self.failed.emit("Chemin de transcription manquant.")
+            return
+
+        duration = probe_duration_seconds(self.job.input_path, self.ffprobe_path, self.ffmpeg_path)
+        self.duration_unknown.emit(duration is None)
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ekovideo-transcribe-"))
+        wav_path = tmp_dir / "audio.wav"
+        try:
+            self.status.emit("Préparation audio original…")
+            ss = self.job.trim_start if self.job.trim_enabled else None
+            to = self.job.trim_end if self.job.trim_enabled else None
+            extract_cmd = build_audio_extract_cmd(
+                ffmpeg_path=self.ffmpeg_path,
+                in_path=self.job.input_path,
+                wav_path=str(wav_path),
+                speech_enhance=self.enhance_audio,
+                ss=ss,
+                to=to,
+            )
+            self._proc = subprocess.Popen(
+                extract_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            last_pct = -1
+            while True:
+                if self._stop_requested:
+                    self.failed.emit("Annulé.")
+                    return
+
+                line = self._proc.stdout.readline() if self._proc.stdout else ""
+                if not line:
+                    break
+                line = line.strip()
+
+                if line.startswith("out_time_ms="):
+                    try:
+                        out_time_ms = int(line.split("=", 1)[1])
+                    except Exception:
+                        continue
+
+                    if duration and duration > 0:
+                        current_sec = out_time_ms / 1_000_000.0
+                        pct = int(min(25, max(0, (current_sec / duration) * 25)))
+                        if pct != last_pct:
+                            last_pct = pct
+                            self.progress.emit(pct)
+                            self.status.emit(f"Préparation audio… {pct}%")
+                    else:
+                        self.status.emit("Préparation audio…")
+
+                elif line.startswith("progress=end"):
+                    break
+
+            rc = self._proc.wait()
+            if rc != 0:
+                err = ""
+                try:
+                    err = (self._proc.stderr.read() or "").strip()
+                except Exception:
+                    pass
+                self.failed.emit(err or f"ffmpeg a échoué (code {rc}).")
+                return
+
+            if self._stop_requested:
+                self.failed.emit("Annulé.")
+                return
+
+            out_path = Path(self.job.transcript_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            cmd = build_mlx_whisper_cmd(
+                mlx_whisper_path=self.mlx_whisper_path,
+                audio_path=str(wav_path),
+                output_path=str(out_path),
+                model=self.model,
+                language=self.language,
+                output_format=self.output_format,
+                initial_prompt=self.initial_prompt,
+            )
+
+            self.duration_unknown.emit(True)
+            self.progress.emit(25)
+            self.status.emit("Transcription locale MLX…")
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = self._proc.communicate()
+
+            if self._stop_requested:
+                self.failed.emit("Annulé.")
+                return
+
+            if self._proc.returncode != 0:
+                detail = (stderr or stdout or "").strip()
+                self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
+                return
+
+            self.duration_unknown.emit(False)
+            self.progress.emit(100)
+            self.status.emit("Transcription terminée.")
+            self.finished_ok.emit(str(out_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self._proc = None
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 class UpdateWorker(QThread):
     check_finished = Signal(object)
     download_progress = Signal(int)
@@ -745,7 +947,10 @@ class MainWindow(QWidget):
         self.failed_count = 0
         self.running_index: int | None = None
         self.current_index: int = -1
-        self.worker: EncodeWorker | None = None
+        self.worker: EncodeWorker | TranscribeWorker | None = None
+        self.batch_mode = "compress"
+        self.current_job_progress_offset = 0
+        self.current_job_progress_scale = 100
         self.update_worker: UpdateWorker | None = None
         self._last_update_info: dict | None = None
         self._update_phase: str = ""
@@ -866,6 +1071,11 @@ class MainWindow(QWidget):
         audio_layout.setContentsMargins(6, 6, 6, 6)
         audio_layout.setSpacing(8)
 
+        transcription_tab = QWidget()
+        transcription_layout = QVBoxLayout(transcription_tab)
+        transcription_layout.setContentsMargins(6, 6, 6, 6)
+        transcription_layout.setSpacing(8)
+
         workflow_group = QGroupBox("Workflow")
         workflow_form = QFormLayout(workflow_group)
         workflow_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -956,6 +1166,86 @@ class MainWindow(QWidget):
 
         audio_layout.addWidget(audio_group)
 
+        transcribe_group = QGroupBox("Transcription locale")
+        transcribe_form = QFormLayout(transcribe_group)
+        transcribe_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        transcribe_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self.check_transcribe_after_encode = QCheckBox("Transcrire après compression")
+        self.check_transcribe_after_encode.setChecked(self.settings.value("transcribe_after_encode", False, type=bool))
+        transcribe_form.addRow("", self.check_transcribe_after_encode)
+
+        self.combo_transcription_engine = QComboBox()
+        self.combo_transcription_engine.addItems(["MLX Whisper"])
+        transcribe_form.addRow("Moteur", self.combo_transcription_engine)
+
+        self.edit_mlx_whisper_path = QLineEdit(
+            self.settings.value("mlx_whisper_path", "", type=str).strip() or find_binary("mlx_whisper") or ""
+        )
+        self.edit_mlx_whisper_path.setPlaceholderText("mlx_whisper")
+        btn_mlx_path = QPushButton("…")
+        btn_mlx_path.setObjectName("secondaryButton")
+        btn_mlx_path.clicked.connect(self.pick_mlx_whisper)
+        mlx_row = QHBoxLayout()
+        mlx_row.addWidget(self.edit_mlx_whisper_path)
+        mlx_row.addWidget(btn_mlx_path)
+        transcribe_form.addRow("Commande", mlx_row)
+
+        self.edit_transcription_model = QLineEdit(
+            str(
+                self.settings.value(
+                    "transcription_model",
+                    "mlx-community/whisper-large-v3-turbo",
+                    type=str,
+                )
+            )
+        )
+        transcribe_form.addRow("Modèle", self.edit_transcription_model)
+
+        self.combo_transcription_language = QComboBox()
+        self.combo_transcription_language.addItems(["fr", "auto", "en", "es", "de", "it"])
+        self.combo_transcription_language.setCurrentText(
+            str(self.settings.value("transcription_language", "fr", type=str))
+        )
+        transcribe_form.addRow("Langue", self.combo_transcription_language)
+
+        self.combo_transcription_format = QComboBox()
+        self.combo_transcription_format.addItems(["txt", "srt", "vtt", "json", "all"])
+        self.combo_transcription_format.setCurrentText(
+            str(self.settings.value("transcription_format", "txt", type=str))
+        )
+        transcribe_form.addRow("Sortie", self.combo_transcription_format)
+
+        self.edit_transcription_suffix = QLineEdit(
+            str(self.settings.value("transcription_suffix", "_transcription", type=str))
+        )
+        transcribe_form.addRow("Suffixe", self.edit_transcription_suffix)
+
+        self.check_transcription_enhance = QCheckBox("Nettoyer la voix avant transcription")
+        self.check_transcription_enhance.setChecked(
+            self.settings.value("transcription_enhance_audio", True, type=bool)
+        )
+        transcribe_form.addRow("", self.check_transcription_enhance)
+
+        self.edit_transcription_prompt = QTextEdit()
+        self.edit_transcription_prompt.setAcceptRichText(False)
+        self.edit_transcription_prompt.setPlaceholderText("Noms propres, clients, projets, acronymes, vocabulaire métier…")
+        self.edit_transcription_prompt.setPlainText(
+            str(self.settings.value("transcription_prompt", "", type=str))
+        )
+        self.edit_transcription_prompt.setFixedHeight(96)
+        transcribe_form.addRow("Contexte", self.edit_transcription_prompt)
+
+        self.lbl_transcription_hint = QLabel(
+            "La transcription utilise l'audio extrait depuis la vidéo originale, avec le contexte ci-dessus pour aider les noms propres."
+        )
+        self.lbl_transcription_hint.setObjectName("metaLabel")
+        self.lbl_transcription_hint.setWordWrap(True)
+
+        transcription_layout.addWidget(transcribe_group)
+        transcription_layout.addWidget(self.lbl_transcription_hint)
+        transcription_layout.addStretch(1)
+
         trim_group = QGroupBox("Rognage")
         trim_form = QFormLayout(trim_group)
         trim_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -990,6 +1280,7 @@ class MainWindow(QWidget):
         self.tabs.addTab(workflow_tab, "Workflow")
         self.tabs.addTab(video_tab, "Vidéo")
         self.tabs.addTab(audio_tab, "Audio")
+        self.tabs.addTab(transcription_tab, "Transcription")
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_col)
@@ -1022,6 +1313,11 @@ class MainWindow(QWidget):
         self.btn_start.clicked.connect(self.start_encode)
         self.btn_start.setEnabled(False)
 
+        self.btn_transcribe = QPushButton("Transcrire")
+        self.btn_transcribe.setObjectName("secondaryButton")
+        self.btn_transcribe.clicked.connect(self.start_transcription)
+        self.btn_transcribe.setEnabled(False)
+
         self.btn_cancel = QPushButton("Annuler")
         self.btn_cancel.setObjectName("secondaryButton")
         self.btn_cancel.clicked.connect(self.cancel_encode)
@@ -1029,6 +1325,7 @@ class MainWindow(QWidget):
 
         actions.addWidget(self.btn_open_output)
         actions.addStretch(1)
+        actions.addWidget(self.btn_transcribe)
         actions.addWidget(self.btn_start)
         actions.addWidget(self.btn_cancel)
         root.addLayout(actions)
@@ -1209,12 +1506,15 @@ class MainWindow(QWidget):
             background: #2f8f69;
             color: #ffffff;
         }
-        QComboBox, QSpinBox, QTimeEdit, QLineEdit {
+        QComboBox, QSpinBox, QTimeEdit, QLineEdit, QTextEdit {
             background: #ffffff;
             border: 1px solid #bdd6c7;
             border-radius: 9px;
             padding: 6px 9px;
             min-height: 20px;
+        }
+        QTextEdit {
+            selection-background-color: #cfeadc;
         }
         QComboBox::drop-down {
             border: none;
@@ -1302,6 +1602,14 @@ class MainWindow(QWidget):
         self.settings.setValue("output_dir", self.edit_output_dir.text().strip())
         self.settings.setValue("suffix", self.edit_suffix.text().strip())
         self.settings.setValue("continue_on_error", self.check_continue_on_error.isChecked())
+        self.settings.setValue("transcribe_after_encode", self.check_transcribe_after_encode.isChecked())
+        self.settings.setValue("mlx_whisper_path", self.edit_mlx_whisper_path.text().strip())
+        self.settings.setValue("transcription_model", self.edit_transcription_model.text().strip())
+        self.settings.setValue("transcription_language", self.combo_transcription_language.currentText())
+        self.settings.setValue("transcription_format", self.combo_transcription_format.currentText())
+        self.settings.setValue("transcription_suffix", self.edit_transcription_suffix.text().strip())
+        self.settings.setValue("transcription_enhance_audio", self.check_transcription_enhance.isChecked())
+        self.settings.setValue("transcription_prompt", self.edit_transcription_prompt.toPlainText().strip())
 
     def check_updates(self):
         if self.update_worker is not None:
@@ -1453,10 +1761,13 @@ class MainWindow(QWidget):
                     "  parent=\"$(dirname \"$dst\")\"",
                     "  mkdir -p \"$parent\" || return 1",
                     "  rm -rf \"${dst}.new\" || return 1",
-                    "  cp -R \"$src\" \"${dst}.new\" || return 1",
+                    "  ditto --noqtn \"$src\" \"${dst}.new\" || return 1",
+                    "  xattr -cr \"${dst}.new\" || true",
                     "  xattr -dr com.apple.quarantine \"${dst}.new\" || true",
                     "  rm -rf \"$dst\" || return 1",
                     "  mv \"${dst}.new\" \"$dst\" || return 1",
+                    "  xattr -cr \"$dst\" || true",
+                    "  xattr -dr com.apple.quarantine \"$dst\" || true",
                     "  return 0",
                     "}",
                     "for i in {1..120}; do",
@@ -1544,6 +1855,11 @@ class MainWindow(QWidget):
         if directory:
             self.edit_output_dir.setText(directory)
 
+    def pick_mlx_whisper(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choisir mlx_whisper", str(Path.home()), "Tous (*.*)")
+        if path:
+            self.edit_mlx_whisper_path.setText(path)
+
     def open_output_dir(self):
         out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home()))
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1585,6 +1901,7 @@ class MainWindow(QWidget):
             self.queue_list.setCurrentRow(0)
 
         self.btn_start.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
+        self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
         if added:
             self.status.setText(f"{added} fichier(s) ajouté(s).")
 
@@ -1605,6 +1922,7 @@ class MainWindow(QWidget):
             self.update_estimation(None)
 
         self.btn_start.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
+        self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
 
     def clear_queue(self):
         if self.is_batch_running:
@@ -1617,6 +1935,7 @@ class MainWindow(QWidget):
         self.progress.setValue(0)
         self.progress_global.setValue(0)
         self.btn_start.setEnabled(False)
+        self.btn_transcribe.setEnabled(False)
 
     def status_prefix(self, job: QueueJob) -> str:
         if job.status == "done":
@@ -1637,6 +1956,10 @@ class MainWindow(QWidget):
         if item:
             item.setText(title)
             tooltip = job.input_path
+            if job.output_path:
+                tooltip += f"\nVidéo: {job.output_path}"
+            if job.transcript_path:
+                tooltip += f"\nTranscription: {job.transcript_path}"
             if job.error_message:
                 tooltip += f"\nErreur: {job.error_message}"
             item.setToolTip(tooltip)
@@ -1812,12 +2135,24 @@ class MainWindow(QWidget):
         end = QTime.fromString(job.trim_end, "HH:mm:ss")
         return start.isValid() and end.isValid() and start < end
 
+    def _transcription_output_path(self, job: QueueJob, out_dir: Path) -> str:
+        return default_transcript_path(
+            job.input_path,
+            str(out_dir),
+            self.edit_transcription_suffix.text().strip(),
+            self.combo_transcription_format.currentText(),
+        )
+
+    def _mlx_whisper_path(self) -> str:
+        return self.edit_mlx_whisper_path.text().strip() or find_binary("mlx_whisper") or ""
+
     def _set_running_ui(self, running: bool):
         self.is_batch_running = running
         self.btn_pick.setEnabled(not running)
         self.btn_remove.setEnabled(not running)
         self.btn_clear.setEnabled(not running)
         self.btn_start.setEnabled(bool(self.queue_jobs) and not running)
+        self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not running)
         self.btn_cancel.setEnabled(running)
         self.btn_settings.setEnabled(not running)
         self.btn_update.setEnabled(not running and self.update_worker is None)
@@ -1835,6 +2170,20 @@ class MainWindow(QWidget):
         if self.current_index >= 0:
             self.save_current_job_from_controls(force_custom=False)
         self.save_global_settings()
+        self.batch_mode = "compress_transcribe" if self.check_transcribe_after_encode.isChecked() else "compress"
+        if self.batch_mode == "compress_transcribe":
+            mlx_path = self._mlx_whisper_path()
+            if not mlx_path or not Path(mlx_path).exists():
+                QMessageBox.warning(
+                    self,
+                    "mlx_whisper introuvable",
+                    "La transcription après compression est activée, mais mlx_whisper est introuvable.\n\n"
+                    "Installez MLX Whisper avec:\npython3 -m pip install mlx-whisper\n\n"
+                    "Puis renseignez le chemin de la commande dans l'onglet Transcription.",
+                )
+                self.tabs.setCurrentIndex(3)
+                return
+            self.edit_mlx_whisper_path.setText(mlx_path)
 
         out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1847,6 +2196,59 @@ class MainWindow(QWidget):
                 return
 
             self.queue_jobs[idx].output_path = default_out_path(job.input_path, str(out_dir), self.edit_suffix.text().strip())
+            self.queue_jobs[idx].transcript_path = (
+                self._transcription_output_path(job, out_dir) if self.batch_mode == "compress_transcribe" else ""
+            )
+            self.queue_jobs[idx].status = "pending"
+            self.queue_jobs[idx].error_message = ""
+
+        self.pending_indices = list(range(len(self.queue_jobs)))
+        self.completed_count = 0
+        self.failed_count = 0
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress_global.setRange(0, 100)
+        self.progress_global.setValue(0)
+        self.refresh_all_queue_items()
+        self._set_running_ui(True)
+        self._start_next_job()
+
+    def start_transcription(self):
+        if not self.queue_jobs:
+            return
+
+        if not self.ffmpeg_path or not Path(self.ffmpeg_path).exists():
+            QMessageBox.critical(self, "ffmpeg introuvable", "ffmpeg est requis pour préparer l'audio.")
+            return
+
+        mlx_path = self._mlx_whisper_path()
+        if not mlx_path or not Path(mlx_path).exists():
+            QMessageBox.warning(
+                self,
+                "mlx_whisper introuvable",
+                "Installez MLX Whisper avec:\npython3 -m pip install mlx-whisper\n\n"
+                "Puis renseignez le chemin de la commande dans l'onglet Transcription.",
+            )
+            self.tabs.setCurrentIndex(3)
+            return
+        self.edit_mlx_whisper_path.setText(mlx_path)
+
+        if self.current_index >= 0:
+            self.save_current_job_from_controls(force_custom=False)
+        self.save_global_settings()
+        self.batch_mode = "transcribe"
+
+        out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.edit_output_dir.setText(str(out_dir))
+
+        for idx, job in enumerate(self.queue_jobs):
+            if not self._validate_trim(job):
+                QMessageBox.warning(self, "Rognage invalide", f"Le rognage est invalide pour {Path(job.input_path).name}.")
+                self.queue_list.setCurrentRow(idx)
+                return
+
+            self.queue_jobs[idx].transcript_path = self._transcription_output_path(job, out_dir)
             self.queue_jobs[idx].status = "pending"
             self.queue_jobs[idx].error_message = ""
 
@@ -1878,11 +2280,39 @@ class MainWindow(QWidget):
         total = len(self.queue_jobs)
         self.status.setText(f"Traitement {current}/{total}: {Path(job.input_path).name}")
 
+        if self.batch_mode == "transcribe":
+            self.current_job_progress_offset = 0
+            self.current_job_progress_scale = 100
+            self._start_transcribe_worker(idx)
+            return
+
+        self.current_job_progress_offset = 0
+        self.current_job_progress_scale = 50 if self.batch_mode == "compress_transcribe" else 100
         self.worker = EncodeWorker(self.ffmpeg_path, self.ffprobe_path, replace(job))
         self.worker.progress.connect(self.on_progress)
         self.worker.status.connect(self.on_status)
         self.worker.duration_unknown.connect(self.on_duration_unknown)
         self.worker.finished_ok.connect(self.on_done)
+        self.worker.failed.connect(self.on_fail)
+        self.worker.start()
+
+    def _start_transcribe_worker(self, idx: int):
+        job = self.queue_jobs[idx]
+        self.worker = TranscribeWorker(
+            self.ffmpeg_path,
+            self.ffprobe_path,
+            replace(job),
+            self._mlx_whisper_path(),
+            self.edit_transcription_model.text().strip(),
+            self.combo_transcription_language.currentText(),
+            self.combo_transcription_format.currentText(),
+            self.edit_transcription_prompt.toPlainText().strip(),
+            self.check_transcription_enhance.isChecked(),
+        )
+        self.worker.progress.connect(self.on_progress)
+        self.worker.status.connect(self.on_status)
+        self.worker.duration_unknown.connect(self.on_duration_unknown)
+        self.worker.finished_ok.connect(self.on_transcription_done)
         self.worker.failed.connect(self.on_fail)
         self.worker.start()
 
@@ -1898,11 +2328,14 @@ class MainWindow(QWidget):
     def on_progress(self, pct: int):
         if self.progress.maximum() == 0:
             self.progress.setRange(0, 100)
-        self.progress.setValue(pct)
+        display_pct = int(
+            min(100, max(0, self.current_job_progress_offset + (pct * self.current_job_progress_scale / 100.0)))
+        )
+        self.progress.setValue(display_pct)
 
         total = max(1, len(self.queue_jobs))
         done = self.completed_count + self.failed_count
-        global_pct = int(min(100, ((done + pct / 100.0) / total) * 100))
+        global_pct = int(min(100, ((done + display_pct / 100.0) / total) * 100))
         self.progress_global.setValue(global_pct)
 
     def cancel_encode(self):
@@ -1916,9 +2349,40 @@ class MainWindow(QWidget):
             return
         idx = self.running_index
         job = self.queue_jobs[idx]
+        if self.batch_mode == "compress_transcribe":
+            job.output_path = out_path
+            self.worker = None
+            self.current_job_progress_offset = 50
+            self.current_job_progress_scale = 50
+            self.progress.setRange(0, 100)
+            self.progress.setValue(50)
+            self.status.setText(f"Compression terminée, transcription: {Path(job.input_path).name}")
+            self._start_transcribe_worker(idx)
+            return
+
         job.status = "done"
         job.error_message = ""
         job.output_path = out_path
+        self.completed_count += 1
+        self.running_index = None
+        self.worker = None
+
+        self.refresh_queue_item(idx)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(100)
+
+        total = max(1, len(self.queue_jobs))
+        self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
+        self._start_next_job()
+
+    def on_transcription_done(self, transcript_path: str):
+        if self.running_index is None:
+            return
+        idx = self.running_index
+        job = self.queue_jobs[idx]
+        job.status = "done"
+        job.error_message = ""
+        job.transcript_path = transcript_path
         self.completed_count += 1
         self.running_index = None
         self.worker = None
@@ -1944,6 +2408,7 @@ class MainWindow(QWidget):
             job.status = "failed"
             job.error_message = "Annulé"
             self.refresh_queue_item(idx)
+            self.progress.setRange(0, 100)
             self._finish_batch(cancelled=True)
             return
 
@@ -1951,6 +2416,7 @@ class MainWindow(QWidget):
         job.error_message = msg
         self.failed_count += 1
         self.refresh_queue_item(idx)
+        self.progress.setRange(0, 100)
 
         if not self.check_continue_on_error.isChecked():
             self.pending_indices.clear()

@@ -1,0 +1,38 @@
+name: Build macOS
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Homebrew ffmpeg
+        run: |
+          brew update
+          brew install ffmpeg
+
+      - name: Build app bundle
+        env:
+          APP_VERSION: dev-${{ github.run_number }}
+        run: |
+          chmod +x scripts/build_macos.sh
+          scripts/build_macos.sh "$APP_VERSION"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EkoVideoCompressor-macos-arm64
+          path: dist/release/*.zip

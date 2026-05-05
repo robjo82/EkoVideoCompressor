@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
 
 import certifi
@@ -7,6 +8,7 @@ import certifi
 # `__file__` is not defined when PyInstaller executes spec files in CI.
 # The build script/workflow runs from repository root, so cwd is reliable here.
 project_dir = Path.cwd().resolve()
+app_version = os.environ.get("APP_VERSION", "0.0.0").strip().lstrip("v") or "0.0.0"
 
 binaries = []
 for name in ("ffmpeg", "ffprobe"):
@@ -39,8 +41,6 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
     name='EkoVideoCompressor',
     debug=False,
@@ -55,11 +55,27 @@ exe = EXE(
     target_arch='arm64',
     codesign_identity=None,
     entitlements_file=None,
+    exclude_binaries=True,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='EkoVideoCompressor',
 )
 
 app = BUNDLE(
-    exe,
+    coll,
     name='EkoVideoCompressor.app',
     icon=None,
     bundle_identifier='com.ekonum.ekovideocompressor',
+    info_plist={
+        "CFBundleDisplayName": "EkoVideoCompressor",
+        "CFBundleShortVersionString": app_version,
+        "CFBundleVersion": app_version,
+    },
 )

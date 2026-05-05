@@ -38,6 +38,27 @@ Flux:
 Si le dépôt est privé, renseignez un token GitHub (lecture du repo) dans:
 `Paramètres` → `Token update`.
 
+## Transcription locale
+
+L'app peut lancer une transcription locale via **MLX Whisper** sur Apple Silicon.
+La vidéo originale est utilisée comme source audio, puis l'audio temporaire est extrait en WAV propre avant transcription.
+
+Installation optionnelle:
+
+```bash
+python3 -m pip install mlx-whisper
+```
+
+Dans l'onglet `Transcription`, le modèle recommandé par défaut est:
+`mlx-community/whisper-large-v3-turbo`.
+
+Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper.
+
+## Builds GitHub
+
+- Un push sur `main` lance un build macOS de test disponible dans les artifacts GitHub Actions.
+- Une release installable par l'auto-update est publiée uniquement quand un tag `vX.Y.Z` est poussé.
+
 ## Build local macOS
 
 ```bash
