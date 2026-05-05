@@ -1354,6 +1354,7 @@ class MainWindow(QWidget):
         self.running_index: int | None = None
         self.current_index: int = -1
         self.worker: EncodeWorker | TranscribeWorker | None = None
+        self._active_workers: list[QThread] = []
         self.mlx_install_worker: MlxWhisperInstallWorker | None = None
         self.batch_mode = "compress"
         self.current_job_progress_offset = 0
@@ -2912,18 +2913,20 @@ class MainWindow(QWidget):
 
         self.current_job_progress_offset = 0
         self.current_job_progress_scale = 50 if self.batch_mode == "compress_transcribe" else 100
-        self.worker = EncodeWorker(self.ffmpeg_path, self.ffprobe_path, replace(job))
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status.connect(self.on_status)
-        self.worker.duration_unknown.connect(self.on_duration_unknown)
-        self.worker.finished_ok.connect(self.on_done)
-        self.worker.failed.connect(self.on_fail)
-        self.worker.start()
+        worker = EncodeWorker(self.ffmpeg_path, self.ffprobe_path, replace(job))
+        self.worker = worker
+        self._track_worker(worker)
+        worker.progress.connect(self.on_progress)
+        worker.status.connect(self.on_status)
+        worker.duration_unknown.connect(self.on_duration_unknown)
+        worker.finished_ok.connect(self.on_done)
+        worker.failed.connect(self.on_fail)
+        worker.start()
 
     def _start_transcribe_worker(self, idx: int):
         job = self.queue_jobs[idx]
         venv_python = managed_venv_python_path()
-        self.worker = TranscribeWorker(
+        worker = TranscribeWorker(
             self.ffmpeg_path,
             self.ffprobe_path,
             replace(job),
@@ -2937,12 +2940,26 @@ class MainWindow(QWidget):
             hf_token=self.transcription_hf_token,
             venv_python_path=str(venv_python) if venv_python.exists() else "",
         )
-        self.worker.progress.connect(self.on_progress)
-        self.worker.status.connect(self.on_status)
-        self.worker.duration_unknown.connect(self.on_duration_unknown)
-        self.worker.finished_ok.connect(self.on_transcription_done)
-        self.worker.failed.connect(self.on_fail)
-        self.worker.start()
+        self.worker = worker
+        self._track_worker(worker)
+        worker.progress.connect(self.on_progress)
+        worker.status.connect(self.on_status)
+        worker.duration_unknown.connect(self.on_duration_unknown)
+        worker.finished_ok.connect(self.on_transcription_done)
+        worker.failed.connect(self.on_fail)
+        worker.start()
+
+    def _track_worker(self, worker: QThread):
+        self._active_workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._release_worker(w))
+
+    def _release_worker(self, worker: QThread):
+        if self.worker is worker:
+            self.worker = None
+        try:
+            self._active_workers.remove(worker)
+        except ValueError:
+            pass
 
     def on_duration_unknown(self, unknown: bool):
         if unknown:
@@ -2979,7 +2996,6 @@ class MainWindow(QWidget):
         job = self.queue_jobs[idx]
         if self.batch_mode == "compress_transcribe":
             job.output_path = out_path
-            self.worker = None
             self.current_job_progress_offset = 50
             self.current_job_progress_scale = 50
             self.progress.setRange(0, 100)
@@ -2993,7 +3009,6 @@ class MainWindow(QWidget):
         job.output_path = out_path
         self.completed_count += 1
         self.running_index = None
-        self.worker = None
 
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
@@ -3013,7 +3028,6 @@ class MainWindow(QWidget):
         job.transcript_path = transcript_path
         self.completed_count += 1
         self.running_index = None
-        self.worker = None
 
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
@@ -3030,7 +3044,6 @@ class MainWindow(QWidget):
         idx = self.running_index
         job = self.queue_jobs[idx]
         self.running_index = None
-        self.worker = None
 
         if msg == "Annulé.":
             job.status = "failed"
