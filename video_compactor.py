@@ -1571,11 +1571,58 @@ class LibraryView(QWidget):
         
         self.btn_open = QPushButton("Voir résultat")
         self.btn_open.clicked.connect(self.open_result)
-        layout.addWidget(self.btn_open)
+        
+        self.btn_restart = QPushButton("Relancer / Réparer")
+        self.btn_restart.clicked.connect(self.restart_job)
+        
+        self.btn_delete = QPushButton("Supprimer")
+        self.btn_delete.setObjectName("secondaryButton")
+        self.btn_delete.clicked.connect(self.delete_entry)
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.btn_open)
+        actions.addWidget(self.btn_restart)
+        actions.addWidget(self.btn_delete)
+        layout.addLayout(actions)
         
         self.refresh()
         
     def refresh(self):
+        # ... (unchanged refresh logic)
+        
+    def restart_job(self):
+        item = self.list.currentItem()
+        if not item: return
+        job_id = item.data(Qt.UserRole)
+        self.db.update_job_status(job_id, "PENDING", "")
+        # Signal MainWindow to reload from DB (simplified via a custom signal or direct call if parent is MW)
+        main_win = self.window()
+        if hasattr(main_win, "queue_jobs"):
+            main_win.queue_jobs.clear()
+            main_win.queue_list.clear()
+            main_win.load_jobs_from_db()
+            QMessageBox.information(self, "Restart", "La vidéo a été remise en file d'attente.")
+
+    def delete_entry(self):
+        item = self.list.currentItem()
+        if not item: return
+        job_id = item.data(Qt.UserRole)
+        confirm = QMessageBox.question(self, "Confirmer", "Supprimer cette entrée de la bibliothèque ? (Le fichier de transcription ne sera pas supprimé)")
+        if confirm == QMessageBox.StandardButton.Yes:
+            job = self.db.get_job(job_id)
+            if job and job['workspace_dir'] and Path(job['workspace_dir']).exists():
+                try:
+                    shutil.rmtree(job['workspace_dir'])
+                except Exception:
+                    pass
+            self.db.delete_job(job_id)
+            self.refresh()
+            # Also sync main queue
+            main_win = self.window()
+            if hasattr(main_win, "queue_jobs"):
+                main_win.queue_jobs.clear()
+                main_win.queue_list.clear()
+                main_win.load_jobs_from_db()
         query = self.search_input.text().strip()
         self.list.clear()
         
@@ -2925,6 +2972,10 @@ class MainWindow(QWidget):
             job.workspace_dir = row['workspace_dir'] or ""
             job.output_path = row['output_path'] or ""
             
+            # INDUSTRIAL CLEANUP: If job failed/cancelled and has workspace, 
+            # we could clean it, but keeping for now for manual restart.
+            # Instead, let's just make sure we don't leak temp dirs.
+
             self.queue_jobs.append(job)
             self.queue_list.addItem(QListWidgetItem())
             self.refresh_queue_item(len(self.queue_jobs) - 1)
@@ -3529,6 +3580,15 @@ class MainWindow(QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.library_view.refresh()
+        
+        # INDUSTRIAL CLEANUP: Remove bulky intermediate WAV to save space
+        if job.workspace_dir:
+            wav_path = Path(job.workspace_dir) / "audio.wav"
+            if wav_path.exists():
+                try:
+                    wav_path.unlink()
+                except Exception:
+                    pass
 
         total = max(1, len(self.queue_jobs))
         self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
@@ -3549,6 +3609,15 @@ class MainWindow(QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.library_view.refresh()
+        
+        # INDUSTRIAL CLEANUP: Remove bulky intermediate WAV to save space
+        if job.workspace_dir:
+            wav_path = Path(job.workspace_dir) / "audio.wav"
+            if wav_path.exists():
+                try:
+                    wav_path.unlink()
+                except Exception:
+                    pass
 
         total = max(1, len(self.queue_jobs))
         self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
