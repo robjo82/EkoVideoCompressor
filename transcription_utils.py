@@ -297,12 +297,19 @@ except Exception as exc:
 turns = []
 # pyannote-audio 3.x returns an Annotation object with itertracks.
 # pyannote-audio 4.x (with pyannoteai-sdk) might return a DiarizeOutput object.
-# If it's a DiarizeOutput, try to convert it to a standard Annotation.
-if not hasattr(diar, "itertracks") and hasattr(diar, "to_annotation"):
-    try:
-        diar = diar.to_annotation()
-    except Exception:
-        pass
+
+# If it's a DiarizeOutput (from pyannote-audio 4.x), extract the annotation.
+if not hasattr(diar, "itertracks"):
+    # Try commercial/new SDK structure first
+    if hasattr(diar, "exclusive_speaker_diarization"):
+        diar = diar.exclusive_speaker_diarization
+    elif hasattr(diar, "speaker_diarization"):
+        diar = diar.speaker_diarization
+    elif hasattr(diar, "to_annotation"):
+        try:
+            diar = diar.to_annotation()
+        except Exception:
+            pass
 
 if hasattr(diar, "itertracks"):
     for turn, _, speaker in diar.itertracks(yield_label=True):
