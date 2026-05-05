@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -141,9 +141,13 @@ WHISPER_SEGMENT_RE = re.compile(r"\[(\d{1,2}):(\d{2}):(\d{2}(?:[.,]\d+)?)\s*-->"
 SEMVER_RE = re.compile(r"^v?\.?(\d+)\.(\d+)\.(\d+)$")
 
 
+from database_manager import DatabaseManager
+
 @dataclass
 class QueueJob:
     input_path: str
+    db_id: Optional[int] = None
+    workspace_dir: str = ""
     output_path: str = ""
     profile_name: str = "Réunion équilibrée"
     resolution: str = "720p"
@@ -883,6 +887,7 @@ class TranscribeWorker(QThread):
         output_format: str,
         initial_prompt: str,
         enhance_audio: bool,
+        db: DatabaseManager,
         diarization_enabled: bool = False,
         hf_token: str = "",
         venv_python_path: str = "",
@@ -895,6 +900,7 @@ class TranscribeWorker(QThread):
         self.model = model
         self.language = language
         self.output_format = output_format
+        self.db = db
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -907,6 +913,11 @@ class TranscribeWorker(QThread):
 
     def _log(self, message: str):
         append_app_log(f"transcription file={Path(self.job.input_path).name!r} {message}")
+
+    def _update_db_status(self, status: str, error: str = ""):
+        if self.job.db_id:
+            self.db.update_job_status(self.job.db_id, status, error)
+            self.job.status = status
 
     def _log_process_result(
         self,
@@ -965,74 +976,93 @@ class TranscribeWorker(QThread):
             f"format={self.output_format!r} enhance_audio={self.enhance_audio} "
             f"diarization_enabled={self.diarization_enabled} "
             f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)} "
-            f"prompt_chars={len(self.initial_prompt)}"
+            f"prompt_chars={len(self.initial_prompt)} db_status={self.job.status}"
         )
         duration = probe_duration_seconds(self.job.input_path, self.ffprobe_path, self.ffmpeg_path)
         self.duration_unknown.emit(duration is None)
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="ekovideo-transcribe-"))
-        wav_path = tmp_dir / "audio.wav"
+        # Resumption logic: use workspace if it exists, otherwise use temp
+        tmp_dir = None
+        if self.job.workspace_dir and Path(self.job.workspace_dir).exists():
+            work_dir = Path(self.job.workspace_dir)
+        else:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="ekovideo-transcribe-"))
+            work_dir = tmp_dir
+            
+        wav_path = work_dir / "audio.wav"
+        
         try:
-            self.status.emit("Préparation audio original…")
-            ss = self.job.trim_start if self.job.trim_enabled else None
-            to = self.job.trim_end if self.job.trim_enabled else None
-            extract_cmd = build_audio_extract_cmd(
-                ffmpeg_path=self.ffmpeg_path,
-                in_path=self.job.input_path,
-                wav_path=str(wav_path),
-                speech_enhance=self.enhance_audio,
-                ss=ss,
-                to=to,
-            )
-            self._proc = subprocess.Popen(
-                extract_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
+            # --- STEP 1: Audio Extraction ---
+            skip_audio = (self.job.status in {"AUDIO_READY", "WHISPER_DONE", "COMPLETED"} 
+                         and wav_path.exists())
+            
+            if not skip_audio:
+                self._update_db_status("IMPORTING")
+                self.status.emit("Préparation audio original…")
+                ss = self.job.trim_start if self.job.trim_enabled else None
+                to = self.job.trim_end if self.job.trim_enabled else None
+                extract_cmd = build_audio_extract_cmd(
+                    ffmpeg_path=self.ffmpeg_path,
+                    in_path=self.job.input_path,
+                    wav_path=str(wav_path),
+                    speech_enhance=self.enhance_audio,
+                    ss=ss,
+                    to=to,
+                )
+                self._proc = subprocess.Popen(
+                    extract_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                )
 
-            last_pct = -1
-            while True:
-                if self._stop_requested:
-                    self.failed.emit("Annulé.")
-                    return
+                last_pct = -1
+                while True:
+                    if self._stop_requested:
+                        self.failed.emit("Annulé.")
+                        return
 
-                line = self._proc.stdout.readline() if self._proc.stdout else ""
-                if not line:
-                    break
-                line = line.strip()
+                    line = self._proc.stdout.readline() if self._proc.stdout else ""
+                    if not line:
+                        break
+                    line = line.strip()
 
-                if line.startswith("out_time_ms="):
-                    try:
-                        out_time_ms = int(line.split("=", 1)[1])
-                    except Exception:
-                        continue
+                    if line.startswith("out_time_ms="):
+                        try:
+                            out_time_ms = int(line.split("=", 1)[1])
+                        except Exception:
+                            continue
 
-                    if duration and duration > 0:
-                        current_sec = out_time_ms / 1_000_000.0
-                        pct = int(min(25, max(0, (current_sec / duration) * 25)))
-                        if pct != last_pct:
-                            last_pct = pct
-                            self.progress.emit(pct)
+                        if duration and duration > 0:
+                            current_sec = out_time_ms / 1_000_000.0
+                            pct = int(min(25, max(0, (current_sec / duration) * 25)))
+                            if pct != last_pct:
+                                last_pct = pct
+                                self.progress.emit(pct)
+                                self.status.emit("Préparation audio…")
+                        else:
                             self.status.emit("Préparation audio…")
-                    else:
-                        self.status.emit("Préparation audio…")
 
-                elif line.startswith("progress=end"):
-                    break
+                    elif line.startswith("progress=end"):
+                        break
 
-            rc = self._proc.wait()
-            if rc != 0:
-                err = ""
-                try:
-                    err = (self._proc.stderr.read() or "").strip()
-                except Exception:
-                    pass
-                self._log_process_result("ffmpeg_extract", rc, stderr=err)
-                self.failed.emit(err or f"ffmpeg a échoué (code {rc}).")
-                return
+                rc = self._proc.wait()
+                if rc != 0:
+                    err = ""
+                    try:
+                        err = (self._proc.stderr.read() or "").strip()
+                    except Exception:
+                        pass
+                    self._log_process_result("ffmpeg_extract", rc, stderr=err)
+                    self._update_db_status("FAILED", err or "ffmpeg failed")
+                    self.failed.emit(err or f"ffmpeg a échoué (code {rc}).")
+                    return
+                self._update_db_status("AUDIO_READY")
+            else:
+                self._log("resumption skip=audio_extract")
+                self.progress.emit(25)
 
             if self._stop_requested:
                 self._log("cancelled after_audio_extract")
@@ -1046,92 +1076,106 @@ class TranscribeWorker(QThread):
             # (segments with timestamps) — we'll fuse it with pyannote turns
             # and re-render to the user's chosen format ourselves.
             run_diarization = bool(self.diarization_enabled and self.hf_token and self.venv_python_path)
-            if self.diarization_enabled and not run_diarization:
-                self._log(
-                    "diarization_skipped "
-                    f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)}"
-                )
-                self.status.emit(
-                    "Détection des locuteurs ignorée (token Hugging Face ou installation manquante)."
-                )
-
-            whisper_target_dir = tmp_dir if run_diarization else out_path.parent
+            
+            whisper_target_dir = work_dir if run_diarization else out_path.parent
             whisper_target_stem = "whisper" if run_diarization else out_path.stem
             whisper_format = "json" if run_diarization else self.output_format
             whisper_target = whisper_target_dir / f"{whisper_target_stem}.{transcript_output_ext(whisper_format)}"
-            cmd = build_mlx_whisper_cmd(
-                mlx_whisper_path=self.mlx_whisper_path,
-                audio_path=str(wav_path),
-                output_path=str(whisper_target),
-                model=self.model,
-                language=self.language,
-                output_format=whisper_format,
-                initial_prompt=self.initial_prompt,
-            )
 
-            self.duration_unknown.emit(duration is None)
-            self.progress.emit(25)
-            self.status.emit("Transcription locale MLX…")
-            self._log(
-                "mlx_whisper_start "
-                f"target={str(whisper_target)!r} target_format={whisper_format!r} "
-                f"cmd={_command_for_log(cmd)!r}"
-            )
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-                env=self._subprocess_env(),
-            )
-            output_lines: list[str] = []
-            last_transcribe_pct = 25
-            while True:
+            # --- STEP 2: MLX Whisper ---
+            skip_whisper = (self.job.status in {"WHISPER_DONE", "COMPLETED"} 
+                           and whisper_target.exists())
+            
+            if not skip_whisper:
+                if self.diarization_enabled and not run_diarization:
+                    self._log(
+                        "diarization_skipped "
+                        f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)}"
+                    )
+                    self.status.emit(
+                        "Détection des locuteurs ignorée (token Hugging Face ou installation manquante)."
+                    )
+
+                cmd = build_mlx_whisper_cmd(
+                    mlx_whisper_path=self.mlx_whisper_path,
+                    audio_path=str(wav_path),
+                    output_path=str(whisper_target),
+                    model=self.model,
+                    language=self.language,
+                    output_format=whisper_format,
+                    initial_prompt=self.initial_prompt,
+                )
+
+                self.duration_unknown.emit(duration is None)
+                self.progress.emit(25)
+                self.status.emit("Transcription locale MLX…")
+                self._log(
+                    "mlx_whisper_start "
+                    f"target={str(whisper_target)!r} target_format={whisper_format!r} "
+                    f"cmd={_command_for_log(cmd)!r}"
+                )
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True,
+                    env=self._subprocess_env(),
+                )
+                output_lines: list[str] = []
+                last_transcribe_pct = 25
+                while True:
+                    if self._stop_requested:
+                        self._proc.kill()
+                        self.failed.emit("Annulé.")
+                        return
+
+                    line = self._proc.stdout.readline() if self._proc.stdout else ""
+                    if not line:
+                        if self._proc.poll() is not None:
+                            break
+                        continue
+
+                    output_lines.append(line)
+                    if duration and duration > 0:
+                        segment_seconds = parse_whisper_segment_seconds(line)
+                        if segment_seconds is not None:
+                            pct = 25 + int(min(50, max(0, (segment_seconds / duration) * 50)))
+                            if pct > last_transcribe_pct:
+                                last_transcribe_pct = pct
+                                self.progress.emit(pct)
+
+                self._proc.wait()
+                stdout = "".join(output_lines)
+                stderr = ""
+
                 if self._stop_requested:
-                    self._proc.kill()
                     self.failed.emit("Annulé.")
                     return
 
-                line = self._proc.stdout.readline() if self._proc.stdout else ""
-                if not line:
-                    if self._proc.poll() is not None:
-                        break
-                    continue
+                if self._proc.returncode != 0:
+                    detail = (stderr or stdout or "").strip()
+                    self._log_process_result("mlx_whisper_failed", self._proc.returncode, stdout, stderr)
+                    self._update_db_status("FAILED", detail or "whisper failed")
+                    self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
+                    return
+                if not whisper_target.exists():
+                    detail = _tail_for_log(stderr or stdout)
+                    self._log_process_result("mlx_whisper_missing_output", self._proc.returncode, stdout, stderr)
+                    self._update_db_status("FAILED", "missing whisper output")
+                    self.failed.emit(
+                        "mlx_whisper n'a pas produit le fichier de transcription attendu. "
+                        f"{detail}".strip()
+                    )
+                    return
+                self._log_process_result("mlx_whisper_ok", self._proc.returncode, stdout, stderr)
+                self._update_db_status("WHISPER_DONE")
+            else:
+                self._log("resumption skip=whisper")
+                self.progress.emit(75)
 
-                output_lines.append(line)
-                if duration and duration > 0:
-                    segment_seconds = parse_whisper_segment_seconds(line)
-                    if segment_seconds is not None:
-                        pct = 25 + int(min(50, max(0, (segment_seconds / duration) * 50)))
-                        if pct > last_transcribe_pct:
-                            last_transcribe_pct = pct
-                            self.progress.emit(pct)
-
-            self._proc.wait()
-            stdout = "".join(output_lines)
-            stderr = ""
-
-            if self._stop_requested:
-                self.failed.emit("Annulé.")
-                return
-
-            if self._proc.returncode != 0:
-                detail = (stderr or stdout or "").strip()
-                self._log_process_result("mlx_whisper_failed", self._proc.returncode, stdout, stderr)
-                self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
-                return
-            if not whisper_target.exists():
-                detail = _tail_for_log(stderr or stdout)
-                self._log_process_result("mlx_whisper_missing_output", self._proc.returncode, stdout, stderr)
-                self.failed.emit(
-                    "mlx_whisper n'a pas produit le fichier de transcription attendu. "
-                    f"{detail}".strip()
-                )
-                return
-            self._log_process_result("mlx_whisper_ok", self._proc.returncode, stdout, stderr)
-
+            # --- STEP 3: Diarization & Fusion ---
             if run_diarization:
                 self.progress.emit(75)
                 self.status.emit("Détection des locuteurs (pyannote)…")
@@ -1159,6 +1203,7 @@ class TranscribeWorker(QThread):
                     except Exception as exc:
                         detail = str(exc).replace("Diarisation: ", "", 1)
                     self._log_process_result("diarization_failed", self._proc.returncode, d_stdout, d_stderr)
+                    self._update_db_status("FAILED", f"diarization failed: {detail}")
                     self.failed.emit(
                         f"Détection des locuteurs échouée (code {self._proc.returncode}). {detail}"
                     )
@@ -1169,25 +1214,46 @@ class TranscribeWorker(QThread):
                     turns = parse_diarization_output(d_stdout)
                     whisper_segments = parse_whisper_json_segments(str(whisper_target))
                     fused = assign_speakers_to_segments(whisper_segments, turns)
+                    
+                    # Store segments in DB for search
+                    if self.job.db_id:
+                        self.db.add_segments(self.job.db_id, fused)
+                        
                     rendered = render_segments_with_speakers(fused, self.output_format)
                 except Exception as exc:
                     self._log(f"fusion_failed error={exc!r}")
+                    self._update_db_status("FAILED", f"fusion failed: {exc}")
                     self.failed.emit(f"Fusion transcription/locuteurs échouée: {exc}")
                     return
 
                 out_path.write_text(rendered, encoding="utf-8")
+            else:
+                # If no diarization, we still want to store segments in DB if it was a JSON run
+                # (actually if it wasn't diarized, we might not have segments in the same format easily,
+                # but parse_whisper_json_segments works on whisper.json)
+                if whisper_format == "json" and self.job.db_id:
+                    try:
+                        whisper_segments = parse_whisper_json_segments(str(whisper_target))
+                        self.db.add_segments(self.job.db_id, whisper_segments)
+                    except Exception:
+                        pass
 
             self.duration_unknown.emit(False)
             self.progress.emit(100)
             self.status.emit("Transcription terminée.")
+            self._update_db_status("COMPLETED")
+            if self.job.db_id:
+                self.db.update_job_output(self.job.db_id, str(out_path))
             self._log(f"success output={str(out_path)!r}")
             self.finished_ok.emit(str(out_path))
         except Exception as exc:
             self._log(f"unexpected_error error={exc!r}")
+            self._update_db_status("FAILED", str(exc))
             self.failed.emit(str(exc))
         finally:
             self._proc = None
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class MlxWhisperInstallWorker(QThread):
@@ -1481,6 +1547,79 @@ class CollapsibleSection(QFrame):
         self._body.setVisible(checked)
 
 
+class LibraryView(QWidget):
+    def __init__(self, db: DatabaseManager, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.db = db
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 10, 0, 0)
+        
+        search_box = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Rechercher un mot-clé ou un locuteur…")
+        self.search_input.returnPressed.connect(self.refresh)
+        btn_search = QPushButton("Chercher")
+        btn_search.clicked.connect(self.refresh)
+        search_box.addWidget(self.search_input)
+        search_box.addWidget(btn_search)
+        layout.addLayout(search_box)
+        
+        self.list = QListWidget()
+        self.list.setObjectName("libraryList")
+        self.list.itemDoubleClicked.connect(self.open_result)
+        layout.addWidget(self.list)
+        
+        self.btn_open = QPushButton("Voir résultat")
+        self.btn_open.clicked.connect(self.open_result)
+        layout.addWidget(self.btn_open)
+        
+        self.refresh()
+        
+    def refresh(self):
+        query = self.search_input.text().strip()
+        self.list.clear()
+        
+        if query:
+            results = self.db.search_segments(query_text=query)
+            seen_jobs = {} # db_id -> list of snippets
+            for s in results:
+                job_id = s['job_id']
+                if job_id not in seen_jobs:
+                    seen_jobs[job_id] = []
+                if len(seen_jobs[job_id]) < 2:
+                    seen_jobs[job_id].append(s['text'])
+            
+            for job_id, snippets in seen_jobs.items():
+                job = self.db.get_job(job_id)
+                if not job: continue
+                title = Path(job['source_path']).name
+                item = QListWidgetItem(f"📄 {title}\n   \"{snippets[0][:80]}…\"")
+                item.setData(Qt.UserRole, job_id)
+                self.list.addItem(item)
+        else:
+            jobs = self.db.list_jobs(limit=100)
+            for job in jobs:
+                title = Path(job['source_path']).name
+                status_emoji = "✅" if job['status'] == "COMPLETED" else "⏳" if job['status'] == "PENDING" else "❌"
+                item = QListWidgetItem(f"{status_emoji} {title}\n   Statut: {job['status']}")
+                item.setData(Qt.UserRole, job['id'])
+                self.list.addItem(item)
+
+    def open_result(self):
+        item = self.list.currentItem()
+        if not item: return
+        job_id = item.data(Qt.UserRole)
+        job = self.db.get_job(job_id)
+        if job and job['output_path'] and Path(job['output_path']).exists():
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", job['output_path']])
+            elif sys.platform.startswith("win"):
+                os.startfile(job['output_path'])
+            else:
+                subprocess.Popen(["xdg-open", job['output_path']])
+        else:
+            QMessageBox.information(self, "Infos", "Le fichier de transcription n'est pas encore prêt ou a été déplacé.")
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -1488,6 +1627,14 @@ class MainWindow(QWidget):
         self.setMinimumSize(1080, 700)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
+        
+        # Initialize Database and Workspace
+        app_data = app_support_dir()
+        app_data.mkdir(parents=True, exist_ok=True)
+        self.db = DatabaseManager(app_data / "library.db")
+        self.workspace_root = app_data / "Workspace"
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+
         icon_path = resource_path(APP_ICON_FILE)
         if Path(icon_path).exists():
             self.setWindowIcon(QIcon(icon_path))
@@ -1549,6 +1696,8 @@ class MainWindow(QWidget):
         self.status_timer.timeout.connect(self._set_status_with_progress_context)
         self.status_timer.start(1000)
 
+        self.load_jobs_from_db()
+
         self._build_ui(icon_path)
         self.apply_style()
 
@@ -1605,10 +1754,19 @@ class MainWindow(QWidget):
         left_col.setContentsMargins(0, 0, 0, 0)
         left_col.setSpacing(10)
 
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        
+        # TAB 1: Queue
+        queue_tab = QWidget()
+        queue_layout = QVBoxLayout(queue_tab)
+        queue_layout.setContentsMargins(0, 10, 0, 0)
+        queue_layout.setSpacing(10)
+
         self.drop = DropZone()
         self.drop.files_dropped.connect(self.add_input_files)
         self.drop.clicked.connect(self.pick_files)
-        left_col.addWidget(self.drop, 1)
+        queue_layout.addWidget(self.drop, 1)
 
         queue_actions = QHBoxLayout()
         queue_actions.setSpacing(8)
@@ -1624,13 +1782,21 @@ class MainWindow(QWidget):
         queue_actions.addWidget(self.btn_pick, 1)
         queue_actions.addWidget(self.btn_remove, 0)
         queue_actions.addWidget(self.btn_clear, 0)
-        left_col.addLayout(queue_actions)
+        queue_layout.addLayout(queue_actions)
 
         self.queue_list = QListWidget()
         self.queue_list.setObjectName("queueList")
         self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.queue_list.currentRowChanged.connect(self.on_queue_selection_changed)
-        left_col.addWidget(self.queue_list, 1)
+        queue_layout.addWidget(self.queue_list, 1)
+        
+        self.tabs.addTab(queue_tab, "File d'attente")
+        
+        # TAB 2: Library
+        self.library_view = LibraryView(self.db)
+        self.tabs.addTab(self.library_view, "Bibliothèque")
+        
+        left_col.addWidget(self.tabs, 1)
 
         self.lbl_input_meta = QLabel("Aucune vidéo sélectionnée.")
         self.lbl_input_meta.setObjectName("metaLabel")
@@ -1960,6 +2126,42 @@ class MainWindow(QWidget):
         }
         QToolButton#gear:hover {
             background: #ececf0;
+        }
+        QTabWidget#mainTabs::pane {
+            border: 1px solid #d2d2d7;
+            border-radius: 12px;
+            background: #fbfbfd;
+            top: -1px;
+        }
+        QTabBar::tab {
+            background: #f5f5f7;
+            border: 1px solid #d2d2d7;
+            border-bottom: none;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            padding: 6px 16px;
+            margin-right: 4px;
+            color: #1d1d1f;
+            font-weight: 500;
+        }
+        QTabBar::tab:selected {
+            background: #ffffff;
+            border-color: #d2d2d7;
+            font-weight: 600;
+        }
+        QListWidget#libraryList {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 10px;
+            outline: none;
+        }
+        QListWidget#libraryList::item {
+            padding: 10px;
+            border-bottom: 1px solid #f2f2f7;
+        }
+        QListWidget#libraryList::item:selected {
+            background: #e8f2ff;
+            color: #007aff;
         }
         QFrame#dropZone {
             background: #ffffff;
@@ -2711,6 +2913,25 @@ class MainWindow(QWidget):
         if paths:
             self.add_input_files(paths)
 
+    def load_jobs_from_db(self):
+        rows = self.db.list_jobs(limit=1000)
+        for row in rows:
+            settings = json.loads(row['settings_json']) if row['settings_json'] else {}
+            # Restore status and other fields from DB row
+            job = QueueJob(**settings)
+            job.db_id = row['id']
+            job.status = row['status']
+            job.error_message = row['error_message'] or ""
+            job.workspace_dir = row['workspace_dir'] or ""
+            job.output_path = row['output_path'] or ""
+            
+            self.queue_jobs.append(job)
+            self.queue_list.addItem(QListWidgetItem())
+            self.refresh_queue_item(len(self.queue_jobs) - 1)
+
+        if self.queue_jobs:
+            self.queue_list.setCurrentRow(0)
+
     def _new_job(self, input_path: str) -> QueueJob:
         base_job = QueueJob(input_path=input_path)
         base_job = apply_profile_to_job(base_job, "Réunion équilibrée")
@@ -2723,10 +2944,25 @@ class MainWindow(QWidget):
         existing = {job.input_path for job in self.queue_jobs}
         added = 0
         for p in paths:
-            resolved = str(Path(p))
+            resolved = str(Path(p).resolve())
             if not resolved or resolved in existing or not Path(resolved).exists():
                 continue
+            
             job = self._new_job(resolved)
+            
+            # Create persistent workspace and DB record
+            job_slug = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{Path(resolved).stem}"[:50]
+            job_ws = self.workspace_root / job_slug
+            job_ws.mkdir(parents=True, exist_ok=True)
+            job.workspace_dir = str(job_ws)
+            
+            db_id = self.db.create_job(
+                source_path=resolved,
+                workspace_dir=str(job_ws),
+                settings=asdict(job)
+            )
+            job.db_id = db_id
+            
             self.queue_jobs.append(job)
             self.queue_list.addItem(QListWidgetItem())
             self.refresh_queue_item(len(self.queue_jobs) - 1)
@@ -3195,6 +3431,7 @@ class MainWindow(QWidget):
             self.transcription_format,
             self._transcription_glossary(),
             self.transcription_enhance_audio,
+            self.db,
             diarization_enabled=self.transcription_diarization_enabled,
             hf_token=self.transcription_hf_token,
             venv_python_path=str(venv_python) if venv_python.exists() else "",
@@ -3291,6 +3528,7 @@ class MainWindow(QWidget):
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
+        self.library_view.refresh()
 
         total = max(1, len(self.queue_jobs))
         self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
@@ -3310,6 +3548,7 @@ class MainWindow(QWidget):
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
+        self.library_view.refresh()
 
         total = max(1, len(self.queue_jobs))
         self.progress_global.setValue(int(((self.completed_count + self.failed_count) / total) * 100))
@@ -3337,6 +3576,7 @@ class MainWindow(QWidget):
         self.failed_count += 1
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
+        self.library_view.refresh()
 
         if not self.check_continue_on_error.isChecked():
             self.pending_indices.clear()
