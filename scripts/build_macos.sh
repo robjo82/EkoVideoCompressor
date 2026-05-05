@@ -67,6 +67,13 @@ pyinstaller --noconfirm --clean video_compactor.spec
 # Without this, an updated bundle is treated as a brand-new unsigned app and
 # Gatekeeper may refuse to relaunch — even on manual reopen — until reinstall.
 APP_BUNDLE="dist/EkoVideoCompressor.app"
+
+# Compatibility for older updaters that smoke-test the bundle from a staging
+# path ending in `.app.new`. PyInstaller then fails to detect the macOS bundle
+# layout and looks for `Contents/MacOS/_internal/Python`; this symlink keeps
+# those older updaters able to install the fixed build.
+ln -sfn ../Frameworks "$APP_BUNDLE/Contents/MacOS/_internal"
+
 xattr -cr "$APP_BUNDLE" || true
 codesign --force --deep --sign - --timestamp=none "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"
