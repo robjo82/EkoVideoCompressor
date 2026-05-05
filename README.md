@@ -43,13 +43,18 @@ Si le dépôt est privé, renseignez un token GitHub (lecture du repo) dans:
 L'app peut lancer une transcription locale via **MLX Whisper** sur Apple Silicon.
 La vidéo originale est utilisée comme source audio, puis l'audio temporaire est extrait en WAV propre avant transcription.
 
-Installation optionnelle:
+Dans l'onglet `Transcrire`, le bouton `Installer MLX Whisper` crée un environnement isolé dans
+`~/Library/Application Support/EkoVideo Compressor/mlx-whisper-venv`.
+L'app ne modifie pas le Python système/Homebrew.
+
+L'installation automatique requiert Python 3.11, 3.12 ou 3.13 disponible sur le Mac.
+Si besoin:
 
 ```bash
-python3 -m pip install mlx-whisper
+brew install python@3.12
 ```
 
-Dans l'onglet `Transcription`, le modèle recommandé par défaut est:
+Dans l'onglet `Transcrire`, le modèle recommandé par défaut est:
 `mlx-community/whisper-large-v3-turbo`.
 
 Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper.

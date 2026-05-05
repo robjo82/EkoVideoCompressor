@@ -78,6 +78,8 @@ BUNDLE_IDENTIFIER = "com.ekonum.ekovideocompressor"
 GITHUB_OWNER = "robjo82"
 GITHUB_REPO = "EkoVideoCompressor"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+MLX_WHISPER_PACKAGE = "mlx-whisper"
+MANAGED_TRANSCRIPTION_ENV = "mlx-whisper-venv"
 
 PROFILE_PRESETS = {
     "Réunion rapide": {
@@ -152,9 +154,26 @@ def app_base_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
+def app_support_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    return Path.home() / f".{APP_NAME.replace(' ', '').lower()}"
+
+
+def managed_transcription_venv_dir() -> Path:
+    return app_support_dir() / MANAGED_TRANSCRIPTION_ENV
+
+
+def managed_mlx_whisper_path() -> Path:
+    if sys.platform.startswith("win"):
+        return managed_transcription_venv_dir() / "Scripts" / "mlx_whisper.exe"
+    return managed_transcription_venv_dir() / "bin" / "mlx_whisper"
+
+
 def candidate_bin_paths() -> list[Path]:
     base = app_base_dir()
     return [
+        managed_mlx_whisper_path(),
         base / "ffmpeg",
         base / "ffprobe",
         base / "mlx_whisper",
@@ -200,6 +219,46 @@ def find_binary(name: str) -> str | None:
         if in_path:
             return in_path
 
+    return None
+
+
+def find_compatible_python() -> str | None:
+    candidates = [
+        os.getenv("EKO_TRANSCRIPTION_PYTHON", "").strip(),
+        "/opt/homebrew/bin/python3.12",
+        "/opt/homebrew/bin/python3.13",
+        "/opt/homebrew/bin/python3.11",
+        "/usr/local/bin/python3.12",
+        "/usr/local/bin/python3.13",
+        "/usr/local/bin/python3.11",
+        "python3.12",
+        "python3.13",
+        "python3.11",
+        "python3",
+    ]
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        path = shutil.which(candidate) if not Path(candidate).is_absolute() else candidate
+        if not path or not Path(path).exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [
+                    path,
+                    "-c",
+                    "import sys; raise SystemExit(0 if (3, 9) <= sys.version_info[:2] < (3, 14) else 1)",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                return str(path)
+        except Exception:
+            continue
     return None
 
 
@@ -634,7 +693,7 @@ class TranscribeWorker(QThread):
             return
         if not self.mlx_whisper_path or not Path(self.mlx_whisper_path).exists():
             self.failed.emit(
-                "mlx_whisper introuvable. Installez-le avec: python3 -m pip install mlx-whisper"
+                "mlx_whisper introuvable. Utilisez le bouton Installer MLX Whisper dans l'onglet Transcrire."
             )
             return
         if not Path(self.job.input_path).exists():
@@ -755,6 +814,54 @@ class TranscribeWorker(QThread):
         finally:
             self._proc = None
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+class MlxWhisperInstallWorker(QThread):
+    status = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, python_path: str, venv_dir: Path):
+        super().__init__()
+        self.python_path = python_path
+        self.venv_dir = venv_dir
+
+    def _run_cmd(self, cmd: list[str], label: str):
+        self.status.emit(label)
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(detail or f"Commande échouée: {' '.join(cmd)}")
+
+    def run(self):
+        try:
+            self.venv_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._run_cmd(
+                [self.python_path, "-m", "venv", str(self.venv_dir)],
+                "Création de l'environnement local…",
+            )
+
+            venv_python = self.venv_dir / "bin" / "python"
+            if sys.platform.startswith("win"):
+                venv_python = self.venv_dir / "Scripts" / "python.exe"
+
+            self._run_cmd(
+                [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+                "Préparation de pip…",
+            )
+            self._run_cmd(
+                [str(venv_python), "-m", "pip", "install", "--upgrade", MLX_WHISPER_PACKAGE],
+                "Installation de MLX Whisper…",
+            )
+
+            mlx_path = managed_mlx_whisper_path()
+            if not is_executable(mlx_path):
+                raise RuntimeError("Installation terminée, mais la commande mlx_whisper est introuvable.")
+
+            self.status.emit("MLX Whisper installé.")
+            self.finished_ok.emit(str(mlx_path))
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class UpdateWorker(QThread):
@@ -948,6 +1055,7 @@ class MainWindow(QWidget):
         self.running_index: int | None = None
         self.current_index: int = -1
         self.worker: EncodeWorker | TranscribeWorker | None = None
+        self.mlx_install_worker: MlxWhisperInstallWorker | None = None
         self.batch_mode = "compress"
         self.current_job_progress_offset = 0
         self.current_job_progress_scale = 100
@@ -1205,6 +1313,11 @@ class MainWindow(QWidget):
         mlx_row.addWidget(btn_mlx_path)
         transcribe_form.addRow("Commande", mlx_row)
 
+        self.btn_install_mlx = QPushButton("Installer MLX Whisper")
+        self.btn_install_mlx.setObjectName("secondaryButton")
+        self.btn_install_mlx.clicked.connect(self.install_mlx_whisper)
+        transcribe_form.addRow("", self.btn_install_mlx)
+
         self.edit_transcription_model = QLineEdit(
             str(
                 self.settings.value(
@@ -1251,7 +1364,7 @@ class MainWindow(QWidget):
         transcribe_form.addRow("Contexte", self.edit_transcription_prompt)
 
         self.lbl_transcription_hint = QLabel(
-            "La transcription utilise l'audio extrait depuis la vidéo originale, avec le contexte ci-dessus pour aider les noms propres."
+            "MLX Whisper est installé dans un environnement isolé de l'app. La transcription utilise l'audio extrait depuis la vidéo originale."
         )
         self.lbl_transcription_hint.setObjectName("metaLabel")
         self.lbl_transcription_hint.setWordWrap(True)
@@ -1893,6 +2006,79 @@ class MainWindow(QWidget):
         if path:
             self.edit_mlx_whisper_path.setText(path)
 
+    def install_mlx_whisper(self):
+        if self.mlx_install_worker is not None:
+            return
+
+        python_path = find_compatible_python()
+        if not python_path:
+            QMessageBox.warning(
+                self,
+                "Python compatible introuvable",
+                (
+                    "L'installation automatique requiert Python 3.11, 3.12 ou 3.13.\n\n"
+                    "Installez-en un avec Homebrew, puis relancez l'installation:\n"
+                    "brew install python@3.12"
+                ),
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Installer MLX Whisper",
+            (
+                "L'app va installer MLX Whisper dans un environnement isolé:\n"
+                f"{managed_transcription_venv_dir()}\n\n"
+                "Cette installation peut prendre quelques minutes et télécharger plusieurs paquets."
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_install_mlx.setEnabled(False)
+        self.btn_transcribe.setEnabled(False)
+        self.status.setText("Installation de MLX Whisper…")
+        self.progress.setRange(0, 0)
+
+        worker = MlxWhisperInstallWorker(python_path, managed_transcription_venv_dir())
+        self.mlx_install_worker = worker
+        worker.status.connect(self.on_mlx_install_status)
+        worker.finished_ok.connect(self.on_mlx_install_done)
+        worker.failed.connect(self.on_mlx_install_failed)
+        worker.finished.connect(self.on_mlx_install_finished)
+        worker.start()
+
+    def on_mlx_install_status(self, text: str):
+        self.status.setText(text)
+
+    def on_mlx_install_done(self, mlx_path: str):
+        self.edit_mlx_whisper_path.setText(mlx_path)
+        self.settings.setValue("mlx_whisper_path", mlx_path)
+        self.status.setText("MLX Whisper installé.")
+        QMessageBox.information(
+            self,
+            "MLX Whisper installé",
+            "La transcription locale est prête. Le modèle sera téléchargé automatiquement au premier lancement.",
+        )
+
+    def on_mlx_install_failed(self, message: str):
+        self.status.setText("Installation MLX Whisper échouée.")
+        QMessageBox.warning(
+            self,
+            "Installation MLX Whisper",
+            (
+                "Impossible d'installer MLX Whisper dans l'environnement isolé.\n"
+                f"Détail: {message}"
+            ),
+        )
+
+    def on_mlx_install_finished(self):
+        self.mlx_install_worker = None
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.btn_install_mlx.setEnabled(True)
+        self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
+
     def open_output_dir(self):
         out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home()))
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2179,6 +2365,19 @@ class MainWindow(QWidget):
     def _mlx_whisper_path(self) -> str:
         return self.edit_mlx_whisper_path.text().strip() or find_binary("mlx_whisper") or ""
 
+    def _prompt_install_mlx_whisper(self, message: str):
+        self.tabs.setCurrentIndex(3)
+        answer = QMessageBox.question(
+            self,
+            "MLX Whisper requis",
+            (
+                f"{message}\n\n"
+                "L'app peut l'installer automatiquement dans un environnement isolé, sans modifier Python ou Homebrew."
+            ),
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.install_mlx_whisper()
+
     def _set_running_ui(self, running: bool):
         self.is_batch_running = running
         self.btn_pick.setEnabled(not running)
@@ -2191,6 +2390,7 @@ class MainWindow(QWidget):
         self.btn_update.setEnabled(not running and self.update_worker is None)
         self.btn_apply_to_all.setEnabled(not running)
         self.btn_reset_preset.setEnabled(not running)
+        self.btn_install_mlx.setEnabled(not running and self.mlx_install_worker is None)
 
     def start_encode(self):
         if not self.queue_jobs:
@@ -2207,14 +2407,9 @@ class MainWindow(QWidget):
         if self.batch_mode == "compress_transcribe":
             mlx_path = self._mlx_whisper_path()
             if not mlx_path or not Path(mlx_path).exists():
-                QMessageBox.warning(
-                    self,
-                    "mlx_whisper introuvable",
-                    "La transcription après compression est activée, mais mlx_whisper est introuvable.\n\n"
-                    "Installez MLX Whisper avec:\npython3 -m pip install mlx-whisper\n\n"
-                    "Puis renseignez le chemin de la commande dans l'onglet Transcription.",
+                self._prompt_install_mlx_whisper(
+                    "La transcription après compression est activée, mais MLX Whisper n'est pas encore installé."
                 )
-                self.tabs.setCurrentIndex(3)
                 return
             self.edit_mlx_whisper_path.setText(mlx_path)
 
@@ -2256,13 +2451,9 @@ class MainWindow(QWidget):
 
         mlx_path = self._mlx_whisper_path()
         if not mlx_path or not Path(mlx_path).exists():
-            QMessageBox.warning(
-                self,
-                "mlx_whisper introuvable",
-                "Installez MLX Whisper avec:\npython3 -m pip install mlx-whisper\n\n"
-                "Puis renseignez le chemin de la commande dans l'onglet Transcription.",
+            self._prompt_install_mlx_whisper(
+                "MLX Whisper n'est pas encore installé pour la transcription locale."
             )
-            self.tabs.setCurrentIndex(3)
             return
         self.edit_mlx_whisper_path.setText(mlx_path)
 
