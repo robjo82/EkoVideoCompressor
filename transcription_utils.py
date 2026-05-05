@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -16,6 +17,7 @@ TRANSCRIPTION_AUDIO_FILTERS = [
 # license on huggingface.co before a token can download them.
 PYANNOTE_DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 PYANNOTE_SEGMENTATION_MODEL = "pyannote/segmentation-3.0"
+PYANNOTE_COMMUNITY_MODEL = "pyannote/speaker-diarization-community-1"
 
 # Whisper's `--initial-prompt` is fed to the decoder as a fake prefix; the
 # model truncates anything beyond ~224 tokens, so the prompt must be tight
@@ -34,7 +36,7 @@ def transcript_output_ext(output_format: str) -> str:
 
 def default_transcript_path(in_path: str, out_dir: str, suffix: str, output_format: str) -> str:
     source = Path(in_path)
-    safe_suffix = suffix.strip() or "_transcription"
+    safe_suffix = suffix.strip()
     ext = transcript_output_ext(output_format)
     base = Path(out_dir) / f"{source.stem}{safe_suffix}.{ext}"
     out = base
@@ -43,6 +45,97 @@ def default_transcript_path(in_path: str, out_dir: str, suffix: str, output_form
         out = Path(out_dir) / f"{source.stem}{safe_suffix}_{i}.{ext}"
         i += 1
     return str(out)
+
+
+_GENERIC_OPENING_RE = re.compile(
+    r"^(bonjour|bonsoir|salut|merci|ok|alors|donc|du coup|euh|hum|oui|non|très bien|tres bien)[, .!?]*",
+    re.IGNORECASE,
+)
+_TITLE_NOISE_RE = re.compile(
+    r"^(on va parler de|je vais|on va|nous allons|aujourd'hui|aujourd’hui|là on va|c'est parti pour|c’est parti pour)\s+",
+    re.IGNORECASE,
+)
+_SPEAKER_PREFIX_RE = re.compile(r"^(\[[^\]]+\]|SPEAKER[_ -]?\d+|INTERVENANT[_ -]?\d+)\s*:?\s*", re.IGNORECASE)
+_TIMESTAMP_RE = re.compile(r"^\[?\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\s*-->|^\d+$")
+
+
+def sanitize_filename_stem(stem: str, fallback: str = "Transcription") -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", stem or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .-_")
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rsplit(" ", 1)[0].strip(" .-_")
+    return cleaned or fallback
+
+
+def _plain_transcript_lines(transcript_text: str) -> list[str]:
+    text = transcript_text or ""
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            text = str(payload.get("text") or "")
+    except Exception:
+        pass
+
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or _TIMESTAMP_RE.search(line):
+            continue
+        line = _SPEAKER_PREFIX_RE.sub("", line).strip()
+        line = re.sub(r"\[[0-9:. ,>\-]+\]", "", line).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def suggest_transcript_stem(transcript_text: str, fallback_stem: str) -> str:
+    fallback = sanitize_filename_stem(fallback_stem or "Transcription")
+    joined = " ".join(_plain_transcript_lines(transcript_text))[:5000]
+    if not joined:
+        return fallback
+
+    chunks = [
+        part.strip(" -–—:;,.!?")
+        for part in re.split(r"[.!?\n]+", joined)
+        if part.strip(" -–—:;,.!?")
+    ]
+    topic_words = {
+        "présentation", "presentation", "outil", "outils", "rh", "module",
+        "projet", "client", "atelier", "formation", "demo", "démo",
+        "planning", "budget", "process", "workflow", "intégration", "integration",
+    }
+
+    best = ""
+    best_score = -1
+    for chunk in chunks[:30]:
+        candidate = _GENERIC_OPENING_RE.sub("", chunk).strip(" ,.")
+        while True:
+            cleaned = _TITLE_NOISE_RE.sub("", candidate).strip(" ,.")
+            if cleaned == candidate:
+                break
+            candidate = cleaned
+        words = candidate.split()
+        if len(words) < 3 or len(candidate) < 12:
+            continue
+        if len(words) > 14:
+            candidate = " ".join(words[:14]).strip(" ,.")
+            words = candidate.split()
+
+        lowered = {word.strip(" ,.;:!?()[]{}'\"").lower() for word in words}
+        score = 0
+        score += min(len(words), 10)
+        score += 8 * len(lowered & topic_words)
+        if any(word[:1].isupper() for word in words[1:]):
+            score += 4
+        if candidate.lower().startswith(("bonjour", "merci", "ok", "oui", "non")):
+            score -= 8
+        if score > best_score:
+            best_score = score
+            best = candidate
+
+    if best_score < 10:
+        return fallback
+    return sanitize_filename_stem(best, fallback)
 
 
 def build_audio_extract_cmd(
@@ -159,6 +252,17 @@ except Exception as exc:
     sys.exit(3)
 
 try:
+    def _clean_error(message):
+        text = str(message)
+        if "speaker-diarization-community-1" in text or "Cannot access gated repo" in text:
+            return (
+                "Accès Hugging Face refusé pour pyannote/speaker-diarization-community-1. "
+                "Ouvrez https://huggingface.co/pyannote/speaker-diarization-community-1, "
+                "acceptez les conditions d'utilisation, vérifiez que votre token a le droit Read, "
+                "puis relancez la transcription."
+            )
+        return text
+
     try:
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
@@ -174,7 +278,7 @@ try:
     if pipeline is None:
         raise RuntimeError("pipeline unavailable; check Hugging Face token and accepted pyannote licenses")
 except Exception as exc:
-    print(json.dumps({"error": f"pipeline load failed: {exc}"}))
+    print(json.dumps({"error": f"pipeline load failed: {_clean_error(exc)}"}))
     sys.exit(4)
 
 # Apple Silicon: prefer MPS when available, fall back to CPU.

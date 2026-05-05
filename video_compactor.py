@@ -7,6 +7,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -26,6 +27,7 @@ from transcription_utils import (
     parse_whisper_json_segments,
     render_segments_with_speakers,
     structured_initial_prompt,
+    suggest_transcript_stem,
     transcript_output_ext,
 )
 from PySide6.QtCore import QSettings, QThread, QTime, Qt, Signal
@@ -135,6 +137,7 @@ PROFILE_SUFFIX = {
 }
 
 DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+WHISPER_SEGMENT_RE = re.compile(r"\[(\d{1,2}):(\d{2}):(\d{2}(?:[.,]\d+)?)\s*-->")
 SEMVER_RE = re.compile(r"^v?\.?(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -340,6 +343,16 @@ def parse_duration_hms(text: str) -> float | None:
     return hh * 3600 + mm * 60 + ss
 
 
+def parse_whisper_segment_seconds(line: str) -> float | None:
+    m = WHISPER_SEGMENT_RE.search(line)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    ss = float(m.group(3).replace(",", "."))
+    return hh * 3600 + mm * 60 + ss
+
+
 def probe_duration_seconds(in_path: str, ffprobe_path: str | None, ffmpeg_path: str) -> float | None:
     if ffprobe_path and Path(ffprobe_path).exists():
         try:
@@ -440,6 +453,20 @@ def format_seconds(seconds: float | None) -> str:
         return "-"
     total = int(seconds)
     return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+
+def format_compact_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    total = max(0, int(seconds))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    if hours:
+        return f"{hours}h{minutes:02d}"
+    if minutes:
+        return f"{minutes}m{secs:02d}"
+    return f"{secs}s"
 
 
 def format_size(size_bytes: int | None) -> str:
@@ -602,8 +629,9 @@ class SettingsDialog(QDialog):
         self.transcription_format_combo.setCurrentText(str(transcription_settings.get("format", "txt")))
         transcription_form.addRow("Format", self.transcription_format_combo)
 
-        self.transcription_suffix_edit = QLineEdit(str(transcription_settings.get("suffix", "_transcription")))
-        transcription_form.addRow("Suffixe", self.transcription_suffix_edit)
+        self.transcription_suffix_value = str(transcription_settings.get("suffix", "")).strip()
+        if self.transcription_suffix_value == "_transcription":
+            self.transcription_suffix_value = ""
 
         self.transcription_enhance_check = QCheckBox("Nettoyer la voix avant transcription")
         self.transcription_enhance_check.setChecked(bool(transcription_settings.get("enhance_audio", True)))
@@ -631,7 +659,8 @@ class SettingsDialog(QDialog):
             "huggingface.co/settings/tokens (Read access) APRÈS avoir accepté "
             "les licences :\n"
             "• huggingface.co/pyannote/segmentation-3.0\n"
-            "• huggingface.co/pyannote/speaker-diarization-3.1"
+            "• huggingface.co/pyannote/speaker-diarization-3.1\n"
+            "• huggingface.co/pyannote/speaker-diarization-community-1"
         )
         hf_hint.setWordWrap(True)
         hf_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
@@ -717,7 +746,7 @@ class SettingsDialog(QDialog):
                 "model": self.transcription_model_edit.text().strip(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
-                "suffix": self.transcription_suffix_edit.text().strip(),
+                "suffix": self.transcription_suffix_value,
                 "enhance_audio": self.transcription_enhance_check.isChecked(),
                 "diarization_enabled": self.transcription_diarization_check.isChecked(),
                 "hf_token": self.transcription_hf_token_edit.text().strip(),
@@ -1040,7 +1069,7 @@ class TranscribeWorker(QThread):
                 initial_prompt=self.initial_prompt,
             )
 
-            self.duration_unknown.emit(True)
+            self.duration_unknown.emit(duration is None)
             self.progress.emit(25)
             self.status.emit("Transcription locale MLX…")
             self._log(
@@ -1051,11 +1080,38 @@ class TranscribeWorker(QThread):
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
+                universal_newlines=True,
                 env=self._subprocess_env(),
             )
-            stdout, stderr = self._proc.communicate()
+            output_lines: list[str] = []
+            last_transcribe_pct = 25
+            while True:
+                if self._stop_requested:
+                    self._proc.kill()
+                    self.failed.emit("Annulé.")
+                    return
+
+                line = self._proc.stdout.readline() if self._proc.stdout else ""
+                if not line:
+                    if self._proc.poll() is not None:
+                        break
+                    continue
+
+                output_lines.append(line)
+                if duration and duration > 0:
+                    segment_seconds = parse_whisper_segment_seconds(line)
+                    if segment_seconds is not None:
+                        pct = 25 + int(min(50, max(0, (segment_seconds / duration) * 50)))
+                        if pct > last_transcribe_pct:
+                            last_transcribe_pct = pct
+                            self.progress.emit(pct)
+
+            self._proc.wait()
+            stdout = "".join(output_lines)
+            stderr = ""
 
             if self._stop_requested:
                 self.failed.emit("Annulé.")
@@ -1098,6 +1154,10 @@ class TranscribeWorker(QThread):
 
                 if self._proc.returncode != 0:
                     detail = (d_stderr or d_stdout or "").strip()
+                    try:
+                        parse_diarization_output(d_stdout)
+                    except Exception as exc:
+                        detail = str(exc).replace("Diarisation: ", "", 1)
                     self._log_process_result("diarization_failed", self._proc.returncode, d_stdout, d_stderr)
                     self.failed.emit(
                         f"Détection des locuteurs échouée (code {self._proc.returncode}). {detail}"
@@ -1445,10 +1505,9 @@ class MainWindow(QWidget):
         ).strip()
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
-        self.transcription_suffix = (
-            str(self.settings.value("transcription_suffix", "_transcription", type=str)).strip()
-            or "_transcription"
-        )
+        self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
+        if self.transcription_suffix == "_transcription":
+            self.transcription_suffix = ""
         self.transcription_enhance_audio = self.settings.value("transcription_enhance_audio", True, type=bool)
         # Diarisation (séparation des locuteurs) — opt-in, requires HF token.
         self.transcription_diarization_enabled = self.settings.value(
@@ -1471,6 +1530,9 @@ class MainWindow(QWidget):
         self.batch_mode = "compress"
         self.current_job_progress_offset = 0
         self.current_job_progress_scale = 100
+        self.current_job_started_at: float | None = None
+        self.current_job_status_text = ""
+        self.current_job_display_pct = 0
         self.update_worker: UpdateWorker | None = None
         self._last_update_info: dict | None = None
         self._update_phase: str = ""
@@ -1611,8 +1673,10 @@ class MainWindow(QWidget):
         out_row.addWidget(self.btn_output_dir)
         main_form.addRow("Dossier sortie", out_row)
 
+        # Kept as an internal setting for existing users, but hidden from the
+        # main flow: the default output naming is enough for day-to-day use.
         self.edit_suffix = QLineEdit(str(self.settings.value("suffix", "_compressed", type=str)))
-        main_form.addRow("Suffixe", self.edit_suffix)
+        self.edit_suffix.setVisible(False)
 
         self.check_continue_on_error = QCheckBox("Continuer en cas d'erreur")
         self.check_continue_on_error.setChecked(self.settings.value("continue_on_error", True, type=bool))
@@ -2119,7 +2183,8 @@ class MainWindow(QWidget):
         }
 
     def _refresh_transcription_summary(self):
-        mlx_status = "installé" if self._mlx_whisper_path() and Path(self._mlx_whisper_path()).exists() else "à installer"
+        mlx_installed = bool(self._mlx_whisper_path() and Path(self._mlx_whisper_path()).exists())
+        mlx_status = "installé" if mlx_installed else "à installer"
         if self.transcription_diarization_enabled:
             if self.transcription_hf_token:
                 diar_status = "ON"
@@ -2133,6 +2198,9 @@ class MainWindow(QWidget):
             f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}\n"
             f"Détection des locuteurs: {diar_status}"
         )
+        if hasattr(self, "btn_install_mlx"):
+            self.btn_install_mlx.setVisible(not mlx_installed or self.mlx_install_worker is not None)
+            self.btn_install_mlx.setText("Installation en cours…" if self.mlx_install_worker else "Installer MLX Whisper")
 
     def _transcription_glossary(self) -> str:
         glossary = self.edit_transcription_prompt.toPlainText().strip()
@@ -2161,9 +2229,9 @@ class MainWindow(QWidget):
         )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
-        self.transcription_suffix = (
-            str(transcription_settings.get("suffix", "_transcription")).strip() or "_transcription"
-        )
+        self.transcription_suffix = str(transcription_settings.get("suffix", "")).strip()
+        if self.transcription_suffix == "_transcription":
+            self.transcription_suffix = ""
         self.transcription_enhance_audio = bool(transcription_settings.get("enhance_audio", True))
         self.transcription_diarization_enabled = bool(
             transcription_settings.get("diarization_enabled", False)
@@ -2617,6 +2685,7 @@ class MainWindow(QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self._set_progress_visible(False)
+        self._refresh_transcription_summary()
         self.btn_install_mlx.setEnabled(True)
         self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
 
@@ -2904,6 +2973,36 @@ class MainWindow(QWidget):
             self.transcription_format,
         )
 
+    def _auto_rename_transcript(self, transcript_path: str, job: QueueJob) -> str:
+        path = Path(transcript_path)
+        if not path.exists() or path.suffix.lower() not in {".txt", ".srt", ".vtt", ".json"}:
+            return transcript_path
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except Exception:
+            return transcript_path
+
+        suggested_stem = suggest_transcript_stem(raw, Path(job.input_path).stem)
+        suggested_path = path.with_name(f"{suggested_stem}{path.suffix}")
+        if suggested_path == path:
+            return transcript_path
+
+        candidate = suggested_path
+        index = 1
+        while candidate.exists():
+            candidate = suggested_path.with_name(f"{suggested_path.stem}_{index}{suggested_path.suffix}")
+            index += 1
+
+        try:
+            path.rename(candidate)
+            append_app_log(
+                f"transcription_auto_rename from={str(path)!r} to={str(candidate)!r}"
+            )
+            return str(candidate)
+        except Exception as exc:
+            append_app_log(f"transcription_auto_rename_failed path={str(path)!r} error={exc!r}")
+            return transcript_path
+
     def _mlx_whisper_path(self) -> str:
         return self.mlx_whisper_path.strip() or find_binary("mlx_whisper") or ""
 
@@ -3048,6 +3147,9 @@ class MainWindow(QWidget):
         job = self.queue_jobs[idx]
         job.status = "running"
         job.error_message = ""
+        self.current_job_started_at = time.monotonic()
+        self.current_job_status_text = ""
+        self.current_job_display_pct = 0
         self.refresh_queue_item(idx)
         self.queue_list.setCurrentRow(idx)
 
@@ -3115,10 +3217,27 @@ class MainWindow(QWidget):
         if unknown:
             self.progress.setRange(0, 0)
 
-    def on_status(self, text: str):
+    def _status_timing_suffix(self) -> str:
+        if self.current_job_started_at is None:
+            return ""
+        elapsed = time.monotonic() - self.current_job_started_at
+        parts = [f"écoulé {format_compact_seconds(elapsed)}"]
+        if self.progress.maximum() > 0 and 2 <= self.current_job_display_pct < 100:
+            remaining = elapsed * (100 / self.current_job_display_pct - 1)
+            parts.append(f"reste ~{format_compact_seconds(remaining)}")
+        return f" ({' · '.join(parts)})"
+
+    def _set_status_with_progress_context(self):
         current = self.completed_count + self.failed_count + (1 if self.running_index is not None else 0)
         total = max(1, len(self.queue_jobs))
-        self.status.setText(f"[{current}/{total}] {text}")
+        text = self.current_job_status_text or "Traitement…"
+        if self.progress.maximum() > 0 and self.current_job_display_pct:
+            text = f"{text} {self.current_job_display_pct}%"
+        self.status.setText(f"[{current}/{total}] {text}{self._status_timing_suffix()}")
+
+    def on_status(self, text: str):
+        self.current_job_status_text = text
+        self._set_status_with_progress_context()
 
     def on_progress(self, pct: int):
         if self.progress.maximum() == 0:
@@ -3126,12 +3245,14 @@ class MainWindow(QWidget):
         display_pct = int(
             min(100, max(0, self.current_job_progress_offset + (pct * self.current_job_progress_scale / 100.0)))
         )
+        self.current_job_display_pct = display_pct
         self.progress.setValue(display_pct)
 
         total = max(1, len(self.queue_jobs))
         done = self.completed_count + self.failed_count
         global_pct = int(min(100, ((done + display_pct / 100.0) / total) * 100))
         self.progress_global.setValue(global_pct)
+        self._set_status_with_progress_context()
 
     def cancel_encode(self):
         self.pending_indices.clear()
@@ -3175,7 +3296,7 @@ class MainWindow(QWidget):
         job = self.queue_jobs[idx]
         job.status = "done"
         job.error_message = ""
-        job.transcript_path = transcript_path
+        job.transcript_path = self._auto_rename_transcript(transcript_path, job)
         self.completed_count += 1
         self.running_index = None
 

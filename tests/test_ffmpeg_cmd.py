@@ -14,6 +14,7 @@ from transcription_utils import (
     parse_whisper_json_segments,
     render_segments_with_speakers,
     structured_initial_prompt,
+    suggest_transcript_stem,
 )
 
 
@@ -92,6 +93,10 @@ class TranscriptionCommandTest(unittest.TestCase):
         path = default_transcript_path("/tmp/reunion.mp4", "/tmp", "_notes", "json")
         self.assertEqual(path, "/tmp/reunion_notes.json")
 
+    def test_default_transcript_path_allows_no_suffix(self):
+        path = default_transcript_path("/tmp/reunion.mp4", "/tmp", "", "txt")
+        self.assertEqual(path, "/tmp/reunion.txt")
+
 
 class StructuredInitialPromptTest(unittest.TestCase):
     def test_empty_context_returns_empty(self):
@@ -109,6 +114,18 @@ class StructuredInitialPromptTest(unittest.TestCase):
         prompt = structured_initial_prompt("Ekonum,   MAIA\n\nRGPD")
         self.assertNotIn("\n", prompt)
         self.assertNotIn("  ", prompt)
+
+
+class TranscriptTitleTest(unittest.TestCase):
+    def test_suggest_transcript_stem_uses_topic_sentence(self):
+        text = "Bonjour à tous. Aujourd'hui on va parler de Présentation des outils RH pour les équipes."
+        self.assertEqual(
+            suggest_transcript_stem(text, "Capture ecran"),
+            "Présentation des outils RH pour les équipes",
+        )
+
+    def test_suggest_transcript_stem_falls_back_for_generic_opening(self):
+        self.assertEqual(suggest_transcript_stem("Bonjour. Merci.", "Réunion client"), "Réunion client")
 
 
 class DiarizationCommandTest(unittest.TestCase):
