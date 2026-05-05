@@ -895,6 +895,13 @@ class TranscribeWorker(QThread):
             details.append(f"stderr={stderr_tail!r}")
         self._log(" ".join(details))
 
+    def _subprocess_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        ffmpeg_dir = str(Path(self.ffmpeg_path).parent)
+        if ffmpeg_dir:
+            env["PATH"] = ffmpeg_dir + os.pathsep + env.get("PATH", "")
+        return env
+
     def request_stop(self):
         self._stop_requested = True
         if self._proc:
@@ -1046,6 +1053,7 @@ class TranscribeWorker(QThread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=self._subprocess_env(),
             )
             stdout, stderr = self._proc.communicate()
 
@@ -1058,13 +1066,21 @@ class TranscribeWorker(QThread):
                 self._log_process_result("mlx_whisper_failed", self._proc.returncode, stdout, stderr)
                 self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
                 return
+            if not whisper_target.exists():
+                detail = _tail_for_log(stderr or stdout)
+                self._log_process_result("mlx_whisper_missing_output", self._proc.returncode, stdout, stderr)
+                self.failed.emit(
+                    "mlx_whisper n'a pas produit le fichier de transcription attendu. "
+                    f"{detail}".strip()
+                )
+                return
             self._log_process_result("mlx_whisper_ok", self._proc.returncode, stdout, stderr)
 
             if run_diarization:
                 self.progress.emit(75)
                 self.status.emit("Détection des locuteurs (pyannote)…")
                 diar_cmd = build_diarization_cmd(self.venv_python_path, str(wav_path))
-                env = os.environ.copy()
+                env = self._subprocess_env()
                 env["HF_TOKEN"] = self.hf_token
                 self._log(f"diarization_start cmd={_command_for_log(diar_cmd)!r}")
                 self._proc = subprocess.Popen(

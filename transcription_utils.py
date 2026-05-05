@@ -159,10 +159,20 @@ except Exception as exc:
     sys.exit(3)
 
 try:
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token,
-    )
+    try:
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            token=hf_token,
+        )
+    except TypeError as exc:
+        if "token" not in str(exc):
+            raise
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token,
+        )
+    if pipeline is None:
+        raise RuntimeError("pipeline unavailable; check Hugging Face token and accepted pyannote licenses")
 except Exception as exc:
     print(json.dumps({"error": f"pipeline load failed: {exc}"}))
     sys.exit(4)
