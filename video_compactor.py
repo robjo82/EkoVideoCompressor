@@ -2206,8 +2206,12 @@ class MainWindow(QWidget):
         zip_path, info = self._update_download_payload
         try:
             tmp_dir = Path(tempfile.mkdtemp(prefix="ekovideo-update-"))
-            with zipfile.ZipFile(zip_path, "r") as archive:
-                archive.extractall(tmp_dir)
+            ditto = shutil.which("ditto")
+            if ditto:
+                subprocess.run([ditto, "-x", "-k", "--noqtn", zip_path, str(tmp_dir)], check=True)
+            else:
+                with zipfile.ZipFile(zip_path, "r") as archive:
+                    archive.extractall(tmp_dir)
 
             candidates = list(tmp_dir.rglob("EkoVideoCompressor.app"))
             if not candidates:
@@ -2216,11 +2220,14 @@ class MainWindow(QWidget):
                 raise RuntimeError("Archive de mise à jour invalide: app introuvable.")
 
             new_app_path = candidates[0].resolve()
+            self._restore_app_executable_permissions(new_app_path)
             target_app_path = self._target_app_bundle_path()
             script_path = (tmp_dir / "apply_update.sh").resolve()
             pid = os.getpid()
             fallback_app = (Path.home() / "Applications" / "EkoVideoCompressor.app").resolve()
-            log_path = (Path(tempfile.gettempdir()) / "ekovideo-updater.log").resolve()
+            log_dir = app_support_dir()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = (log_dir / "updater.log").resolve()
 
             lsregister_path = (
                 "/System/Library/Frameworks/CoreServices.framework"
@@ -2238,11 +2245,24 @@ class MainWindow(QWidget):
                     f"TARGET_APP={shlex.quote(str(target_app_path))}",
                     f"FALLBACK_APP={shlex.quote(str(fallback_app))}",
                     f"LSREGISTER={shlex.quote(lsregister_path)}",
+                    "restore_exec_bits() {",
+                    "  local app=\"$1\"",
+                    "  if [ -d \"$app/Contents/MacOS\" ]; then",
+                    "    chmod +x \"$app/Contents/MacOS\"/* 2>/dev/null || true",
+                    "  fi",
+                    "  if [ -d \"$app/Contents/Resources/bin\" ]; then",
+                    "    chmod +x \"$app/Contents/Resources/bin\"/* 2>/dev/null || true",
+                    "  fi",
+                    "  if [ -d \"$app/Contents/Frameworks/bin\" ]; then",
+                    "    chmod +x \"$app/Contents/Frameworks/bin\"/* 2>/dev/null || true",
+                    "  fi",
+                    "}",
                     "verify_app() {",
                     "  local app=\"$1\"",
                     "  local exe=\"$app/Contents/MacOS/EkoVideoCompressor\"",
+                    "  restore_exec_bits \"$app\"",
                     "  if [ ! -x \"$exe\" ]; then",
-                    "    echo \"Executable missing: $exe\"",
+                    "    echo \"Executable missing or not executable: $exe\"",
                     "    return 1",
                     "  fi",
                     "  \"$exe\" --smoke-test >/dev/null 2>&1",
@@ -2254,6 +2274,7 @@ class MainWindow(QWidget):
                     # manual reopen can fail until reinstall.
                     "finalize_app() {",
                     "  local dst=\"$1\"",
+                    "  restore_exec_bits \"$dst\"",
                     "  xattr -cr \"$dst\" || true",
                     "  xattr -dr com.apple.quarantine \"$dst\" || true",
                     "  codesign --force --deep --sign - --timestamp=none \"$dst\" >/dev/null 2>&1 || true",
@@ -2274,6 +2295,7 @@ class MainWindow(QWidget):
                     "  verify_app \"$src\" || return 1",
                     "  rm -rf \"$staged\" || return 1",
                     "  ditto --noqtn \"$src\" \"$staged\" || return 1",
+                    "  restore_exec_bits \"$staged\"",
                     "  xattr -cr \"$staged\" || true",
                     "  xattr -dr com.apple.quarantine \"$staged\" || true",
                     "  verify_app \"$staged\" || { rm -rf \"$staged\"; return 1; }",
@@ -2348,6 +2370,22 @@ class MainWindow(QWidget):
 
     def on_update_failed(self, message: str):
         self._update_error_message = message
+
+    def _restore_app_executable_permissions(self, app_path: Path):
+        for rel_dir in (
+            Path("Contents/MacOS"),
+            Path("Contents/Resources/bin"),
+            Path("Contents/Frameworks/bin"),
+        ):
+            directory = app_path / rel_dir
+            if not directory.is_dir():
+                continue
+            for item in directory.iterdir():
+                if item.is_file():
+                    try:
+                        item.chmod(item.stat().st_mode | 0o111)
+                    except Exception:
+                        pass
 
     def _show_update_error(self, message: str):
         self.btn_update.setEnabled(not self.is_batch_running)
