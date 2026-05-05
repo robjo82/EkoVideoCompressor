@@ -724,3 +724,45 @@ def render_segments_with_speakers(segments: list[dict], output_format: str) -> s
             current_text.append(seg["text"])
     flush()
     return "\n".join(lines) + "\n"
+
+
+_MULTIMODAL_AUDIO_SCRIPT = '''
+import json
+import sys
+import os
+
+try:
+    from mlx_vlm import load, generate
+except ImportError:
+    print(json.dumps({"error": "mlx-vlm not installed"}))
+    sys.exit(1)
+
+model_path = sys.argv[1]
+audio_path = sys.argv[2]
+prompt_text = sys.argv[3]
+
+try:
+    model, processor = load(model_path)
+    
+    # Format prompt for Qwen2-Audio or generic Audio model
+    if "qwen" in model_path.lower() and "audio" in model_path.lower():
+        formatted_prompt = f"<|audio_bos|><|AUDIO|><|audio_eos|>{prompt_text}"
+    else:
+        formatted_prompt = prompt_text
+        
+    response = generate(model, processor, prompt=formatted_prompt, audio=audio_path, max_tokens=200, verbose=False)
+
+    print(json.dumps({"suggestion": response.strip()}))
+
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(2)
+'''
+
+def build_multimodal_audio_cmd(
+    venv_python_path: str,
+    model_path: str,
+    audio_path: str,
+    prompt: str,
+) -> list[str]:
+    return [venv_python_path, "-c", _MULTIMODAL_AUDIO_SCRIPT, model_path, audio_path, prompt]

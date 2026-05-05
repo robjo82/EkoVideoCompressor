@@ -22,6 +22,7 @@ from transcription_utils import (
     build_audio_extract_cmd,
     build_diarization_cmd,
     build_llm_cmd,
+    build_multimodal_audio_cmd,
     build_mlx_whisper_cmd,
     default_transcript_path,
     parse_diarization_output,
@@ -959,7 +960,7 @@ class TranscribeWorker(QThread):
         if not self.venv_python_path or not Path(self.venv_python_path).exists():
             return False
         probe = subprocess.run(
-            [self.venv_python_path, "-c", "import mlx_lm"],
+            [self.venv_python_path, "-c", "import mlx_lm; import mlx_vlm"],
             capture_output=True,
             text=True,
             env=self._subprocess_env(),
@@ -967,9 +968,9 @@ class TranscribeWorker(QThread):
         if probe.returncode == 0:
             return True
 
-        self.status.emit("Installation post-traitement local…")
+        self.status.emit("Installation de l'IA locale (MLX LM et MLX VLM)…")
         install = subprocess.run(
-            [self.venv_python_path, "-m", "pip", "install", "--upgrade", "mlx-lm"],
+            [self.venv_python_path, "-m", "pip", "install", "--upgrade", "mlx-lm", "mlx-vlm"],
             capture_output=True,
             text=True,
             env=self._subprocess_env(),
@@ -1094,12 +1095,12 @@ class TranscribeWorker(QThread):
         work_dir: Path,
         uncertain_passages: list[dict],
     ) -> list[dict]:
-        if not uncertain_passages or not wav_path.exists():
+        if not uncertain_passages or not wav_path.exists() or not self.venv_python_path:
             return []
 
         checks: list[dict] = []
-        self.status.emit("Réécoute ciblée des passages douteux…")
-        for index, passage in enumerate(uncertain_passages[:5], start=1):
+        self.status.emit("Validation Multimodale (Audio AI)…")
+        for index, passage in enumerate(uncertain_passages[:10], start=1):
             if self._stop_requested:
                 break
             if not isinstance(passage, dict):
@@ -1107,22 +1108,38 @@ class TranscribeWorker(QThread):
             center = self._timestamp_to_seconds(str(passage.get("timestamp") or ""))
             if center is None:
                 continue
-            start = max(0.0, center - 15.0)
-            end = center + 20.0
-            clip_target = work_dir / f"recheck_{index}.json"
-            cmd = build_mlx_whisper_cmd(
-                mlx_whisper_path=self.mlx_whisper_path,
-                audio_path=str(wav_path),
-                output_path=str(clip_target),
-                model=self.model,
-                language=self.language,
-                output_format="json",
-                initial_prompt=self.initial_prompt,
-                condition_on_previous_text=False,
-                clip_timestamps=f"{self._format_seconds_for_clip(start)},{self._format_seconds_for_clip(end)}",
+            start = max(0.0, center - 5.0)
+            end = center + 10.0
+            
+            # 1. Extract specific audio clip
+            clip_wav = work_dir / f"clip_{index}.wav"
+            extract_cmd = build_audio_extract_cmd(
+                self.ffmpeg_path,
+                str(wav_path),
+                str(clip_wav),
+                speech_enhance=False,
+                ss=self._format_seconds_for_clip(start),
+                to=self._format_seconds_for_clip(end)
+            )
+            subprocess.run(extract_cmd, capture_output=True, env=self._subprocess_env())
+            if not clip_wav.exists():
+                continue
+                
+            passage["clip_path"] = str(clip_wav)
+            
+            # 2. Run multimodal AI check
+            question = str(passage.get("text") or "")
+            reason = str(passage.get("reason") or "")
+            prompt = f"La transcription hésite sur : '{question}'. Raison : {reason}. Que dit réellement la personne dans cet extrait ?"
+            
+            cmd = build_multimodal_audio_cmd(
+                venv_python_path=self.venv_python_path,
+                model_path=self.llm_model,
+                audio_path=str(clip_wav),
+                prompt=prompt
             )
             self._log(
-                "clip_recheck_start "
+                "multimodal_check_start "
                 f"timestamp={str(passage.get('timestamp') or '')!r} cmd={_command_for_log(cmd)!r}"
             )
             proc = subprocess.run(
@@ -1132,19 +1149,24 @@ class TranscribeWorker(QThread):
                 env=self._subprocess_env(),
                 timeout=600,
             )
-            if proc.returncode != 0 or not clip_target.exists():
-                self._log_process_result("clip_recheck_failed", proc.returncode, proc.stdout, proc.stderr)
+            if proc.returncode != 0:
+                self._log_process_result("multimodal_check_failed", proc.returncode, proc.stdout, proc.stderr)
                 continue
+                
             try:
-                segments = parse_whisper_json_segments(str(clip_target))
+                result = json.loads((proc.stdout or "").strip().splitlines()[-1])
+                suggestion = result.get("suggestion")
+                if suggestion:
+                    passage["suggestion"] = suggestion
             except Exception as exc:
-                self._log(f"clip_recheck_parse_failed error={exc!r}")
+                self._log(f"multimodal_check_parse_failed error={exc!r}")
                 continue
+                
             checks.append({
                 "timestamp": str(passage.get("timestamp") or ""),
-                "question": str(passage.get("text") or ""),
+                "question": question,
                 "suggestion": str(passage.get("suggestion") or ""),
-                "audio_transcript": " ".join(str(seg.get("text") or "") for seg in segments).strip(),
+                "audio_transcript": "(multimodal évalué)",
             })
         return checks
 
