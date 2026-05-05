@@ -28,7 +28,7 @@ from transcription_utils import (
     transcript_output_ext,
 )
 from PySide6.QtCore import QSettings, QThread, QTime, Qt, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QScrollArea,
     QSplitter,
     QSlider,
     QSpinBox,
@@ -1258,6 +1259,53 @@ class DropZone(QFrame):
         super().mousePressEvent(event)
 
 
+class CollapsibleSection(QFrame):
+    """
+    Header row + collapsible body. The header is a QToolButton showing a
+    chevron that rotates when expanded. Used to fold per-job advanced
+    overrides (resolution, bitrate, trim…) so the main view stays clean
+    for the 95% case.
+    """
+
+    def __init__(self, title: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("collapsibleSection")
+        self._toggle = QToolButton()
+        self._toggle.setObjectName("collapsibleToggle")
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(False)
+        self._toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._toggle.toggled.connect(self._on_toggled)
+
+        self._body = QFrame()
+        self._body.setObjectName("collapsibleBody")
+        self._body_layout = QVBoxLayout(self._body)
+        self._body_layout.setContentsMargins(0, 8, 0, 0)
+        self._body_layout.setSpacing(10)
+        self._body.setVisible(False)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._toggle)
+        outer.addWidget(self._body)
+
+    def add_widget(self, widget: QWidget):
+        self._body_layout.addWidget(widget)
+
+    def set_expanded(self, expanded: bool):
+        self._toggle.setChecked(expanded)
+
+    def _on_toggled(self, checked: bool):
+        self._toggle.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+        self._body.setVisible(checked)
+
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -1407,52 +1455,39 @@ class MainWindow(QWidget):
         self.lbl_input_meta.setWordWrap(True)
         left_col.addWidget(self.lbl_input_meta)
 
+        # Right panel: single scrollable column instead of 4 tabs.
+        # Per-job essentials are visible by default; technical overrides
+        # (resolution, bitrate, trim) are folded into a collapsible section
+        # so the team's day-to-day flow stays uncluttered.
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
         right_col.setMinimumWidth(430)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(10)
-        self.tabs = QTabWidget()
-        self.tabs.setObjectName("controlTabs")
-        self.tabs.setDocumentMode(True)
-        self.tabs.setUsesScrollButtons(False)
-        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
-        self.tabs.tabBar().setExpanding(False)
-        right_layout.addWidget(self.tabs, 1)
 
-        workflow_tab = QWidget()
-        workflow_layout = QVBoxLayout(workflow_tab)
-        workflow_layout.setContentsMargins(4, 10, 4, 4)
-        workflow_layout.setSpacing(10)
+        scroll = QScrollArea()
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_body = QFrame()
+        scroll_body.setObjectName("settingsScrollBody")
+        scroll_layout = QVBoxLayout(scroll_body)
+        scroll_layout.setContentsMargins(4, 4, 4, 4)
+        scroll_layout.setSpacing(12)
 
-        video_tab = QWidget()
-        video_layout = QVBoxLayout(video_tab)
-        video_layout.setContentsMargins(4, 10, 4, 4)
-        video_layout.setSpacing(10)
-
-        audio_tab = QWidget()
-        audio_layout = QVBoxLayout(audio_tab)
-        audio_layout.setContentsMargins(4, 10, 4, 4)
-        audio_layout.setSpacing(10)
-
-        transcription_tab = QWidget()
-        transcription_layout = QVBoxLayout(transcription_tab)
-        transcription_layout.setContentsMargins(4, 10, 4, 4)
-        transcription_layout.setSpacing(10)
-
-        workflow_group = QGroupBox("Workflow")
-        workflow_form = QFormLayout(workflow_group)
-        workflow_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        workflow_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        workflow_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        workflow_form.setHorizontalSpacing(10)
-        workflow_form.setVerticalSpacing(12)
+        # --- Profil + sortie -----------------------------------------
+        main_group = QGroupBox("Réglages de cette vidéo")
+        main_form = QFormLayout(main_group)
+        main_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        main_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        main_form.setHorizontalSpacing(10)
+        main_form.setVerticalSpacing(12)
 
         self.combo_profile = QComboBox()
         self.combo_profile.addItems(["Personnalisé", *PROFILE_PRESETS.keys()])
         self.combo_profile.currentTextChanged.connect(self.on_profile_changed)
-        workflow_form.addRow("Preset", self.combo_profile)
+        main_form.addRow("Profil", self.combo_profile)
 
         out_row = QHBoxLayout()
         self.edit_output_dir = QLineEdit(str(self.settings.value("output_dir", str(Path.home() / "Desktop"), type=str)))
@@ -1461,29 +1496,73 @@ class MainWindow(QWidget):
         self.btn_output_dir.clicked.connect(self.pick_output_dir)
         out_row.addWidget(self.edit_output_dir)
         out_row.addWidget(self.btn_output_dir)
-        workflow_form.addRow("Dossier sortie", out_row)
+        main_form.addRow("Dossier sortie", out_row)
 
         self.edit_suffix = QLineEdit(str(self.settings.value("suffix", "_compressed", type=str)))
-        workflow_form.addRow("Suffixe nom", self.edit_suffix)
+        main_form.addRow("Suffixe", self.edit_suffix)
 
         self.check_continue_on_error = QCheckBox("Continuer en cas d'erreur")
         self.check_continue_on_error.setChecked(self.settings.value("continue_on_error", True, type=bool))
-        workflow_form.addRow("", self.check_continue_on_error)
+        main_form.addRow("", self.check_continue_on_error)
 
-        btn_row = QVBoxLayout()
-        self.btn_apply_to_all = QPushButton("Appliquer ces réglages à tous")
-        self.btn_apply_to_all.setObjectName("secondaryButton")
-        self.btn_apply_to_all.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn_apply_to_all.clicked.connect(self.apply_current_settings_to_all)
-        self.btn_reset_preset = QPushButton("Réinitialiser au preset")
-        self.btn_reset_preset.setObjectName("secondaryButton")
-        self.btn_reset_preset.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.btn_reset_preset.clicked.connect(self.reset_current_job_to_preset)
-        btn_row.addWidget(self.btn_apply_to_all)
-        btn_row.addWidget(self.btn_reset_preset)
-        workflow_form.addRow("", btn_row)
+        self.check_transcribe_after_encode = QCheckBox("Transcrire après compression")
+        self.check_transcribe_after_encode.setChecked(self.settings.value("transcribe_after_encode", False, type=bool))
+        main_form.addRow("", self.check_transcribe_after_encode)
 
-        workflow_layout.addWidget(workflow_group)
+        scroll_layout.addWidget(main_group)
+
+        # --- Glossaire transcription ---------------------------------
+        glossary_group = QGroupBox("Vocabulaire de la réunion")
+        glossary_layout = QVBoxLayout(glossary_group)
+        glossary_layout.setContentsMargins(12, 16, 12, 12)
+        glossary_layout.setSpacing(8)
+
+        self.edit_transcription_prompt = QTextEdit()
+        self.edit_transcription_prompt.setAcceptRichText(False)
+        self.edit_transcription_prompt.setPlaceholderText(
+            "Noms propres, clients, projets, acronymes, vocabulaire métier…"
+        )
+        self.edit_transcription_prompt.setPlainText(
+            str(
+                self.settings.value(
+                    "transcription_glossary",
+                    self.settings.value("transcription_prompt", "", type=str),
+                    type=str,
+                )
+            )
+        )
+        self.edit_transcription_prompt.setMinimumHeight(110)
+        glossary_layout.addWidget(self.edit_transcription_prompt)
+
+        self.lbl_transcription_hint = QLabel(
+            "Conservé entre les réunions. Sera transmis à Whisper comme vocabulaire attendu."
+        )
+        self.lbl_transcription_hint.setObjectName("metaLabel")
+        self.lbl_transcription_hint.setWordWrap(True)
+        glossary_layout.addWidget(self.lbl_transcription_hint)
+
+        scroll_layout.addWidget(glossary_group)
+
+        # --- État de la transcription + installer --------------------
+        transcription_status_group = QGroupBox("Transcription locale")
+        transcription_status_layout = QVBoxLayout(transcription_status_group)
+        transcription_status_layout.setContentsMargins(12, 16, 12, 12)
+        transcription_status_layout.setSpacing(8)
+
+        self.lbl_transcription_config = QLabel()
+        self.lbl_transcription_config.setObjectName("metaLabel")
+        self.lbl_transcription_config.setWordWrap(True)
+        transcription_status_layout.addWidget(self.lbl_transcription_config)
+
+        self.btn_install_mlx = QPushButton("Installer MLX Whisper")
+        self.btn_install_mlx.setObjectName("secondaryButton")
+        self.btn_install_mlx.clicked.connect(self.install_mlx_whisper)
+        transcription_status_layout.addWidget(self.btn_install_mlx)
+
+        scroll_layout.addWidget(transcription_status_group)
+
+        # --- Avancé (collapsible): compression / audio / rognage ----
+        self.advanced_section = CollapsibleSection("▸ Réglages avancés (compression, audio, rognage)")
 
         comp_group = QGroupBox("Compression vidéo")
         comp_form = QFormLayout(comp_group)
@@ -1514,7 +1593,7 @@ class MainWindow(QWidget):
         self.combo_preset.currentTextChanged.connect(self.on_control_changed)
         comp_form.addRow("Vitesse encodage", self.combo_preset)
 
-        video_layout.addWidget(comp_group)
+        self.advanced_section.add_widget(comp_group)
 
         audio_group = QGroupBox("Audio / voix")
         audio_form = QFormLayout(audio_group)
@@ -1536,55 +1615,7 @@ class MainWindow(QWidget):
         self.check_mono.toggled.connect(self.on_control_changed)
         audio_form.addRow("", self.check_mono)
 
-        audio_layout.addWidget(audio_group)
-
-        transcribe_group = QGroupBox("Transcription locale")
-        transcribe_form = QFormLayout(transcribe_group)
-        transcribe_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        transcribe_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        transcribe_form.setHorizontalSpacing(10)
-        transcribe_form.setVerticalSpacing(12)
-
-        self.check_transcribe_after_encode = QCheckBox("Transcrire après compression")
-        self.check_transcribe_after_encode.setChecked(self.settings.value("transcribe_after_encode", False, type=bool))
-        transcribe_form.addRow("", self.check_transcribe_after_encode)
-
-        self.btn_install_mlx = QPushButton("Installer MLX Whisper")
-        self.btn_install_mlx.setObjectName("secondaryButton")
-        self.btn_install_mlx.clicked.connect(self.install_mlx_whisper)
-        transcribe_form.addRow("", self.btn_install_mlx)
-
-        self.lbl_transcription_config = QLabel()
-        self.lbl_transcription_config.setObjectName("metaLabel")
-        self.lbl_transcription_config.setWordWrap(True)
-        transcribe_form.addRow("", self.lbl_transcription_config)
-
-        self.edit_transcription_prompt = QTextEdit()
-        self.edit_transcription_prompt.setAcceptRichText(False)
-        self.edit_transcription_prompt.setPlaceholderText(
-            "Noms propres, clients, projets, acronymes, vocabulaire métier…"
-        )
-        self.edit_transcription_prompt.setPlainText(
-            str(
-                self.settings.value(
-                    "transcription_glossary",
-                    self.settings.value("transcription_prompt", "", type=str),
-                    type=str,
-                )
-            )
-        )
-        self.edit_transcription_prompt.setMinimumHeight(130)
-        transcribe_form.addRow("Bibliothèque", self.edit_transcription_prompt)
-
-        self.lbl_transcription_hint = QLabel(
-            "Les réglages avancés de transcription sont dans Réglages > Transcription. La bibliothèque ci-dessus est conservée entre les réunions."
-        )
-        self.lbl_transcription_hint.setObjectName("metaLabel")
-        self.lbl_transcription_hint.setWordWrap(True)
-
-        transcription_layout.addWidget(transcribe_group)
-        transcription_layout.addWidget(self.lbl_transcription_hint)
-        transcription_layout.addStretch(1)
+        self.advanced_section.add_widget(audio_group)
 
         trim_group = QGroupBox("Rognage")
         trim_form = QFormLayout(trim_group)
@@ -1609,20 +1640,32 @@ class MainWindow(QWidget):
         self.time_end.timeChanged.connect(self.on_control_changed)
         trim_form.addRow("Fin", self.time_end)
 
-        video_layout.addWidget(trim_group)
+        self.advanced_section.add_widget(trim_group)
 
+        per_job_btns = QHBoxLayout()
+        self.btn_apply_to_all = QPushButton("Appliquer à toute la file")
+        self.btn_apply_to_all.setObjectName("secondaryButton")
+        self.btn_apply_to_all.clicked.connect(self.apply_current_settings_to_all)
+        self.btn_reset_preset = QPushButton("Réinitialiser au profil")
+        self.btn_reset_preset.setObjectName("secondaryButton")
+        self.btn_reset_preset.clicked.connect(self.reset_current_job_to_preset)
+        per_job_btns.addWidget(self.btn_apply_to_all)
+        per_job_btns.addWidget(self.btn_reset_preset)
+        per_job_btns_widget = QWidget()
+        per_job_btns_widget.setLayout(per_job_btns)
+        self.advanced_section.add_widget(per_job_btns_widget)
+
+        scroll_layout.addWidget(self.advanced_section)
+
+        # --- Estimation (toujours visible en bas) --------------------
         self.lbl_estimation = QLabel("Estimation: sélectionnez une vidéo.")
         self.lbl_estimation.setObjectName("metaLabel")
         self.lbl_estimation.setWordWrap(True)
-        workflow_layout.addWidget(self.lbl_estimation)
-        workflow_layout.addStretch(1)
-        video_layout.addStretch(1)
-        audio_layout.addStretch(1)
+        scroll_layout.addWidget(self.lbl_estimation)
 
-        self.tabs.addTab(workflow_tab, "Workflow")
-        self.tabs.addTab(video_tab, "Vidéo")
-        self.tabs.addTab(audio_tab, "Audio")
-        self.tabs.addTab(transcription_tab, "Transcrire")
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_body)
+        right_layout.addWidget(scroll, 1)
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_col)
@@ -1673,6 +1716,10 @@ class MainWindow(QWidget):
         actions.addWidget(self.btn_start)
         actions.addWidget(self.btn_cancel)
         root.addLayout(actions)
+
+        # Cmd+, opens Réglages (macOS standard preferences shortcut).
+        self._settings_shortcut = QShortcut(QKeySequence("Ctrl+,"), self)
+        self._settings_shortcut.activated.connect(self.open_settings)
 
         self._refresh_transcription_summary()
         self.on_trim_toggled(False)
@@ -1790,32 +1837,35 @@ class MainWindow(QWidget):
             color: #1d1d1f;
             background: #ffffff;
         }
-        QTabWidget#controlTabs::pane {
-            border: none;
+        QScrollArea#settingsScroll {
             background: transparent;
-            margin-top: 10px;
+            border: none;
         }
-        QTabBar::tab {
+        QFrame#settingsScrollBody {
+            background: transparent;
+        }
+        QFrame#collapsibleSection {
+            background: transparent;
+            border: none;
+        }
+        QToolButton#collapsibleToggle {
             background: #f2f2f7;
-            border: 1px solid #d2d2d7;
+            border: 1px solid #e1e1e6;
             border-radius: 9px;
-            color: #3a3a3c;
-            padding: 8px 8px;
-            margin-right: 6px;
-            min-width: 76px;
-            font-size: 12px;
+            padding: 8px 12px;
+            text-align: left;
+            color: #1d1d1f;
             font-weight: 600;
         }
-        QTabBar::tab:selected {
-            background: #007aff;
-            color: #ffffff;
-            border-color: #007aff;
-        }
-        QTabBar::tab:!selected {
-            margin-top: 0px;
-        }
-        QTabBar::tab:hover:!selected {
+        QToolButton#collapsibleToggle:hover {
             background: #e9e9ee;
+        }
+        QToolButton#collapsibleToggle:checked {
+            background: #e9e9ee;
+        }
+        QFrame#collapsibleBody {
+            background: transparent;
+            padding-left: 4px;
         }
         QPushButton#primaryButton {
             background: #007aff;
@@ -2707,7 +2757,8 @@ class MainWindow(QWidget):
         return self.mlx_whisper_path.strip() or find_binary("mlx_whisper") or ""
 
     def _prompt_install_mlx_whisper(self, message: str):
-        self.tabs.setCurrentIndex(3)
+        # Make sure the install button is on screen — the advanced section
+        # is collapsed by default but the install button is always visible.
         answer = QMessageBox.question(
             self,
             "MLX Whisper requis",
