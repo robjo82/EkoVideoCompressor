@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
 import certifi
@@ -173,6 +174,51 @@ def app_support_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.home() / f".{APP_NAME.replace(' ', '').lower()}"
+
+
+def app_log_path() -> Path:
+    return app_support_dir() / "app.log"
+
+
+def _tail_for_log(text: str | None, limit: int = 4000) -> str:
+    value = (text or "").strip()
+    if len(value) <= limit:
+        return value
+    return f"...{value[-limit:]}"
+
+
+def _command_for_log(cmd: list[str]) -> str:
+    redacted: list[str] = []
+    redact_next = False
+    inline_python_next = False
+    for arg in cmd:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+        if inline_python_next:
+            redacted.append("<inline-python>")
+            inline_python_next = False
+            continue
+
+        redacted.append(arg)
+        if arg in {"--initial-prompt"}:
+            redact_next = True
+        elif arg == "-c":
+            inline_python_next = True
+
+    return shlex.join(redacted)
+
+
+def append_app_log(message: str):
+    try:
+        path = app_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
 
 
 def managed_transcription_venv_dir() -> Path:
@@ -830,6 +876,25 @@ class TranscribeWorker(QThread):
         self._stop_requested = False
         self._proc: subprocess.Popen | None = None
 
+    def _log(self, message: str):
+        append_app_log(f"transcription file={Path(self.job.input_path).name!r} {message}")
+
+    def _log_process_result(
+        self,
+        label: str,
+        returncode: int | None,
+        stdout: str | None = None,
+        stderr: str | None = None,
+    ):
+        details = [f"{label} returncode={returncode}"]
+        stdout_tail = _tail_for_log(stdout)
+        stderr_tail = _tail_for_log(stderr)
+        if stdout_tail:
+            details.append(f"stdout={stdout_tail!r}")
+        if stderr_tail:
+            details.append(f"stderr={stderr_tail!r}")
+        self._log(" ".join(details))
+
     def request_stop(self):
         self._stop_requested = True
         if self._proc:
@@ -840,20 +905,32 @@ class TranscribeWorker(QThread):
 
     def run(self):
         if not self.ffmpeg_path or not Path(self.ffmpeg_path).exists():
+            self._log(f"blocked reason=missing_ffmpeg path={self.ffmpeg_path!r}")
             self.failed.emit("ffmpeg introuvable. Vérifiez les paramètres.")
             return
         if not self.mlx_whisper_path or not Path(self.mlx_whisper_path).exists():
+            self._log(f"blocked reason=missing_mlx_whisper path={self.mlx_whisper_path!r}")
             self.failed.emit(
                 "mlx_whisper introuvable. Utilisez le bouton Installer MLX Whisper dans l'onglet Transcrire."
             )
             return
         if not Path(self.job.input_path).exists():
+            self._log(f"blocked reason=missing_input path={self.job.input_path!r}")
             self.failed.emit("Fichier d'entrée introuvable.")
             return
         if not self.job.transcript_path:
+            self._log("blocked reason=missing_transcript_path")
             self.failed.emit("Chemin de transcription manquant.")
             return
 
+        self._log(
+            "start "
+            f"output={self.job.transcript_path!r} model={self.model!r} language={self.language!r} "
+            f"format={self.output_format!r} enhance_audio={self.enhance_audio} "
+            f"diarization_enabled={self.diarization_enabled} "
+            f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)} "
+            f"prompt_chars={len(self.initial_prompt)}"
+        )
         duration = probe_duration_seconds(self.job.input_path, self.ffprobe_path, self.ffmpeg_path)
         self.duration_unknown.emit(duration is None)
 
@@ -917,10 +994,12 @@ class TranscribeWorker(QThread):
                     err = (self._proc.stderr.read() or "").strip()
                 except Exception:
                     pass
+                self._log_process_result("ffmpeg_extract", rc, stderr=err)
                 self.failed.emit(err or f"ffmpeg a échoué (code {rc}).")
                 return
 
             if self._stop_requested:
+                self._log("cancelled after_audio_extract")
                 self.failed.emit("Annulé.")
                 return
 
@@ -932,6 +1011,10 @@ class TranscribeWorker(QThread):
             # and re-render to the user's chosen format ourselves.
             run_diarization = bool(self.diarization_enabled and self.hf_token and self.venv_python_path)
             if self.diarization_enabled and not run_diarization:
+                self._log(
+                    "diarization_skipped "
+                    f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)}"
+                )
                 self.status.emit(
                     "Détection des locuteurs ignorée (token Hugging Face ou installation manquante)."
                 )
@@ -953,6 +1036,11 @@ class TranscribeWorker(QThread):
             self.duration_unknown.emit(True)
             self.progress.emit(25)
             self.status.emit("Transcription locale MLX…")
+            self._log(
+                "mlx_whisper_start "
+                f"target={str(whisper_target)!r} target_format={whisper_format!r} "
+                f"cmd={_command_for_log(cmd)!r}"
+            )
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -967,8 +1055,10 @@ class TranscribeWorker(QThread):
 
             if self._proc.returncode != 0:
                 detail = (stderr or stdout or "").strip()
+                self._log_process_result("mlx_whisper_failed", self._proc.returncode, stdout, stderr)
                 self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
                 return
+            self._log_process_result("mlx_whisper_ok", self._proc.returncode, stdout, stderr)
 
             if run_diarization:
                 self.progress.emit(75)
@@ -976,6 +1066,7 @@ class TranscribeWorker(QThread):
                 diar_cmd = build_diarization_cmd(self.venv_python_path, str(wav_path))
                 env = os.environ.copy()
                 env["HF_TOKEN"] = self.hf_token
+                self._log(f"diarization_start cmd={_command_for_log(diar_cmd)!r}")
                 self._proc = subprocess.Popen(
                     diar_cmd,
                     stdout=subprocess.PIPE,
@@ -991,10 +1082,12 @@ class TranscribeWorker(QThread):
 
                 if self._proc.returncode != 0:
                     detail = (d_stderr or d_stdout or "").strip()
+                    self._log_process_result("diarization_failed", self._proc.returncode, d_stdout, d_stderr)
                     self.failed.emit(
                         f"Détection des locuteurs échouée (code {self._proc.returncode}). {detail}"
                     )
                     return
+                self._log_process_result("diarization_ok", self._proc.returncode, d_stdout, d_stderr)
 
                 try:
                     turns = parse_diarization_output(d_stdout)
@@ -1002,6 +1095,7 @@ class TranscribeWorker(QThread):
                     fused = assign_speakers_to_segments(whisper_segments, turns)
                     rendered = render_segments_with_speakers(fused, self.output_format)
                 except Exception as exc:
+                    self._log(f"fusion_failed error={exc!r}")
                     self.failed.emit(f"Fusion transcription/locuteurs échouée: {exc}")
                     return
 
@@ -1010,8 +1104,10 @@ class TranscribeWorker(QThread):
             self.duration_unknown.emit(False)
             self.progress.emit(100)
             self.status.emit("Transcription terminée.")
+            self._log(f"success output={str(out_path)!r}")
             self.finished_ok.emit(str(out_path))
         except Exception as exc:
+            self._log(f"unexpected_error error={exc!r}")
             self.failed.emit(str(exc))
         finally:
             self._proc = None
@@ -3082,6 +3178,7 @@ class MainWindow(QWidget):
         idx = self.running_index
         job = self.queue_jobs[idx]
         self.running_index = None
+        append_app_log(f"queue_failure file={Path(job.input_path).name!r} message={_tail_for_log(msg)!r}")
 
         if msg == "Annulé.":
             job.status = "failed"
