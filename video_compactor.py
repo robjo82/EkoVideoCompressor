@@ -30,7 +30,7 @@ from transcription_utils import (
     suggest_transcript_stem,
     transcript_output_ext,
 )
-from PySide6.QtCore import QSettings, QThread, QTime, Qt, Signal
+from PySide6.QtCore import QSettings, QThread, QTime, QTimer, Qt, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -841,7 +841,7 @@ class EncodeWorker(QThread):
                         if pct != last_pct:
                             last_pct = pct
                             self.progress.emit(pct)
-                            self.status.emit(f"Compression… {pct}%")
+                            self.status.emit("Compression…")
                     else:
                         self.status.emit("Compression…")
 
@@ -1016,7 +1016,7 @@ class TranscribeWorker(QThread):
                         if pct != last_pct:
                             last_pct = pct
                             self.progress.emit(pct)
-                            self.status.emit(f"Préparation audio… {pct}%")
+                            self.status.emit("Préparation audio…")
                     else:
                         self.status.emit("Préparation audio…")
 
@@ -1397,14 +1397,17 @@ class DropZone(QFrame):
         title = QLabel("Déposez vos vidéos")
         title.setObjectName("dropTitle")
         title.setAlignment(Qt.AlignCenter)
+        title.setWordWrap(True)
 
         subtitle = QLabel('ou utilisez "Ajouter des vidéos"')
         subtitle.setObjectName("dropSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setWordWrap(True)
 
         details = QLabel("Compression par lots, transcription locale en option")
         details.setObjectName("dropDetails")
         details.setAlignment(Qt.AlignCenter)
+        details.setWordWrap(True)
 
         layout.addWidget(icon)
         layout.addWidget(title)
@@ -1501,7 +1504,7 @@ class MainWindow(QWidget):
             or ""
         )
         self.transcription_model = str(
-            self.settings.value("transcription_model", "mlx-community/whisper-large-v3-turbo", type=str)
+            self.settings.value("transcription_model", "mlx-community/whisper-large-v3", type=str)
         ).strip()
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
@@ -1541,6 +1544,10 @@ class MainWindow(QWidget):
         self._update_error_message: str | None = None
         self.is_batch_running = False
         self._syncing_job = False
+
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self._set_status_with_progress_context)
+        self.status_timer.start(1000)
 
         self._build_ui(icon_path)
         self.apply_style()
@@ -2194,7 +2201,7 @@ class MainWindow(QWidget):
             diar_status = "OFF"
         self.lbl_transcription_config.setText(
             f"MLX Whisper: {mlx_status}\n"
-            f"Modèle: {self.transcription_model or 'mlx-community/whisper-large-v3-turbo'}\n"
+            f"Modèle: {self.transcription_model or 'mlx-community/whisper-large-v3'}\n"
             f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}\n"
             f"Détection des locuteurs: {diar_status}"
         )
@@ -3228,11 +3235,11 @@ class MainWindow(QWidget):
         return f" ({' · '.join(parts)})"
 
     def _set_status_with_progress_context(self):
+        if not self.is_batch_running or self.running_index is None:
+            return
         current = self.completed_count + self.failed_count + (1 if self.running_index is not None else 0)
         total = max(1, len(self.queue_jobs))
         text = self.current_job_status_text or "Traitement…"
-        if self.progress.maximum() > 0 and self.current_job_display_pct:
-            text = f"{text} {self.current_job_display_pct}%"
         self.status.setText(f"[{current}/{total}] {text}{self._status_timing_suffix()}")
 
     def on_status(self, text: str):

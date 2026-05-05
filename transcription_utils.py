@@ -204,7 +204,7 @@ def build_mlx_whisper_cmd(
         mlx_whisper_path,
         audio_path,
         "--model",
-        model.strip() or "mlx-community/whisper-large-v3-turbo",
+        model.strip() or "mlx-community/whisper-large-v3",
         "-f",
         fmt,
         "--output-dir",
@@ -295,12 +295,46 @@ except Exception as exc:
     sys.exit(5)
 
 turns = []
-for turn, _, speaker in diar.itertracks(yield_label=True):
-    turns.append({
-        "start": float(turn.start),
-        "end": float(turn.end),
-        "speaker": str(speaker),
-    })
+# pyannote-audio 3.x returns an Annotation object with itertracks.
+# pyannote-audio 4.x (with pyannoteai-sdk) might return a DiarizeOutput object.
+# If it's a DiarizeOutput, try to convert it to a standard Annotation.
+if not hasattr(diar, "itertracks") and hasattr(diar, "to_annotation"):
+    try:
+        diar = diar.to_annotation()
+    except Exception:
+        pass
+
+if hasattr(diar, "itertracks"):
+    for turn, _, speaker in diar.itertracks(yield_label=True):
+        turns.append({
+            "start": float(turn.start),
+            "end": float(turn.end),
+            "speaker": str(speaker),
+        })
+elif hasattr(diar, "segments"):
+    # Probable structure for DiarizeOutput or similar commercial SDK outputs
+    for segment in diar.segments:
+        turns.append({
+            "start": float(getattr(segment, "start", 0)),
+            "end": float(getattr(segment, "end", 0)),
+            "speaker": str(getattr(segment, "speaker", "UNKNOWN")),
+        })
+else:
+    # Last resort: if it's iterable, maybe it's already a list of segments
+    try:
+        for segment in diar:
+            if hasattr(segment, "start") and hasattr(segment, "speaker"):
+                turns.append({
+                    "start": float(segment.start),
+                    "end": float(segment.end),
+                    "speaker": str(segment.speaker),
+                })
+    except Exception:
+        pass
+
+if not turns:
+    print(json.dumps({"error": f"Unexpected diarization output type: {type(diar)} or empty results"}))
+    sys.exit(6)
 
 print(json.dumps({"turns": turns}))
 '''
