@@ -4,16 +4,24 @@ Application desktop macOS pour compresser rapidement des enregistrements de réu
 
 ## Installation équipe Mac (Apple Silicon)
 
-1. Ouvrez la page **Releases** du dépôt GitHub.
-2. Téléchargez l'archive `EkoVideoCompressor-macos-arm64-vX.Y.Z.zip`.
-3. Décompressez et déplacez `EkoVideoCompressor.app` dans `/Applications`.
-4. Premier lancement: clic droit sur l'app, puis `Open`.
+L'app est signée ad-hoc (pas de compte développeur Apple payant). Au **premier
+lancement seulement**, macOS demande une confirmation explicite. Les mises à
+jour automatiques sont ensuite transparentes.
 
-Si macOS bloque l'app ou ffmpeg, exécutez:
+1. Ouvrez la page **Releases** du dépôt GitHub.
+2. Téléchargez `EkoVideoCompressor-macos-arm64-vX.Y.Z.zip`.
+3. Décompressez et déplacez `EkoVideoCompressor.app` dans `/Applications`.
+4. **Premier lancement** : clic droit sur l'app → `Ouvrir` → `Ouvrir` dans
+   la boîte de dialogue. Les lancements suivants se font normalement.
+
+Si macOS affiche `app endommagée` ou bloque ffmpeg, le bundle a été mis en
+quarantaine par le navigateur. Une seule commande suffit :
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/EkoVideoCompressor.app
 ```
+
+Puis double-cliquez normalement.
 
 ## Release automatisée
 
@@ -57,7 +65,23 @@ brew install python@3.12
 Dans l'onglet `Transcrire`, le modèle recommandé par défaut est:
 `mlx-community/whisper-large-v3-turbo`.
 
-Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper.
+Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper. Le contenu est automatiquement formaté pour Whisper (phrase d'amorce en français — le modèle le traite comme du vocabulaire attendu, pas comme une liste).
+
+## Détection des locuteurs (diarisation)
+
+Pour identifier qui parle quand dans une réunion à plusieurs voix, l'app utilise [pyannote.audio 3.1](https://huggingface.co/pyannote/speaker-diarization-3.1). Setup en une fois par poste :
+
+1. Créez un compte gratuit sur huggingface.co (ou connectez-vous).
+2. Acceptez les licences (un clic chacune) :
+   - https://huggingface.co/pyannote/segmentation-3.0
+   - https://huggingface.co/pyannote/speaker-diarization-3.1
+3. Générez un token Read sur https://huggingface.co/settings/tokens
+4. Ouvrez `Réglages` → onglet `Transcription` → cochez **Détection des locuteurs** et collez le token dans **Token Hugging Face**.
+5. Le bouton `Installer MLX Whisper` (onglet `Transcrire`) installe désormais aussi pyannote + torch (~2 Go, 5-10 min la première fois).
+
+La transcription produit alors des segments préfixés `[SPEAKER_00]`, `[SPEAKER_01]`, etc. Vous pouvez renommer les locuteurs dans le fichier de sortie. Formats supportés : txt, srt, vtt, json, tsv.
+
+Sans token ou pyannote installé, l'app retombe sur la transcription standard (sans étiquettes locuteur) avec un avertissement.
 
 ## Builds GitHub
 
