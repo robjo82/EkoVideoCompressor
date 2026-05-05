@@ -3591,11 +3591,18 @@ class MainWindow(QWidget):
         self.completed_count += 1
         self.running_index = None
 
+        # EncodeWorker doesn't talk to the DB itself, so update from here.
+        # TranscribeWorker updates the DB during run(); this is the
+        # compression-only path.
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "COMPLETED")
+            self.db.update_job_output(job.db_id, out_path)
+
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.library_view.refresh()
-        
+
         self._cleanup_workspace_wav(job)
 
         total = max(1, len(self.queue_jobs))
@@ -3636,6 +3643,8 @@ class MainWindow(QWidget):
         if msg == "Annulé.":
             job.status = "failed"
             job.error_message = "Annulé"
+            if job.db_id:
+                self.db.update_job_status(job.db_id, "CANCELLED", "Annulé")
             self.refresh_queue_item(idx)
             self.progress.setRange(0, 100)
             self._finish_batch(cancelled=True)
@@ -3644,6 +3653,11 @@ class MainWindow(QWidget):
         job.status = "failed"
         job.error_message = msg
         self.failed_count += 1
+        # TranscribeWorker may already have set FAILED with a richer message,
+        # but EncodeWorker never touches the DB. Update unconditionally —
+        # update_job_status overwrites with the latest, so this is safe.
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "FAILED", msg)
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
         self.library_view.refresh()
