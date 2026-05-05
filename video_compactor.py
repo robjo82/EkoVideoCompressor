@@ -557,6 +557,22 @@ def choose_release_asset(assets: list[dict]) -> dict | None:
     return arm_assets[0] if arm_assets else zip_assets[0]
 
 
+def is_hf_model_cached(repo_id: str) -> bool:
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+    if not repo_dir.exists():
+        return False
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.exists() and list(snapshots_dir.iterdir()):
+        return True
+    return False
+
+
+LLM_MODELS = [
+    "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+    "mlx-community/Qwen2-Audio-7B-Instruct-8bit"
+]
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -633,7 +649,26 @@ class SettingsDialog(QDialog):
         transcription_form.addRow("Commande", mlx_row)
 
         self.transcription_model_edit = QLineEdit(str(transcription_settings.get("model", "")))
-        transcription_form.addRow("Modèle", self.transcription_model_edit)
+        transcription_form.addRow("Modèle Whisper", self.transcription_model_edit)
+
+        self.transcription_llm_model_combo = QComboBox()
+        self.transcription_llm_model_combo.setEditable(True)
+        current_llm = str(transcription_settings.get("llm_model", LLM_MODELS[0]))
+        
+        # Populate combo box with cache status
+        for model_id in LLM_MODELS:
+            status = " (Téléchargé)" if is_hf_model_cached(model_id) else " (À télécharger)"
+            self.transcription_llm_model_combo.addItem(f"{model_id}{status}", model_id)
+            
+        # Set current if exists or add as custom
+        idx = self.transcription_llm_model_combo.findData(current_llm)
+        if idx >= 0:
+            self.transcription_llm_model_combo.setCurrentIndex(idx)
+        else:
+            self.transcription_llm_model_combo.addItem(current_llm, current_llm)
+            self.transcription_llm_model_combo.setCurrentIndex(self.transcription_llm_model_combo.count() - 1)
+            
+        transcription_form.addRow("Modèle IA Audio", self.transcription_llm_model_combo)
 
         self.transcription_language_combo = QComboBox()
         self.transcription_language_combo.addItems(["fr", "auto", "en", "es", "de", "it"])
@@ -760,6 +795,7 @@ class SettingsDialog(QDialog):
             {
                 "mlx_whisper_path": self.mlx_whisper_edit.text().strip(),
                 "model": self.transcription_model_edit.text().strip(),
+                "llm_model": self.transcription_llm_model_combo.currentData() or self.transcription_llm_model_combo.currentText().strip(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_value,
@@ -2119,6 +2155,9 @@ class MainWindow(QWidget):
         self.transcription_model = str(
             self.settings.value("transcription_model", "mlx-community/whisper-large-v3", type=str)
         ).strip()
+        self.transcription_llm_model = str(
+            self.settings.value("transcription_llm_model", LLM_MODELS[0], type=str)
+        ).strip()
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
         self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
@@ -2852,6 +2891,7 @@ class MainWindow(QWidget):
         return {
             "mlx_whisper_path": self.mlx_whisper_path,
             "model": self.transcription_model,
+            "llm_model": getattr(self, "transcription_llm_model", LLM_MODELS[0]),
             "language": self.transcription_language,
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
@@ -2905,6 +2945,9 @@ class MainWindow(QWidget):
         self.transcription_model = (
             str(transcription_settings.get("model", "")).strip() or "mlx-community/whisper-large-v3-turbo"
         )
+        self.transcription_llm_model = (
+            str(transcription_settings.get("llm_model", "")).strip() or LLM_MODELS[0]
+        )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
         self.transcription_suffix = str(transcription_settings.get("suffix", "")).strip()
@@ -2920,6 +2963,7 @@ class MainWindow(QWidget):
         self.settings.setValue("github_token", self.github_token)
         self.settings.setValue("mlx_whisper_path", self.mlx_whisper_path)
         self.settings.setValue("transcription_model", self.transcription_model)
+        self.settings.setValue("transcription_llm_model", self.transcription_llm_model)
         self.settings.setValue("transcription_language", self.transcription_language)
         self.settings.setValue("transcription_format", self.transcription_format)
         self.settings.setValue("transcription_suffix", self.transcription_suffix)
@@ -3909,6 +3953,7 @@ class MainWindow(QWidget):
             diarization_enabled=self.transcription_diarization_enabled,
             hf_token=self.transcription_hf_token,
             venv_python_path=str(venv_python) if venv_python.exists() else "",
+            llm_model=getattr(self, "transcription_llm_model", LLM_MODELS[0]),
         )
         self.worker = worker
         self._track_worker(worker)
