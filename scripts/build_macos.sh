@@ -61,6 +61,7 @@ trap cleanup EXIT
 cat > _build_version.py <<EOF
 APP_VERSION = "${VERSION}"
 EOF
+QT_QPA_PLATFORM=offscreen python video_compactor.py --startup-smoke-test
 pyinstaller --noconfirm --clean video_compactor.spec
 
 # Ad-hoc sign so macOS treats the bundle as a stable identity across replacements.

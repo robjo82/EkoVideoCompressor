@@ -184,6 +184,9 @@ def app_base_dir() -> Path:
 
 
 def app_support_dir() -> Path:
+    override = os.getenv("EKO_APP_SUPPORT_DIR", "").strip()
+    if override:
+        return Path(override)
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / APP_NAME
     return Path.home() / f".{APP_NAME.replace(' ', '').lower()}"
@@ -1860,10 +1863,9 @@ class MainWindow(QWidget):
         self.status_timer.timeout.connect(self._set_status_with_progress_context)
         self.status_timer.start(1000)
 
-        self.load_jobs_from_db()
-
         self._build_ui(icon_path)
         self.apply_style()
+        self.load_jobs_from_db()
 
         if not self.ffmpeg_path:
             self.status.setText("ffmpeg non détecté. Ouvrez Paramètres (⚙).")
@@ -3842,6 +3844,22 @@ def main():
         return
     if "--smoke-test" in sys.argv:
         print(f"{APP_NAME} {APP_VERSION} ok")
+        return
+    if "--startup-smoke-test" in sys.argv:
+        with tempfile.TemporaryDirectory(prefix="ekovideo-startup-") as tmp_dir:
+            os.environ["EKO_APP_SUPPORT_DIR"] = tmp_dir
+            DatabaseManager(Path(tmp_dir) / "library.db").create_job(
+                source_path="/tmp/ekovideo-startup-smoke.mp4",
+                workspace_dir=str(Path(tmp_dir) / "Workspace"),
+                settings=asdict(QueueJob(input_path="/tmp/ekovideo-startup-smoke.mp4")),
+            )
+            app = QApplication([sys.argv[0]])
+            app.setOrganizationName(ORG_NAME)
+            app.setOrganizationDomain(ORG_DOMAIN)
+            app.setApplicationName(APP_NAME)
+            window = MainWindow()
+            window.close()
+            print(f"{APP_NAME} {APP_VERSION} startup ok")
         return
 
     app = QApplication(sys.argv)
