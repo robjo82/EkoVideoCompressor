@@ -26,13 +26,19 @@ class DatabaseManager:
                     source_path TEXT,
                     workspace_dir TEXT,
                     output_path TEXT,
+                    custom_title TEXT,
                     status TEXT DEFAULT 'PENDING',
                     error_message TEXT,
                     settings_json TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    duration_ffmpeg REAL,
+                    duration_whisper REAL,
+                    duration_diarization REAL,
+                    duration_total REAL
                 )
             """)
+            self._ensure_jobs_columns(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS transcription_segments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,6 +53,22 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_job_id ON transcription_segments(job_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_speaker ON transcription_segments(speaker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_text ON transcription_segments(text)")
+
+    def _ensure_jobs_columns(self, conn):
+        existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        columns = {
+            "custom_title": "TEXT",
+            "duration_ffmpeg": "REAL",
+            "duration_whisper": "REAL",
+            "duration_diarization": "REAL",
+            "duration_total": "REAL",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
     def create_job(self, source_path: str, workspace_dir: str, settings: dict) -> int:
         with self._get_connection() as conn:
@@ -68,6 +90,21 @@ class DatabaseManager:
             conn.execute(
                 "UPDATE jobs SET output_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (output_path, job_id)
+            )
+
+    def update_job_durations(self, job_id: int, ffmpeg: float = 0, whisper: float = 0, diarization: float = 0):
+        total = ffmpeg + whisper + diarization
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET duration_ffmpeg = ?, duration_whisper = ?, duration_diarization = ?, duration_total = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (ffmpeg, whisper, diarization, total, job_id)
+            )
+
+    def update_job_title(self, job_id: int, title: str):
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET custom_title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (title, job_id)
             )
 
     def get_job(self, job_id: int) -> Optional[dict]:

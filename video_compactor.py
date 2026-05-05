@@ -21,6 +21,7 @@ from transcription_utils import (
     assign_speakers_to_segments,
     build_audio_extract_cmd,
     build_diarization_cmd,
+    build_llm_cmd,
     build_mlx_whisper_cmd,
     default_transcript_path,
     parse_diarization_output,
@@ -97,7 +98,7 @@ MLX_WHISPER_PACKAGE = "mlx-whisper"
 MANAGED_TRANSCRIPTION_ENV = "mlx-whisper-venv"
 # pyannote 3.1 needs torch>=2.0; on Apple Silicon we use the standard wheels
 # (MPS support is built in). torchaudio is required for audio I/O.
-DIARIZATION_PIP_PACKAGES = ["torch", "torchaudio", "pyannote.audio>=3.1"]
+DIARIZATION_PIP_PACKAGES = ["torch", "torchaudio", "pyannote.audio>=3.1", "mlx-lm"]
 
 PROFILE_PRESETS = {
     "Réunion rapide": {
@@ -149,6 +150,11 @@ class QueueJob:
     db_id: int | None = None
     workspace_dir: str = ""
     output_path: str = ""
+    custom_title: str = ""
+    duration_ffmpeg: float = 0
+    duration_whisper: float = 0
+    duration_diarization: float = 0
+    duration_total: float = 0
     profile_name: str = "Réunion équilibrée"
     resolution: str = "720p"
     fps: int = 12
@@ -891,6 +897,7 @@ class TranscribeWorker(QThread):
         diarization_enabled: bool = False,
         hf_token: str = "",
         venv_python_path: str = "",
+        llm_model: str = "mlx-community/Llama-3.2-3B-Instruct-4bit",
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -901,6 +908,7 @@ class TranscribeWorker(QThread):
         self.language = language
         self.output_format = output_format
         self.db = db
+        self.llm_model = llm_model
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -941,6 +949,106 @@ class TranscribeWorker(QThread):
         if ffmpeg_dir:
             env["PATH"] = ffmpeg_dir + os.pathsep + env.get("PATH", "")
         return env
+
+    def _ensure_mlx_lm_available(self) -> bool:
+        if not self.venv_python_path or not Path(self.venv_python_path).exists():
+            return False
+        probe = subprocess.run(
+            [self.venv_python_path, "-c", "import mlx_lm"],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if probe.returncode == 0:
+            return True
+
+        self.status.emit("Installation post-traitement local…")
+        install = subprocess.run(
+            [self.venv_python_path, "-m", "pip", "install", "--upgrade", "mlx-lm"],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if install.returncode != 0:
+            self._log_process_result("mlx_lm_install_failed", install.returncode, install.stdout, install.stderr)
+            return False
+        return True
+
+    def _run_llm_post_process(self, out_path: Path) -> tuple[str, dict[str, str]]:
+        if not out_path.exists() or not self._ensure_mlx_lm_available():
+            return "", {}
+
+        self.status.emit("Analyse du titre et des interlocuteurs…")
+        cmd = build_llm_cmd(self.venv_python_path, self.llm_model, str(out_path))
+        self._log(f"llm_postprocess_start model={self.llm_model!r}")
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            timeout=1800,
+        )
+        if proc.returncode != 0:
+            self._log_process_result("llm_postprocess_failed", proc.returncode, proc.stdout, proc.stderr)
+            return "", {}
+        self._log_process_result("llm_postprocess_ok", proc.returncode, proc.stdout, proc.stderr)
+
+        try:
+            payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
+        except Exception as exc:
+            self._log(f"llm_postprocess_parse_failed error={exc!r}")
+            return "", {}
+
+        title = str(payload.get("title") or "").strip()
+        speakers_raw = payload.get("speakers") or {}
+        speakers = {
+            str(key).strip(): str(value).strip()
+            for key, value in speakers_raw.items()
+            if str(key).strip().startswith("SPEAKER_") and str(value).strip()
+        } if isinstance(speakers_raw, dict) else {}
+        return title, speakers
+
+    def _apply_speaker_names(self, out_path: Path, speakers: dict[str, str]):
+        if not speakers or not out_path.exists():
+            return
+        try:
+            if out_path.suffix.lower() == ".json":
+                payload = json.loads(out_path.read_text(encoding="utf-8"))
+                for segment in payload.get("segments", []):
+                    speaker = str(segment.get("speaker") or "")
+                    if speaker in speakers:
+                        segment["speaker"] = speakers[speaker]
+                out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                return
+
+            text = out_path.read_text(encoding="utf-8")
+            for speaker_id, speaker_name in speakers.items():
+                text = text.replace(f"[{speaker_id}]", f"[{speaker_name}]")
+                text = re.sub(rf"\b{re.escape(speaker_id)}\b", speaker_name, text)
+            out_path.write_text(text, encoding="utf-8")
+        except Exception as exc:
+            self._log(f"speaker_rename_failed error={exc!r}")
+
+    def _rename_transcript_file(self, out_path: Path, title: str) -> Path:
+        if not out_path.exists():
+            return out_path
+        try:
+            if not title:
+                title = suggest_transcript_stem(out_path.read_text(encoding="utf-8"), Path(self.job.input_path).stem)
+            safe_stem = suggest_transcript_stem(title, Path(self.job.input_path).stem)
+            candidate = out_path.with_name(f"{safe_stem}{out_path.suffix}")
+            if candidate == out_path:
+                return out_path
+            index = 1
+            while candidate.exists():
+                candidate = out_path.with_name(f"{safe_stem}_{index}{out_path.suffix}")
+                index += 1
+            out_path.rename(candidate)
+            self._log(f"transcription_auto_rename from={str(out_path)!r} to={str(candidate)!r}")
+            return candidate
+        except Exception as exc:
+            self._log(f"transcription_auto_rename_failed path={str(out_path)!r} error={exc!r}")
+            return out_path
 
     def request_stop(self):
         self._stop_requested = True
@@ -991,13 +1099,18 @@ class TranscribeWorker(QThread):
             
         wav_path = work_dir / "audio.wav"
         
+        t_start = time.monotonic()
+        d_ffmpeg = 0
+        d_whisper = 0
+        d_diarization = 0
+
         try:
-            # --- STEP 1: Audio Extraction ---
+            # --- STEP 1: audio extraction ---------------------------------
+            t_step = time.monotonic()
             skip_audio = (self.job.status in {"AUDIO_READY", "WHISPER_DONE", "COMPLETED"} 
                          and wav_path.exists())
             
             if not skip_audio:
-                self._update_db_status("IMPORTING")
                 self.status.emit("Préparation audio original…")
                 ss = self.job.trim_start if self.job.trim_enabled else None
                 to = self.job.trim_end if self.job.trim_enabled else None
@@ -1009,6 +1122,7 @@ class TranscribeWorker(QThread):
                     ss=ss,
                     to=to,
                 )
+                self._log(f"audio_extract_start cmd={_command_for_log(extract_cmd)!r}")
                 self._proc = subprocess.Popen(
                     extract_cmd,
                     stdout=subprocess.PIPE,
@@ -1016,6 +1130,7 @@ class TranscribeWorker(QThread):
                     text=True,
                     bufsize=1,
                     universal_newlines=True,
+                    env=self._subprocess_env(),
                 )
 
                 last_pct = -1
@@ -1049,14 +1164,15 @@ class TranscribeWorker(QThread):
                         break
 
                 rc = self._proc.wait()
+                d_ffmpeg = time.monotonic() - t_step
                 if rc != 0:
                     err = ""
                     try:
                         err = (self._proc.stderr.read() or "").strip()
                     except Exception:
                         pass
-                    self._log_process_result("ffmpeg_extract", rc, stderr=err)
-                    self._update_db_status("FAILED", err or "ffmpeg failed")
+                    self._log_process_result("ffmpeg_extract_failed", rc, stderr=err)
+                    self._update_db_status("FAILED", err or f"ffmpeg a échoué (code {rc}).")
                     self.failed.emit(err or f"ffmpeg a échoué (code {rc}).")
                     return
                 self._update_db_status("AUDIO_READY")
@@ -1065,37 +1181,31 @@ class TranscribeWorker(QThread):
                 self.progress.emit(25)
 
             if self._stop_requested:
-                self._log("cancelled after_audio_extract")
                 self.failed.emit("Annulé.")
                 return
 
             out_path = Path(self.job.transcript_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # When diarisation is on, we always need Whisper's JSON output
-            # (segments with timestamps) — we'll fuse it with pyannote turns
-            # and re-render to the user's chosen format ourselves.
             run_diarization = bool(self.diarization_enabled and self.hf_token and self.venv_python_path)
-            
+            if self.diarization_enabled and not run_diarization:
+                self._log(
+                    "diarization_skipped "
+                    f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)}"
+                )
+                self.status.emit("Détection des locuteurs ignorée (token Hugging Face ou installation manquante).")
+
             whisper_target_dir = work_dir if run_diarization else out_path.parent
             whisper_target_stem = "whisper" if run_diarization else out_path.stem
             whisper_format = "json" if run_diarization else self.output_format
             whisper_target = whisper_target_dir / f"{whisper_target_stem}.{transcript_output_ext(whisper_format)}"
 
-            # --- STEP 2: MLX Whisper ---
+            # --- STEP 2: MLX Whisper --------------------------------------
+            t_step = time.monotonic()
             skip_whisper = (self.job.status in {"WHISPER_DONE", "COMPLETED"} 
                            and whisper_target.exists())
             
             if not skip_whisper:
-                if self.diarization_enabled and not run_diarization:
-                    self._log(
-                        "diarization_skipped "
-                        f"hf_token_configured={bool(self.hf_token)} venv_python_configured={bool(self.venv_python_path)}"
-                    )
-                    self.status.emit(
-                        "Détection des locuteurs ignorée (token Hugging Face ou installation manquante)."
-                    )
-
                 cmd = build_mlx_whisper_cmd(
                     mlx_whisper_path=self.mlx_whisper_path,
                     audio_path=str(wav_path),
@@ -1123,6 +1233,7 @@ class TranscribeWorker(QThread):
                     universal_newlines=True,
                     env=self._subprocess_env(),
                 )
+
                 output_lines: list[str] = []
                 last_transcribe_pct = 25
                 while True:
@@ -1147,23 +1258,19 @@ class TranscribeWorker(QThread):
                                 self.progress.emit(pct)
 
                 self._proc.wait()
+                d_whisper = time.monotonic() - t_step
                 stdout = "".join(output_lines)
                 stderr = ""
-
-                if self._stop_requested:
-                    self.failed.emit("Annulé.")
-                    return
-
                 if self._proc.returncode != 0:
                     detail = (stderr or stdout or "").strip()
                     self._log_process_result("mlx_whisper_failed", self._proc.returncode, stdout, stderr)
-                    self._update_db_status("FAILED", detail or "whisper failed")
+                    self._update_db_status("FAILED", detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
                     self.failed.emit(detail or f"mlx_whisper a échoué (code {self._proc.returncode}).")
                     return
                 if not whisper_target.exists():
-                    detail = _tail_for_log(stderr or stdout)
+                    detail = _tail_for_log(stdout)
                     self._log_process_result("mlx_whisper_missing_output", self._proc.returncode, stdout, stderr)
-                    self._update_db_status("FAILED", "missing whisper output")
+                    self._update_db_status("FAILED", "mlx_whisper n'a pas produit le fichier attendu.")
                     self.failed.emit(
                         "mlx_whisper n'a pas produit le fichier de transcription attendu. "
                         f"{detail}".strip()
@@ -1175,8 +1282,9 @@ class TranscribeWorker(QThread):
                 self._log("resumption skip=whisper")
                 self.progress.emit(75)
 
-            # --- STEP 3: Diarization & Fusion ---
+            # --- STEP 3: diarization and fusion ---------------------------
             if run_diarization:
+                t_step = time.monotonic()
                 self.progress.emit(75)
                 self.status.emit("Détection des locuteurs (pyannote)…")
                 diar_cmd = build_diarization_cmd(self.venv_python_path, str(wav_path))
@@ -1191,6 +1299,7 @@ class TranscribeWorker(QThread):
                     env=env,
                 )
                 d_stdout, d_stderr = self._proc.communicate()
+                d_diarization = time.monotonic() - t_step
 
                 if self._stop_requested:
                     self.failed.emit("Annulé.")
@@ -1203,7 +1312,7 @@ class TranscribeWorker(QThread):
                     except Exception as exc:
                         detail = str(exc).replace("Diarisation: ", "", 1)
                     self._log_process_result("diarization_failed", self._proc.returncode, d_stdout, d_stderr)
-                    self._update_db_status("FAILED", f"diarization failed: {detail}")
+                    self._update_db_status("FAILED", f"Détection des locuteurs échouée: {detail}")
                     self.failed.emit(
                         f"Détection des locuteurs échouée (code {self._proc.returncode}). {detail}"
                     )
@@ -1214,38 +1323,40 @@ class TranscribeWorker(QThread):
                     turns = parse_diarization_output(d_stdout)
                     whisper_segments = parse_whisper_json_segments(str(whisper_target))
                     fused = assign_speakers_to_segments(whisper_segments, turns)
-                    
-                    # Store segments in DB for search
-                    if self.job.db_id:
-                        self.db.add_segments(self.job.db_id, fused)
-                        
                     rendered = render_segments_with_speakers(fused, self.output_format)
                 except Exception as exc:
                     self._log(f"fusion_failed error={exc!r}")
-                    self._update_db_status("FAILED", f"fusion failed: {exc}")
+                    self._update_db_status("FAILED", f"Fusion transcription/locuteurs échouée: {exc}")
                     self.failed.emit(f"Fusion transcription/locuteurs échouée: {exc}")
                     return
 
                 out_path.write_text(rendered, encoding="utf-8")
-            else:
-                # If no diarization, we still want to store segments in DB if it was a JSON run
-                # (actually if it wasn't diarized, we might not have segments in the same format easily,
-                # but parse_whisper_json_segments works on whisper.json)
-                if whisper_format == "json" and self.job.db_id:
+                if self.job.db_id:
+                    self.db.add_segments(self.job.db_id, fused)
+
+            if self.job.db_id:
+                self.db.update_job_durations(self.job.db_id, d_ffmpeg, d_whisper, d_diarization)
+                if not run_diarization and whisper_format == "json":
                     try:
-                        whisper_segments = parse_whisper_json_segments(str(whisper_target))
-                        self.db.add_segments(self.job.db_id, whisper_segments)
+                        self.db.add_segments(self.job.db_id, parse_whisper_json_segments(str(whisper_target)))
                     except Exception:
                         pass
+
+            # --- STEP 4: optional local LLM post-processing ---------------
+            title, speakers = self._run_llm_post_process(out_path)
+            self._apply_speaker_names(out_path, speakers)
+            final_out_path = self._rename_transcript_file(out_path, title)
+            if self.job.db_id and title:
+                self.db.update_job_title(self.job.db_id, title)
 
             self.duration_unknown.emit(False)
             self.progress.emit(100)
             self.status.emit("Transcription terminée.")
             self._update_db_status("COMPLETED")
             if self.job.db_id:
-                self.db.update_job_output(self.job.db_id, str(out_path))
-            self._log(f"success output={str(out_path)!r}")
-            self.finished_ok.emit(str(out_path))
+                self.db.update_job_output(self.job.db_id, str(final_out_path))
+            self._log(f"success output={str(final_out_path)!r}")
+            self.finished_ok.emit(str(final_out_path))
         except Exception as exc:
             self._log(f"unexpected_error error={exc!r}")
             self._update_db_status("FAILED", str(exc))
@@ -1606,13 +1717,13 @@ class LibraryView(QWidget):
                 job = self.db.get_job(job_id)
                 if not job:
                     continue
-                title = Path(job['source_path']).name
+                title = job.get('custom_title') or Path(job['source_path']).name
                 item = QListWidgetItem(f"📄 {title}\n   \"{snippets[0][:80]}…\"")
                 item.setData(Qt.UserRole, job_id)
                 self.list.addItem(item)
         else:
             for job in self.db.list_jobs(limit=100):
-                title = Path(job['source_path']).name
+                title = job.get('custom_title') or Path(job['source_path']).name
                 status = job['status']
                 emoji = "✅" if status == "COMPLETED" else "⏳" if status == "PENDING" else "❌"
                 item = QListWidgetItem(f"{emoji} {title}\n   Statut: {status}")
@@ -1677,7 +1788,7 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setMinimumSize(1080, 700)
+        self.setMinimumSize(980, 680)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
         
@@ -1803,6 +1914,7 @@ class MainWindow(QWidget):
         splitter.setChildrenCollapsible(False)
 
         left_panel = QWidget()
+        left_panel.setMinimumWidth(0)
         left_col = QVBoxLayout(left_panel)
         left_col.setContentsMargins(0, 0, 0, 0)
         left_col.setSpacing(10)
@@ -1862,7 +1974,8 @@ class MainWindow(QWidget):
         # so the team's day-to-day flow stays uncluttered.
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
-        right_col.setMinimumWidth(430)
+        right_col.setMinimumWidth(340)
+        right_col.setMaximumWidth(430)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(10)
@@ -2072,19 +2185,21 @@ class MainWindow(QWidget):
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_col)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([640, 440])
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([660, 360])
 
         root.addWidget(splitter, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
+        self.progress.setTextVisible(False)
         self.progress.setVisible(False)
         root.addWidget(self.progress)
 
         self.progress_global = QProgressBar()
         self.progress_global.setRange(0, 100)
+        self.progress_global.setTextVisible(False)
         self.progress_global.setVisible(False)
         root.addWidget(self.progress_global)
 

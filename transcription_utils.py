@@ -224,7 +224,51 @@ def build_mlx_whisper_cmd(
     return cmd
 
 
-# --- Diarisation ----------------------------------------------------------
+_LLM_POST_PROCESS_SCRIPT = '''
+import json
+import sys
+import os
+
+try:
+    from mlx_lm import load, generate
+except ImportError:
+    print(json.dumps({"error": "mlx-lm not installed"}))
+    sys.exit(1)
+
+model_path = sys.argv[1]
+transcript_path = sys.argv[2]
+
+try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        text = f.read()[:10000] # Limit context for speed
+
+    model, tokenizer = load(model_path)
+
+    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+Tu es un assistant expert en analyse de réunions.
+Ta mission est d'identifier les interlocuteurs (remplacer SPEAKER_XX par leur vrai nom si mentionné) et de donner un titre représentatif à la réunion.
+Réponds UNIQUEMENT par un objet JSON valide avec les clés "title" et "speakers" (un dictionnaire SPEAKER_ID: NOM).
+
+Transcription:
+{text}
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+Analyse cette transcription.<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=500, verbose=False)
+
+    # Try to extract JSON from response
+    start = response.find("{")
+    end = response.rfind("}") + 1
+    result = json.loads(response[start:end])
+    print(json.dumps(result))
+
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(2)
+'''
+
+def build_llm_cmd(venv_python_path: str, model_path: str, transcript_path: str) -> list[str]:
+    return [venv_python_path, "-c", _LLM_POST_PROCESS_SCRIPT, model_path, transcript_path]
 #
 # We run pyannote.audio inside the same managed venv that hosts mlx_whisper.
 # The script below is invoked via `<venv>/bin/python -c <script>`. It loads
