@@ -26,6 +26,7 @@ from transcription_utils import (
     default_transcript_path,
     parse_diarization_output,
     parse_whisper_json_segments,
+    render_segments_plain,
     render_segments_with_speakers,
     structured_initial_prompt,
     suggest_transcript_stem,
@@ -1198,15 +1199,29 @@ class TranscribeWorker(QThread):
                 )
                 self.status.emit("Détection des locuteurs ignorée (token Hugging Face ou installation manquante).")
 
+            # Always keep a JSON Whisper intermediate so we can validate and
+            # filter hallucinated segments before rendering the user-facing
+            # transcript. This is essential for long recordings with noisy
+            # leading silence, where Whisper can otherwise output only "...".
             whisper_target_dir = work_dir if run_diarization else out_path.parent
-            whisper_target_stem = "whisper" if run_diarization else out_path.stem
-            whisper_format = "json" if run_diarization else self.output_format
+            whisper_target_stem = "whisper" if run_diarization else f"{out_path.stem}.whisper"
+            whisper_format = "json"
             whisper_target = whisper_target_dir / f"{whisper_target_stem}.{transcript_output_ext(whisper_format)}"
 
             # --- STEP 2: MLX Whisper --------------------------------------
             t_step = time.monotonic()
             skip_whisper = (self.job.status in {"WHISPER_DONE", "COMPLETED"} 
                            and whisper_target.exists())
+            if skip_whisper:
+                try:
+                    if not parse_whisper_json_segments(str(whisper_target)):
+                        whisper_target.unlink(missing_ok=True)
+                        skip_whisper = False
+                        self._log("resumption discard=invalid_whisper_json")
+                except Exception:
+                    whisper_target.unlink(missing_ok=True)
+                    skip_whisper = False
+                    self._log("resumption discard=unreadable_whisper_json")
             
             if not skip_whisper:
                 cmd = build_mlx_whisper_cmd(
@@ -1279,11 +1294,45 @@ class TranscribeWorker(QThread):
                         f"{detail}".strip()
                     )
                     return
+                try:
+                    whisper_segments = parse_whisper_json_segments(str(whisper_target))
+                except Exception as exc:
+                    self._log(f"mlx_whisper_invalid_json error={exc!r}")
+                    self._update_db_status("FAILED", f"Lecture de la transcription Whisper impossible: {exc}")
+                    self.failed.emit(f"Lecture de la transcription Whisper impossible: {exc}")
+                    return
+                if not whisper_segments:
+                    self._log_process_result("mlx_whisper_no_speech_after_filter", self._proc.returncode, stdout, stderr)
+                    self._update_db_status(
+                        "FAILED",
+                        "Whisper n'a produit que des segments vides ou hallucines.",
+                    )
+                    self.failed.emit(
+                        "Whisper n'a produit que des segments vides ou hallucines. "
+                        "Essayez sans nettoyage audio, ou avec la vidéo originale si vous transcriviez une version compressée."
+                    )
+                    return
                 self._log_process_result("mlx_whisper_ok", self._proc.returncode, stdout, stderr)
                 self._update_db_status("WHISPER_DONE")
             else:
                 self._log("resumption skip=whisper")
                 self.progress.emit(75)
+
+            try:
+                whisper_segments = parse_whisper_json_segments(str(whisper_target))
+            except Exception as exc:
+                self._log(f"mlx_whisper_parse_failed error={exc!r}")
+                self._update_db_status("FAILED", f"Lecture de la transcription Whisper impossible: {exc}")
+                self.failed.emit(f"Lecture de la transcription Whisper impossible: {exc}")
+                return
+            if not whisper_segments:
+                self._log("mlx_whisper_empty_after_filter")
+                self._update_db_status("FAILED", "Whisper n'a produit aucun segment vocal exploitable.")
+                self.failed.emit(
+                    "Whisper n'a produit aucun segment vocal exploitable. "
+                    "La sortie brute ressemblait à une hallucination de silence."
+                )
+                return
 
             # --- STEP 3: diarization and fusion ---------------------------
             if run_diarization:
@@ -1324,7 +1373,6 @@ class TranscribeWorker(QThread):
 
                 try:
                     turns = parse_diarization_output(d_stdout)
-                    whisper_segments = parse_whisper_json_segments(str(whisper_target))
                     fused = assign_speakers_to_segments(whisper_segments, turns)
                     rendered = render_segments_with_speakers(fused, self.output_format)
                 except Exception as exc:
@@ -1336,16 +1384,18 @@ class TranscribeWorker(QThread):
                 out_path.write_text(rendered, encoding="utf-8")
                 if self.job.db_id:
                     self.db.add_segments(self.job.db_id, fused)
+            else:
+                rendered = render_segments_plain(whisper_segments, self.output_format)
+                out_path.write_text(rendered, encoding="utf-8")
+                if self.job.db_id:
+                    self.db.add_segments(self.job.db_id, whisper_segments)
 
             if self.job.db_id:
                 self.db.update_job_durations(self.job.db_id, d_ffmpeg, d_whisper, d_diarization)
-                if not run_diarization and whisper_format == "json":
-                    try:
-                        self.db.add_segments(self.job.db_id, parse_whisper_json_segments(str(whisper_target)))
-                    except Exception:
-                        pass
 
             # --- STEP 4: optional local LLM post-processing ---------------
+            self._log(f"base_transcript_ready output={str(out_path)!r}")
+            self.status.emit("Transcription disponible. Amélioration locale en cours…")
             title, speakers = self._run_llm_post_process(out_path)
             self._apply_speaker_names(out_path, speakers)
             final_out_path = self._rename_transcript_file(out_path, title)

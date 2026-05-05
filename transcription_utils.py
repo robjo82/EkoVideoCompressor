@@ -197,6 +197,8 @@ def build_mlx_whisper_cmd(
     language: str = "fr",
     output_format: str = "txt",
     initial_prompt: str = "",
+    condition_on_previous_text: bool = False,
+    clip_timestamps: str = "",
 ) -> list[str]:
     out = Path(output_path)
     fmt = (output_format or "txt").strip().lower()
@@ -221,7 +223,86 @@ def build_mlx_whisper_cmd(
     if prompt:
         cmd += ["--initial-prompt", prompt]
 
+    # Long meetings often start with silence, room noise, or screen-share
+    # sounds. If Whisper conditions each window on the previous one, a single
+    # hallucinated "..." can poison the full recording.
+    cmd += ["--condition-on-previous-text", "True" if condition_on_previous_text else "False"]
+
+    clips = (clip_timestamps or "").strip()
+    if clips:
+        cmd += ["--clip-timestamps", clips]
+
     return cmd
+
+
+_TEXT_SIGNAL_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]")
+_ONLY_PUNCTUATION_RE = re.compile(r"^[\s.…·!?;:,\\/_|()\\[\\]{}'\"`+-]+$")
+_SPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_segment_text(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    normalized = normalized.replace("’", "'").replace("…", "...")
+    normalized = re.sub(r"[^a-z0-9à-öø-ÿ']+", " ", normalized)
+    return _SPACE_RE.sub(" ", normalized).strip()
+
+
+def is_hallucinated_whisper_segment(segment: dict) -> bool:
+    text = str(segment.get("text", "")).strip()
+    if not text:
+        return True
+    if _ONLY_PUNCTUATION_RE.fullmatch(text):
+        return True
+    if not _TEXT_SIGNAL_RE.search(text):
+        return True
+
+    normalized = _normalize_segment_text(text)
+    if normalized in {
+        "sous titrage st 501",
+        "sous titres realises par la communaute d'amara org",
+        "merci d'avoir regarde cette video",
+    }:
+        return True
+    if normalized.startswith("sous titrage"):
+        return True
+
+    compression_ratio = float(segment.get("compression_ratio") or 0.0)
+    if compression_ratio >= 2.4 and len(normalized) <= 4:
+        return True
+    return False
+
+
+def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
+    """
+    Drop obvious Whisper hallucinations without rewriting real speech.
+
+    This targets the common local-Whisper failure mode on long recordings:
+    silence or room noise produces "..." or stock subtitle artefacts, then
+    `condition_on_previous_text=True` propagates that failure for minutes.
+    """
+    out: list[dict] = []
+    last_norm = ""
+    repeat_count = 0
+
+    for seg in segments:
+        if is_hallucinated_whisper_segment(seg):
+            continue
+
+        cleaned = dict(seg)
+        cleaned["text"] = str(cleaned.get("text", "")).strip()
+        normalized = _normalize_segment_text(cleaned["text"])
+        if normalized and normalized == last_norm:
+            repeat_count += 1
+        else:
+            last_norm = normalized
+            repeat_count = 1
+
+        # Keep the first repeated phrase because people do repeat themselves;
+        # discard long decoder loops.
+        if repeat_count > 2:
+            continue
+        out.append(cleaned)
+    return out
 
 
 _LLM_POST_PROCESS_SCRIPT = '''
@@ -430,8 +511,53 @@ def parse_whisper_json_segments(json_path: str) -> list[dict]:
             "start": float(seg.get("start", 0.0)),
             "end": float(seg.get("end", 0.0)),
             "text": str(seg.get("text", "")).strip(),
+            "avg_logprob": seg.get("avg_logprob"),
+            "compression_ratio": seg.get("compression_ratio"),
+            "no_speech_prob": seg.get("no_speech_prob"),
         })
-    return out
+    return clean_whisper_segments(out)
+
+
+def render_segments_plain(segments: list[dict], output_format: str) -> str:
+    """
+    Render Whisper segments without speaker labels, after hallucination
+    filtering. This keeps non-diarized transcripts clean.
+    """
+    fmt = (output_format or "txt").strip().lower()
+    if fmt == "all":
+        fmt = "txt"
+
+    if fmt == "json":
+        return json.dumps({"segments": segments}, ensure_ascii=False, indent=2)
+
+    if fmt == "tsv":
+        lines = ["start\tend\ttext"]
+        for seg in segments:
+            lines.append(f"{seg['start']:.3f}\t{seg['end']:.3f}\t{seg['text']}")
+        return "\n".join(lines) + "\n"
+
+    if fmt == "srt":
+        lines = []
+        for i, seg in enumerate(segments, start=1):
+            lines.append(str(i))
+            lines.append(
+                f"{_format_timestamp_srt(seg['start'])} --> {_format_timestamp_srt(seg['end'])}"
+            )
+            lines.append(seg["text"])
+            lines.append("")
+        return "\n".join(lines)
+
+    if fmt == "vtt":
+        lines = ["WEBVTT", ""]
+        for seg in segments:
+            lines.append(
+                f"{_format_timestamp_vtt(seg['start'])} --> {_format_timestamp_vtt(seg['end'])}"
+            )
+            lines.append(seg["text"])
+            lines.append("")
+        return "\n".join(lines)
+
+    return "\n".join(seg["text"] for seg in segments if seg.get("text")).strip() + "\n"
 
 
 def assign_speakers_to_segments(

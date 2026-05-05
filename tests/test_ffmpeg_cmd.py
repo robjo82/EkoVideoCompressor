@@ -9,9 +9,11 @@ from transcription_utils import (
     build_audio_extract_cmd,
     build_diarization_cmd,
     build_mlx_whisper_cmd,
+    clean_whisper_segments,
     default_transcript_path,
     parse_diarization_output,
     parse_whisper_json_segments,
+    render_segments_plain,
     render_segments_with_speakers,
     structured_initial_prompt,
     suggest_transcript_stem,
@@ -88,6 +90,20 @@ class TranscriptionCommandTest(unittest.TestCase):
         self.assertIn("--language", cmd)
         self.assertIn("fr", cmd)
         self.assertIn("--initial-prompt", cmd)
+        self.assertIn("--condition-on-previous-text", cmd)
+        self.assertIn("False", cmd)
+
+    def test_build_mlx_whisper_command_can_clip_audio(self):
+        cmd = build_mlx_whisper_cmd(
+            mlx_whisper_path="/opt/homebrew/bin/mlx_whisper",
+            audio_path="/tmp/audio.wav",
+            output_path="/tmp/reunion.json",
+            model="mlx-community/whisper-large-v3-turbo",
+            clip_timestamps="600,900",
+        )
+
+        self.assertIn("--clip-timestamps", cmd)
+        self.assertIn("600,900", cmd)
 
     def test_default_transcript_path_uses_format_extension(self):
         path = default_transcript_path("/tmp/reunion.mp4", "/tmp", "_notes", "json")
@@ -218,6 +234,32 @@ class FuseAndRenderTest(unittest.TestCase):
         self.assertEqual(len(segs), 2)
         self.assertEqual(segs[0]["text"], "Bonjour à tous.")  # stripped
         self.assertEqual(segs[1]["start"], 2.0)
+
+    def test_clean_whisper_segments_drops_ellipsis_hallucinations(self):
+        segs = clean_whisper_segments([
+            {"start": 0.0, "end": 2.0, "text": " ...", "compression_ratio": 3.6},
+            {"start": 30.0, "end": 32.0, "text": "Sous-titrage ST' 501"},
+            {"start": 117.0, "end": 119.0, "text": "Bonjour tous les deux."},
+        ])
+
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0]["text"], "Bonjour tous les deux.")
+
+    def test_clean_whisper_segments_limits_decoder_loops(self):
+        repeated = [
+            {"start": float(i), "end": float(i + 1), "text": "C'est pour tout ce qui est avant-vente."}
+            for i in range(5)
+        ]
+
+        self.assertEqual(len(clean_whisper_segments(repeated)), 2)
+
+    def test_render_plain_segments_has_no_speaker_placeholder(self):
+        out = render_segments_plain([
+            {"start": 0.0, "end": 2.0, "text": "Bonjour"},
+            {"start": 2.0, "end": 4.0, "text": "à tous"},
+        ], "txt")
+
+        self.assertEqual(out, "Bonjour\nà tous\n")
 
 
 if __name__ == "__main__":
