@@ -318,28 +318,61 @@ except ImportError:
 
 model_path = sys.argv[1]
 transcript_path = sys.argv[2]
+glossary = sys.argv[3] if len(sys.argv) > 3 else ""
 
 try:
     with open(transcript_path, "r", encoding="utf-8") as f:
-        text = f.read()[:10000] # Limit context for speed
+        text = f.read()[:45000]
 
     model, tokenizer = load(model_path)
 
-    prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-Tu es un assistant expert en analyse de réunions.
-Ta mission est d'identifier les interlocuteurs (remplacer SPEAKER_XX par leur vrai nom si mentionné) et de donner un titre représentatif à la réunion.
-Réponds UNIQUEMENT par un objet JSON valide avec les clés "title" et "speakers" (un dictionnaire SPEAKER_ID: NOM).
+    prompt = f"""[INST] Tu es un assistant expert en transcription de réunions professionnelles françaises.
+Tu dois améliorer la transcription SANS inventer.
 
-Transcription:
+Règles strictes :
+- Ne propose une correction que si le texte original exact apparait dans la transcription.
+- Une correction doit préserver le sens oral et être justifiée par le contexte.
+- Pour les doutes, ne corrige pas : ajoute un élément dans uncertain_passages.
+- Utilise le vocabulaire métier fourni en priorité.
+- Réponds uniquement en JSON valide, sans markdown.
+
+Schéma JSON attendu :
+{{
+  "title": "Titre court et professionnel",
+  "speakers": {{"SPEAKER_00": "Nom probable"}},
+  "corrections": [
+    {{
+      "timestamp": "00:12:34",
+      "original": "texte exact à remplacer",
+      "replacement": "texte corrigé",
+      "confidence": 0.0,
+      "reason": "raison courte"
+    }}
+  ],
+  "uncertain_passages": [
+    {{
+      "timestamp": "00:12:34",
+      "text": "extrait douteux",
+      "reason": "pourquoi c'est douteux",
+      "suggestion": "hypothèse éventuelle"
+    }}
+  ]
+}}
+
+Vocabulaire métier :
+{glossary or "(aucun vocabulaire fourni)"}
+
+Transcription horodatée :
 {text}
-<|eot_id|><|start_header_id|>user<|end_header_id|>
-Analyse cette transcription.<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+[/INST]"""
 
-    response = generate(model, tokenizer, prompt=prompt, max_tokens=500, verbose=False)
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=1800, verbose=False)
 
     # Try to extract JSON from response
     start = response.find("{")
     end = response.rfind("}") + 1
+    if start < 0 or end <= start:
+        raise ValueError("no JSON object in model response")
     result = json.loads(response[start:end])
     print(json.dumps(result))
 
@@ -348,8 +381,13 @@ except Exception as e:
     sys.exit(2)
 '''
 
-def build_llm_cmd(venv_python_path: str, model_path: str, transcript_path: str) -> list[str]:
-    return [venv_python_path, "-c", _LLM_POST_PROCESS_SCRIPT, model_path, transcript_path]
+def build_llm_cmd(
+    venv_python_path: str,
+    model_path: str,
+    transcript_path: str,
+    glossary: str = "",
+) -> list[str]:
+    return [venv_python_path, "-c", _LLM_POST_PROCESS_SCRIPT, model_path, transcript_path, glossary]
 #
 # We run pyannote.audio inside the same managed venv that hosts mlx_whisper.
 # The script below is invoked via `<venv>/bin/python -c <script>`. It loads

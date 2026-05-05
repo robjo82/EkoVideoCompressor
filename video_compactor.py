@@ -901,7 +901,7 @@ class TranscribeWorker(QThread):
         diarization_enabled: bool = False,
         hf_token: str = "",
         venv_python_path: str = "",
-        llm_model: str = "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        llm_model: str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -978,12 +978,12 @@ class TranscribeWorker(QThread):
             return False
         return True
 
-    def _run_llm_post_process(self, out_path: Path) -> tuple[str, dict[str, str]]:
-        if not out_path.exists() or not self._ensure_mlx_lm_available():
-            return "", {}
+    def _run_llm_post_process(self, analysis_path: Path, glossary: str) -> dict:
+        if not analysis_path.exists() or not self._ensure_mlx_lm_available():
+            return {}
 
-        self.status.emit("Analyse du titre et des interlocuteurs…")
-        cmd = build_llm_cmd(self.venv_python_path, self.llm_model, str(out_path))
+        self.status.emit("Analyse locale: titre, interlocuteurs, passages douteux…")
+        cmd = build_llm_cmd(self.venv_python_path, self.llm_model, str(analysis_path), glossary)
         self._log(f"llm_postprocess_start model={self.llm_model!r}")
         proc = subprocess.run(
             cmd,
@@ -1001,16 +1001,19 @@ class TranscribeWorker(QThread):
             payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
         except Exception as exc:
             self._log(f"llm_postprocess_parse_failed error={exc!r}")
-            return "", {}
+            return {}
 
-        title = str(payload.get("title") or "").strip()
+        return payload if isinstance(payload, dict) else {}
+
+    def _speaker_names_from_payload(self, payload: dict) -> dict[str, str]:
         speakers_raw = payload.get("speakers") or {}
-        speakers = {
+        if not isinstance(speakers_raw, dict):
+            return {}
+        return {
             str(key).strip(): str(value).strip()
             for key, value in speakers_raw.items()
             if str(key).strip().startswith("SPEAKER_") and str(value).strip()
-        } if isinstance(speakers_raw, dict) else {}
-        return title, speakers
+        }
 
     def _apply_speaker_names(self, out_path: Path, speakers: dict[str, str]):
         if not speakers or not out_path.exists():
@@ -1032,6 +1035,218 @@ class TranscribeWorker(QThread):
             out_path.write_text(text, encoding="utf-8")
         except Exception as exc:
             self._log(f"speaker_rename_failed error={exc!r}")
+
+    def _enhanced_transcript_path(self, out_path: Path) -> Path:
+        return out_path.with_name(f"{out_path.stem} - améliorée{out_path.suffix}")
+
+    def _review_transcript_path(self, out_path: Path) -> Path:
+        return out_path.with_name(f"{out_path.stem} - à vérifier.md")
+
+    def _confidence_value(self, value) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+
+    def _apply_text_corrections(self, text: str, corrections: list[dict]) -> tuple[str, list[dict]]:
+        applied: list[dict] = []
+        improved = text
+        for raw in corrections:
+            if not isinstance(raw, dict):
+                continue
+            original = str(raw.get("original") or "").strip()
+            replacement = str(raw.get("replacement") or "").strip()
+            confidence = self._confidence_value(raw.get("confidence"))
+            if len(original) < 3 or not replacement or original == replacement:
+                continue
+            if confidence < 0.75 or original not in improved:
+                continue
+            improved = improved.replace(original, replacement)
+            applied.append({
+                "timestamp": str(raw.get("timestamp") or "").strip(),
+                "original": original,
+                "replacement": replacement,
+                "confidence": confidence,
+                "reason": str(raw.get("reason") or "").strip(),
+            })
+        return improved, applied
+
+    def _timestamp_to_seconds(self, value: str) -> float | None:
+        text = (value or "").strip()
+        match = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", text)
+        if not match:
+            return None
+        first = int(match.group(1))
+        second = int(match.group(2))
+        third = int(match.group(3) or 0)
+        if match.group(3) is None:
+            return float(first * 60 + second)
+        return float(first * 3600 + second * 60 + third)
+
+    def _format_seconds_for_clip(self, seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        return f"{seconds:.2f}".rstrip("0").rstrip(".")
+
+    def _run_clip_rechecks(
+        self,
+        wav_path: Path,
+        work_dir: Path,
+        uncertain_passages: list[dict],
+    ) -> list[dict]:
+        if not uncertain_passages or not wav_path.exists():
+            return []
+
+        checks: list[dict] = []
+        self.status.emit("Réécoute ciblée des passages douteux…")
+        for index, passage in enumerate(uncertain_passages[:5], start=1):
+            if self._stop_requested:
+                break
+            if not isinstance(passage, dict):
+                continue
+            center = self._timestamp_to_seconds(str(passage.get("timestamp") or ""))
+            if center is None:
+                continue
+            start = max(0.0, center - 15.0)
+            end = center + 20.0
+            clip_target = work_dir / f"recheck_{index}.json"
+            cmd = build_mlx_whisper_cmd(
+                mlx_whisper_path=self.mlx_whisper_path,
+                audio_path=str(wav_path),
+                output_path=str(clip_target),
+                model=self.model,
+                language=self.language,
+                output_format="json",
+                initial_prompt=self.initial_prompt,
+                condition_on_previous_text=False,
+                clip_timestamps=f"{self._format_seconds_for_clip(start)},{self._format_seconds_for_clip(end)}",
+            )
+            self._log(
+                "clip_recheck_start "
+                f"timestamp={str(passage.get('timestamp') or '')!r} cmd={_command_for_log(cmd)!r}"
+            )
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=self._subprocess_env(),
+                timeout=600,
+            )
+            if proc.returncode != 0 or not clip_target.exists():
+                self._log_process_result("clip_recheck_failed", proc.returncode, proc.stdout, proc.stderr)
+                continue
+            try:
+                segments = parse_whisper_json_segments(str(clip_target))
+            except Exception as exc:
+                self._log(f"clip_recheck_parse_failed error={exc!r}")
+                continue
+            checks.append({
+                "timestamp": str(passage.get("timestamp") or ""),
+                "question": str(passage.get("text") or ""),
+                "suggestion": str(passage.get("suggestion") or ""),
+                "audio_transcript": " ".join(str(seg.get("text") or "") for seg in segments).strip(),
+            })
+        return checks
+
+    def _write_review_file(
+        self,
+        review_path: Path,
+        payload: dict,
+        applied_corrections: list[dict],
+        clip_checks: list[dict],
+    ):
+        lines = [
+            "# Vérification de transcription",
+            "",
+            "Ce fichier liste les corrections appliquées automatiquement et les passages qui restent à vérifier.",
+            "",
+        ]
+
+        if applied_corrections:
+            lines += ["## Corrections appliquées", ""]
+            for corr in applied_corrections:
+                ts = corr.get("timestamp") or "sans timestamp"
+                reason = corr.get("reason") or "contexte"
+                lines.append(
+                    f"- `{ts}` `{corr['original']}` -> `{corr['replacement']}` "
+                    f"(confiance {corr['confidence']:.2f}) : {reason}"
+                )
+            lines.append("")
+
+        uncertain = payload.get("uncertain_passages") or []
+        if isinstance(uncertain, list) and uncertain:
+            lines += ["## Passages à vérifier", ""]
+            for item in uncertain[:20]:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(f"- `{item.get('timestamp') or 'sans timestamp'}` {item.get('text') or ''}")
+                if item.get("reason"):
+                    lines.append(f"  Raison : {item.get('reason')}")
+                if item.get("suggestion"):
+                    lines.append(f"  Hypothèse : {item.get('suggestion')}")
+            lines.append("")
+
+        if clip_checks:
+            lines += ["## Réécoute ciblée", ""]
+            for check in clip_checks:
+                lines.append(f"- `{check['timestamp']}` {check['question']}")
+                if check.get("suggestion"):
+                    lines.append(f"  Hypothèse IA : {check['suggestion']}")
+                lines.append(f"  Réécoute Whisper : {check.get('audio_transcript') or '(vide)'}")
+            lines.append("")
+
+        if len(lines) <= 4:
+            lines.append("Aucune correction ni vérification signalée.")
+        review_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    def _create_enhanced_transcript(
+        self,
+        out_path: Path,
+        payload: dict,
+        wav_path: Path,
+        work_dir: Path,
+    ) -> Path | None:
+        if not payload or not out_path.exists():
+            return None
+        try:
+            base_text = out_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            self._log(f"enhancement_read_failed error={exc!r}")
+            return None
+
+        speakers = self._speaker_names_from_payload(payload)
+        enhanced_text = base_text
+        for speaker_id, speaker_name in speakers.items():
+            enhanced_text = enhanced_text.replace(f"[{speaker_id}]", f"[{speaker_name}]")
+            enhanced_text = re.sub(rf"\b{re.escape(speaker_id)}\b", speaker_name, enhanced_text)
+
+        corrections_raw = payload.get("corrections") or []
+        corrections = corrections_raw if isinstance(corrections_raw, list) else []
+        enhanced_text, applied = self._apply_text_corrections(enhanced_text, corrections)
+
+        uncertain_raw = payload.get("uncertain_passages") or []
+        uncertain = uncertain_raw if isinstance(uncertain_raw, list) else []
+        clip_checks = self._run_clip_rechecks(wav_path, work_dir, uncertain)
+
+        has_changes = enhanced_text != base_text or applied or speakers
+        has_review = applied or uncertain or clip_checks
+        if has_review:
+            self._write_review_file(self._review_transcript_path(out_path), payload, applied, clip_checks)
+
+        if not has_changes:
+            return None
+
+        enhanced_path = self._enhanced_transcript_path(out_path)
+        index = 1
+        while enhanced_path.exists():
+            enhanced_path = out_path.with_name(f"{out_path.stem} - améliorée_{index}{out_path.suffix}")
+            index += 1
+        enhanced_path.write_text(enhanced_text, encoding="utf-8")
+        self._log(
+            "enhanced_transcript_written "
+            f"output={str(enhanced_path)!r} corrections={len(applied)} speakers={len(speakers)} "
+            f"review={has_review}"
+        )
+        return enhanced_path
 
     def _rename_transcript_file(self, out_path: Path, title: str) -> Path:
         if not out_path.exists():
@@ -1335,6 +1550,7 @@ class TranscribeWorker(QThread):
                 return
 
             # --- STEP 3: diarization and fusion ---------------------------
+            analysis_segments = whisper_segments
             if run_diarization:
                 t_step = time.monotonic()
                 self.progress.emit(75)
@@ -1374,6 +1590,7 @@ class TranscribeWorker(QThread):
                 try:
                     turns = parse_diarization_output(d_stdout)
                     fused = assign_speakers_to_segments(whisper_segments, turns)
+                    analysis_segments = fused
                     rendered = render_segments_with_speakers(fused, self.output_format)
                 except Exception as exc:
                     self._log(f"fusion_failed error={exc!r}")
@@ -1395,10 +1612,19 @@ class TranscribeWorker(QThread):
 
             # --- STEP 4: optional local LLM post-processing ---------------
             self._log(f"base_transcript_ready output={str(out_path)!r}")
+            self.progress.emit(90)
             self.status.emit("Transcription disponible. Amélioration locale en cours…")
-            title, speakers = self._run_llm_post_process(out_path)
-            self._apply_speaker_names(out_path, speakers)
-            final_out_path = self._rename_transcript_file(out_path, title)
+            analysis_path = work_dir / "transcript_for_local_analysis.txt"
+            analysis_path.write_text(
+                render_segments_with_speakers(analysis_segments, "txt"),
+                encoding="utf-8",
+            )
+            payload = self._run_llm_post_process(analysis_path, self.initial_prompt)
+            title = str(payload.get("title") or "").strip() if payload else ""
+            enhanced_out_path = self._create_enhanced_transcript(out_path, payload, wav_path, work_dir)
+            final_out_path = enhanced_out_path or out_path
+            if enhanced_out_path and title:
+                final_out_path = self._rename_transcript_file(enhanced_out_path, f"{title} améliorée")
             if self.job.db_id and title:
                 self.db.update_job_title(self.job.db_id, title)
 

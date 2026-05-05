@@ -25,14 +25,8 @@ Puis double-cliquez normalement.
 
 ## Release automatisée
 
-Le workflow GitHub Actions `.github/workflows/release-macos.yml` publie automatiquement une release macOS quand un tag `vX.Y.Z` est poussé.
-
-Exemple:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+Le workflow GitHub Actions `.github/workflows/release-macos.yml` utilise semantic-release.
+Un push sur `main` déclenche les tests, calcule la prochaine version à partir des messages de commit conventionnels, crée le tag GitHub, build l'app macOS et publie la release installable par l'auto-update.
 
 ## Auto-update in-app
 
@@ -67,6 +61,21 @@ Dans l'onglet `Transcrire`, le modèle recommandé par défaut est:
 
 Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper. Le contenu est automatiquement formaté pour Whisper (phrase d'amorce en français — le modèle le traite comme du vocabulaire attendu, pas comme une liste).
 
+## Amélioration locale progressive
+
+Après la transcription Whisper, l'app lance une passe locale via MLX-LM si nécessaire.
+Elle installe `mlx-lm` automatiquement dans le même environnement isolé que MLX Whisper, sans commande Terminal côté utilisateur.
+
+Cette passe utilise par défaut `mlx-community/Mistral-7B-Instruct-v0.3-4bit` pour :
+
+- proposer un titre ;
+- associer les locuteurs à des noms quand le dialogue le permet ;
+- appliquer uniquement des corrections textuelles à forte confiance ;
+- lister les passages douteux dans un fichier `- à vérifier.md` ;
+- relancer Whisper sur quelques extraits audio ciblés autour des timestamps douteux.
+
+Le fichier brut Whisper reste disponible. Si des améliorations fiables existent, l'app écrit un second fichier `- améliorée`.
+
 ## Détection des locuteurs (diarisation)
 
 Pour identifier qui parle quand dans une réunion à plusieurs voix, l'app utilise pyannote.audio. Setup en une fois par poste :
@@ -87,7 +96,7 @@ Sans token ou pyannote installé, l'app retombe sur la transcription standard (s
 ## Builds GitHub
 
 - Un push sur `main` lance un build macOS de test disponible dans les artifacts GitHub Actions.
-- Une release installable par l'auto-update est publiée uniquement quand un tag `vX.Y.Z` est poussé.
+- Si semantic-release détecte un changement publiable, une release installable par l'auto-update est publiée automatiquement.
 
 ## Build local macOS
 

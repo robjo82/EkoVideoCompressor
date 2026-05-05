@@ -3,11 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import transcription_utils
 from ffmpeg_utils import build_ffmpeg_cmd
 from transcription_utils import (
     assign_speakers_to_segments,
     build_audio_extract_cmd,
     build_diarization_cmd,
+    build_llm_cmd,
     build_mlx_whisper_cmd,
     clean_whisper_segments,
     default_transcript_path,
@@ -104,6 +106,21 @@ class TranscriptionCommandTest(unittest.TestCase):
 
         self.assertIn("--clip-timestamps", cmd)
         self.assertIn("600,900", cmd)
+
+    def test_build_llm_command_passes_glossary(self):
+        cmd = build_llm_cmd(
+            "/tmp/venv/bin/python",
+            "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+            "/tmp/transcript.txt",
+            "DKV, Odoo, CVR Contrôles",
+        )
+
+        self.assertEqual(cmd[0], "/tmp/venv/bin/python")
+        self.assertEqual(cmd[-1], "DKV, Odoo, CVR Contrôles")
+        self.assertIn("corrections", cmd[2])
+
+    def test_inline_llm_script_is_valid_python(self):
+        compile(transcription_utils._LLM_POST_PROCESS_SCRIPT, "<llm-post-process>", "exec")
 
     def test_default_transcript_path_uses_format_extension(self):
         path = default_transcript_path("/tmp/reunion.mp4", "/tmp", "_notes", "json")
