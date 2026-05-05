@@ -447,12 +447,32 @@ def choose_release_asset(assets: list[dict]) -> dict | None:
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent: QWidget, ffmpeg_path: str, ffprobe_path: str, github_token: str):
+    def __init__(
+        self,
+        parent: QWidget,
+        ffmpeg_path: str,
+        ffprobe_path: str,
+        github_token: str,
+        transcription_settings: dict[str, str | bool],
+    ):
         super().__init__(parent)
         self.setWindowTitle("Paramètres")
         self.setModal(True)
 
-        form = QFormLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        tabs = QTabWidget()
+        tabs.setObjectName("settingsTabs")
+        root.addWidget(tabs)
+
+        tools_tab = QWidget()
+        tools_form = QFormLayout(tools_tab)
+        tools_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        tools_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        tools_form.setHorizontalSpacing(12)
+        tools_form.setVerticalSpacing(12)
 
         self.ffmpeg_edit = QLineEdit(ffmpeg_path or "")
         self.ffmpeg_edit.setPlaceholderText("Chemin vers ffmpeg")
@@ -470,51 +490,109 @@ class SettingsDialog(QDialog):
         row2.addWidget(self.ffprobe_edit)
         row2.addWidget(btn_ffprobe)
 
-        form.addRow("ffmpeg", row1)
-        form.addRow("ffprobe", row2)
+        tools_form.addRow("ffmpeg", row1)
+        tools_form.addRow("ffprobe", row2)
 
         self.token_edit = QLineEdit(github_token or "")
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_edit.setPlaceholderText("GitHub token (optionnel, requis si repo privé)")
-        form.addRow("Token update", self.token_edit)
+        tools_form.addRow("Token update", self.token_edit)
 
         hint = QLabel(
             "Si ffmpeg est bloqué par macOS, ouvrez Terminal puis:\n"
             "xattr -dr com.apple.quarantine /Applications/EkoVideoCompressor.app"
         )
         hint.setWordWrap(True)
-        form.addRow("", hint)
+        tools_form.addRow("", hint)
+
+        transcription_tab = QWidget()
+        transcription_form = QFormLayout(transcription_tab)
+        transcription_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        transcription_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        transcription_form.setHorizontalSpacing(12)
+        transcription_form.setVerticalSpacing(12)
+
+        self.mlx_whisper_edit = QLineEdit(str(transcription_settings.get("mlx_whisper_path", "")))
+        self.mlx_whisper_edit.setPlaceholderText("Chemin vers mlx_whisper")
+        btn_mlx_whisper = QPushButton("Parcourir…")
+        btn_mlx_whisper.clicked.connect(self.pick_mlx_whisper)
+        mlx_row = QHBoxLayout()
+        mlx_row.addWidget(self.mlx_whisper_edit)
+        mlx_row.addWidget(btn_mlx_whisper)
+        transcription_form.addRow("Commande", mlx_row)
+
+        self.transcription_model_edit = QLineEdit(str(transcription_settings.get("model", "")))
+        transcription_form.addRow("Modèle", self.transcription_model_edit)
+
+        self.transcription_language_combo = QComboBox()
+        self.transcription_language_combo.addItems(["fr", "auto", "en", "es", "de", "it"])
+        self.transcription_language_combo.setCurrentText(str(transcription_settings.get("language", "fr")))
+        transcription_form.addRow("Langue", self.transcription_language_combo)
+
+        self.transcription_format_combo = QComboBox()
+        self.transcription_format_combo.addItems(["txt", "srt", "vtt", "json", "all"])
+        self.transcription_format_combo.setCurrentText(str(transcription_settings.get("format", "txt")))
+        transcription_form.addRow("Format", self.transcription_format_combo)
+
+        self.transcription_suffix_edit = QLineEdit(str(transcription_settings.get("suffix", "_transcription")))
+        transcription_form.addRow("Suffixe", self.transcription_suffix_edit)
+
+        self.transcription_enhance_check = QCheckBox("Nettoyer la voix avant transcription")
+        self.transcription_enhance_check.setChecked(bool(transcription_settings.get("enhance_audio", True)))
+        transcription_form.addRow("", self.transcription_enhance_check)
+
+        tabs.addTab(tools_tab, "Outils")
+        tabs.addTab(transcription_tab, "Transcription")
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        form.addRow(buttons)
+        root.addWidget(buttons)
 
-        self.setMinimumWidth(580)
+        self.setMinimumWidth(660)
         self.setStyleSheet(
             """
         QDialog {
-            background: #f4faf6;
-            color: #1f3529;
-            font-family: "SF Pro Text", "Avenir Next", "Trebuchet MS", sans-serif;
+            background: #f5f5f7;
+            color: #1d1d1f;
+            font-family: ".AppleSystemUIFont", "Helvetica Neue", "Arial", sans-serif;
             font-size: 14px;
         }
-        QLineEdit {
+        QLabel { background: transparent; color: #1d1d1f; }
+        QLineEdit, QComboBox {
             background: #ffffff;
-            border: 1px solid #bdd6c7;
+            border: 1px solid #d2d2d7;
             border-radius: 9px;
             padding: 8px 10px;
             min-height: 24px;
         }
         QPushButton {
             background: #ffffff;
-            border: 1px solid #bcd6c8;
+            border: 1px solid #d2d2d7;
             border-radius: 10px;
             padding: 8px 14px;
             font-weight: 600;
-            color: #244238;
+            color: #1d1d1f;
         }
-        QPushButton:hover { background: #eef7f1; }
+        QPushButton:hover { background: #f2f2f7; }
+        QTabWidget::pane {
+            border: none;
+            margin-top: 10px;
+        }
+        QTabBar::tab {
+            background: #f2f2f7;
+            border: 1px solid #d2d2d7;
+            border-radius: 9px;
+            color: #3a3a3c;
+            padding: 8px 18px;
+            margin-right: 6px;
+            font-weight: 600;
+        }
+        QTabBar::tab:selected {
+            background: #007aff;
+            color: #ffffff;
+            border-color: #007aff;
+        }
         """
         )
 
@@ -528,11 +606,24 @@ class SettingsDialog(QDialog):
         if path:
             self.ffprobe_edit.setText(path)
 
-    def values(self) -> tuple[str, str, str]:
+    def pick_mlx_whisper(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choisir mlx_whisper", str(Path.home()), "Tous (*.*)")
+        if path:
+            self.mlx_whisper_edit.setText(path)
+
+    def values(self) -> tuple[str, str, str, dict[str, str | bool]]:
         return (
             self.ffmpeg_edit.text().strip(),
             self.ffprobe_edit.text().strip(),
             self.token_edit.text().strip(),
+            {
+                "mlx_whisper_path": self.mlx_whisper_edit.text().strip(),
+                "model": self.transcription_model_edit.text().strip(),
+                "language": self.transcription_language_combo.currentText(),
+                "format": self.transcription_format_combo.currentText(),
+                "suffix": self.transcription_suffix_edit.text().strip(),
+                "enhance_audio": self.transcription_enhance_check.isChecked(),
+            },
         )
 
 
@@ -986,6 +1077,7 @@ class UpdateWorker(QThread):
 
 class DropZone(QFrame):
     files_dropped = Signal(list)
+    clicked = Signal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -1029,6 +1121,13 @@ class DropZone(QFrame):
         if paths:
             self.files_dropped.emit(paths)
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -1047,6 +1146,21 @@ class MainWindow(QWidget):
             self.settings.value("github_token", "", type=str).strip()
             or os.getenv("EKO_UPDATER_GITHUB_TOKEN", "").strip()
         )
+        self.mlx_whisper_path = (
+            self.settings.value("mlx_whisper_path", "", type=str).strip()
+            or find_binary("mlx_whisper")
+            or ""
+        )
+        self.transcription_model = str(
+            self.settings.value("transcription_model", "mlx-community/whisper-large-v3-turbo", type=str)
+        ).strip()
+        self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
+        self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
+        self.transcription_suffix = (
+            str(self.settings.value("transcription_suffix", "_transcription", type=str)).strip()
+            or "_transcription"
+        )
+        self.transcription_enhance_audio = self.settings.value("transcription_enhance_audio", True, type=bool)
 
         self.queue_jobs: list[QueueJob] = []
         self.pending_indices: list[int] = []
@@ -1126,6 +1240,7 @@ class MainWindow(QWidget):
 
         self.drop = DropZone()
         self.drop.files_dropped.connect(self.add_input_files)
+        self.drop.clicked.connect(self.pick_files)
         left_col.addWidget(self.drop, 1)
 
         queue_actions = QHBoxLayout()
@@ -1157,7 +1272,7 @@ class MainWindow(QWidget):
 
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
-        right_col.setMinimumWidth(390)
+        right_col.setMinimumWidth(430)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(10)
@@ -1166,7 +1281,7 @@ class MainWindow(QWidget):
         self.tabs.setDocumentMode(True)
         self.tabs.setUsesScrollButtons(False)
         self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
-        self.tabs.tabBar().setExpanding(True)
+        self.tabs.tabBar().setExpanding(False)
         right_layout.addWidget(self.tabs, 1)
 
         workflow_tab = QWidget()
@@ -1297,74 +1412,35 @@ class MainWindow(QWidget):
         self.check_transcribe_after_encode.setChecked(self.settings.value("transcribe_after_encode", False, type=bool))
         transcribe_form.addRow("", self.check_transcribe_after_encode)
 
-        self.combo_transcription_engine = QComboBox()
-        self.combo_transcription_engine.addItems(["MLX Whisper"])
-        transcribe_form.addRow("Moteur", self.combo_transcription_engine)
-
-        self.edit_mlx_whisper_path = QLineEdit(
-            self.settings.value("mlx_whisper_path", "", type=str).strip() or find_binary("mlx_whisper") or ""
-        )
-        self.edit_mlx_whisper_path.setPlaceholderText("mlx_whisper")
-        btn_mlx_path = QPushButton("…")
-        btn_mlx_path.setObjectName("secondaryButton")
-        btn_mlx_path.clicked.connect(self.pick_mlx_whisper)
-        mlx_row = QHBoxLayout()
-        mlx_row.addWidget(self.edit_mlx_whisper_path)
-        mlx_row.addWidget(btn_mlx_path)
-        transcribe_form.addRow("Commande", mlx_row)
-
         self.btn_install_mlx = QPushButton("Installer MLX Whisper")
         self.btn_install_mlx.setObjectName("secondaryButton")
         self.btn_install_mlx.clicked.connect(self.install_mlx_whisper)
         transcribe_form.addRow("", self.btn_install_mlx)
 
-        self.edit_transcription_model = QLineEdit(
+        self.lbl_transcription_config = QLabel()
+        self.lbl_transcription_config.setObjectName("metaLabel")
+        self.lbl_transcription_config.setWordWrap(True)
+        transcribe_form.addRow("", self.lbl_transcription_config)
+
+        self.edit_transcription_prompt = QTextEdit()
+        self.edit_transcription_prompt.setAcceptRichText(False)
+        self.edit_transcription_prompt.setPlaceholderText(
+            "Noms propres, clients, projets, acronymes, vocabulaire métier…"
+        )
+        self.edit_transcription_prompt.setPlainText(
             str(
                 self.settings.value(
-                    "transcription_model",
-                    "mlx-community/whisper-large-v3-turbo",
+                    "transcription_glossary",
+                    self.settings.value("transcription_prompt", "", type=str),
                     type=str,
                 )
             )
         )
-        transcribe_form.addRow("Modèle", self.edit_transcription_model)
-
-        self.combo_transcription_language = QComboBox()
-        self.combo_transcription_language.addItems(["fr", "auto", "en", "es", "de", "it"])
-        self.combo_transcription_language.setCurrentText(
-            str(self.settings.value("transcription_language", "fr", type=str))
-        )
-        transcribe_form.addRow("Langue", self.combo_transcription_language)
-
-        self.combo_transcription_format = QComboBox()
-        self.combo_transcription_format.addItems(["txt", "srt", "vtt", "json", "all"])
-        self.combo_transcription_format.setCurrentText(
-            str(self.settings.value("transcription_format", "txt", type=str))
-        )
-        transcribe_form.addRow("Sortie", self.combo_transcription_format)
-
-        self.edit_transcription_suffix = QLineEdit(
-            str(self.settings.value("transcription_suffix", "_transcription", type=str))
-        )
-        transcribe_form.addRow("Suffixe", self.edit_transcription_suffix)
-
-        self.check_transcription_enhance = QCheckBox("Nettoyer la voix avant transcription")
-        self.check_transcription_enhance.setChecked(
-            self.settings.value("transcription_enhance_audio", True, type=bool)
-        )
-        transcribe_form.addRow("", self.check_transcription_enhance)
-
-        self.edit_transcription_prompt = QTextEdit()
-        self.edit_transcription_prompt.setAcceptRichText(False)
-        self.edit_transcription_prompt.setPlaceholderText("Noms propres, clients, projets, acronymes, vocabulaire métier…")
-        self.edit_transcription_prompt.setPlainText(
-            str(self.settings.value("transcription_prompt", "", type=str))
-        )
-        self.edit_transcription_prompt.setFixedHeight(96)
-        transcribe_form.addRow("Contexte", self.edit_transcription_prompt)
+        self.edit_transcription_prompt.setMinimumHeight(130)
+        transcribe_form.addRow("Bibliothèque", self.edit_transcription_prompt)
 
         self.lbl_transcription_hint = QLabel(
-            "MLX Whisper est installé dans un environnement isolé de l'app. La transcription utilise l'audio extrait depuis la vidéo originale."
+            "Les réglages avancés de transcription sont dans Réglages > Transcription. La bibliothèque ci-dessus est conservée entre les réunions."
         )
         self.lbl_transcription_hint.setObjectName("metaLabel")
         self.lbl_transcription_hint.setWordWrap(True)
@@ -1415,16 +1491,18 @@ class MainWindow(QWidget):
         splitter.addWidget(right_col)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([680, 420])
+        splitter.setSizes([640, 440])
 
         root.addWidget(splitter, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
+        self.progress.setVisible(False)
         root.addWidget(self.progress)
 
         self.progress_global = QProgressBar()
         self.progress_global.setRange(0, 100)
+        self.progress_global.setVisible(False)
         root.addWidget(self.progress_global)
 
         self.status = QLabel("Prêt.")
@@ -1459,6 +1537,7 @@ class MainWindow(QWidget):
         actions.addWidget(self.btn_cancel)
         root.addLayout(actions)
 
+        self._refresh_transcription_summary()
         self.on_trim_toggled(False)
 
     def apply_style(self):
@@ -1584,16 +1663,16 @@ class MainWindow(QWidget):
             border: 1px solid #d2d2d7;
             border-radius: 9px;
             color: #3a3a3c;
-            padding: 7px 8px;
-            margin-right: 5px;
+            padding: 8px 8px;
+            margin-right: 6px;
             min-width: 76px;
             font-size: 12px;
             font-weight: 600;
         }
         QTabBar::tab:selected {
-            background: #1d1d1f;
+            background: #007aff;
             color: #ffffff;
-            border-color: #1d1d1f;
+            border-color: #007aff;
         }
         QTabBar::tab:!selected {
             margin-top: 0px;
@@ -1704,8 +1783,9 @@ class MainWindow(QWidget):
             font-size: 13px;
         }
         QSplitter::handle {
-            background: transparent;
-            width: 10px;
+            background: #e5e5ea;
+            width: 1px;
+            margin: 8px 10px;
         }
         QScrollBar:vertical {
             width: 9px;
@@ -1726,18 +1806,65 @@ class MainWindow(QWidget):
         """
         )
 
+    def _transcription_settings_payload(self) -> dict[str, str | bool]:
+        return {
+            "mlx_whisper_path": self.mlx_whisper_path,
+            "model": self.transcription_model,
+            "language": self.transcription_language,
+            "format": self.transcription_format,
+            "suffix": self.transcription_suffix,
+            "enhance_audio": self.transcription_enhance_audio,
+        }
+
+    def _refresh_transcription_summary(self):
+        mlx_status = "installé" if self._mlx_whisper_path() and Path(self._mlx_whisper_path()).exists() else "à installer"
+        self.lbl_transcription_config.setText(
+            f"MLX Whisper: {mlx_status}\n"
+            f"Modèle: {self.transcription_model or 'mlx-community/whisper-large-v3-turbo'}\n"
+            f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}"
+        )
+
+    def _transcription_glossary(self) -> str:
+        glossary = self.edit_transcription_prompt.toPlainText().strip()
+        if not glossary:
+            return ""
+        return "Vocabulaire à respecter, noms propres, clients et projets:\n" + glossary
+
     def open_settings(self):
-        dlg = SettingsDialog(self, self.ffmpeg_path, self.ffprobe_path, self.github_token)
+        dlg = SettingsDialog(
+            self,
+            self.ffmpeg_path,
+            self.ffprobe_path,
+            self.github_token,
+            self._transcription_settings_payload(),
+        )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        ffmpeg_path, ffprobe_path, github_token = dlg.values()
+        ffmpeg_path, ffprobe_path, github_token, transcription_settings = dlg.values()
         self.ffmpeg_path = ffmpeg_path or find_binary("ffmpeg") or ""
         self.ffprobe_path = ffprobe_path or find_binary("ffprobe") or ""
         self.github_token = github_token
+        self.mlx_whisper_path = str(transcription_settings.get("mlx_whisper_path", "")).strip()
+        self.transcription_model = (
+            str(transcription_settings.get("model", "")).strip() or "mlx-community/whisper-large-v3-turbo"
+        )
+        self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
+        self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
+        self.transcription_suffix = (
+            str(transcription_settings.get("suffix", "_transcription")).strip() or "_transcription"
+        )
+        self.transcription_enhance_audio = bool(transcription_settings.get("enhance_audio", True))
         self.settings.setValue("ffmpeg_path", self.ffmpeg_path)
         self.settings.setValue("ffprobe_path", self.ffprobe_path)
         self.settings.setValue("github_token", self.github_token)
+        self.settings.setValue("mlx_whisper_path", self.mlx_whisper_path)
+        self.settings.setValue("transcription_model", self.transcription_model)
+        self.settings.setValue("transcription_language", self.transcription_language)
+        self.settings.setValue("transcription_format", self.transcription_format)
+        self.settings.setValue("transcription_suffix", self.transcription_suffix)
+        self.settings.setValue("transcription_enhance_audio", self.transcription_enhance_audio)
+        self._refresh_transcription_summary()
 
         if self.ffmpeg_path:
             self.status.setText("Paramètres enregistrés.")
@@ -1749,13 +1876,13 @@ class MainWindow(QWidget):
         self.settings.setValue("suffix", self.edit_suffix.text().strip())
         self.settings.setValue("continue_on_error", self.check_continue_on_error.isChecked())
         self.settings.setValue("transcribe_after_encode", self.check_transcribe_after_encode.isChecked())
-        self.settings.setValue("mlx_whisper_path", self.edit_mlx_whisper_path.text().strip())
-        self.settings.setValue("transcription_model", self.edit_transcription_model.text().strip())
-        self.settings.setValue("transcription_language", self.combo_transcription_language.currentText())
-        self.settings.setValue("transcription_format", self.combo_transcription_format.currentText())
-        self.settings.setValue("transcription_suffix", self.edit_transcription_suffix.text().strip())
-        self.settings.setValue("transcription_enhance_audio", self.check_transcription_enhance.isChecked())
-        self.settings.setValue("transcription_prompt", self.edit_transcription_prompt.toPlainText().strip())
+        self.settings.setValue("mlx_whisper_path", self.mlx_whisper_path)
+        self.settings.setValue("transcription_model", self.transcription_model)
+        self.settings.setValue("transcription_language", self.transcription_language)
+        self.settings.setValue("transcription_format", self.transcription_format)
+        self.settings.setValue("transcription_suffix", self.transcription_suffix)
+        self.settings.setValue("transcription_enhance_audio", self.transcription_enhance_audio)
+        self.settings.setValue("transcription_glossary", self.edit_transcription_prompt.toPlainText().strip())
 
     def check_updates(self):
         if self.update_worker is not None:
@@ -1900,20 +2027,46 @@ class MainWindow(QWidget):
                     f"NEW_APP={shlex.quote(str(new_app_path))}",
                     f"TARGET_APP={shlex.quote(str(target_app_path))}",
                     f"FALLBACK_APP={shlex.quote(str(fallback_app))}",
+                    "verify_app() {",
+                    "  local app=\"$1\"",
+                    "  local exe=\"$app/Contents/MacOS/EkoVideoCompressor\"",
+                    "  if [ ! -x \"$exe\" ]; then",
+                    "    echo \"Executable missing: $exe\"",
+                    "    return 1",
+                    "  fi",
+                    "  \"$exe\" --smoke-test >/dev/null 2>&1",
+                    "}",
                     "install_app() {",
                     "  local src=\"$1\"",
                     "  local dst=\"$2\"",
                     "  local parent",
+                    "  local staged",
+                    "  local backup",
                     "  parent=\"$(dirname \"$dst\")\"",
+                    "  staged=\"${dst}.new\"",
+                    "  backup=\"${dst}.backup.$(date +%s)\"",
                     "  mkdir -p \"$parent\" || return 1",
-                    "  rm -rf \"${dst}.new\" || return 1",
-                    "  ditto --noqtn \"$src\" \"${dst}.new\" || return 1",
-                    "  xattr -cr \"${dst}.new\" || true",
-                    "  xattr -dr com.apple.quarantine \"${dst}.new\" || true",
-                    "  rm -rf \"$dst\" || return 1",
-                    "  mv \"${dst}.new\" \"$dst\" || return 1",
+                    "  verify_app \"$src\" || return 1",
+                    "  rm -rf \"$staged\" || return 1",
+                    "  ditto --noqtn \"$src\" \"$staged\" || return 1",
+                    "  xattr -cr \"$staged\" || true",
+                    "  xattr -dr com.apple.quarantine \"$staged\" || true",
+                    "  verify_app \"$staged\" || { rm -rf \"$staged\"; return 1; }",
+                    "  if [ -d \"$dst\" ]; then",
+                    "    mv \"$dst\" \"$backup\" || { rm -rf \"$staged\"; return 1; }",
+                    "  fi",
+                    "  if ! mv \"$staged\" \"$dst\"; then",
+                    "    [ -d \"$backup\" ] && mv \"$backup\" \"$dst\"",
+                    "    return 1",
+                    "  fi",
                     "  xattr -cr \"$dst\" || true",
                     "  xattr -dr com.apple.quarantine \"$dst\" || true",
+                    "  if ! verify_app \"$dst\"; then",
+                    "    rm -rf \"$dst\"",
+                    "    [ -d \"$backup\" ] && mv \"$backup\" \"$dst\"",
+                    "    return 1",
+                    "  fi",
+                    "  rm -rf \"$backup\" || true",
                     "  return 0",
                     "}",
                     "for i in {1..120}; do",
@@ -2004,7 +2157,9 @@ class MainWindow(QWidget):
     def pick_mlx_whisper(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choisir mlx_whisper", str(Path.home()), "Tous (*.*)")
         if path:
-            self.edit_mlx_whisper_path.setText(path)
+            self.mlx_whisper_path = path
+            self.settings.setValue("mlx_whisper_path", self.mlx_whisper_path)
+            self._refresh_transcription_summary()
 
     def install_mlx_whisper(self):
         if self.mlx_install_worker is not None:
@@ -2038,6 +2193,7 @@ class MainWindow(QWidget):
         self.btn_install_mlx.setEnabled(False)
         self.btn_transcribe.setEnabled(False)
         self.status.setText("Installation de MLX Whisper…")
+        self._set_progress_visible(True)
         self.progress.setRange(0, 0)
 
         worker = MlxWhisperInstallWorker(python_path, managed_transcription_venv_dir())
@@ -2052,8 +2208,9 @@ class MainWindow(QWidget):
         self.status.setText(text)
 
     def on_mlx_install_done(self, mlx_path: str):
-        self.edit_mlx_whisper_path.setText(mlx_path)
+        self.mlx_whisper_path = mlx_path
         self.settings.setValue("mlx_whisper_path", mlx_path)
+        self._refresh_transcription_summary()
         self.status.setText("MLX Whisper installé.")
         QMessageBox.information(
             self,
@@ -2076,6 +2233,7 @@ class MainWindow(QWidget):
         self.mlx_install_worker = None
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self._set_progress_visible(False)
         self.btn_install_mlx.setEnabled(True)
         self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
 
@@ -2153,6 +2311,7 @@ class MainWindow(QWidget):
         self.update_estimation(None)
         self.progress.setValue(0)
         self.progress_global.setValue(0)
+        self._set_progress_visible(False)
         self.btn_start.setEnabled(False)
         self.btn_transcribe.setEnabled(False)
 
@@ -2358,12 +2517,12 @@ class MainWindow(QWidget):
         return default_transcript_path(
             job.input_path,
             str(out_dir),
-            self.edit_transcription_suffix.text().strip(),
-            self.combo_transcription_format.currentText(),
+            self.transcription_suffix,
+            self.transcription_format,
         )
 
     def _mlx_whisper_path(self) -> str:
-        return self.edit_mlx_whisper_path.text().strip() or find_binary("mlx_whisper") or ""
+        return self.mlx_whisper_path.strip() or find_binary("mlx_whisper") or ""
 
     def _prompt_install_mlx_whisper(self, message: str):
         self.tabs.setCurrentIndex(3)
@@ -2377,6 +2536,10 @@ class MainWindow(QWidget):
         )
         if answer == QMessageBox.StandardButton.Yes:
             self.install_mlx_whisper()
+
+    def _set_progress_visible(self, visible: bool):
+        self.progress.setVisible(visible)
+        self.progress_global.setVisible(False)
 
     def _set_running_ui(self, running: bool):
         self.is_batch_running = running
@@ -2411,7 +2574,8 @@ class MainWindow(QWidget):
                     "La transcription après compression est activée, mais MLX Whisper n'est pas encore installé."
                 )
                 return
-            self.edit_mlx_whisper_path.setText(mlx_path)
+            self.mlx_whisper_path = mlx_path
+            self._refresh_transcription_summary()
 
         out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2437,6 +2601,7 @@ class MainWindow(QWidget):
         self.progress.setValue(0)
         self.progress_global.setRange(0, 100)
         self.progress_global.setValue(0)
+        self._set_progress_visible(True)
         self.refresh_all_queue_items()
         self._set_running_ui(True)
         self._start_next_job()
@@ -2455,7 +2620,8 @@ class MainWindow(QWidget):
                 "MLX Whisper n'est pas encore installé pour la transcription locale."
             )
             return
-        self.edit_mlx_whisper_path.setText(mlx_path)
+        self.mlx_whisper_path = mlx_path
+        self._refresh_transcription_summary()
 
         if self.current_index >= 0:
             self.save_current_job_from_controls(force_custom=False)
@@ -2483,6 +2649,7 @@ class MainWindow(QWidget):
         self.progress.setValue(0)
         self.progress_global.setRange(0, 100)
         self.progress_global.setValue(0)
+        self._set_progress_visible(True)
         self.refresh_all_queue_items()
         self._set_running_ui(True)
         self._start_next_job()
@@ -2527,11 +2694,11 @@ class MainWindow(QWidget):
             self.ffprobe_path,
             replace(job),
             self._mlx_whisper_path(),
-            self.edit_transcription_model.text().strip(),
-            self.combo_transcription_language.currentText(),
-            self.combo_transcription_format.currentText(),
-            self.edit_transcription_prompt.toPlainText().strip(),
-            self.check_transcription_enhance.isChecked(),
+            self.transcription_model,
+            self.transcription_language,
+            self.transcription_format,
+            self._transcription_glossary(),
+            self.transcription_enhance_audio,
         )
         self.worker.progress.connect(self.on_progress)
         self.worker.status.connect(self.on_status)
@@ -2656,12 +2823,14 @@ class MainWindow(QWidget):
 
         if cancelled:
             self.status.setText("Traitement annulé.")
+            self._set_progress_visible(False)
             QMessageBox.warning(self, "Annulé", f"Traitement annulé. Réussis: {done}, Erreurs: {failed}.")
             return
 
         self.progress.setRange(0, 100)
         self.progress.setValue(100 if done else 0)
         self.progress_global.setValue(100 if total else 0)
+        self._set_progress_visible(False)
 
         if failed == 0:
             self.status.setText("Terminé.")
@@ -2695,6 +2864,13 @@ class MainWindow(QWidget):
 
 
 def main():
+    if "--version" in sys.argv:
+        print(APP_VERSION)
+        return
+    if "--smoke-test" in sys.argv:
+        print(f"{APP_NAME} {APP_VERSION} ok")
+        return
+
     app = QApplication(sys.argv)
     app.setOrganizationName(ORG_NAME)
     app.setOrganizationDomain(ORG_DOMAIN)
