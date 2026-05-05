@@ -2,6 +2,7 @@
 __pycache__
 .venv
 .venv-build
+node_modules/
 dist/
 build/
 .idea/

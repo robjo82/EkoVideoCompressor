@@ -1,0 +1,20 @@
+{
+  "name": "ekovideo-compressor-release",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "Release automation for EkoVideo Compressor.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robjo82/EkoVideoCompressor.git"
+  },
+  "scripts": {
+    "semantic-release": "semantic-release"
+  },
+  "devDependencies": {
+    "@semantic-release/commit-analyzer": "^13.0.1",
+    "@semantic-release/exec": "^7.1.0",
+    "@semantic-release/github": "^12.0.6",
+    "@semantic-release/release-notes-generator": "^14.1.0",
+    "semantic-release": "^25.0.3"
+  }
+}

@@ -2,20 +2,38 @@ name: Release macOS
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release-macos
+  cancel-in-progress: false
 
 jobs:
-  build-release:
+  release:
     runs-on: macos-14
     permissions:
       contents: write
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+          cache: npm
+
+      - name: Install release tooling
+        run: npm ci
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -24,39 +42,13 @@ jobs:
           brew update
           brew install ffmpeg
 
-      - name: Build app bundle
+      - name: Semantic release
         env:
-          APP_VERSION: ${{ github.ref_name }}
-        run: |
-          chmod +x scripts/build_macos.sh
-          scripts/build_macos.sh "${APP_VERSION#v}"
-
-      - name: Prepare release notes
-        run: |
-          cat > RELEASE_NOTES.md <<EOF
-          ## EkoVideo Compressor ${{ github.ref_name }}
-
-          - Date: $(date -u +"%Y-%m-%d %H:%M UTC")
-          - Commit: ${{ github.sha }}
-          - Plateforme: macOS Apple Silicon (arm64)
-
-          ### Installation rapide
-          1. Téléchargez le zip de cette Release.
-          2. Décompressez et déplacez \\`EkoVideoCompressor.app\\` dans \\`/Applications\\`.
-          3. Premier lancement: clic droit sur l'app > Open.
-
-          ### Si macOS bloque le lancement
-          Exécutez:
-          \\`xattr -dr com.apple.quarantine /Applications/EkoVideoCompressor.app\\`
-          EOF
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: RELEASE_NOTES.md
-          files: dist/release/*.zip
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
 
       - name: Future notarization secrets (placeholder)
+        if: always()
         run: |
           echo "APPLE_CERTIFICATE_BASE64 configured: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}"
           echo "APPLE_CERT_PASSWORD configured: ${{ secrets.APPLE_CERT_PASSWORD != '' }}"
