@@ -4,16 +4,24 @@ Application desktop macOS pour compresser rapidement des enregistrements de réu
 
 ## Installation équipe Mac (Apple Silicon)
 
-1. Ouvrez la page **Releases** du dépôt GitHub.
-2. Téléchargez l'archive `EkoVideoCompressor-macos-arm64-vX.Y.Z.zip`.
-3. Décompressez et déplacez `EkoVideoCompressor.app` dans `/Applications`.
-4. Premier lancement: clic droit sur l'app, puis `Open`.
+L'app est signée ad-hoc (pas de compte développeur Apple payant). Au **premier
+lancement seulement**, macOS demande une confirmation explicite. Les mises à
+jour automatiques sont ensuite transparentes.
 
-Si macOS bloque l'app ou ffmpeg, exécutez:
+1. Ouvrez la page **Releases** du dépôt GitHub.
+2. Téléchargez `EkoVideoCompressor-macos-arm64-vX.Y.Z.zip`.
+3. Décompressez et déplacez `EkoVideoCompressor.app` dans `/Applications`.
+4. **Premier lancement** : clic droit sur l'app → `Ouvrir` → `Ouvrir` dans
+   la boîte de dialogue. Les lancements suivants se font normalement.
+
+Si macOS affiche `app endommagée` ou bloque ffmpeg, le bundle a été mis en
+quarantaine par le navigateur. Une seule commande suffit :
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/EkoVideoCompressor.app
 ```
+
+Puis double-cliquez normalement.
 
 ## Release automatisée
 

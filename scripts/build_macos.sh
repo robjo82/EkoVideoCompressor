@@ -63,6 +63,14 @@ APP_VERSION = "${VERSION}"
 EOF
 pyinstaller --noconfirm --clean video_compactor.spec
 
+# Ad-hoc sign so macOS treats the bundle as a stable identity across replacements.
+# Without this, an updated bundle is treated as a brand-new unsigned app and
+# Gatekeeper may refuse to relaunch — even on manual reopen — until reinstall.
+APP_BUNDLE="dist/EkoVideoCompressor.app"
+xattr -cr "$APP_BUNDLE" || true
+codesign --force --deep --sign - --timestamp=none "$APP_BUNDLE"
+codesign --verify --deep --strict "$APP_BUNDLE"
+
 mkdir -p dist/release
 rm -f "dist/release/${ARTIFACT_NAME}"
 (

@@ -2016,6 +2016,10 @@ class MainWindow(QWidget):
             fallback_app = (Path.home() / "Applications" / "EkoVideoCompressor.app").resolve()
             log_path = (Path(tempfile.gettempdir()) / "ekovideo-updater.log").resolve()
 
+            lsregister_path = (
+                "/System/Library/Frameworks/CoreServices.framework"
+                "/Frameworks/LaunchServices.framework/Support/lsregister"
+            )
             script_content = "\n".join(
                 [
                     "#!/bin/bash",
@@ -2027,6 +2031,7 @@ class MainWindow(QWidget):
                     f"NEW_APP={shlex.quote(str(new_app_path))}",
                     f"TARGET_APP={shlex.quote(str(target_app_path))}",
                     f"FALLBACK_APP={shlex.quote(str(fallback_app))}",
+                    f"LSREGISTER={shlex.quote(lsregister_path)}",
                     "verify_app() {",
                     "  local app=\"$1\"",
                     "  local exe=\"$app/Contents/MacOS/EkoVideoCompressor\"",
@@ -2035,6 +2040,20 @@ class MainWindow(QWidget):
                     "    return 1",
                     "  fi",
                     "  \"$exe\" --smoke-test >/dev/null 2>&1",
+                    "}",
+                    # Re-sign ad-hoc and refresh LaunchServices so macOS treats the
+                    # replaced bundle as the same identity it knew before. Without
+                    # this, Gatekeeper's first-launch check on the moved bundle
+                    # races with `open` and the app fails to relaunch — and even
+                    # manual reopen can fail until reinstall.
+                    "finalize_app() {",
+                    "  local dst=\"$1\"",
+                    "  xattr -cr \"$dst\" || true",
+                    "  xattr -dr com.apple.quarantine \"$dst\" || true",
+                    "  codesign --force --deep --sign - --timestamp=none \"$dst\" >/dev/null 2>&1 || true",
+                    "  if [ -x \"$LSREGISTER\" ]; then",
+                    "    \"$LSREGISTER\" -f -R \"$dst\" >/dev/null 2>&1 || true",
+                    "  fi",
                     "}",
                     "install_app() {",
                     "  local src=\"$1\"",
@@ -2059,13 +2078,7 @@ class MainWindow(QWidget):
                     "    [ -d \"$backup\" ] && mv \"$backup\" \"$dst\"",
                     "    return 1",
                     "  fi",
-                    "  xattr -cr \"$dst\" || true",
-                    "  xattr -dr com.apple.quarantine \"$dst\" || true",
-                    "  if ! verify_app \"$dst\"; then",
-                    "    rm -rf \"$dst\"",
-                    "    [ -d \"$backup\" ] && mv \"$backup\" \"$dst\"",
-                    "    return 1",
-                    "  fi",
+                    "  finalize_app \"$dst\"",
                     "  rm -rf \"$backup\" || true",
                     "  return 0",
                     "}",
@@ -2075,17 +2088,31 @@ class MainWindow(QWidget):
                     "  fi",
                     "  sleep 0.25",
                     "done",
+                    # Settle the filesystem so LaunchServices sees a stable bundle
+                    # before `open -n` requests a fresh instance.
+                    "relaunch() {",
+                    "  local app=\"$1\"",
+                    "  sleep 0.5",
+                    "  open -n \"$app\" && return 0",
+                    "  sleep 1",
+                    "  open -n \"$app\" && return 0",
+                    "  open \"$app\" && return 0",
+                    "  return 1",
+                    "}",
                     "if install_app \"$NEW_APP\" \"$TARGET_APP\"; then",
                     "  echo \"Installed update to: $TARGET_APP\"",
-                    "  open \"$TARGET_APP\" && exit 0",
+                    "  relaunch \"$TARGET_APP\" && exit 0",
+                    "  echo \"Relaunch failed for: $TARGET_APP\"",
                     "fi",
                     "echo \"Primary target failed, trying fallback: $FALLBACK_APP\"",
                     "if install_app \"$NEW_APP\" \"$FALLBACK_APP\"; then",
                     "  echo \"Installed update to fallback: $FALLBACK_APP\"",
-                    "  open \"$FALLBACK_APP\" && exit 0",
+                    "  relaunch \"$FALLBACK_APP\" && exit 0",
+                    "  echo \"Relaunch failed for: $FALLBACK_APP\"",
                     "fi",
                     "echo \"Install failed, opening extracted app directly\"",
-                    "open \"$NEW_APP\" && exit 0",
+                    "finalize_app \"$NEW_APP\"",
+                    "relaunch \"$NEW_APP\" && exit 0",
                     "echo \"Updater failed to relaunch app\"",
                     "",
                 ]
