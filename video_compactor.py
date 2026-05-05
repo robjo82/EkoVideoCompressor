@@ -32,7 +32,8 @@ from transcription_utils import (
     suggest_transcript_stem,
     transcript_output_ext,
 )
-from PySide6.QtCore import QSettings, QThread, QTime, QTimer, Qt, Signal
+from PySide6.QtCore import QSettings, QThread, QTime, QTimer, Qt, Signal, QUrl
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -994,7 +995,7 @@ class TranscribeWorker(QThread):
         )
         if proc.returncode != 0:
             self._log_process_result("llm_postprocess_failed", proc.returncode, proc.stdout, proc.stderr)
-            return "", {}
+            return {}
         self._log_process_result("llm_postprocess_ok", proc.returncode, proc.stdout, proc.stderr)
 
         try:
@@ -2253,7 +2254,7 @@ class MainWindow(QWidget):
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
         right_col.setMinimumWidth(340)
-        right_col.setMaximumWidth(430)
+        right_col.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(10)
@@ -2463,8 +2464,8 @@ class MainWindow(QWidget):
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_col)
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 3)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
         splitter.setSizes([660, 360])
 
         root.addWidget(splitter, 1)
@@ -4113,6 +4114,122 @@ class MainWindow(QWidget):
             f"Réussis: {done}/{total}\nErreurs: {failed}\n\n{preview}{gatekeeper_hint}",
         )
 
+
+class ReviewDashboard(QDialog):
+    def __init__(self, job_title: str, review_data: dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Validation chirurgicale (IA) - {job_title}")
+        self.setMinimumSize(800, 500)
+        
+        self.review_data = review_data
+        self.audio_player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.audio_player.setAudioOutput(self.audio_output)
+        self.audio_output.setVolume(1.0)
+        
+        layout = QVBoxLayout(self)
+        
+        # Header
+        header = QLabel("Passages nécessitant votre validation")
+        header.setObjectName("h1")
+        layout.addWidget(header)
+        
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Left: List of uncertainties
+        self.doubt_list = QListWidget()
+        self.doubt_list.currentRowChanged.connect(self.on_doubt_selected)
+        splitter.addWidget(self.doubt_list)
+        
+        # Populate list
+        for item in self.review_data.get("uncertain_passages", []):
+            list_item = QListWidgetItem(f"[{item.get('timestamp', '00:00:00')}] {item.get('text', '')}")
+            list_item.setData(Qt.UserRole, item)
+            self.doubt_list.addItem(list_item)
+            
+        # Right: Edit area
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        
+        # Audio controls
+        audio_layout = QHBoxLayout()
+        self.btn_play = QPushButton("▶ Écouter l'extrait (5s)")
+        self.btn_play.clicked.connect(self.play_audio)
+        self.btn_play.setEnabled(False)
+        audio_layout.addWidget(self.btn_play)
+        audio_layout.addStretch()
+        right_layout.addLayout(audio_layout)
+        
+        # Text details
+        form = QFormLayout()
+        self.lbl_whisper = QLabel("")
+        self.lbl_whisper.setWordWrap(True)
+        form.addRow("Original (Whisper):", self.lbl_whisper)
+        
+        self.lbl_ai = QLabel("")
+        self.lbl_ai.setWordWrap(True)
+        form.addRow("Suggestion (IA):", self.lbl_ai)
+        right_layout.addLayout(form)
+        
+        # Edit box
+        self.edit_correction = QTextEdit()
+        self.edit_correction.setMaximumHeight(80)
+        right_layout.addWidget(self.edit_correction)
+        
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        self.btn_accept = QPushButton("Accepter la suggestion")
+        self.btn_accept.setObjectName("accentButton")
+        self.btn_accept.clicked.connect(self.accept_suggestion)
+        
+        self.btn_save = QPushButton("Enregistrer ma correction")
+        self.btn_save.setObjectName("primaryButton")
+        self.btn_save.clicked.connect(self.save_correction)
+        
+        self.btn_skip = QPushButton("Ignorer")
+        self.btn_skip.clicked.connect(self.skip_item)
+        
+        btn_layout.addWidget(self.btn_accept)
+        btn_layout.addWidget(self.btn_save)
+        btn_layout.addWidget(self.btn_skip)
+        btn_layout.addStretch()
+        right_layout.addLayout(btn_layout)
+        right_layout.addStretch()
+        
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        
+        layout.addWidget(splitter, 1)
+
+    def on_doubt_selected(self, row):
+        if row < 0:
+            self.btn_play.setEnabled(False)
+            return
+        item_data = self.doubt_list.item(row).data(Qt.UserRole)
+        self.lbl_whisper.setText(item_data.get("text", ""))
+        self.lbl_ai.setText(item_data.get("suggestion", "Aucune hypothèse IA"))
+        self.edit_correction.setPlainText(item_data.get("suggestion", item_data.get("text", "")))
+        self.btn_play.setEnabled(True)
+        
+        clip_path = item_data.get("clip_path")
+        if clip_path and Path(clip_path).exists():
+            self.audio_player.setSource(QUrl.fromLocalFile(clip_path))
+        
+    def play_audio(self):
+        self.audio_player.play()
+        
+    def accept_suggestion(self):
+        self.skip_item()
+        
+    def save_correction(self):
+        self.skip_item()
+        
+    def skip_item(self):
+        row = self.doubt_list.currentRow()
+        if row >= 0:
+            item = self.doubt_list.takeItem(row)
+            del item
 
 def main():
     if "--version" in sys.argv:
