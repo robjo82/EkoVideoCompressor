@@ -1,6 +1,9 @@
 # EkoVideo Compressor
 
-Application desktop macOS pour compresser rapidement des enregistrements de réunions visio.
+Application desktop macOS pour compresser rapidement des enregistrements de
+réunions visio. Accepte aussi les **enregistrements audio seuls** (mp3,
+m4a, wav, flac, ogg, opus…) — la sortie est alors un `.m4a` (AAC) au
+lieu d'un `.mp4` H.265.
 
 ## Installation équipe Mac (Apple Silicon)
 

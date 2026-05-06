@@ -16,7 +16,15 @@ from datetime import datetime
 from pathlib import Path
 
 import certifi
-from ffmpeg_utils import build_ffmpeg_cmd
+from ffmpeg_utils import (
+    AUDIO_EXTENSIONS,
+    MEDIA_EXTENSIONS,
+    MEDIA_FILTER,
+    VIDEO_EXTENSIONS,
+    build_ffmpeg_cmd,
+    default_out_path,
+    is_audio_only_path,
+)
 from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
@@ -95,7 +103,8 @@ APP_VERSION = normalize_app_version(BUILT_APP_VERSION or os.getenv("APP_VERSION"
 ORG_NAME = "Ekonum"
 ORG_DOMAIN = "ekonum"
 
-VIDEO_FILTER = "Vidéos (*.mp4 *.mov *.mkv *.m4v *.avi *.webm);;Tous les fichiers (*.*)"
+# Audio/video extension catalogues + MEDIA_FILTER live in ffmpeg_utils so
+# they can be unit-tested without pulling in the Qt stack.
 APP_ICON_FILE = "ekovideo_icon.png"
 APP_LOGO_FILE = "ekovideo_logo.png"
 BUNDLE_IDENTIFIER = "com.ekonum.ekovideocompressor"
@@ -508,18 +517,6 @@ def format_size(size_bytes: int | None) -> str:
     return f"{val:.1f} {units[idx]}"
 
 
-def default_out_path(in_path: str, out_dir: str, suffix: str) -> str:
-    source = Path(in_path)
-    safe_suffix = suffix.strip() or "_compressed"
-    base = Path(out_dir) / f"{source.stem}{safe_suffix}.mp4"
-    out = base
-    i = 1
-    while out.exists():
-        out = Path(out_dir) / f"{source.stem}{safe_suffix}_{i}.mp4"
-        i += 1
-    return str(out)
-
-
 def infer_profile_name(job: QueueJob) -> str:
     for preset_name, preset in PROFILE_PRESETS.items():
         if (
@@ -916,6 +913,11 @@ class EncodeWorker(QThread):
         duration = probe_duration_seconds(self.job.input_path, self.ffprobe_path, self.ffmpeg_path)
         self.duration_unknown.emit(duration is None)
 
+        # Audio-only inputs (.mp3 / .m4a / .wav…) shouldn't be re-encoded
+        # as H.265 video. We trust the extension first; ffprobe will catch
+        # anything weird when it actually runs.
+        audio_only = is_audio_only_path(self.job.input_path) or is_audio_only_path(self.job.output_path)
+
         ss = self.job.trim_start if self.job.trim_enabled else None
         to = self.job.trim_end if self.job.trim_enabled else None
         cmd = build_ffmpeg_cmd(
@@ -931,6 +933,7 @@ class EncodeWorker(QThread):
             mono_audio=self.job.mono_audio,
             ss=ss,
             to=to,
+            audio_only=audio_only,
         )
 
         try:
@@ -2065,17 +2068,17 @@ class DropZone(QFrame):
         icon.setObjectName("dropIcon")
         icon.setAlignment(Qt.AlignCenter)
 
-        title = QLabel("Déposez vos vidéos")
+        title = QLabel("Déposez vos vidéos ou audios")
         title.setObjectName("dropTitle")
         title.setAlignment(Qt.AlignCenter)
         title.setWordWrap(True)
 
-        subtitle = QLabel('ou utilisez "Ajouter des vidéos"')
+        subtitle = QLabel('ou utilisez "Ajouter des fichiers"')
         subtitle.setObjectName("dropSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
 
-        details = QLabel("Compression par lots, transcription locale en option")
+        details = QLabel("Vidéos (mp4, mov, mkv…) ou audios (mp3, m4a, wav…) — compression par lots, transcription locale en option")
         details.setObjectName("dropDetails")
         details.setAlignment(Qt.AlignCenter)
         details.setWordWrap(True)
@@ -2485,7 +2488,7 @@ class MainWindow(QWidget):
 
         queue_actions = QHBoxLayout()
         queue_actions.setSpacing(8)
-        self.btn_pick = QPushButton("Ajouter des vidéos…")
+        self.btn_pick = QPushButton("Ajouter des fichiers…")
         self.btn_pick.setObjectName("primaryButton")
         self.btn_pick.clicked.connect(self.pick_files)
         self.btn_remove = QPushButton("Retirer")
@@ -3668,7 +3671,9 @@ class MainWindow(QWidget):
             subprocess.Popen(["xdg-open", str(out_dir)])
 
     def pick_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Choisir des vidéos", str(Path.home()), VIDEO_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choisir des vidéos ou audios", str(Path.home()), MEDIA_FILTER
+        )
         if paths:
             self.add_input_files(paths)
 
@@ -3702,11 +3707,18 @@ class MainWindow(QWidget):
     def add_input_files(self, paths: list[str]):
         existing = {job.input_path for job in self.queue_jobs}
         added = 0
+        rejected = 0
         for p in paths:
             resolved = str(Path(p).resolve())
             if not resolved or resolved in existing or not Path(resolved).exists():
                 continue
-            
+            # Reject anything that isn't a known media file. ffmpeg accepts
+            # almost anything, but silently encoding (say) a `.txt` into an
+            # `.mp4` confuses users — better to surface it here.
+            if Path(resolved).suffix.lower() not in MEDIA_EXTENSIONS:
+                rejected += 1
+                continue
+
             job = self._new_job(resolved)
             
             # Create persistent workspace and DB record
@@ -3733,8 +3745,16 @@ class MainWindow(QWidget):
 
         self.btn_start.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
         self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
-        if added:
+        if added and rejected:
+            self.status.setText(
+                f"{added} fichier(s) ajouté(s) · {rejected} ignoré(s) (extension non supportée)."
+            )
+        elif added:
             self.status.setText(f"{added} fichier(s) ajouté(s).")
+        elif rejected:
+            self.status.setText(
+                f"{rejected} fichier(s) ignoré(s) — extensions acceptées: vidéo (mp4, mov…) ou audio (mp3, m4a, wav…)."
+            )
 
     def remove_selected_files(self):
         rows = sorted({idx.row() for idx in self.queue_list.selectedIndexes()}, reverse=True)
@@ -3749,7 +3769,7 @@ class MainWindow(QWidget):
         if self.queue_jobs:
             self.queue_list.setCurrentRow(min(rows[-1], len(self.queue_jobs) - 1))
         else:
-            self.lbl_input_meta.setText("Aucune vidéo sélectionnée.")
+            self.lbl_input_meta.setText("Aucun fichier sélectionné.")
             self.update_estimation(None)
 
         self.btn_start.setEnabled(bool(self.queue_jobs) and not self.is_batch_running)
@@ -3761,7 +3781,7 @@ class MainWindow(QWidget):
         self.queue_jobs.clear()
         self.queue_list.clear()
         self.current_index = -1
-        self.lbl_input_meta.setText("Aucune vidéo sélectionnée.")
+        self.lbl_input_meta.setText("Aucun fichier sélectionné.")
         self.update_estimation(None)
         self.progress.setValue(0)
         self.progress_global.setValue(0)
@@ -3783,13 +3803,19 @@ class MainWindow(QWidget):
             return
         job = self.queue_jobs[idx]
         suffix = PROFILE_SUFFIX.get(job.profile_name, "[Custom]")
-        title = f"{self.status_prefix(job)} {Path(job.input_path).name} {suffix}"
+        # The 🎧 marker tells the user at a glance that this entry skips
+        # the video re-encode pipeline and outputs an .m4a — useful when
+        # a queue mixes meeting screen-shares and audio-only Zoom dumps.
+        media_marker = "🎧 " if is_audio_only_path(job.input_path) else ""
+        title = f"{self.status_prefix(job)} {media_marker}{Path(job.input_path).name} {suffix}"
         item = self.queue_list.item(idx)
         if item:
             item.setText(title)
             tooltip = job.input_path
+            if is_audio_only_path(job.input_path):
+                tooltip += "\nType: audio (sortie en .m4a)"
             if job.output_path:
-                tooltip += f"\nVidéo: {job.output_path}"
+                tooltip += f"\nSortie: {job.output_path}"
             if job.transcript_path:
                 tooltip += f"\nTranscription: {job.transcript_path}"
             if job.error_message:
@@ -3803,7 +3829,7 @@ class MainWindow(QWidget):
     def on_queue_selection_changed(self, row: int):
         self.current_index = row
         if row < 0 or row >= len(self.queue_jobs):
-            self.lbl_input_meta.setText("Aucune vidéo sélectionnée.")
+            self.lbl_input_meta.setText("Aucun fichier sélectionné.")
             self.update_estimation(None)
             return
 
@@ -3824,15 +3850,24 @@ class MainWindow(QWidget):
         self.on_trim_toggled(job.trim_enabled)
 
         meta = probe_video_metadata(job.input_path, self.ffprobe_path)
-        dims = "-"
-        if meta.get("width") and meta.get("height"):
-            dims = f"{meta['width']}x{meta['height']}"
-        fps = f"{meta['fps']:.1f}" if meta.get("fps") else "-"
-        self.lbl_input_meta.setText(
-            f"Fichier: {Path(job.input_path).name}\n"
-            f"Durée: {format_seconds(meta.get('duration'))} | Résolution: {dims} | FPS: {fps}\n"
-            f"Poids actuel: {format_size(meta.get('size_bytes'))}"
-        )
+        if is_audio_only_path(job.input_path):
+            # Audio-only files have no resolution/FPS — showing "-" everywhere
+            # is noisy, so we render a dedicated one-liner.
+            self.lbl_input_meta.setText(
+                f"Fichier audio: {Path(job.input_path).name}\n"
+                f"Durée: {format_seconds(meta.get('duration'))} | Sortie: .m4a (AAC)\n"
+                f"Poids actuel: {format_size(meta.get('size_bytes'))}"
+            )
+        else:
+            dims = "-"
+            if meta.get("width") and meta.get("height"):
+                dims = f"{meta['width']}x{meta['height']}"
+            fps = f"{meta['fps']:.1f}" if meta.get("fps") else "-"
+            self.lbl_input_meta.setText(
+                f"Fichier: {Path(job.input_path).name}\n"
+                f"Durée: {format_seconds(meta.get('duration'))} | Résolution: {dims} | FPS: {fps}\n"
+                f"Poids actuel: {format_size(meta.get('size_bytes'))}"
+            )
         self.update_estimation(meta)
 
     def on_profile_changed(self, profile_name: str):
