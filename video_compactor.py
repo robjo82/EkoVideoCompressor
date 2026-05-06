@@ -765,9 +765,11 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self.setMinimumWidth(660)
+        self.setMinimumWidth(720)
+        chevron_url = Path(resource_path("assets/chevron-down.svg")).as_posix()
+        check_url = Path(resource_path("assets/check.svg")).as_posix()
         self.setStyleSheet(
-            """
+            ("""
         QDialog {
             background: #f5f5f7;
             color: #1d1d1f;
@@ -775,12 +777,62 @@ class SettingsDialog(QDialog):
             font-size: 14px;
         }
         QLabel { background: transparent; color: #1d1d1f; }
-        QLineEdit, QComboBox {
+        QLineEdit {
             background: #ffffff;
             border: 1px solid #d2d2d7;
             border-radius: 9px;
             padding: 8px 10px;
             min-height: 24px;
+        }
+        QLineEdit:focus { border-color: #007aff; }
+        QComboBox {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 9px;
+            padding: 7px 30px 7px 10px;
+            min-height: 24px;
+        }
+        QComboBox:hover { border-color: #b8b8c0; }
+        QComboBox:focus { border-color: #007aff; }
+        QComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 26px;
+            border-left: 1px solid #ececef;
+            border-top-right-radius: 9px;
+            border-bottom-right-radius: 9px;
+            background: #fbfbfd;
+        }
+        QComboBox::down-arrow {
+            image: url(__CHEVRON_URL__);
+            width: 12px;
+            height: 12px;
+        }
+        QComboBox QAbstractItemView {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: #007aff;
+            selection-color: #ffffff;
+            outline: none;
+        }
+        QComboBox QAbstractItemView::item {
+            padding: 6px 10px;
+            border-radius: 5px;
+            min-height: 22px;
+        }
+        QCheckBox { color: #1d1d1f; spacing: 8px; }
+        QCheckBox::indicator {
+            width: 16px; height: 16px;
+            border-radius: 4px;
+            border: 1px solid #c7c7cc;
+            background: #ffffff;
+        }
+        QCheckBox::indicator:checked {
+            background: #007aff;
+            border-color: #007aff;
+            image: url(__CHECK_URL__);
         }
         QPushButton {
             background: #ffffff;
@@ -810,6 +862,9 @@ class SettingsDialog(QDialog):
             border-color: #007aff;
         }
         """
+            )
+            .replace("__CHEVRON_URL__", chevron_url)
+            .replace("__CHECK_URL__", check_url)
         )
 
     def _build_llm_combo(self, catalog: list[dict], current_id: str) -> QComboBox:
@@ -2060,33 +2115,39 @@ class DropZone(QFrame):
         self.setAcceptDrops(True)
         self.setObjectName("dropZone")
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(10)
+        # Horizontal layout: icon left, two-line label centered next to it.
+        # Much more compact than the previous vertical 4-line stack and
+        # plays nicely with the 120-px fixed height.
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(14)
 
         icon = QLabel("⌘")
         icon.setObjectName("dropIcon")
         icon.setAlignment(Qt.AlignCenter)
+        icon.setFixedWidth(56)
 
-        title = QLabel("Déposez vos vidéos ou audios")
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+
+        title = QLabel("Déposez vos vidéos ou audios ici")
         title.setObjectName("dropTitle")
-        title.setAlignment(Qt.AlignCenter)
         title.setWordWrap(True)
 
-        subtitle = QLabel('ou utilisez "Ajouter des fichiers"')
-        subtitle.setObjectName("dropSubtitle")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-
-        details = QLabel("Vidéos (mp4, mov, mkv…) ou audios (mp3, m4a, wav…) — compression par lots, transcription locale en option")
+        details = QLabel(
+            "Vidéos (mp4, mov, mkv…) ou audios (mp3, m4a, wav…) · "
+            "compression par lots, transcription locale en option"
+        )
         details.setObjectName("dropDetails")
-        details.setAlignment(Qt.AlignCenter)
         details.setWordWrap(True)
 
+        text_box.addStretch(1)
+        text_box.addWidget(title)
+        text_box.addWidget(details)
+        text_box.addStretch(1)
+
         layout.addWidget(icon)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addWidget(details)
+        layout.addLayout(text_box, 1)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -2328,7 +2389,11 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setMinimumSize(980, 680)
+        # Below ~1140 the right-side settings column gets squashed and the
+        # splitter starts cropping group titles. 1180×760 gives the queue
+        # list, the drop zone and the settings column enough breathing
+        # room while still fitting on a 13" MacBook screen.
+        self.setMinimumSize(1180, 760)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
         
@@ -2444,7 +2509,12 @@ class MainWindow(QWidget):
         title_box.setSpacing(1)
         self.h1 = QLabel(APP_NAME)
         self.h1.setObjectName("h1")
-        self.h2 = QLabel(f"Compression réunion macOS · version {APP_VERSION}")
+        # Avoid "vdev" when APP_VERSION isn't a real semver; only prefix
+        # "v" when the value is a numeric version string.
+        version_label = (
+            f"v{APP_VERSION}" if APP_VERSION and APP_VERSION[:1].isdigit() else APP_VERSION
+        )
+        self.h2 = QLabel(f"Compression et transcription locale · macOS · {version_label}")
         self.h2.setObjectName("h2")
         title_box.addWidget(self.h1)
         title_box.addWidget(self.h2)
@@ -2484,7 +2554,11 @@ class MainWindow(QWidget):
         self.drop = DropZone()
         self.drop.files_dropped.connect(self.add_input_files)
         self.drop.clicked.connect(self.pick_files)
-        queue_layout.addWidget(self.drop, 1)
+        # The drop zone is a hint, not the main canvas — give it a fixed
+        # compact height so the queue list (the actual workspace) gets
+        # the bulk of the vertical room.
+        self.drop.setFixedHeight(120)
+        queue_layout.addWidget(self.drop, 0)
 
         queue_actions = QHBoxLayout()
         queue_actions.setSpacing(8)
@@ -2516,7 +2590,7 @@ class MainWindow(QWidget):
         
         left_col.addWidget(self.tabs, 1)
 
-        self.lbl_input_meta = QLabel("Aucune vidéo sélectionnée.")
+        self.lbl_input_meta = QLabel("Aucun fichier sélectionné.")
         self.lbl_input_meta.setObjectName("metaLabel")
         self.lbl_input_meta.setWordWrap(True)
         left_col.addWidget(self.lbl_input_meta)
@@ -2527,7 +2601,12 @@ class MainWindow(QWidget):
         # so the team's day-to-day flow stays uncluttered.
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
-        right_col.setMinimumWidth(340)
+        # Hard floor of 420 so the QGroupBox titles, the "..." pickers and
+        # the dropdown chevrons never get cropped, even on small windows.
+        # Capping at 560 keeps the long form labels readable when the
+        # window is widened.
+        right_col.setMinimumWidth(420)
+        right_col.setMaximumWidth(560)
         right_col.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
@@ -2600,13 +2679,16 @@ class MainWindow(QWidget):
                 )
             )
         )
-        self.edit_transcription_prompt.setMinimumHeight(110)
+        # Compact by default; users can drag the splitter or scroll if
+        # they need to inspect a long glossary.
+        self.edit_transcription_prompt.setMinimumHeight(70)
+        self.edit_transcription_prompt.setMaximumHeight(140)
         glossary_layout.addWidget(self.edit_transcription_prompt)
 
         self.lbl_transcription_hint = QLabel(
-            "Conservé entre les réunions. Sera transmis à Whisper comme vocabulaire attendu."
+            "Conservé entre les réunions · transmis à Whisper comme vocabulaire attendu."
         )
-        self.lbl_transcription_hint.setObjectName("metaLabel")
+        self.lbl_transcription_hint.setObjectName("inlineHint")
         self.lbl_transcription_hint.setWordWrap(True)
         glossary_layout.addWidget(self.lbl_transcription_hint)
 
@@ -2738,9 +2820,12 @@ class MainWindow(QWidget):
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_col)
+        # Left grows; right keeps its preferred width thanks to setMaximumWidth.
+        # setStretchFactor(1, 0) means extra horizontal space all goes left.
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([660, 360])
+        splitter.setSizes([720, 460])
+        splitter.setHandleWidth(1)
 
         root.addWidget(splitter, 1)
 
@@ -2796,8 +2881,14 @@ class MainWindow(QWidget):
         self.on_trim_toggled(False)
 
     def apply_style(self):
+        # Forward-slash-only paths play nicest with Qt's stylesheet parser
+        # on every platform (and in PyInstaller-bundled apps where the
+        # asset lives under sys._MEIPASS).
+        chevron_url = Path(resource_path("assets/chevron-down.svg")).as_posix()
+        check_url = Path(resource_path("assets/check.svg")).as_posix()
         self.setStyleSheet(
-            """
+            (
+                """
         QWidget {
             background: #f5f5f7;
             color: #1d1d1f;
@@ -2931,18 +3022,38 @@ class MainWindow(QWidget):
         QGroupBox {
             border: 1px solid #e5e5ea;
             border-radius: 12px;
-            margin-top: 16px;
-            padding: 16px 12px 12px 12px;
+            margin-top: 14px;
+            padding: 14px 10px 10px 10px;
             background: #ffffff;
             font-weight: 700;
+            font-size: 13px;
             color: #1d1d1f;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
             left: 12px;
-            padding: 0 7px;
+            padding: 0 6px;
             color: #1d1d1f;
             background: #ffffff;
+        }
+        QCheckBox {
+            color: #1d1d1f;
+            spacing: 8px;
+        }
+        QCheckBox::indicator {
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 1px solid #c7c7cc;
+            background: #ffffff;
+        }
+        QCheckBox::indicator:checked {
+            background: #007aff;
+            border-color: #007aff;
+            image: url(__CHECK_URL__);
+        }
+        QCheckBox::indicator:hover {
+            border-color: #007aff;
         }
         QScrollArea#settingsScroll {
             background: transparent;
@@ -3024,20 +3135,63 @@ class MainWindow(QWidget):
             border-color: #007aff;
             color: #ffffff;
         }
-        QComboBox, QSpinBox, QTimeEdit, QLineEdit, QTextEdit {
+        QSpinBox, QTimeEdit, QLineEdit, QTextEdit {
             background: #ffffff;
             border: 1px solid #d2d2d7;
             border-radius: 9px;
             padding: 7px 10px;
             min-height: 24px;
             color: #1d1d1f;
-        }
-        QTextEdit {
             selection-background-color: #b8d7ff;
         }
+        QLineEdit:focus, QSpinBox:focus, QTimeEdit:focus, QTextEdit:focus {
+            border-color: #007aff;
+        }
+        /* QComboBox needs its own block — the same styling on the body
+           plus an explicit chevron, otherwise it just looks like a
+           rectangle of text with no affordance for "this is a dropdown". */
+        QComboBox {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 9px;
+            padding: 6px 30px 6px 10px;
+            min-height: 24px;
+            color: #1d1d1f;
+            selection-background-color: #b8d7ff;
+        }
+        QComboBox:hover { border-color: #b8b8c0; }
+        QComboBox:focus { border-color: #007aff; }
         QComboBox::drop-down {
-            border: none;
-            width: 22px;
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 26px;
+            border-left: 1px solid #ececef;
+            border-top-right-radius: 9px;
+            border-bottom-right-radius: 9px;
+            background: #fbfbfd;
+        }
+        QComboBox::drop-down:hover { background: #f2f2f7; }
+        /* Real SVG chevron — Qt QSS doesn't render the CSS triangle hack
+           reliably so we ship a tiny vector asset and let the bundler
+           pick it up. */
+        QComboBox::down-arrow {
+            image: url(__CHEVRON_URL__);
+            width: 12px;
+            height: 12px;
+        }
+        QComboBox QAbstractItemView {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: #007aff;
+            selection-color: #ffffff;
+            outline: none;
+        }
+        QComboBox QAbstractItemView::item {
+            padding: 6px 10px;
+            border-radius: 5px;
+            min-height: 22px;
         }
         QSlider::groove:horizontal {
             height: 6px;
@@ -3076,6 +3230,12 @@ class MainWindow(QWidget):
             padding: 10px;
             font-size: 13px;
         }
+        QLabel#inlineHint {
+            color: #6e6e73;
+            background: transparent;
+            font-size: 12px;
+            padding: 2px 0;
+        }
         QSplitter::handle {
             background: #e5e5ea;
             width: 1px;
@@ -3098,6 +3258,9 @@ class MainWindow(QWidget):
             height: 0px;
         }
         """
+            )
+            .replace("__CHEVRON_URL__", chevron_url)
+            .replace("__CHECK_URL__", check_url)
         )
 
     def _transcription_settings_payload(self) -> dict[str, str | bool]:
