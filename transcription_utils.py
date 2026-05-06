@@ -19,6 +19,72 @@ PYANNOTE_DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
 PYANNOTE_SEGMENTATION_MODEL = "pyannote/segmentation-3.0"
 PYANNOTE_COMMUNITY_MODEL = "pyannote/speaker-diarization-community-1"
 
+
+# ---------------------------------------------------------------------------
+# Local LLM catalogues
+#
+# Two distinct families because they're loaded by two distinct mlx
+# packages. Mixing them up (e.g. asking mlx_lm to load Qwen2-Audio) yields
+# either a load failure or garbage output.
+#
+# We keep the lists short on purpose: 2-4 well-known checkpoints per
+# family, ordered light → heavy, so users can pick a default for M1
+# (3 B, 4-bit) and a stronger option for M4 Max (14 B, 4-bit).
+# ---------------------------------------------------------------------------
+
+TEXT_LLM_MODELS: list[dict] = [
+    {
+        "id": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+        "label": "Mistral 7B Instruct · 4-bit (~4 Go) — recommandé",
+        "family": "Mistral",
+    },
+    {
+        "id": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        "label": "Llama 3.2 3B Instruct · 4-bit (~2 Go) — léger (M1)",
+        "family": "Llama",
+    },
+    {
+        "id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
+        "label": "Qwen 2.5 7B Instruct · 4-bit (~4 Go)",
+        "family": "Qwen",
+    },
+    {
+        "id": "mlx-community/Qwen2.5-14B-Instruct-4bit",
+        "label": "Qwen 2.5 14B Instruct · 4-bit (~8 Go) — qualité supérieure (M4 Max)",
+        "family": "Qwen",
+    },
+]
+
+AUDIO_LLM_MODELS: list[dict] = [
+    {
+        "id": "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+        "label": "Qwen2-Audio 7B Instruct · 4-bit (~4 Go) — recommandé",
+        "family": "Qwen-Audio",
+    },
+    {
+        "id": "mlx-community/Qwen2-Audio-7B-Instruct-8bit",
+        "label": "Qwen2-Audio 7B Instruct · 8-bit (~7 Go) — qualité supérieure",
+        "family": "Qwen-Audio",
+    },
+]
+
+DEFAULT_TEXT_LLM_MODEL = TEXT_LLM_MODELS[0]["id"]
+DEFAULT_AUDIO_LLM_MODEL = AUDIO_LLM_MODELS[0]["id"]
+
+
+def text_llm_label_for(model_id: str) -> str:
+    for entry in TEXT_LLM_MODELS:
+        if entry["id"] == model_id:
+            return entry["label"]
+    return model_id
+
+
+def audio_llm_label_for(model_id: str) -> str:
+    for entry in AUDIO_LLM_MODELS:
+        if entry["id"] == model_id:
+            return entry["label"]
+    return model_id
+
 # Whisper's `--initial-prompt` is fed to the decoder as a fake prefix; the
 # model truncates anything beyond ~224 tokens, so the prompt must be tight
 # and front-load the most important vocabulary.

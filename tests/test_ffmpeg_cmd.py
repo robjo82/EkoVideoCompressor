@@ -6,11 +6,17 @@ from pathlib import Path
 import transcription_utils
 from ffmpeg_utils import build_ffmpeg_cmd
 from transcription_utils import (
+    AUDIO_LLM_MODELS,
+    DEFAULT_AUDIO_LLM_MODEL,
+    DEFAULT_TEXT_LLM_MODEL,
+    TEXT_LLM_MODELS,
     assign_speakers_to_segments,
+    audio_llm_label_for,
     build_audio_extract_cmd,
     build_diarization_cmd,
     build_llm_cmd,
     build_mlx_whisper_cmd,
+    build_multimodal_audio_cmd,
     clean_whisper_segments,
     default_transcript_path,
     parse_diarization_output,
@@ -19,6 +25,7 @@ from transcription_utils import (
     render_segments_with_speakers,
     structured_initial_prompt,
     suggest_transcript_stem,
+    text_llm_label_for,
 )
 
 
@@ -121,6 +128,26 @@ class TranscriptionCommandTest(unittest.TestCase):
 
     def test_inline_llm_script_is_valid_python(self):
         compile(transcription_utils._LLM_POST_PROCESS_SCRIPT, "<llm-post-process>", "exec")
+
+    def test_build_multimodal_audio_command_carries_model_and_clip(self):
+        cmd = build_multimodal_audio_cmd(
+            venv_python_path="/tmp/venv/bin/python",
+            model_path="mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+            audio_path="/tmp/clip.wav",
+            prompt="Que dit la personne ?",
+        )
+
+        self.assertEqual(cmd[0], "/tmp/venv/bin/python")
+        self.assertEqual(cmd[1], "-c")
+        # The script must reference the audio entry-point so the venv knows
+        # to pull in mlx_vlm rather than mlx_lm.
+        self.assertIn("mlx_vlm", cmd[2])
+        self.assertEqual(cmd[3], "mlx-community/Qwen2-Audio-7B-Instruct-4bit")
+        self.assertEqual(cmd[4], "/tmp/clip.wav")
+        self.assertEqual(cmd[5], "Que dit la personne ?")
+
+    def test_inline_multimodal_script_is_valid_python(self):
+        compile(transcription_utils._MULTIMODAL_AUDIO_SCRIPT, "<multimodal-audio>", "exec")
 
     def test_default_transcript_path_uses_format_extension(self):
         path = default_transcript_path("/tmp/reunion.mp4", "/tmp", "_notes", "json")
@@ -277,6 +304,52 @@ class FuseAndRenderTest(unittest.TestCase):
         ], "txt")
 
         self.assertEqual(out, "Bonjour\nà tous\n")
+
+
+class LlmCatalogTest(unittest.TestCase):
+    """
+    The two catalogues power the Settings dropdowns. The data needs to stay
+    well-structured: an unparseable label or a missing id silently breaks
+    the UI without raising at import time.
+    """
+
+    def test_text_catalog_has_required_keys(self):
+        self.assertGreaterEqual(len(TEXT_LLM_MODELS), 2)
+        for entry in TEXT_LLM_MODELS:
+            self.assertIn("id", entry)
+            self.assertIn("label", entry)
+            self.assertIn("family", entry)
+            self.assertTrue(entry["id"].startswith("mlx-community/"))
+
+    def test_audio_catalog_has_required_keys(self):
+        self.assertGreaterEqual(len(AUDIO_LLM_MODELS), 1)
+        for entry in AUDIO_LLM_MODELS:
+            self.assertIn("id", entry)
+            self.assertIn("label", entry)
+            self.assertIn("family", entry)
+            # The audio catalog must point at multimodal-capable repos.
+            self.assertIn("Audio", entry["id"])
+
+    def test_text_and_audio_catalogs_are_disjoint(self):
+        text_ids = {e["id"] for e in TEXT_LLM_MODELS}
+        audio_ids = {e["id"] for e in AUDIO_LLM_MODELS}
+        # Mixing them up is exactly the bug we're guarding against.
+        self.assertFalse(text_ids & audio_ids)
+
+    def test_default_models_are_present_in_their_catalogs(self):
+        text_ids = {e["id"] for e in TEXT_LLM_MODELS}
+        audio_ids = {e["id"] for e in AUDIO_LLM_MODELS}
+        self.assertIn(DEFAULT_TEXT_LLM_MODEL, text_ids)
+        self.assertIn(DEFAULT_AUDIO_LLM_MODEL, audio_ids)
+
+    def test_label_helpers_return_humanised_label_for_known_id(self):
+        self.assertIn("Mistral", text_llm_label_for(DEFAULT_TEXT_LLM_MODEL))
+        self.assertIn("Qwen", audio_llm_label_for(DEFAULT_AUDIO_LLM_MODEL))
+
+    def test_label_helpers_fall_back_to_raw_id_for_custom_model(self):
+        custom = "user-org/Some-Custom-Model"
+        self.assertEqual(text_llm_label_for(custom), custom)
+        self.assertEqual(audio_llm_label_for(custom), custom)
 
 
 if __name__ == "__main__":

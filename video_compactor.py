@@ -18,7 +18,12 @@ from pathlib import Path
 import certifi
 from ffmpeg_utils import build_ffmpeg_cmd
 from transcription_utils import (
+    AUDIO_LLM_MODELS,
+    DEFAULT_AUDIO_LLM_MODEL,
+    DEFAULT_TEXT_LLM_MODEL,
+    TEXT_LLM_MODELS,
     assign_speakers_to_segments,
+    audio_llm_label_for,
     build_audio_extract_cmd,
     build_diarization_cmd,
     build_llm_cmd,
@@ -31,10 +36,10 @@ from transcription_utils import (
     render_segments_with_speakers,
     structured_initial_prompt,
     suggest_transcript_stem,
+    text_llm_label_for,
     transcript_output_ext,
 )
-from PySide6.QtCore import QSettings, QThread, QTime, QTimer, Qt, Signal, QUrl
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtCore import QSettings, QThread, QTime, QTimer, Qt, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -101,7 +106,13 @@ MLX_WHISPER_PACKAGE = "mlx-whisper"
 MANAGED_TRANSCRIPTION_ENV = "mlx-whisper-venv"
 # pyannote 3.1 needs torch>=2.0; on Apple Silicon we use the standard wheels
 # (MPS support is built in). torchaudio is required for audio I/O.
-DIARIZATION_PIP_PACKAGES = ["torch", "torchaudio", "pyannote.audio>=3.1", "mlx-lm"]
+DIARIZATION_PIP_PACKAGES = ["torch", "torchaudio", "pyannote.audio>=3.1"]
+# mlx-lm is small (~200 Mo) and powers the text LLM step (title, speakers,
+# corrections, doubt flagging). We install it eagerly so the first
+# transcription doesn't block on a pip install. mlx-vlm is heavier and only
+# pulled in if the user opts into the multimodal re-listen step.
+TEXT_LLM_PIP_PACKAGES = ["mlx-lm"]
+MULTIMODAL_LLM_PIP_PACKAGES = ["mlx-vlm"]
 
 PROFILE_PRESETS = {
     "Réunion rapide": {
@@ -558,20 +569,20 @@ def choose_release_asset(assets: list[dict]) -> dict | None:
 
 
 def is_hf_model_cached(repo_id: str) -> bool:
+    """
+    True if a Hugging Face repo has at least one snapshot under the local
+    cache. We use this in Settings to show the user which models are already
+    downloaded vs need a fresh pull (multi-Go).
+    """
     cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
     repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
     if not repo_dir.exists():
         return False
     snapshots_dir = repo_dir / "snapshots"
-    if snapshots_dir.exists() and list(snapshots_dir.iterdir()):
+    if snapshots_dir.exists() and any(snapshots_dir.iterdir()):
         return True
     return False
 
-
-LLM_MODELS = [
-    "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
-    "mlx-community/Qwen2-Audio-7B-Instruct-8bit"
-]
 
 class SettingsDialog(QDialog):
     def __init__(
@@ -651,24 +662,56 @@ class SettingsDialog(QDialog):
         self.transcription_model_edit = QLineEdit(str(transcription_settings.get("model", "")))
         transcription_form.addRow("Modèle Whisper", self.transcription_model_edit)
 
-        self.transcription_llm_model_combo = QComboBox()
-        self.transcription_llm_model_combo.setEditable(True)
-        current_llm = str(transcription_settings.get("llm_model", LLM_MODELS[0]))
-        
-        # Populate combo box with cache status
-        for model_id in LLM_MODELS:
-            status = " (Téléchargé)" if is_hf_model_cached(model_id) else " (À télécharger)"
-            self.transcription_llm_model_combo.addItem(f"{model_id}{status}", model_id)
-            
-        # Set current if exists or add as custom
-        idx = self.transcription_llm_model_combo.findData(current_llm)
-        if idx >= 0:
-            self.transcription_llm_model_combo.setCurrentIndex(idx)
-        else:
-            self.transcription_llm_model_combo.addItem(current_llm, current_llm)
-            self.transcription_llm_model_combo.setCurrentIndex(self.transcription_llm_model_combo.count() - 1)
-            
-        transcription_form.addRow("Modèle IA Audio", self.transcription_llm_model_combo)
+        # --- Text LLM (analyse, titre, locuteurs, corrections) ---------------
+        # Run via mlx_lm. Default Mistral 7B is the sweet spot on M1 16 Go.
+        # Heavier variants are listed for users with M4 Max / more RAM.
+        current_text_llm = str(
+            transcription_settings.get("text_llm_model")
+            or transcription_settings.get("llm_model")
+            or DEFAULT_TEXT_LLM_MODEL
+        )
+        self.transcription_text_llm_combo = self._build_llm_combo(TEXT_LLM_MODELS, current_text_llm)
+        transcription_form.addRow("Modèle IA texte", self.transcription_text_llm_combo)
+
+        text_llm_hint = QLabel(
+            "Utilisé après transcription pour proposer un titre, identifier les "
+            "interlocuteurs, signaler les passages douteux et corriger les erreurs "
+            "manifestes. Tourne 100% en local. Le modèle est téléchargé au premier usage."
+        )
+        text_llm_hint.setWordWrap(True)
+        text_llm_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", text_llm_hint)
+
+        # --- Multimodal audio recheck (re-écoute IA) -------------------------
+        self.transcription_audio_recheck_check = QCheckBox(
+            "Réécoute IA des passages douteux (multimodal, expérimental)"
+        )
+        self.transcription_audio_recheck_check.setChecked(
+            bool(transcription_settings.get("audio_recheck_enabled", False))
+        )
+        transcription_form.addRow("", self.transcription_audio_recheck_check)
+
+        current_audio_llm = str(
+            transcription_settings.get("audio_llm_model") or DEFAULT_AUDIO_LLM_MODEL
+        )
+        self.transcription_audio_llm_combo = self._build_llm_combo(AUDIO_LLM_MODELS, current_audio_llm)
+        transcription_form.addRow("Modèle IA audio", self.transcription_audio_llm_combo)
+
+        # Disable the audio model dropdown when the recheck step is OFF — it's
+        # only meaningful when we're actually going to call mlx_vlm.
+        def _sync_audio_combo(checked: bool):
+            self.transcription_audio_llm_combo.setEnabled(checked)
+        self.transcription_audio_recheck_check.toggled.connect(_sync_audio_combo)
+        _sync_audio_combo(self.transcription_audio_recheck_check.isChecked())
+
+        audio_llm_hint = QLabel(
+            "Optionnel. Quand activé, l'IA réécoute des extraits courts (5-15 s) autour "
+            "des passages signalés douteux pour proposer une transcription plus précise. "
+            "Téléchargement supplémentaire ~4-7 Go au premier usage."
+        )
+        audio_llm_hint.setWordWrap(True)
+        audio_llm_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", audio_llm_hint)
 
         self.transcription_language_combo = QComboBox()
         self.transcription_language_combo.addItems(["fr", "auto", "en", "es", "de", "it"])
@@ -772,6 +815,29 @@ class SettingsDialog(QDialog):
         """
         )
 
+    def _build_llm_combo(self, catalog: list[dict], current_id: str) -> QComboBox:
+        """
+        Build a QComboBox from a model catalog (TEXT_LLM_MODELS / AUDIO_LLM_MODELS).
+        Each entry is shown with its human label + cache status. The
+        underlying model id is stored as Qt user-data so we read it back via
+        currentData() instead of parsing the visible text.
+        """
+        combo = QComboBox()
+        combo.setEditable(True)  # Allow advanced users to paste a custom HF id.
+        for entry in catalog:
+            cached = is_hf_model_cached(entry["id"])
+            badge = "● téléchargé" if cached else "○ à télécharger"
+            combo.addItem(f"{entry['label']}  —  {badge}", entry["id"])
+
+        # Pre-select the current model (or add it if it's a custom override).
+        idx = combo.findData(current_id)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        elif current_id:
+            combo.addItem(f"{current_id}  —  (personnalisé)", current_id)
+            combo.setCurrentIndex(combo.count() - 1)
+        return combo
+
     def pick_ffmpeg(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choisir ffmpeg", str(Path.home()), "Tous (*.*)")
         if path:
@@ -787,6 +853,15 @@ class SettingsDialog(QDialog):
         if path:
             self.mlx_whisper_edit.setText(path)
 
+    def _combo_model_id(self, combo: QComboBox) -> str:
+        # currentData() is the structured id; if the user typed a custom one,
+        # Qt stores it as text only — fall back to the visible string in that
+        # case so power users keep their override.
+        data = combo.currentData()
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        return combo.currentText().strip()
+
     def values(self) -> tuple[str, str, str, dict[str, str | bool]]:
         return (
             self.ffmpeg_edit.text().strip(),
@@ -795,7 +870,9 @@ class SettingsDialog(QDialog):
             {
                 "mlx_whisper_path": self.mlx_whisper_edit.text().strip(),
                 "model": self.transcription_model_edit.text().strip(),
-                "llm_model": self.transcription_llm_model_combo.currentData() or self.transcription_llm_model_combo.currentText().strip(),
+                "text_llm_model": self._combo_model_id(self.transcription_text_llm_combo),
+                "audio_llm_model": self._combo_model_id(self.transcription_audio_llm_combo),
+                "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_value,
@@ -939,7 +1016,9 @@ class TranscribeWorker(QThread):
         diarization_enabled: bool = False,
         hf_token: str = "",
         venv_python_path: str = "",
-        llm_model: str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+        text_llm_model: str = DEFAULT_TEXT_LLM_MODEL,
+        audio_llm_model: str = DEFAULT_AUDIO_LLM_MODEL,
+        audio_recheck_enabled: bool = False,
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -950,7 +1029,12 @@ class TranscribeWorker(QThread):
         self.language = language
         self.output_format = output_format
         self.db = db
-        self.llm_model = llm_model
+        # Two distinct models: the text LLM (mlx_lm) is required for the
+        # title/speakers/corrections pass; the audio multimodal model
+        # (mlx_vlm) is only loaded when the optional re-listen step runs.
+        self.text_llm_model = text_llm_model or DEFAULT_TEXT_LLM_MODEL
+        self.audio_llm_model = audio_llm_model or DEFAULT_AUDIO_LLM_MODEL
+        self.audio_recheck_enabled = bool(audio_recheck_enabled)
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -960,6 +1044,7 @@ class TranscribeWorker(QThread):
         self.venv_python_path = venv_python_path
         self._stop_requested = False
         self._proc: subprocess.Popen | None = None
+        self._mlx_vlm_available: bool | None = None
 
     def _log(self, message: str):
         append_app_log(f"transcription file={Path(self.job.input_path).name!r} {message}")
@@ -993,10 +1078,14 @@ class TranscribeWorker(QThread):
         return env
 
     def _ensure_mlx_lm_available(self) -> bool:
+        """
+        Probe / install mlx_lm in the managed venv. Used by the text LLM step
+        (title/speakers/corrections). Cheap install (~200 Mo).
+        """
         if not self.venv_python_path or not Path(self.venv_python_path).exists():
             return False
         probe = subprocess.run(
-            [self.venv_python_path, "-c", "import mlx_lm; import mlx_vlm"],
+            [self.venv_python_path, "-c", "import mlx_lm"],
             capture_output=True,
             text=True,
             env=self._subprocess_env(),
@@ -1004,9 +1093,9 @@ class TranscribeWorker(QThread):
         if probe.returncode == 0:
             return True
 
-        self.status.emit("Installation de l'IA locale (MLX LM et MLX VLM)…")
+        self.status.emit("Installation de l'IA texte locale (MLX LM)…")
         install = subprocess.run(
-            [self.venv_python_path, "-m", "pip", "install", "--upgrade", "mlx-lm", "mlx-vlm"],
+            [self.venv_python_path, "-m", "pip", "install", "--upgrade", "mlx-lm"],
             capture_output=True,
             text=True,
             env=self._subprocess_env(),
@@ -1016,13 +1105,48 @@ class TranscribeWorker(QThread):
             return False
         return True
 
+    def _ensure_mlx_vlm_available(self) -> bool:
+        """
+        Probe / install mlx_vlm. Heavier than mlx_lm (~500 Mo) and only
+        needed if the user opted into the audio re-listen step. We cache
+        the probe result so we don't pay for it on every clip.
+        """
+        if self._mlx_vlm_available is not None:
+            return self._mlx_vlm_available
+        if not self.venv_python_path or not Path(self.venv_python_path).exists():
+            self._mlx_vlm_available = False
+            return False
+        probe = subprocess.run(
+            [self.venv_python_path, "-c", "import mlx_vlm"],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if probe.returncode == 0:
+            self._mlx_vlm_available = True
+            return True
+
+        self.status.emit("Installation de l'IA multimodale (MLX VLM, ~500 Mo)…")
+        install = subprocess.run(
+            [self.venv_python_path, "-m", "pip", "install", "--upgrade", "mlx-vlm"],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if install.returncode != 0:
+            self._log_process_result("mlx_vlm_install_failed", install.returncode, install.stdout, install.stderr)
+            self._mlx_vlm_available = False
+            return False
+        self._mlx_vlm_available = True
+        return True
+
     def _run_llm_post_process(self, analysis_path: Path, glossary: str) -> dict:
         if not analysis_path.exists() or not self._ensure_mlx_lm_available():
             return {}
 
         self.status.emit("Analyse locale: titre, interlocuteurs, passages douteux…")
-        cmd = build_llm_cmd(self.venv_python_path, self.llm_model, str(analysis_path), glossary)
-        self._log(f"llm_postprocess_start model={self.llm_model!r}")
+        cmd = build_llm_cmd(self.venv_python_path, self.text_llm_model, str(analysis_path), glossary)
+        self._log(f"llm_postprocess_start model={self.text_llm_model!r}")
         proc = subprocess.run(
             cmd,
             capture_output=True,
@@ -1131,11 +1255,20 @@ class TranscribeWorker(QThread):
         work_dir: Path,
         uncertain_passages: list[dict],
     ) -> list[dict]:
+        # The multimodal step is opt-in. Even if the text LLM flagged doubts,
+        # we don't load mlx_vlm + Qwen2-Audio (~5 Go RAM, slow first launch)
+        # unless the user explicitly enabled it in Settings.
+        if not self.audio_recheck_enabled:
+            return []
         if not uncertain_passages or not wav_path.exists() or not self.venv_python_path:
+            return []
+        if not self._ensure_mlx_vlm_available():
+            self.status.emit("Réécoute IA ignorée (mlx-vlm indisponible).")
+            self._log("clip_recheck_skipped reason=mlx_vlm_unavailable")
             return []
 
         checks: list[dict] = []
-        self.status.emit("Validation Multimodale (Audio AI)…")
+        self.status.emit("Réécoute IA des passages douteux (multimodal)…")
         for index, passage in enumerate(uncertain_passages[:10], start=1):
             if self._stop_requested:
                 break
@@ -1170,7 +1303,7 @@ class TranscribeWorker(QThread):
             
             cmd = build_multimodal_audio_cmd(
                 venv_python_path=self.venv_python_path,
-                model_path=self.llm_model,
+                model_path=self.audio_llm_model,
                 audio_path=str(clip_wav),
                 prompt=prompt
             )
@@ -1710,11 +1843,20 @@ class MlxWhisperInstallWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, python_path: str, venv_dir: Path, install_diarization: bool = True):
+    def __init__(
+        self,
+        python_path: str,
+        venv_dir: Path,
+        install_diarization: bool = True,
+        install_multimodal: bool = False,
+    ):
         super().__init__()
         self.python_path = python_path
         self.venv_dir = venv_dir
         self.install_diarization = install_diarization
+        # Multimodal audio (mlx-vlm + Qwen2-Audio) is heavier and rarely used,
+        # so we keep it opt-in. The user can enable it later via Settings.
+        self.install_multimodal = install_multimodal
 
     def _run_cmd(self, cmd: list[str], label: str):
         self.status.emit(label)
@@ -1748,6 +1890,14 @@ class MlxWhisperInstallWorker(QThread):
             if not is_executable(mlx_path):
                 raise RuntimeError("Installation terminée, mais la commande mlx_whisper est introuvable.")
 
+            # mlx-lm is the workhorse for the text post-processing step and is
+            # cheap to install — bundle it with every fresh install so the
+            # "améliorée" transcript works out of the box.
+            self._run_cmd(
+                [str(venv_python), "-m", "pip", "install", "--upgrade", *TEXT_LLM_PIP_PACKAGES],
+                "Installation de l'IA texte locale (MLX LM, ~200 Mo)…",
+            )
+
             if self.install_diarization:
                 self._run_cmd(
                     [str(venv_python), "-m", "pip", "install", "--upgrade", *DIARIZATION_PIP_PACKAGES],
@@ -1765,6 +1915,12 @@ class MlxWhisperInstallWorker(QThread):
                         "Installation détection des locuteurs OK mais l'import échoue: "
                         + (probe.stderr or probe.stdout or "").strip()
                     )
+
+            if self.install_multimodal:
+                self._run_cmd(
+                    [str(venv_python), "-m", "pip", "install", "--upgrade", *MULTIMODAL_LLM_PIP_PACKAGES],
+                    "Installation IA multimodale (MLX VLM, ~500 Mo)…",
+                )
 
             self.status.emit("MLX Whisper installé.")
             self.finished_ok.emit(str(mlx_path))
@@ -2020,16 +2176,24 @@ class LibraryView(QWidget):
         
         self.btn_open = QPushButton("Voir résultat")
         self.btn_open.clicked.connect(self.open_result)
-        
+
+        # Reveal the transcript folder in Finder/Explorer so the user can
+        # open the "à vérifier.md" report, the enhanced version, or the
+        # original transcript side by side.
+        self.btn_show_folder = QPushButton("Ouvrir le dossier")
+        self.btn_show_folder.setObjectName("secondaryButton")
+        self.btn_show_folder.clicked.connect(self.show_folder)
+
         self.btn_restart = QPushButton("Relancer / Réparer")
         self.btn_restart.clicked.connect(self.restart_job)
-        
+
         self.btn_delete = QPushButton("Supprimer")
         self.btn_delete.setObjectName("secondaryButton")
         self.btn_delete.clicked.connect(self.delete_entry)
 
         actions = QHBoxLayout()
         actions.addWidget(self.btn_open)
+        actions.addWidget(self.btn_show_folder)
         actions.addWidget(self.btn_restart)
         actions.addWidget(self.btn_delete)
         layout.addLayout(actions)
@@ -2122,6 +2286,41 @@ class LibraryView(QWidget):
         else:
             QMessageBox.information(self, "Infos", "Le fichier de transcription n'est pas encore prêt ou a été déplacé.")
 
+    def show_folder(self):
+        # Opens the parent directory of the output. The user gets all
+        # related files at once: original transcript, " - améliorée.txt",
+        # " - à vérifier.md" with the LLM's review notes.
+        item = self.list.currentItem()
+        if not item:
+            return
+        job_id = item.data(Qt.UserRole)
+        job = self.db.get_job(job_id)
+        out_path = job and job.get("output_path")
+        if not out_path:
+            QMessageBox.information(self, "Infos", "Pas de dossier de sortie pour cette entrée.")
+            return
+        target = Path(out_path)
+        if not target.exists() and target.parent.exists():
+            target = target.parent
+        if not target.exists():
+            QMessageBox.information(self, "Infos", f"Le dossier {target} est introuvable.")
+            return
+
+        if sys.platform == "darwin":
+            # `-R` reveals the file inside Finder; falls back to `open` for
+            # bare directories.
+            if target.is_file():
+                subprocess.Popen(["open", "-R", str(target)])
+            else:
+                subprocess.Popen(["open", str(target)])
+        elif sys.platform.startswith("win"):
+            if target.is_file():
+                subprocess.Popen(["explorer", "/select,", str(target)])
+            else:
+                os.startfile(str(target))
+        else:
+            subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
+
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -2155,9 +2354,20 @@ class MainWindow(QWidget):
         self.transcription_model = str(
             self.settings.value("transcription_model", "mlx-community/whisper-large-v3", type=str)
         ).strip()
-        self.transcription_llm_model = str(
-            self.settings.value("transcription_llm_model", LLM_MODELS[0], type=str)
-        ).strip()
+        # The legacy "transcription_llm_model" key was a single field used for
+        # both text and audio analyses, even though those need different
+        # families. We split it into two and migrate any old value into the
+        # text slot — the audio one always starts on its sane default.
+        legacy_llm_model = str(self.settings.value("transcription_llm_model", "", type=str)).strip()
+        self.transcription_text_llm_model = str(
+            self.settings.value("transcription_text_llm_model", "", type=str)
+        ).strip() or legacy_llm_model or DEFAULT_TEXT_LLM_MODEL
+        self.transcription_audio_llm_model = str(
+            self.settings.value("transcription_audio_llm_model", DEFAULT_AUDIO_LLM_MODEL, type=str)
+        ).strip() or DEFAULT_AUDIO_LLM_MODEL
+        self.transcription_audio_recheck_enabled = self.settings.value(
+            "transcription_audio_recheck_enabled", False, type=bool
+        )
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
         self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
@@ -2891,7 +3101,9 @@ class MainWindow(QWidget):
         return {
             "mlx_whisper_path": self.mlx_whisper_path,
             "model": self.transcription_model,
-            "llm_model": getattr(self, "transcription_llm_model", LLM_MODELS[0]),
+            "text_llm_model": self.transcription_text_llm_model,
+            "audio_llm_model": self.transcription_audio_llm_model,
+            "audio_recheck_enabled": self.transcription_audio_recheck_enabled,
             "language": self.transcription_language,
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
@@ -2910,11 +3122,21 @@ class MainWindow(QWidget):
                 diar_status = "ON (token HF manquant)"
         else:
             diar_status = "OFF"
+
+        text_llm_short = text_llm_label_for(self.transcription_text_llm_model).split(" · ")[0]
+        if self.transcription_audio_recheck_enabled:
+            audio_llm_short = audio_llm_label_for(self.transcription_audio_llm_model).split(" · ")[0]
+            recheck_line = f"Réécoute IA: ON · {audio_llm_short}"
+        else:
+            recheck_line = "Réécoute IA: OFF"
+
         self.lbl_transcription_config.setText(
             f"MLX Whisper: {mlx_status}\n"
-            f"Modèle: {self.transcription_model or 'mlx-community/whisper-large-v3'}\n"
+            f"Modèle Whisper: {self.transcription_model or 'mlx-community/whisper-large-v3'}\n"
             f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}\n"
-            f"Détection des locuteurs: {diar_status}"
+            f"Détection des locuteurs: {diar_status}\n"
+            f"IA texte: {text_llm_short}\n"
+            f"{recheck_line}"
         )
         if hasattr(self, "btn_install_mlx"):
             self.btn_install_mlx.setVisible(not mlx_installed or self.mlx_install_worker is not None)
@@ -2945,8 +3167,14 @@ class MainWindow(QWidget):
         self.transcription_model = (
             str(transcription_settings.get("model", "")).strip() or "mlx-community/whisper-large-v3-turbo"
         )
-        self.transcription_llm_model = (
-            str(transcription_settings.get("llm_model", "")).strip() or LLM_MODELS[0]
+        self.transcription_text_llm_model = (
+            str(transcription_settings.get("text_llm_model", "")).strip() or DEFAULT_TEXT_LLM_MODEL
+        )
+        self.transcription_audio_llm_model = (
+            str(transcription_settings.get("audio_llm_model", "")).strip() or DEFAULT_AUDIO_LLM_MODEL
+        )
+        self.transcription_audio_recheck_enabled = bool(
+            transcription_settings.get("audio_recheck_enabled", False)
         )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
@@ -2963,7 +3191,15 @@ class MainWindow(QWidget):
         self.settings.setValue("github_token", self.github_token)
         self.settings.setValue("mlx_whisper_path", self.mlx_whisper_path)
         self.settings.setValue("transcription_model", self.transcription_model)
-        self.settings.setValue("transcription_llm_model", self.transcription_llm_model)
+        self.settings.setValue("transcription_text_llm_model", self.transcription_text_llm_model)
+        self.settings.setValue("transcription_audio_llm_model", self.transcription_audio_llm_model)
+        self.settings.setValue(
+            "transcription_audio_recheck_enabled",
+            self.transcription_audio_recheck_enabled,
+        )
+        # Drop the legacy single-key so it doesn't shadow the new ones on
+        # next startup. Safe even if the key isn't there.
+        self.settings.remove("transcription_llm_model")
         self.settings.setValue("transcription_language", self.transcription_language)
         self.settings.setValue("transcription_format", self.transcription_format)
         self.settings.setValue("transcription_suffix", self.transcription_suffix)
@@ -3374,7 +3610,12 @@ class MainWindow(QWidget):
         self._set_progress_visible(True)
         self.progress.setRange(0, 0)
 
-        worker = MlxWhisperInstallWorker(python_path, managed_transcription_venv_dir())
+        worker = MlxWhisperInstallWorker(
+            python_path,
+            managed_transcription_venv_dir(),
+            install_diarization=self.transcription_diarization_enabled,
+            install_multimodal=self.transcription_audio_recheck_enabled,
+        )
         self.mlx_install_worker = worker
         worker.status.connect(self.on_mlx_install_status)
         worker.finished_ok.connect(self.on_mlx_install_done)
@@ -3953,7 +4194,9 @@ class MainWindow(QWidget):
             diarization_enabled=self.transcription_diarization_enabled,
             hf_token=self.transcription_hf_token,
             venv_python_path=str(venv_python) if venv_python.exists() else "",
-            llm_model=getattr(self, "transcription_llm_model", LLM_MODELS[0]),
+            text_llm_model=self.transcription_text_llm_model,
+            audio_llm_model=self.transcription_audio_llm_model,
+            audio_recheck_enabled=self.transcription_audio_recheck_enabled,
         )
         self.worker = worker
         self._track_worker(worker)
@@ -4181,122 +4424,6 @@ class MainWindow(QWidget):
             f"Réussis: {done}/{total}\nErreurs: {failed}\n\n{preview}{gatekeeper_hint}",
         )
 
-
-class ReviewDashboard(QDialog):
-    def __init__(self, job_title: str, review_data: dict, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Validation chirurgicale (IA) - {job_title}")
-        self.setMinimumSize(800, 500)
-        
-        self.review_data = review_data
-        self.audio_player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.audio_player.setAudioOutput(self.audio_output)
-        self.audio_output.setVolume(1.0)
-        
-        layout = QVBoxLayout(self)
-        
-        # Header
-        header = QLabel("Passages nécessitant votre validation")
-        header.setObjectName("h1")
-        layout.addWidget(header)
-        
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left: List of uncertainties
-        self.doubt_list = QListWidget()
-        self.doubt_list.currentRowChanged.connect(self.on_doubt_selected)
-        splitter.addWidget(self.doubt_list)
-        
-        # Populate list
-        for item in self.review_data.get("uncertain_passages", []):
-            list_item = QListWidgetItem(f"[{item.get('timestamp', '00:00:00')}] {item.get('text', '')}")
-            list_item.setData(Qt.UserRole, item)
-            self.doubt_list.addItem(list_item)
-            
-        # Right: Edit area
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
-        # Audio controls
-        audio_layout = QHBoxLayout()
-        self.btn_play = QPushButton("▶ Écouter l'extrait (5s)")
-        self.btn_play.clicked.connect(self.play_audio)
-        self.btn_play.setEnabled(False)
-        audio_layout.addWidget(self.btn_play)
-        audio_layout.addStretch()
-        right_layout.addLayout(audio_layout)
-        
-        # Text details
-        form = QFormLayout()
-        self.lbl_whisper = QLabel("")
-        self.lbl_whisper.setWordWrap(True)
-        form.addRow("Original (Whisper):", self.lbl_whisper)
-        
-        self.lbl_ai = QLabel("")
-        self.lbl_ai.setWordWrap(True)
-        form.addRow("Suggestion (IA):", self.lbl_ai)
-        right_layout.addLayout(form)
-        
-        # Edit box
-        self.edit_correction = QTextEdit()
-        self.edit_correction.setMaximumHeight(80)
-        right_layout.addWidget(self.edit_correction)
-        
-        # Action buttons
-        btn_layout = QHBoxLayout()
-        self.btn_accept = QPushButton("Accepter la suggestion")
-        self.btn_accept.setObjectName("accentButton")
-        self.btn_accept.clicked.connect(self.accept_suggestion)
-        
-        self.btn_save = QPushButton("Enregistrer ma correction")
-        self.btn_save.setObjectName("primaryButton")
-        self.btn_save.clicked.connect(self.save_correction)
-        
-        self.btn_skip = QPushButton("Ignorer")
-        self.btn_skip.clicked.connect(self.skip_item)
-        
-        btn_layout.addWidget(self.btn_accept)
-        btn_layout.addWidget(self.btn_save)
-        btn_layout.addWidget(self.btn_skip)
-        btn_layout.addStretch()
-        right_layout.addLayout(btn_layout)
-        right_layout.addStretch()
-        
-        splitter.addWidget(right_panel)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        
-        layout.addWidget(splitter, 1)
-
-    def on_doubt_selected(self, row):
-        if row < 0:
-            self.btn_play.setEnabled(False)
-            return
-        item_data = self.doubt_list.item(row).data(Qt.UserRole)
-        self.lbl_whisper.setText(item_data.get("text", ""))
-        self.lbl_ai.setText(item_data.get("suggestion", "Aucune hypothèse IA"))
-        self.edit_correction.setPlainText(item_data.get("suggestion", item_data.get("text", "")))
-        self.btn_play.setEnabled(True)
-        
-        clip_path = item_data.get("clip_path")
-        if clip_path and Path(clip_path).exists():
-            self.audio_player.setSource(QUrl.fromLocalFile(clip_path))
-        
-    def play_audio(self):
-        self.audio_player.play()
-        
-    def accept_suggestion(self):
-        self.skip_item()
-        
-    def save_correction(self):
-        self.skip_item()
-        
-    def skip_item(self):
-        row = self.doubt_list.currentRow()
-        if row >= 0:
-            item = self.doubt_list.takeItem(row)
-            del item
 
 def main():
     if "--version" in sys.argv:
