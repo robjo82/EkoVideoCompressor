@@ -4,7 +4,15 @@ import unittest
 from pathlib import Path
 
 import transcription_utils
-from ffmpeg_utils import build_ffmpeg_cmd
+from ffmpeg_utils import (
+    AUDIO_EXTENSIONS,
+    MEDIA_EXTENSIONS,
+    MEDIA_FILTER,
+    VIDEO_EXTENSIONS,
+    build_ffmpeg_cmd,
+    default_out_path,
+    is_audio_only_path,
+)
 from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
@@ -59,6 +67,46 @@ class BuildFfmpegCmdTest(unittest.TestCase):
         self.assertIn("30", cmd)
         self.assertIn("scale=-2:480,fps=10", cmd)
         self.assertEqual(cmd[-1], "/tmp/out.mp4")
+
+    def test_audio_only_command_skips_video_options(self):
+        cmd = build_ffmpeg_cmd(
+            ffmpeg_path="/usr/local/bin/ffmpeg",
+            in_path="/tmp/in.m4a",
+            out_path="/tmp/out.m4a",
+            audio_bitrate="96k",
+            speech_enhance=True,
+            mono_audio=True,
+            audio_only=True,
+        )
+
+        # No video stream → -vn must appear and the H.265/scale knobs
+        # must NOT be in the command. Otherwise ffmpeg fails immediately.
+        self.assertIn("-vn", cmd)
+        self.assertNotIn("libx265", cmd)
+        self.assertNotIn("-c:v", cmd)
+        self.assertNotIn("-vf", cmd)
+        # Audio knobs are still respected.
+        self.assertIn("-c:a", cmd)
+        self.assertIn("aac", cmd)
+        self.assertIn("-b:a", cmd)
+        self.assertIn("96k", cmd)
+        self.assertIn("-ac", cmd)
+        self.assertEqual(cmd[-1], "/tmp/out.m4a")
+
+    def test_audio_only_command_respects_trim_window(self):
+        cmd = build_ffmpeg_cmd(
+            ffmpeg_path="/usr/local/bin/ffmpeg",
+            in_path="/tmp/in.mp3",
+            out_path="/tmp/out.m4a",
+            ss="00:01:00",
+            to="00:02:00",
+            audio_only=True,
+        )
+
+        self.assertIn("-ss", cmd)
+        self.assertIn("00:01:00", cmd)
+        self.assertIn("-to", cmd)
+        self.assertIn("00:02:00", cmd)
 
 
 class TranscriptionCommandTest(unittest.TestCase):
@@ -304,6 +352,46 @@ class FuseAndRenderTest(unittest.TestCase):
         ], "txt")
 
         self.assertEqual(out, "Bonjour\nà tous\n")
+
+
+class AudioOnlyDetectionTest(unittest.TestCase):
+    def test_video_extensions_are_recognised(self):
+        for ext in VIDEO_EXTENSIONS:
+            self.assertFalse(is_audio_only_path(f"/tmp/file{ext}"), ext)
+
+    def test_audio_extensions_are_recognised(self):
+        for ext in AUDIO_EXTENSIONS:
+            self.assertTrue(is_audio_only_path(f"/tmp/file{ext}"), ext)
+
+    def test_audio_detection_is_case_insensitive(self):
+        self.assertTrue(is_audio_only_path("/tmp/PODCAST.MP3"))
+        self.assertTrue(is_audio_only_path("/tmp/Meeting.M4A"))
+
+    def test_extensions_sets_are_disjoint(self):
+        self.assertFalse(VIDEO_EXTENSIONS & AUDIO_EXTENSIONS)
+        self.assertEqual(VIDEO_EXTENSIONS | AUDIO_EXTENSIONS, MEDIA_EXTENSIONS)
+
+    def test_media_filter_advertises_both_categories(self):
+        self.assertIn("Vidéos", MEDIA_FILTER)
+        self.assertIn("Audios", MEDIA_FILTER)
+        self.assertIn("*.mp4", MEDIA_FILTER)
+        self.assertIn("*.mp3", MEDIA_FILTER)
+
+    def test_default_out_path_keeps_mp4_for_video(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = default_out_path("/tmp/in.mov", d, "_compressed")
+        self.assertTrue(out.endswith("_compressed.mp4"))
+
+    def test_default_out_path_uses_m4a_for_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = default_out_path("/tmp/dictaphone.wav", d, "_compressed")
+        self.assertTrue(out.endswith("_compressed.m4a"), out)
+
+    def test_default_out_path_increments_when_target_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "meeting_compressed.m4a").touch()
+            out = default_out_path("/tmp/meeting.mp3", d, "_compressed")
+        self.assertTrue(out.endswith("_compressed_1.m4a"), out)
 
 
 class LlmCatalogTest(unittest.TestCase):
