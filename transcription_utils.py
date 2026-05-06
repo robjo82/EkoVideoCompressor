@@ -71,6 +71,23 @@ AUDIO_LLM_MODELS: list[dict] = [
 DEFAULT_TEXT_LLM_MODEL = TEXT_LLM_MODELS[0]["id"]
 DEFAULT_AUDIO_LLM_MODEL = AUDIO_LLM_MODELS[0]["id"]
 
+WHISPER_MODELS: list[dict] = [
+    {
+        "id": "mlx-community/whisper-large-v3-turbo",
+        "label": "Whisper Large v3 Turbo · rapide — recommandé",
+    },
+    {
+        "id": "mlx-community/whisper-large-v3",
+        "label": "Whisper Large v3 · qualité maximale",
+    },
+    {
+        "id": "mlx-community/whisper-medium",
+        "label": "Whisper Medium · léger",
+    },
+]
+
+DEFAULT_WHISPER_MODEL = WHISPER_MODELS[0]["id"]
+
 
 def text_llm_label_for(model_id: str) -> str:
     for entry in TEXT_LLM_MODELS:
@@ -272,7 +289,7 @@ def build_mlx_whisper_cmd(
         mlx_whisper_path,
         audio_path,
         "--model",
-        model.strip() or "mlx-community/whisper-large-v3",
+        model.strip() or DEFAULT_WHISPER_MODEL,
         "-f",
         fmt,
         "--output-dir",

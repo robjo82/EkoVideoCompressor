@@ -17,7 +17,9 @@ from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
     DEFAULT_TEXT_LLM_MODEL,
+    DEFAULT_WHISPER_MODEL,
     TEXT_LLM_MODELS,
+    WHISPER_MODELS,
     assign_speakers_to_segments,
     audio_llm_label_for,
     build_audio_extract_cmd,
@@ -408,6 +410,11 @@ class LlmCatalogTest(unittest.TestCase):
             self.assertIn("label", entry)
             self.assertIn("family", entry)
             self.assertTrue(entry["id"].startswith("mlx-community/"))
+
+    def test_whisper_catalog_has_default_model(self):
+        ids = {entry["id"] for entry in WHISPER_MODELS}
+        self.assertIn(DEFAULT_WHISPER_MODEL, ids)
+        self.assertIn("turbo", DEFAULT_WHISPER_MODEL)
 
     def test_audio_catalog_has_required_keys(self):
         self.assertGreaterEqual(len(AUDIO_LLM_MODELS), 1)

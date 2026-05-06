@@ -29,7 +29,9 @@ from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
     DEFAULT_TEXT_LLM_MODEL,
+    DEFAULT_WHISPER_MODEL,
     TEXT_LLM_MODELS,
+    WHISPER_MODELS,
     assign_speakers_to_segments,
     audio_llm_label_for,
     build_audio_extract_cmd,
@@ -656,8 +658,9 @@ class SettingsDialog(QDialog):
         mlx_row.addWidget(btn_mlx_whisper)
         transcription_form.addRow("Commande", mlx_row)
 
-        self.transcription_model_edit = QLineEdit(str(transcription_settings.get("model", "")))
-        transcription_form.addRow("Modèle Whisper", self.transcription_model_edit)
+        current_whisper = str(transcription_settings.get("model") or DEFAULT_WHISPER_MODEL)
+        self.transcription_model_combo = self._build_model_combo(WHISPER_MODELS, current_whisper)
+        transcription_form.addRow("Modèle Whisper", self.transcription_model_combo)
 
         # --- Text LLM (analyse, titre, locuteurs, corrections) ---------------
         # Run via mlx_lm. Default Mistral 7B is the sweet spot on M1 16 Go.
@@ -765,7 +768,8 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self.setMinimumWidth(660)
+        self.setMinimumWidth(680)
+        self.resize(760, 560)
         self.setStyleSheet(
             """
         QDialog {
@@ -812,6 +816,23 @@ class SettingsDialog(QDialog):
         """
         )
 
+    def _build_model_combo(self, catalog: list[dict], current_id: str) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(False)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(28)
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for entry in catalog:
+            combo.addItem(entry["label"], entry["id"])
+
+        idx = combo.findData(current_id)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        elif current_id:
+            combo.addItem(f"{current_id} — modèle actuel", current_id)
+            combo.setCurrentIndex(combo.count() - 1)
+        return combo
+
     def _build_llm_combo(self, catalog: list[dict], current_id: str) -> QComboBox:
         """
         Build a QComboBox from a model catalog (TEXT_LLM_MODELS / AUDIO_LLM_MODELS).
@@ -820,7 +841,10 @@ class SettingsDialog(QDialog):
         currentData() instead of parsing the visible text.
         """
         combo = QComboBox()
-        combo.setEditable(True)  # Allow advanced users to paste a custom HF id.
+        combo.setEditable(False)
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(30)
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for entry in catalog:
             cached = is_hf_model_cached(entry["id"])
             badge = "● téléchargé" if cached else "○ à télécharger"
@@ -831,7 +855,7 @@ class SettingsDialog(QDialog):
         if idx >= 0:
             combo.setCurrentIndex(idx)
         elif current_id:
-            combo.addItem(f"{current_id}  —  (personnalisé)", current_id)
+            combo.addItem(f"{current_id}  —  modèle actuel", current_id)
             combo.setCurrentIndex(combo.count() - 1)
         return combo
 
@@ -851,9 +875,8 @@ class SettingsDialog(QDialog):
             self.mlx_whisper_edit.setText(path)
 
     def _combo_model_id(self, combo: QComboBox) -> str:
-        # currentData() is the structured id; if the user typed a custom one,
-        # Qt stores it as text only — fall back to the visible string in that
-        # case so power users keep their override.
+        # currentData() is the structured model id. The visible text includes
+        # human labels and cache badges, so only use it as a defensive fallback.
         data = combo.currentData()
         if isinstance(data, str) and data.strip():
             return data.strip()
@@ -866,7 +889,7 @@ class SettingsDialog(QDialog):
             self.token_edit.text().strip(),
             {
                 "mlx_whisper_path": self.mlx_whisper_edit.text().strip(),
-                "model": self.transcription_model_edit.text().strip(),
+                "model": self.transcription_model_combo.currentData() or DEFAULT_WHISPER_MODEL,
                 "text_llm_model": self._combo_model_id(self.transcription_text_llm_combo),
                 "audio_llm_model": self._combo_model_id(self.transcription_audio_llm_combo),
                 "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
@@ -1817,9 +1840,11 @@ class TranscribeWorker(QThread):
             payload = self._run_llm_post_process(analysis_path, self.initial_prompt)
             title = str(payload.get("title") or "").strip() if payload else ""
             enhanced_out_path = self._create_enhanced_transcript(out_path, payload, wav_path, work_dir)
-            final_out_path = enhanced_out_path or out_path
-            if enhanced_out_path and title:
+            if enhanced_out_path:
+                final_out_path = enhanced_out_path
                 final_out_path = self._rename_transcript_file(enhanced_out_path, f"{title} améliorée")
+            else:
+                final_out_path = self._rename_transcript_file(out_path, title)
             if self.job.db_id and title:
                 self.db.update_job_title(self.job.db_id, title)
 
@@ -2072,16 +2097,19 @@ class DropZone(QFrame):
         title.setObjectName("dropTitle")
         title.setAlignment(Qt.AlignCenter)
         title.setWordWrap(True)
+        title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         subtitle = QLabel('ou utilisez "Ajouter des fichiers"')
         subtitle.setObjectName("dropSubtitle")
         subtitle.setAlignment(Qt.AlignCenter)
         subtitle.setWordWrap(True)
+        subtitle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         details = QLabel("Vidéos (mp4, mov, mkv…) ou audios (mp3, m4a, wav…) — compression par lots, transcription locale en option")
         details.setObjectName("dropDetails")
         details.setAlignment(Qt.AlignCenter)
         details.setWordWrap(True)
+        details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
         layout.addWidget(icon)
         layout.addWidget(title)
@@ -2279,13 +2307,27 @@ class LibraryView(QWidget):
         if not item: return
         job_id = item.data(Qt.UserRole)
         job = self.db.get_job(job_id)
-        if job and job['output_path'] and Path(job['output_path']).exists():
+        out_path = job and job.get('output_path')
+        if out_path and Path(out_path).exists():
             if sys.platform == "darwin":
-                subprocess.Popen(["open", job['output_path']])
+                subprocess.Popen(["open", out_path])
             elif sys.platform.startswith("win"):
-                os.startfile(job['output_path'])
+                os.startfile(out_path)
             else:
-                subprocess.Popen(["xdg-open", job['output_path']])
+                subprocess.Popen(["xdg-open", out_path])
+        elif out_path and Path(out_path).parent.exists():
+            parent = Path(out_path).parent
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(parent)])
+            elif sys.platform.startswith("win"):
+                os.startfile(str(parent))
+            else:
+                subprocess.Popen(["xdg-open", str(parent)])
+            QMessageBox.information(
+                self,
+                "Fichier renommé",
+                "Le fichier référencé n'existe plus à cet emplacement. J'ouvre son dossier de sortie.",
+            )
         else:
             QMessageBox.information(self, "Infos", "Le fichier de transcription n'est pas encore prêt ou a été déplacé.")
 
@@ -2355,8 +2397,8 @@ class MainWindow(QWidget):
             or ""
         )
         self.transcription_model = str(
-            self.settings.value("transcription_model", "mlx-community/whisper-large-v3", type=str)
-        ).strip()
+            self.settings.value("transcription_model", DEFAULT_WHISPER_MODEL, type=str)
+        ).strip() or DEFAULT_WHISPER_MODEL
         # The legacy "transcription_llm_model" key was a single field used for
         # both text and audio analyses, even though those need different
         # families. We split it into two and migrate any old value into the
@@ -2465,18 +2507,23 @@ class MainWindow(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
 
         left_panel = QWidget()
         left_panel.setMinimumWidth(0)
+        left_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         left_col = QVBoxLayout(left_panel)
         left_col.setContentsMargins(0, 0, 0, 0)
         left_col.setSpacing(10)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("mainTabs")
+        self.tabs.setMinimumWidth(0)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # TAB 1: Queue
         queue_tab = QWidget()
+        queue_tab.setMinimumWidth(0)
         queue_layout = QVBoxLayout(queue_tab)
         queue_layout.setContentsMargins(0, 10, 0, 0)
         queue_layout.setSpacing(10)
@@ -2527,7 +2574,8 @@ class MainWindow(QWidget):
         # so the team's day-to-day flow stays uncluttered.
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
-        right_col.setMinimumWidth(340)
+        right_col.setMinimumWidth(300)
+        right_col.setMaximumWidth(390)
         right_col.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
@@ -2536,6 +2584,7 @@ class MainWindow(QWidget):
         scroll = QScrollArea()
         scroll.setObjectName("settingsScroll")
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll_body = QFrame()
         scroll_body.setObjectName("settingsScrollBody")
@@ -2740,7 +2789,7 @@ class MainWindow(QWidget):
         splitter.addWidget(right_col)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([660, 360])
+        splitter.setSizes([700, 320])
 
         root.addWidget(splitter, 1)
 
@@ -3135,7 +3184,7 @@ class MainWindow(QWidget):
 
         self.lbl_transcription_config.setText(
             f"MLX Whisper: {mlx_status}\n"
-            f"Modèle Whisper: {self.transcription_model or 'mlx-community/whisper-large-v3'}\n"
+            f"Modèle Whisper: {self.transcription_model or DEFAULT_WHISPER_MODEL}\n"
             f"Langue: {self.transcription_language} · Sortie: {self.transcription_format}\n"
             f"Détection des locuteurs: {diar_status}\n"
             f"IA texte: {text_llm_short}\n"
@@ -3168,7 +3217,7 @@ class MainWindow(QWidget):
         self.github_token = github_token
         self.mlx_whisper_path = str(transcription_settings.get("mlx_whisper_path", "")).strip()
         self.transcription_model = (
-            str(transcription_settings.get("model", "")).strip() or "mlx-community/whisper-large-v3-turbo"
+            str(transcription_settings.get("model", "")).strip() or DEFAULT_WHISPER_MODEL
         )
         self.transcription_text_llm_model = (
             str(transcription_settings.get("text_llm_model", "")).strip() or DEFAULT_TEXT_LLM_MODEL
@@ -4360,9 +4409,16 @@ class MainWindow(QWidget):
         job = self.queue_jobs[idx]
         job.status = "done"
         job.error_message = ""
-        job.transcript_path = self._auto_rename_transcript(transcript_path, job)
+        # TranscribeWorker owns final naming and DB persistence. Renaming
+        # again here would desynchronise the path stored in the library.
+        job.transcript_path = transcript_path
+        job.output_path = transcript_path
         self.completed_count += 1
         self.running_index = None
+
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "COMPLETED")
+            self.db.update_job_output(job.db_id, transcript_path)
 
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)
