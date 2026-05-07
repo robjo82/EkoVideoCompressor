@@ -775,10 +775,12 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self.setMinimumWidth(680)
-        self.resize(760, 560)
+        self.setMinimumWidth(720)
+        self.resize(820, 600)
+        chevron_url = Path(resource_path("assets/chevron-down.svg")).as_posix()
+        check_url = Path(resource_path("assets/check.svg")).as_posix()
         self.setStyleSheet(
-            """
+            ("""
         QDialog {
             background: #f5f5f7;
             color: #1d1d1f;
@@ -786,12 +788,65 @@ class SettingsDialog(QDialog):
             font-size: 14px;
         }
         QLabel { background: transparent; color: #1d1d1f; }
-        QLineEdit, QComboBox {
+        QLineEdit {
             background: #ffffff;
             border: 1px solid #d2d2d7;
             border-radius: 9px;
             padding: 8px 10px;
             min-height: 24px;
+        }
+        QLineEdit:focus { border-color: #007aff; }
+        /* QComboBox needs its own block: padded right side so the
+           displayed text never overlaps the dropdown chevron. */
+        QComboBox {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 9px;
+            padding: 7px 30px 7px 10px;
+            min-height: 24px;
+        }
+        QComboBox:hover { border-color: #b8b8c0; }
+        QComboBox:focus { border-color: #007aff; }
+        QComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 26px;
+            border-left: 1px solid #ececef;
+            border-top-right-radius: 9px;
+            border-bottom-right-radius: 9px;
+            background: #fbfbfd;
+        }
+        QComboBox::drop-down:hover { background: #f2f2f7; }
+        QComboBox::down-arrow {
+            image: url(__CHEVRON_URL__);
+            width: 12px;
+            height: 12px;
+        }
+        QComboBox QAbstractItemView {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: #007aff;
+            selection-color: #ffffff;
+            outline: none;
+        }
+        QComboBox QAbstractItemView::item {
+            padding: 6px 10px;
+            border-radius: 5px;
+            min-height: 22px;
+        }
+        QCheckBox { color: #1d1d1f; spacing: 8px; }
+        QCheckBox::indicator {
+            width: 16px; height: 16px;
+            border-radius: 4px;
+            border: 1px solid #c7c7cc;
+            background: #ffffff;
+        }
+        QCheckBox::indicator:checked {
+            background: #007aff;
+            border-color: #007aff;
+            image: url(__CHECK_URL__);
         }
         QPushButton {
             background: #ffffff;
@@ -820,7 +875,9 @@ class SettingsDialog(QDialog):
             color: #ffffff;
             border-color: #007aff;
         }
-        """
+        """)
+            .replace("__CHEVRON_URL__", chevron_url)
+            .replace("__CHECK_URL__", check_url)
         )
 
     def _build_model_combo(self, catalog: list[dict], current_id: str) -> QComboBox:
@@ -2185,37 +2242,45 @@ class DropZone(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setObjectName("dropZone")
+        # Pinned compact height — the drop zone is a hint, not the main
+        # canvas. Used to be a 4-line vertical block that hogged the
+        # queue's vertical room; the queue list itself is the real
+        # workspace.
+        self.setFixedHeight(120)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(10)
+        # Horizontal layout: icon left, two-line text centered next to it.
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(14)
 
         icon = QLabel("⌘")
         icon.setObjectName("dropIcon")
         icon.setAlignment(Qt.AlignCenter)
+        icon.setFixedWidth(56)
 
-        title = QLabel("Déposez vos vidéos ou audios")
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+
+        title = QLabel("Déposez vos vidéos ou audios ici")
         title.setObjectName("dropTitle")
-        title.setAlignment(Qt.AlignCenter)
         title.setWordWrap(True)
         title.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
-        subtitle = QLabel('ou utilisez "Ajouter des fichiers"')
-        subtitle.setObjectName("dropSubtitle")
-        subtitle.setAlignment(Qt.AlignCenter)
-        subtitle.setWordWrap(True)
-        subtitle.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-
-        details = QLabel("Vidéos (mp4, mov, mkv…) ou audios (mp3, m4a, wav…) — compression par lots, transcription locale en option")
+        details = QLabel(
+            "Vidéos (mp4, mov, mkv…) ou audios (mp3, m4a, wav…) · "
+            "compression par lots, transcription locale en option"
+        )
         details.setObjectName("dropDetails")
-        details.setAlignment(Qt.AlignCenter)
         details.setWordWrap(True)
         details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
+        text_box.addStretch(1)
+        text_box.addWidget(title)
+        text_box.addWidget(details)
+        text_box.addStretch(1)
+
         layout.addWidget(icon)
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addWidget(details)
+        layout.addLayout(text_box, 1)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -2726,7 +2791,10 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setMinimumSize(980, 680)
+        # Below ~1140 the right-side settings column gets squashed and
+        # the splitter starts cropping group titles. 1180×760 fits a
+        # 13" MacBook screen while leaving room for the library table.
+        self.setMinimumSize(1180, 760)
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
         
@@ -2842,7 +2910,12 @@ class MainWindow(QWidget):
         title_box.setSpacing(1)
         self.h1 = QLabel(APP_NAME)
         self.h1.setObjectName("h1")
-        self.h2 = QLabel(f"Compression réunion macOS · version {APP_VERSION}")
+        # Avoid "vdev" when APP_VERSION isn't a real semver; only prefix
+        # "v" when the value is a numeric version string.
+        version_label = (
+            f"v{APP_VERSION}" if APP_VERSION and APP_VERSION[:1].isdigit() else APP_VERSION
+        )
+        self.h2 = QLabel(f"Compression et transcription locale · macOS · {version_label}")
         self.h2.setObjectName("h2")
         title_box.addWidget(self.h1)
         title_box.addWidget(self.h2)
@@ -2887,7 +2960,9 @@ class MainWindow(QWidget):
         self.drop = DropZone()
         self.drop.files_dropped.connect(self.add_input_files)
         self.drop.clicked.connect(self.pick_files)
-        queue_layout.addWidget(self.drop, 1)
+        # Stretch 0 — the queue list (added below) gets all the extra
+        # vertical room; the drop zone keeps its fixed 120 px.
+        queue_layout.addWidget(self.drop, 0)
 
         queue_actions = QHBoxLayout()
         queue_actions.setSpacing(8)
@@ -2919,7 +2994,7 @@ class MainWindow(QWidget):
         
         left_col.addWidget(self.tabs, 1)
 
-        self.lbl_input_meta = QLabel("Aucune vidéo sélectionnée.")
+        self.lbl_input_meta = QLabel("Aucun fichier sélectionné.")
         self.lbl_input_meta.setObjectName("metaLabel")
         self.lbl_input_meta.setWordWrap(True)
         left_col.addWidget(self.lbl_input_meta)
@@ -3013,13 +3088,18 @@ class MainWindow(QWidget):
                 )
             )
         )
-        self.edit_transcription_prompt.setMinimumHeight(110)
+        # Compact by default; the field grows up to 140 px if the user
+        # has a long glossary, but won't bury the rest of the panel.
+        self.edit_transcription_prompt.setMinimumHeight(70)
+        self.edit_transcription_prompt.setMaximumHeight(140)
         glossary_layout.addWidget(self.edit_transcription_prompt)
 
+        # Subtle inline note rather than the previous "metaLabel" boxed
+        # card-within-a-card.
         self.lbl_transcription_hint = QLabel(
-            "Conservé entre les réunions. Sera transmis à Whisper comme vocabulaire attendu."
+            "Conservé entre les réunions · transmis à Whisper comme vocabulaire attendu."
         )
-        self.lbl_transcription_hint.setObjectName("metaLabel")
+        self.lbl_transcription_hint.setObjectName("inlineHint")
         self.lbl_transcription_hint.setWordWrap(True)
         glossary_layout.addWidget(self.lbl_transcription_hint)
 
@@ -3606,6 +3686,12 @@ class MainWindow(QWidget):
             border-radius: 10px;
             padding: 10px;
             font-size: 13px;
+        }
+        QLabel#inlineHint {
+            color: #6e6e73;
+            background: transparent;
+            font-size: 12px;
+            padding: 2px 0;
         }
         QSplitter::handle {
             background: #e5e5ea;
