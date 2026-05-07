@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 import zipfile
 from dataclasses import dataclass, replace, asdict
 from datetime import datetime
@@ -229,6 +230,10 @@ def app_log_path() -> Path:
     return app_support_dir() / "app.log"
 
 
+def updater_log_path() -> Path:
+    return app_support_dir() / "updater.log"
+
+
 def _tail_for_log(text: str | None, limit: int = 4000) -> str:
     value = (text or "").strip()
     if len(value) <= limit:
@@ -268,6 +273,100 @@ def append_app_log(message: str):
             handle.write(f"[{timestamp}] {message}\n")
     except Exception:
         pass
+
+
+HF_API_BASE = "https://huggingface.co"
+HF_TOKEN_URL = "https://huggingface.co/settings/tokens"
+HF_GATED_MODEL_CHECKS: list[tuple[str, str, str]] = [
+    ("pyannote/segmentation-3.0", "config.yaml", "Segmentation pyannote 3.0"),
+    ("pyannote/speaker-diarization-3.1", "config.yaml", "Diarisation pyannote 3.1"),
+    ("pyannote/speaker-diarization-community-1", "config.yaml", "Diarisation Community-1"),
+]
+
+
+def _open_url(url: str):
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+
+def _hf_request(url: str, token: str = "", method: str = "GET") -> urllib.request.Request:
+    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+    if token.strip():
+        headers["Authorization"] = f"Bearer {token.strip()}"
+    return urllib.request.Request(url, headers=headers, method=method)
+
+
+def hf_whoami(token: str) -> dict:
+    with urllib.request.urlopen(
+        _hf_request(f"{HF_API_BASE}/api/whoami-v2", token),
+        timeout=12,
+        context=ssl.create_default_context(cafile=certifi.where()),
+    ) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def hf_file_access_status(token: str, repo_id: str, filename: str) -> tuple[bool, str]:
+    url = f"{HF_API_BASE}/{repo_id}/resolve/main/{filename}"
+    try:
+        with urllib.request.urlopen(
+            _hf_request(url, token, method="HEAD"),
+            timeout=12,
+            context=ssl.create_default_context(cafile=certifi.where()),
+        ) as response:
+            return 200 <= response.status < 400, f"HTTP {response.status}"
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
+            return False, "conditions à accepter ou token sans accès"
+        if exc.code == 404:
+            return False, "fichier de contrôle introuvable"
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def export_logs_archive(parent: QWidget | None = None) -> Path | None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_path = Path.home() / "Desktop" / f"ekovideo-logs-{timestamp}.zip"
+    chosen, _ = QFileDialog.getSaveFileName(
+        parent,
+        "Exporter les logs",
+        str(default_path),
+        "Archive ZIP (*.zip)",
+    )
+    if not chosen:
+        return None
+
+    out_path = Path(chosen)
+    if out_path.suffix.lower() != ".zip":
+        out_path = out_path.with_suffix(".zip")
+
+    support_dir = app_support_dir()
+    summary = {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "support_dir": str(support_dir),
+        "python": sys.version,
+        "platform": sys.platform,
+        "ffmpeg_in_path": bool(find_binary("ffmpeg")),
+        "ffprobe_in_path": bool(find_binary("ffprobe")),
+        "mlx_whisper_in_path": bool(find_binary("mlx_whisper")),
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, arcname in (
+            (app_log_path(), "app.log"),
+            (updater_log_path(), "updater.log"),
+        ):
+            if path.exists():
+                archive.write(path, arcname)
+        archive.writestr("diagnostic.json", json.dumps(summary, indent=2, ensure_ascii=False))
+
+    append_app_log(f"logs_exported path={str(out_path)!r}")
+    return out_path
 
 
 def managed_transcription_venv_dir() -> Path:
@@ -591,6 +690,117 @@ def is_hf_model_cached(repo_id: str) -> bool:
     return False
 
 
+class HuggingFaceAuthDialog(QDialog):
+    def __init__(self, token: str = "", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Connexion Hugging Face")
+        self.setModal(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(12)
+
+        intro = QLabel(
+            "Connectez un compte Hugging Face pour télécharger les modèles gated "
+            "utilisés par la détection des locuteurs. Hugging Face impose que "
+            "l'utilisateur accepte les conditions dans le navigateur ; l'app vérifie "
+            "ensuite automatiquement l'accès."
+        )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.token_edit = QLineEdit(token or "")
+        self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_edit.setPlaceholderText("Token Hugging Face avec droit Read")
+        form.addRow("Token", self.token_edit)
+        root.addLayout(form)
+
+        actions = QHBoxLayout()
+        self.btn_token = QPushButton("Créer / gérer le token")
+        self.btn_token.clicked.connect(lambda: _open_url(HF_TOKEN_URL))
+        self.btn_terms = QPushButton("Ouvrir les conditions")
+        self.btn_terms.clicked.connect(self.open_terms_pages)
+        self.btn_verify = QPushButton("Vérifier l'accès")
+        self.btn_verify.setObjectName("primaryButton")
+        self.btn_verify.clicked.connect(self.verify_access)
+        actions.addWidget(self.btn_token)
+        actions.addWidget(self.btn_terms)
+        actions.addWidget(self.btn_verify)
+        root.addLayout(actions)
+
+        self.status = QTextEdit()
+        self.status.setReadOnly(True)
+        self.status.setAcceptRichText(False)
+        self.status.setMinimumHeight(170)
+        self.status.setPlainText(
+            "1. Ouvrez les conditions et acceptez les modèles nécessaires.\n"
+            "2. Créez un token Hugging Face avec le droit Read.\n"
+            "3. Collez-le ici puis vérifiez l'accès."
+        )
+        root.addWidget(self.status)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.setMinimumWidth(680)
+        self.resize(740, 430)
+
+    def token(self) -> str:
+        return self.token_edit.text().strip()
+
+    def open_terms_pages(self):
+        _open_url(f"{HF_API_BASE}/login")
+        for repo_id, _filename, _label in HF_GATED_MODEL_CHECKS:
+            _open_url(f"{HF_API_BASE}/{repo_id}")
+
+    def verify_access(self):
+        token = self.token()
+        if not token:
+            self.status.setPlainText("Collez d'abord un token Hugging Face.")
+            return
+
+        lines: list[str] = []
+        try:
+            user = hf_whoami(token)
+            username = (
+                user.get("name")
+                or user.get("preferred_username")
+                or user.get("sub")
+                or "compte HF"
+            )
+            lines.append(f"Compte connecté: {username}")
+        except urllib.error.HTTPError as exc:
+            self.status.setPlainText(
+                f"Token refusé par Hugging Face (HTTP {exc.code}). Vérifiez le token et son droit Read."
+            )
+            return
+        except Exception as exc:
+            self.status.setPlainText(f"Vérification du compte impossible: {exc}")
+            return
+
+        all_ok = True
+        lines.append("")
+        for repo_id, filename, label in HF_GATED_MODEL_CHECKS:
+            ok, detail = hf_file_access_status(token, repo_id, filename)
+            all_ok = all_ok and ok
+            marker = "OK" if ok else "À accepter"
+            lines.append(f"{marker} · {label} ({repo_id}) — {detail}")
+
+        if all_ok:
+            lines.append("\nTous les accès nécessaires à la détection des locuteurs sont validés.")
+        else:
+            lines.append(
+                "\nOuvrez les conditions, acceptez les modèles manquants dans le navigateur, "
+                "puis relancez cette vérification."
+            )
+        self.status.setPlainText("\n".join(lines))
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -649,6 +859,11 @@ class SettingsDialog(QDialog):
         )
         hint.setWordWrap(True)
         tools_form.addRow("", hint)
+
+        btn_export_logs = QPushButton("Exporter les logs…")
+        btn_export_logs.setObjectName("secondaryButton")
+        btn_export_logs.clicked.connect(self.export_logs)
+        tools_form.addRow("Diagnostic", btn_export_logs)
 
         transcription_tab = QWidget()
         transcription_form = QFormLayout(transcription_tab)
@@ -749,19 +964,23 @@ class SettingsDialog(QDialog):
         )
         transcription_form.addRow("", self.transcription_diarization_check)
 
-        self.transcription_hf_token_edit = QLineEdit(
-            str(transcription_settings.get("hf_token", ""))
-        )
+        self.transcription_hf_token_edit = QLineEdit(str(transcription_settings.get("hf_token", "")))
         self.transcription_hf_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.transcription_hf_token_edit.setPlaceholderText(
             "hf_xxxxxxxx (Hugging Face, requis pour la détection des locuteurs)"
         )
-        transcription_form.addRow("Token Hugging Face", self.transcription_hf_token_edit)
+        hf_token_row = QHBoxLayout()
+        hf_token_row.addWidget(self.transcription_hf_token_edit, 1)
+        btn_hf_auth = QPushButton("Connecter…")
+        btn_hf_auth.setObjectName("secondaryButton")
+        btn_hf_auth.clicked.connect(self.open_huggingface_auth)
+        hf_token_row.addWidget(btn_hf_auth, 0)
+        transcription_form.addRow("Hugging Face", hf_token_row)
 
         hf_hint = QLabel(
-            "Token requis pour la détection des locuteurs. Créez-le sur "
-            "huggingface.co/settings/tokens (Read access) APRÈS avoir accepté "
-            "les licences :\n"
+            "Connexion requise pour la détection des locuteurs. Hugging Face impose "
+            "l'acceptation des conditions dans le navigateur ; l'app vérifie ensuite "
+            "que le token Read peut accéder aux modèles :\n"
             "• huggingface.co/pyannote/segmentation-3.0\n"
             "• huggingface.co/pyannote/speaker-diarization-3.1\n"
             "• huggingface.co/pyannote/speaker-diarization-community-1"
@@ -940,6 +1159,20 @@ class SettingsDialog(QDialog):
         path, _ = QFileDialog.getOpenFileName(self, "Choisir mlx_whisper", str(Path.home()), "Tous (*.*)")
         if path:
             self.mlx_whisper_edit.setText(path)
+
+    def export_logs(self):
+        try:
+            archive = export_logs_archive(self)
+        except Exception as exc:
+            QMessageBox.warning(self, "Exporter les logs", f"Export impossible: {exc}")
+            return
+        if archive:
+            QMessageBox.information(self, "Logs exportés", f"Archive créée:\n{archive}")
+
+    def open_huggingface_auth(self):
+        dlg = HuggingFaceAuthDialog(self.transcription_hf_token_edit.text().strip(), self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.transcription_hf_token_edit.setText(dlg.token())
 
     def _combo_model_id(self, combo: QComboBox) -> str:
         # currentData() is the structured model id. The visible text includes
@@ -3223,6 +3456,8 @@ class MainWindow(QWidget):
         self._active_workers: list[QThread] = []
         self.mlx_install_worker: MlxWhisperInstallWorker | None = None
         self.batch_mode = "compress"
+        self.job_run_modes: dict[int, str] = {}
+        self.current_job_mode = "compress"
         self.current_job_progress_offset = 0
         self.current_job_progress_scale = 100
         self.current_job_started_at: float | None = None
@@ -3247,6 +3482,31 @@ class MainWindow(QWidget):
 
         if not self.ffmpeg_path:
             self.status.setText("ffmpeg non détecté. Ouvrez Paramètres (⚙).")
+        if not self.transcription_hf_token and not self.settings.value(
+            "hf_onboarding_seen", False, type=bool
+        ):
+            QTimer.singleShot(800, self._maybe_prompt_hf_onboarding)
+
+    def _maybe_prompt_hf_onboarding(self):
+        if self.transcription_hf_token:
+            return
+        self.settings.setValue("hf_onboarding_seen", True)
+        answer = QMessageBox.question(
+            self,
+            "Connexion Hugging Face",
+            (
+                "La détection des locuteurs utilise des modèles Hugging Face qui "
+                "demandent une connexion et l'acceptation de conditions.\n\n"
+                "Voulez-vous configurer Hugging Face maintenant ?"
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        dlg = HuggingFaceAuthDialog("", self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.transcription_hf_token = dlg.token()
+            self.settings.setValue("transcription_hf_token", self.transcription_hf_token)
+            self._refresh_transcription_summary()
 
     def _build_ui(self, icon_path: str):
         root = QVBoxLayout(self)
@@ -4736,10 +4996,17 @@ class MainWindow(QWidget):
                 settings=asdict(job)
             )
             job.db_id = db_id
+
+            if self.is_batch_running:
+                self._prepare_job_for_active_batch(job, self.batch_mode)
             
             self.queue_jobs.append(job)
             self.queue_list.addItem(QListWidgetItem())
-            self.refresh_queue_item(len(self.queue_jobs) - 1)
+            new_idx = len(self.queue_jobs) - 1
+            if self.is_batch_running:
+                self.job_run_modes[id(job)] = self.batch_mode
+                self.pending_indices.append(new_idx)
+            self.refresh_queue_item(new_idx)
             existing.add(resolved)
             added += 1
 
@@ -4753,11 +5020,32 @@ class MainWindow(QWidget):
                 f"{added} fichier(s) ajouté(s) · {rejected} ignoré(s) (extension non supportée)."
             )
         elif added:
-            self.status.setText(f"{added} fichier(s) ajouté(s).")
+            suffix = " à la file en cours." if self.is_batch_running else "."
+            self.status.setText(f"{added} fichier(s) ajouté(s){suffix}")
         elif rejected:
             self.status.setText(
                 f"{rejected} fichier(s) ignoré(s) — extensions acceptées: vidéo (mp4, mov…) ou audio (mp3, m4a, wav…)."
             )
+
+    def _prepare_job_for_active_batch(self, job: QueueJob, mode: str):
+        """
+        Allow users to keep dropping files while a batch is running. New
+        items inherit the current batch mode and are appended after all
+        already-pending items; the running job itself is untouched.
+        """
+        out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if mode in {"compress", "compress_transcribe"}:
+            job.output_path = default_out_path(job.input_path, str(out_dir), self.edit_suffix.text().strip())
+        if mode in {"transcribe", "compress_transcribe"}:
+            job.transcript_path = self._transcription_output_path(job, out_dir)
+        job.status = "pending"
+        job.error_message = ""
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "PENDING", "")
+            if job.output_path:
+                self.db.update_job_output(job.db_id, job.output_path)
+            self.db.update_job_progress(job.db_id, step="En attente…", progress_pct=0, eta_seconds=None)
 
     def remove_selected_files(self):
         rows = sorted({idx.row() for idx in self.queue_list.selectedIndexes()}, reverse=True)
@@ -4839,12 +5127,14 @@ class MainWindow(QWidget):
         Keep self.queue_jobs in sync when the user drags an item
         somewhere else in the queue list. Qt has already moved the
         QListWidgetItem; we mirror the same move on the parallel
-        queue_jobs array. We never reorder while a batch is running
-        (the queue list is hidden in that mode anyway, but defensively).
+        queue_jobs array. While a batch is running, only still-pending
+        items can move; the running/done/failed rows stay anchored so
+        worker indices keep pointing at the right job.
         """
-        if self.is_batch_running:
-            return
         if start < 0 or start >= len(self.queue_jobs):
+            return
+        if end != start:
+            self.refresh_all_queue_items()
             return
         # Qt's contract for rowsMoved: dest_row is the index BEFORE the
         # move, in the destination, where the item lands. When moving
@@ -4855,8 +5145,13 @@ class MainWindow(QWidget):
             target -= 1
         if target < 0 or target >= len(self.queue_jobs) or target == start:
             return
+        if self.is_batch_running and not self._can_move_queue_row_while_running(start, target):
+            self.refresh_all_queue_items()
+            return
         item = self.queue_jobs.pop(start)
         self.queue_jobs.insert(target, item)
+        if self.is_batch_running:
+            self._rebuild_pending_indices()
         # The current_index should track the moved item if it was
         # selected, otherwise stay on whatever's now at that row.
         if self.current_index == start:
@@ -4866,6 +5161,34 @@ class MainWindow(QWidget):
         elif target <= self.current_index < start:
             self.current_index += 1
         self.refresh_all_queue_items()
+
+    def _can_move_queue_row_while_running(self, start: int, target: int) -> bool:
+        moving = self.queue_jobs[start]
+        if moving.status != "pending":
+            return False
+        moved_ids = {id(moving)}
+        low = min(start, target)
+        high = max(start, target)
+        for idx in range(low, high + 1):
+            if idx == start:
+                continue
+            job = self.queue_jobs[idx]
+            if job.status != "pending" and id(job) not in moved_ids:
+                return False
+        return True
+
+    def _rebuild_pending_indices(self):
+        self.pending_indices = [
+            idx
+            for idx, job in enumerate(self.queue_jobs)
+            if job.status == "pending"
+        ]
+
+    def _job_run_mode(self, job: QueueJob) -> str:
+        return self.job_run_modes.get(id(job), self.batch_mode)
+
+    def _set_all_job_run_modes(self, mode: str):
+        self.job_run_modes = {id(job): mode for job in self.queue_jobs}
 
     def on_queue_selection_changed(self, row: int):
         self.current_index = row
@@ -5109,13 +5432,13 @@ class MainWindow(QWidget):
         # batches in a row only see the switch once.
         if running:
             self._did_auto_switch_to_library = False
-        self.btn_pick.setEnabled(not running)
+        self.btn_pick.setEnabled(True)
         self.btn_remove.setEnabled(not running)
         self.btn_clear.setEnabled(not running)
         self.btn_start.setEnabled(bool(self.queue_jobs) and not running)
         self.btn_transcribe.setEnabled(bool(self.queue_jobs) and not running)
         self.btn_cancel.setEnabled(running)
-        self.btn_settings.setEnabled(not running)
+        self.btn_settings.setEnabled(True)
         self.btn_update.setEnabled(not running and self.update_worker is None)
         self.btn_apply_to_all.setEnabled(not running)
         self.btn_reset_preset.setEnabled(not running)
@@ -5161,6 +5484,7 @@ class MainWindow(QWidget):
             self.queue_jobs[idx].error_message = ""
 
         self.pending_indices = list(range(len(self.queue_jobs)))
+        self._set_all_job_run_modes(self.batch_mode)
         self.completed_count = 0
         self.failed_count = 0
         self.progress.setRange(0, 100)
@@ -5209,6 +5533,7 @@ class MainWindow(QWidget):
             self.queue_jobs[idx].error_message = ""
 
         self.pending_indices = list(range(len(self.queue_jobs)))
+        self._set_all_job_run_modes(self.batch_mode)
         self.completed_count = 0
         self.failed_count = 0
         self.progress.setRange(0, 100)
@@ -5225,15 +5550,9 @@ class MainWindow(QWidget):
         Take an existing library job, reset whatever artefacts the user
         wants to redo, and start a single-job batch on it. Driven from
         LibraryView's "Relancer / Réparer" popup so a relaunch actually
-        runs even when the queue is otherwise empty.
+        runs even when the queue is otherwise empty. If another batch is
+        already running, append the repaired job to the pending queue.
         """
-        if self.is_batch_running:
-            QMessageBox.warning(
-                self,
-                "Traitement en cours",
-                "Un traitement est déjà en cours. Annulez-le ou attendez la fin.",
-            )
-            return
         record = self.db.get_job(job_id)
         if not record:
             return
@@ -5307,6 +5626,26 @@ class MainWindow(QWidget):
         if wants_review:
             self.transcription_audio_recheck_enabled = True
 
+        out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if mode in ("compress", "compress_transcribe") and not job.output_path:
+            job.output_path = default_out_path(job.input_path, str(out_dir), self.edit_suffix.text().strip())
+        if mode in ("transcribe", "compress_transcribe") and not job.transcript_path:
+            job.transcript_path = self._transcription_output_path(job, out_dir)
+
+        if self.is_batch_running:
+            self.queue_jobs.append(job)
+            self.queue_list.addItem(QListWidgetItem())
+            new_idx = len(self.queue_jobs) - 1
+            self.job_run_modes[id(job)] = mode
+            self.pending_indices.append(new_idx)
+            self.refresh_queue_item(new_idx)
+            self.library_view.refresh()
+            self.status.setText(f"Relance ajoutée à la file: {Path(job.input_path).name}")
+            if wants_review and prev_recheck is not None:
+                self.transcription_audio_recheck_enabled = prev_recheck
+            return
+
         # Replace the queue with this single job and kick off the
         # appropriate batch.
         self.queue_jobs = [job]
@@ -5314,13 +5653,7 @@ class MainWindow(QWidget):
         self.queue_list.addItem(QListWidgetItem())
         self.refresh_queue_item(0)
         self.batch_mode = mode
-
-        out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
-        out_dir.mkdir(parents=True, exist_ok=True)
-        if mode in ("compress", "compress_transcribe") and not job.output_path:
-            job.output_path = default_out_path(job.input_path, str(out_dir), self.edit_suffix.text().strip())
-        if mode in ("transcribe", "compress_transcribe") and not job.transcript_path:
-            job.transcript_path = self._transcription_output_path(job, out_dir)
+        self.job_run_modes = {id(job): mode}
 
         self.pending_indices = [0]
         self.completed_count = 0
@@ -5351,6 +5684,7 @@ class MainWindow(QWidget):
         idx = self.pending_indices.pop(0)
         self.running_index = idx
         job = self.queue_jobs[idx]
+        self.current_job_mode = self._job_run_mode(job)
         job.status = "running"
         job.error_message = ""
         self.current_job_started_at = time.monotonic()
@@ -5384,14 +5718,14 @@ class MainWindow(QWidget):
         total = len(self.queue_jobs)
         self.status.setText(f"Traitement {current}/{total}: {Path(job.input_path).name}")
 
-        if self.batch_mode == "transcribe":
+        if self.current_job_mode == "transcribe":
             self.current_job_progress_offset = 0
             self.current_job_progress_scale = 100
             self._start_transcribe_worker(idx)
             return
 
         self.current_job_progress_offset = 0
-        self.current_job_progress_scale = 50 if self.batch_mode == "compress_transcribe" else 100
+        self.current_job_progress_scale = 50 if self.current_job_mode == "compress_transcribe" else 100
         worker = EncodeWorker(self.ffmpeg_path, self.ffprobe_path, replace(job))
         self.worker = worker
         self._track_worker(worker)
@@ -5530,7 +5864,8 @@ class MainWindow(QWidget):
             return
         idx = self.running_index
         job = self.queue_jobs[idx]
-        if self.batch_mode == "compress_transcribe":
+        mode = self._job_run_mode(job)
+        if mode == "compress_transcribe":
             job.output_path = out_path
             self.current_job_progress_offset = 50
             self.current_job_progress_scale = 50
