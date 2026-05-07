@@ -29,6 +29,7 @@ from transcription_utils import (
     build_llm_title_cmd,
     build_mlx_whisper_cmd,
     build_multimodal_audio_cmd,
+    canonical_whisper_model_id,
     clean_whisper_segments,
     default_transcript_path,
     parse_diarization_output,
@@ -421,6 +422,18 @@ class LlmCatalogTest(unittest.TestCase):
         ids = {entry["id"] for entry in WHISPER_MODELS}
         self.assertIn(DEFAULT_WHISPER_MODEL, ids)
         self.assertIn("turbo", DEFAULT_WHISPER_MODEL)
+        self.assertIn("mlx-community/whisper-large-v3-mlx", ids)
+        self.assertNotIn("mlx-community/whisper-large-v3", ids)
+
+    def test_whisper_legacy_model_ids_are_canonicalized(self):
+        self.assertEqual(
+            canonical_whisper_model_id("mlx-community/whisper-large-v3"),
+            "mlx-community/whisper-large-v3-mlx",
+        )
+        self.assertEqual(
+            canonical_whisper_model_id("mlx-community/whisper-medium"),
+            "mlx-community/whisper-medium-mlx",
+        )
 
     def test_audio_catalog_has_required_keys(self):
         self.assertGreaterEqual(len(AUDIO_LLM_MODELS), 1)

@@ -40,6 +40,7 @@ from transcription_utils import (
     build_llm_title_cmd,
     build_multimodal_audio_cmd,
     build_mlx_whisper_cmd,
+    canonical_whisper_model_id,
     default_transcript_path,
     parse_diarization_output,
     parse_llm_corrections_markdown,
@@ -665,7 +666,9 @@ class SettingsDialog(QDialog):
         mlx_row.addWidget(btn_mlx_whisper)
         transcription_form.addRow("Commande", mlx_row)
 
-        current_whisper = str(transcription_settings.get("model") or DEFAULT_WHISPER_MODEL)
+        current_whisper = canonical_whisper_model_id(
+            str(transcription_settings.get("model") or DEFAULT_WHISPER_MODEL)
+        )
         self.transcription_model_combo = self._build_model_combo(WHISPER_MODELS, current_whisper)
         transcription_form.addRow("Modèle Whisper", self.transcription_model_combo)
 
@@ -953,7 +956,9 @@ class SettingsDialog(QDialog):
             self.token_edit.text().strip(),
             {
                 "mlx_whisper_path": self.mlx_whisper_edit.text().strip(),
-                "model": self.transcription_model_combo.currentData() or DEFAULT_WHISPER_MODEL,
+                "model": canonical_whisper_model_id(
+                    str(self.transcription_model_combo.currentData() or DEFAULT_WHISPER_MODEL)
+                ),
                 "text_llm_model": self._combo_model_id(self.transcription_text_llm_combo),
                 "audio_llm_model": self._combo_model_id(self.transcription_audio_llm_combo),
                 "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
@@ -3176,9 +3181,9 @@ class MainWindow(QWidget):
             or find_binary("mlx_whisper")
             or ""
         )
-        self.transcription_model = str(
-            self.settings.value("transcription_model", DEFAULT_WHISPER_MODEL, type=str)
-        ).strip() or DEFAULT_WHISPER_MODEL
+        self.transcription_model = canonical_whisper_model_id(
+            str(self.settings.value("transcription_model", DEFAULT_WHISPER_MODEL, type=str))
+        )
         # The legacy "transcription_llm_model" key was a single field used for
         # both text and audio analyses, even though those need different
         # families. We split it into two and migrate any old value into the
@@ -4165,8 +4170,8 @@ class MainWindow(QWidget):
         self.ffprobe_path = ffprobe_path or find_binary("ffprobe") or ""
         self.github_token = github_token
         self.mlx_whisper_path = str(transcription_settings.get("mlx_whisper_path", "")).strip()
-        self.transcription_model = (
-            str(transcription_settings.get("model", "")).strip() or DEFAULT_WHISPER_MODEL
+        self.transcription_model = canonical_whisper_model_id(
+            str(transcription_settings.get("model", ""))
         )
         self.transcription_text_llm_model = (
             str(transcription_settings.get("text_llm_model", "")).strip() or DEFAULT_TEXT_LLM_MODEL
