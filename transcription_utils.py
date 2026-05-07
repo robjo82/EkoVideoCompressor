@@ -388,10 +388,17 @@ def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
     return out
 
 
-_LLM_POST_PROCESS_SCRIPT = '''
+# The LLM post-process used to ask the model for {title, speakers,
+# corrections, uncertain_passages} in a single 1800-token JSON blob.
+# In practice mlx_lm + Mistral-7B-4bit drifts past ~700 tokens of JSON
+# and emits a missing comma every other run, killing the whole pass.
+# Splitting into two short calls makes each one reliable enough to
+# parse, and lets the title/speakers pass succeed even if the
+# corrections pass fails.
+
+_LLM_TITLE_SPEAKERS_SCRIPT = '''
 import json
 import sys
-import os
 
 try:
     from mlx_lm import load, generate
@@ -405,64 +412,143 @@ glossary = sys.argv[3] if len(sys.argv) > 3 else ""
 
 try:
     with open(transcript_path, "r", encoding="utf-8") as f:
-        text = f.read()[:45000]
+        text = f.read()
+    # Title/speakers can be guessed from the first 6-8 minutes of dialogue;
+    # we cap the input so we always finish in a reasonable time and never
+    # overflow the model's context.
+    text = text[:18000]
 
     model, tokenizer = load(model_path)
 
-    prompt = f"""[INST] Tu es un assistant expert en transcription de réunions professionnelles françaises.
-Tu dois améliorer la transcription SANS inventer.
+    prompt = f"""[INST] Tu es un assistant qui résume de courtes transcriptions de réunions en français.
+
+Tâche : à partir de la transcription ci-dessous, propose
+- un titre court et descriptif (5 à 10 mots, sans guillemets)
+- pour chaque SPEAKER_XX présent, son prénom probable s'il est mentionné explicitement dans la transcription
 
 Règles strictes :
-- Ne propose une correction que si le texte original exact apparait dans la transcription.
-- Une correction doit préserver le sens oral et être justifiée par le contexte.
-- Pour les doutes, ne corrige pas : ajoute un élément dans uncertain_passages.
-- Utilise le vocabulaire métier fourni en priorité.
-- Réponds uniquement en JSON valide, sans markdown.
+- Réponds UNIQUEMENT par un objet JSON valide, sans texte avant/après, sans markdown.
+- Chaque clé "speakers" est un identifiant SPEAKER_XX et la valeur est un prénom (ou "" si tu n'es pas sûr).
+- N'invente JAMAIS un prénom : laisse la chaîne vide en cas de doute.
+- Ne mets que les SPEAKER_XX présents dans la transcription.
 
-Schéma JSON attendu :
-{{
-  "title": "Titre court et professionnel",
-  "speakers": {{"SPEAKER_00": "Nom probable"}},
-  "corrections": [
-    {{
-      "timestamp": "00:12:34",
-      "original": "texte exact à remplacer",
-      "replacement": "texte corrigé",
-      "confidence": 0.0,
-      "reason": "raison courte"
-    }}
-  ],
-  "uncertain_passages": [
-    {{
-      "timestamp": "00:12:34",
-      "text": "extrait douteux",
-      "reason": "pourquoi c'est douteux",
-      "suggestion": "hypothèse éventuelle"
-    }}
-  ]
-}}
+Schéma exact attendu :
+{{"title": "...", "speakers": {{"SPEAKER_00": "..."}}}}
 
-Vocabulaire métier :
-{glossary or "(aucun vocabulaire fourni)"}
+Vocabulaire métier (à respecter dans le titre) :
+{glossary or "(aucun)"}
 
-Transcription horodatée :
+Transcription :
 {text}
 [/INST]"""
 
-    response = generate(model, tokenizer, prompt=prompt, max_tokens=1800, verbose=False)
-
-    # Try to extract JSON from response
-    start = response.find("{")
-    end = response.rfind("}") + 1
-    if start < 0 or end <= start:
-        raise ValueError("no JSON object in model response")
-    result = json.loads(response[start:end])
-    print(json.dumps(result))
+    # Short cap — title + speakers fit comfortably in 250 tokens.
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=300, verbose=False)
+    print(response)
 
 except Exception as e:
     print(json.dumps({"error": str(e)}))
     sys.exit(2)
 '''
+
+
+# The corrections pass is intentionally asked in markdown (not JSON) so a
+# missing comma or quote doesn't burn the entire result. The Python-side
+# parser walks the output line by line.
+_LLM_CORRECTIONS_SCRIPT = '''
+import json
+import sys
+
+try:
+    from mlx_lm import load, generate
+except ImportError:
+    print(json.dumps({"error": "mlx-lm not installed"}))
+    sys.exit(1)
+
+model_path = sys.argv[1]
+transcript_path = sys.argv[2]
+glossary = sys.argv[3] if len(sys.argv) > 3 else ""
+
+try:
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    text = text[:30000]
+
+    model, tokenizer = load(model_path)
+
+    prompt = f"""[INST] Tu es un relecteur expert de transcriptions de réunions professionnelles françaises.
+
+Repère uniquement :
+1. Les passages où Whisper a probablement mal entendu un terme métier ou un nom propre listé dans le vocabulaire ci-dessous, et où tu peux proposer la bonne version sans inventer.
+2. Les passages clairement douteux que tu signales SANS corriger.
+
+Règles strictes :
+- N'INVENTE JAMAIS de mots qui ne sont pas dans la transcription.
+- Format de sortie : markdown, exactement le format ci-dessous, rien d'autre.
+- Si rien à corriger : écris "Aucune correction." puis "Aucun doute." et stop.
+- Maximum 5 corrections + 5 doutes.
+
+Format exact (chaque entrée sur 2 lignes) :
+
+# Corrections
+- [00:12:34] "texte exact dans la transcription" -> "texte corrigé" (raison: …)
+- [00:14:02] "..." -> "..." (raison: …)
+
+# Doutes
+- [00:18:30] "passage exact douteux" (raison: …)
+
+Vocabulaire métier (priorité absolue) :
+{glossary or "(aucun)"}
+
+Transcription :
+{text}
+[/INST]"""
+
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=900, verbose=False)
+    print(response)
+
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(2)
+'''
+
+
+def build_llm_title_cmd(
+    venv_python_path: str,
+    model_path: str,
+    transcript_path: str,
+    glossary: str = "",
+) -> list[str]:
+    return [
+        venv_python_path,
+        "-c",
+        _LLM_TITLE_SPEAKERS_SCRIPT,
+        model_path,
+        transcript_path,
+        glossary,
+    ]
+
+
+def build_llm_corrections_cmd(
+    venv_python_path: str,
+    model_path: str,
+    transcript_path: str,
+    glossary: str = "",
+) -> list[str]:
+    return [
+        venv_python_path,
+        "-c",
+        _LLM_CORRECTIONS_SCRIPT,
+        model_path,
+        transcript_path,
+        glossary,
+    ]
+
+
+# Kept as an alias for callers that already use the old name; points at
+# the title/speakers script which is what the worker calls first.
+_LLM_POST_PROCESS_SCRIPT = _LLM_TITLE_SPEAKERS_SCRIPT
+
 
 def build_llm_cmd(
     venv_python_path: str,
@@ -470,7 +556,145 @@ def build_llm_cmd(
     transcript_path: str,
     glossary: str = "",
 ) -> list[str]:
-    return [venv_python_path, "-c", _LLM_POST_PROCESS_SCRIPT, model_path, transcript_path, glossary]
+    """Backwards-compatible alias for the title/speakers call."""
+    return build_llm_title_cmd(venv_python_path, model_path, transcript_path, glossary)
+
+
+def parse_llm_title_speakers(stdout: str) -> dict:
+    """
+    Parse a JSON {"title": ..., "speakers": {...}} blob produced by the
+    title/speakers script. Tolerates leading prose and missing trailing
+    delimiters so a slightly drifting model still gives us something.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        return {}
+    # Direct parse first (the script prints raw JSON when it succeeds).
+    try:
+        payload = json.loads(text.splitlines()[-1])
+        if isinstance(payload, dict) and "error" in payload:
+            return {}
+        if isinstance(payload, dict):
+            return _coerce_title_speakers(payload)
+    except Exception:
+        pass
+
+    # Fallback: extract the first balanced {...} substring.
+    repaired = _extract_first_json_object(text)
+    if repaired is None:
+        return {}
+    try:
+        payload = json.loads(repaired)
+    except Exception:
+        # Best effort: trim trailing comma before closing brace.
+        cleaned = re.sub(r",(\s*[}\]])", r"\1", repaired)
+        try:
+            payload = json.loads(cleaned)
+        except Exception:
+            return {}
+    return _coerce_title_speakers(payload if isinstance(payload, dict) else {})
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _coerce_title_speakers(payload: dict) -> dict:
+    title = str(payload.get("title") or "").strip().strip('"').strip()
+    speakers_raw = payload.get("speakers") or {}
+    speakers: dict[str, str] = {}
+    if isinstance(speakers_raw, dict):
+        for key, value in speakers_raw.items():
+            key_str = str(key).strip()
+            value_str = str(value).strip().strip('"').strip()
+            if key_str.startswith("SPEAKER_") and value_str:
+                speakers[key_str] = value_str
+    return {"title": title, "speakers": speakers}
+
+
+_CORRECTION_LINE = re.compile(
+    r'^[-*]\s*\[?(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]?\s*'
+    r'"(?P<original>[^"]+)"\s*(?:->|→|=>)\s*"(?P<replacement>[^"]+)"\s*'
+    r'(?:\(raison\s*:\s*(?P<reason>[^)]*)\))?',
+    re.IGNORECASE,
+)
+_DOUBT_LINE = re.compile(
+    r'^[-*]\s*\[?(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]?\s*'
+    r'"(?P<text>[^"]+)"\s*(?:\(raison\s*:\s*(?P<reason>[^)]*)\))?',
+    re.IGNORECASE,
+)
+
+
+def parse_llm_corrections_markdown(stdout: str) -> dict:
+    """
+    Parse the markdown produced by the corrections pass. Tolerant: a
+    drifting model that misses a quote on one line still leaves us
+    with the lines that were well-formed.
+    """
+    text = (stdout or "").strip()
+    if not text or "Aucune correction" in text and "Aucun doute" in text:
+        return {"corrections": [], "uncertain_passages": []}
+
+    corrections: list[dict] = []
+    uncertain: list[dict] = []
+    section: str | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered.startswith("# correction"):
+            section = "corrections"
+            continue
+        if lowered.startswith("# doute") or lowered.startswith("# uncertain"):
+            section = "uncertain"
+            continue
+        if section == "corrections":
+            match = _CORRECTION_LINE.match(line)
+            if match and len(corrections) < 20:
+                corrections.append({
+                    "timestamp": match.group("ts"),
+                    "original": match.group("original").strip(),
+                    "replacement": match.group("replacement").strip(),
+                    "confidence": 0.85,
+                    "reason": (match.group("reason") or "").strip(),
+                })
+        elif section == "uncertain":
+            match = _DOUBT_LINE.match(line)
+            if match and len(uncertain) < 20:
+                uncertain.append({
+                    "timestamp": match.group("ts"),
+                    "text": match.group("text").strip(),
+                    "reason": (match.group("reason") or "").strip(),
+                })
+
+    return {"corrections": corrections, "uncertain_passages": uncertain}
 #
 # We run pyannote.audio inside the same managed venv that hosts mlx_whisper.
 # The script below is invoked via `<venv>/bin/python -c <script>`. It loads

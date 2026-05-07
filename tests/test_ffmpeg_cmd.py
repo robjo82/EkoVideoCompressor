@@ -25,11 +25,15 @@ from transcription_utils import (
     build_audio_extract_cmd,
     build_diarization_cmd,
     build_llm_cmd,
+    build_llm_corrections_cmd,
+    build_llm_title_cmd,
     build_mlx_whisper_cmd,
     build_multimodal_audio_cmd,
     clean_whisper_segments,
     default_transcript_path,
     parse_diarization_output,
+    parse_llm_corrections_markdown,
+    parse_llm_title_speakers,
     parse_whisper_json_segments,
     render_segments_plain,
     render_segments_with_speakers,
@@ -174,10 +178,12 @@ class TranscriptionCommandTest(unittest.TestCase):
 
         self.assertEqual(cmd[0], "/tmp/venv/bin/python")
         self.assertEqual(cmd[-1], "DKV, Odoo, CVR Contrôles")
-        self.assertIn("corrections", cmd[2])
+        # The legacy alias now points at the title/speakers script.
+        self.assertIn("speakers", cmd[2])
 
-    def test_inline_llm_script_is_valid_python(self):
-        compile(transcription_utils._LLM_POST_PROCESS_SCRIPT, "<llm-post-process>", "exec")
+    def test_inline_llm_scripts_are_valid_python(self):
+        compile(transcription_utils._LLM_TITLE_SPEAKERS_SCRIPT, "<llm-title>", "exec")
+        compile(transcription_utils._LLM_CORRECTIONS_SCRIPT, "<llm-corrections>", "exec")
 
     def test_build_multimodal_audio_command_carries_model_and_clip(self):
         cmd = build_multimodal_audio_cmd(
@@ -445,6 +451,98 @@ class LlmCatalogTest(unittest.TestCase):
         custom = "user-org/Some-Custom-Model"
         self.assertEqual(text_llm_label_for(custom), custom)
         self.assertEqual(audio_llm_label_for(custom), custom)
+
+
+class LlmPostProcessParsingTest(unittest.TestCase):
+    """
+    These tests are the regression suite for the bug we just fixed: real
+    Mistral-7B 4-bit outputs that the previous single-shot JSON parser
+    rejected, leaving every transcription without a title or speakers.
+    """
+
+    def test_title_speakers_parses_clean_json(self):
+        out = parse_llm_title_speakers(
+            '{"title": "Présentation des outils RH", '
+            '"speakers": {"SPEAKER_00": "Robin", "SPEAKER_01": ""}}'
+        )
+        self.assertEqual(out["title"], "Présentation des outils RH")
+        # Empty values dropped — we never want to label a SPEAKER as "".
+        self.assertEqual(out["speakers"], {"SPEAKER_00": "Robin"})
+
+    def test_title_speakers_recovers_from_leading_prose(self):
+        # mlx_lm sometimes prepends "Voici votre JSON :" before the object.
+        text = (
+            "Voici votre JSON :\n"
+            '{"title": "Migration v19", "speakers": {"SPEAKER_00": "Robin"}}\n'
+            "(merci !)"
+        )
+        out = parse_llm_title_speakers(text)
+        self.assertEqual(out["title"], "Migration v19")
+
+    def test_title_speakers_recovers_from_trailing_comma(self):
+        # The exact failure mode from the user's app.log.
+        text = '{"title": "Stand-up Odoo", "speakers": {"SPEAKER_00": "Robin",}}'
+        out = parse_llm_title_speakers(text)
+        self.assertEqual(out["title"], "Stand-up Odoo")
+        self.assertEqual(out["speakers"], {"SPEAKER_00": "Robin"})
+
+    def test_title_speakers_returns_empty_on_pure_garbage(self):
+        out = parse_llm_title_speakers("désolé, je ne sais pas")
+        self.assertEqual(out, {})
+
+    def test_corrections_parses_well_formed_markdown(self):
+        text = """# Corrections
+- [00:12:34] "Adel" -> "Adèle" (raison: prénom dans glossaire)
+- [00:14:02] "modifs" -> "modifications" (raison: oral courant)
+
+# Doutes
+- [00:18:30] "Captivea" (raison: nom propre incertain)
+"""
+        out = parse_llm_corrections_markdown(text)
+        self.assertEqual(len(out["corrections"]), 2)
+        self.assertEqual(out["corrections"][0]["original"], "Adel")
+        self.assertEqual(out["corrections"][0]["replacement"], "Adèle")
+        self.assertEqual(len(out["uncertain_passages"]), 1)
+        self.assertEqual(out["uncertain_passages"][0]["text"], "Captivea")
+
+    def test_corrections_skips_malformed_lines(self):
+        # A single bad line shouldn't dynamite the whole pass — that was
+        # the central failure of the old single-JSON design.
+        text = """# Corrections
+- [00:12:34] "Adel" -> "Adèle" (raison: glossaire)
+- garbage line nobody can parse
+- [00:14:02] "modifs" -> "modifications"
+"""
+        out = parse_llm_corrections_markdown(text)
+        self.assertEqual(len(out["corrections"]), 2)
+
+    def test_corrections_handles_empty_marker(self):
+        text = "Aucune correction.\nAucun doute.\n"
+        out = parse_llm_corrections_markdown(text)
+        self.assertEqual(out, {"corrections": [], "uncertain_passages": []})
+
+    def test_build_title_cmd_carries_glossary(self):
+        cmd = build_llm_title_cmd(
+            "/v/bin/python",
+            "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+            "/tmp/t.txt",
+            "Adèle, Odoo",
+        )
+        self.assertEqual(cmd[0], "/v/bin/python")
+        self.assertEqual(cmd[-1], "Adèle, Odoo")
+        self.assertIn("speakers", cmd[2])
+
+    def test_build_corrections_cmd_carries_glossary(self):
+        cmd = build_llm_corrections_cmd(
+            "/v/bin/python",
+            "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+            "/tmp/t.txt",
+            "Adèle, Odoo",
+        )
+        self.assertEqual(cmd[0], "/v/bin/python")
+        self.assertEqual(cmd[-1], "Adèle, Odoo")
+        self.assertIn("Corrections", cmd[2])
+        self.assertIn("Doutes", cmd[2])
 
 
 if __name__ == "__main__":

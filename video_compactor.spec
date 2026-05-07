@@ -21,6 +21,14 @@ for asset in ("ekovideo_icon.png", "ekovideo_logo.png"):
     asset_path = project_dir / asset
     if asset_path.exists():
         datas.append((str(asset_path), "."))
+
+# Ship the SVG assets folder used by the stylesheet (chevron etc).
+assets_dir = project_dir / "assets"
+if assets_dir.exists():
+    for asset_path in sorted(assets_dir.iterdir()):
+        if asset_path.is_file():
+            datas.append((str(asset_path), "assets"))
+
 datas.append((certifi.where(), "certifi"))
 
 a = Analysis(
