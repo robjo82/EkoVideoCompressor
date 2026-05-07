@@ -36,11 +36,14 @@ from transcription_utils import (
     audio_llm_label_for,
     build_audio_extract_cmd,
     build_diarization_cmd,
-    build_llm_cmd,
+    build_llm_corrections_cmd,
+    build_llm_title_cmd,
     build_multimodal_audio_cmd,
     build_mlx_whisper_cmd,
     default_transcript_path,
     parse_diarization_output,
+    parse_llm_corrections_markdown,
+    parse_llm_title_speakers,
     parse_whisper_json_segments,
     render_segments_plain,
     render_segments_with_speakers,
@@ -62,10 +65,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -74,6 +79,8 @@ from PySide6.QtWidgets import (
     QSplitter,
     QSlider,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextEdit,
     QTimeEdit,
@@ -1167,31 +1174,88 @@ class TranscribeWorker(QThread):
         return True
 
     def _run_llm_post_process(self, analysis_path: Path, glossary: str) -> dict:
+        """
+        Two-step LLM analysis. Asking a 7B-4bit model for {title, speakers,
+        corrections, uncertain_passages} in one shot consistently broke the
+        JSON past ~700 output tokens. We now do:
+
+        1. Short JSON call (max 300 tokens) for title + speakers — small
+           enough to be reliable.
+        2. Markdown call (max 900 tokens) for corrections + doubts —
+           tolerant parser, a malformed line drops one entry instead of
+           wrecking the whole pass.
+
+        Either step may fail independently; the worker keeps going with
+        whatever partial data it got.
+        """
         if not analysis_path.exists() or not self._ensure_mlx_lm_available():
             return {}
 
-        self.status.emit("Analyse locale: titre, interlocuteurs, passages douteux…")
-        cmd = build_llm_cmd(self.venv_python_path, self.text_llm_model, str(analysis_path), glossary)
-        self._log(f"llm_postprocess_start model={self.text_llm_model!r}")
-        proc = subprocess.run(
-            cmd,
+        # --- Step 1: title + speakers ----------------------------------
+        self.status.emit("Analyse: titre et interlocuteurs…")
+        title_cmd = build_llm_title_cmd(
+            self.venv_python_path, self.text_llm_model, str(analysis_path), glossary
+        )
+        self._log(f"llm_title_start model={self.text_llm_model!r}")
+        title_proc = subprocess.run(
+            title_cmd,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            timeout=900,
+        )
+        title_speakers: dict = {}
+        if title_proc.returncode != 0:
+            self._log_process_result(
+                "llm_title_failed", title_proc.returncode, title_proc.stdout, title_proc.stderr
+            )
+        else:
+            self._log_process_result(
+                "llm_title_ok", title_proc.returncode, title_proc.stdout, title_proc.stderr
+            )
+            title_speakers = parse_llm_title_speakers(title_proc.stdout)
+            if not title_speakers:
+                self._log("llm_title_parse_empty")
+
+        # --- Step 2: corrections + doubts ------------------------------
+        self.status.emit("Analyse: corrections et passages douteux…")
+        corrections_cmd = build_llm_corrections_cmd(
+            self.venv_python_path, self.text_llm_model, str(analysis_path), glossary
+        )
+        self._log(f"llm_corrections_start model={self.text_llm_model!r}")
+        corrections_proc = subprocess.run(
+            corrections_cmd,
             capture_output=True,
             text=True,
             env=self._subprocess_env(),
             timeout=1800,
         )
-        if proc.returncode != 0:
-            self._log_process_result("llm_postprocess_failed", proc.returncode, proc.stdout, proc.stderr)
-            return {}
-        self._log_process_result("llm_postprocess_ok", proc.returncode, proc.stdout, proc.stderr)
+        corrections_payload: dict = {"corrections": [], "uncertain_passages": []}
+        if corrections_proc.returncode != 0:
+            self._log_process_result(
+                "llm_corrections_failed",
+                corrections_proc.returncode,
+                corrections_proc.stdout,
+                corrections_proc.stderr,
+            )
+        else:
+            self._log_process_result(
+                "llm_corrections_ok",
+                corrections_proc.returncode,
+                corrections_proc.stdout,
+                corrections_proc.stderr,
+            )
+            corrections_payload = parse_llm_corrections_markdown(corrections_proc.stdout)
 
-        try:
-            payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
-        except Exception as exc:
-            self._log(f"llm_postprocess_parse_failed error={exc!r}")
-            return {}
-
-        return payload if isinstance(payload, dict) else {}
+        # Merge both responses into the legacy payload shape so downstream
+        # code (_create_enhanced_transcript, _write_review_file…) stays
+        # untouched.
+        return {
+            "title": title_speakers.get("title", ""),
+            "speakers": title_speakers.get("speakers", {}),
+            "corrections": corrections_payload.get("corrections", []),
+            "uncertain_passages": corrections_payload.get("uncertain_passages", []),
+        }
 
     def _speaker_names_from_payload(self, payload: dict) -> dict[str, str]:
         speakers_raw = payload.get("speakers") or {}
@@ -1825,6 +1889,17 @@ class TranscribeWorker(QThread):
                 if self.job.db_id:
                     self.db.add_segments(self.job.db_id, whisper_segments)
 
+            # The base transcript is now usable on disk. Surface it
+            # immediately in the library so the user can open it while
+            # the LLM enhancement keeps running.
+            if self.job.db_id:
+                self.db.update_job_artefact(self.job.db_id, "transcript", str(out_path))
+                self.db.update_job_progress(
+                    self.job.db_id,
+                    step="Transcription disponible · amélioration en cours…",
+                    progress_pct=90,
+                )
+
             if self.job.db_id:
                 self.db.update_job_durations(self.job.db_id, d_ffmpeg, d_whisper, d_diarization)
 
@@ -1843,8 +1918,28 @@ class TranscribeWorker(QThread):
             if enhanced_out_path:
                 final_out_path = enhanced_out_path
                 final_out_path = self._rename_transcript_file(enhanced_out_path, f"{title} améliorée")
+                if self.job.db_id:
+                    self.db.update_job_artefact(
+                        self.job.db_id, "enhanced_transcript", str(final_out_path)
+                    )
             else:
                 final_out_path = self._rename_transcript_file(out_path, title)
+                # The base transcript may have been renamed — update the
+                # column so the "Ouvrir" button stays in sync.
+                if self.job.db_id and str(final_out_path) != str(out_path):
+                    self.db.update_job_artefact(
+                        self.job.db_id, "transcript", str(final_out_path)
+                    )
+
+            # The .md "à vérifier" report only exists when the LLM had
+            # something to flag, so we resolve the path lazily and
+            # record it only when present.
+            review_candidate = self._review_transcript_path(out_path)
+            if review_candidate.exists() and self.job.db_id:
+                self.db.update_job_artefact(
+                    self.job.db_id, "review", str(review_candidate)
+                )
+
             if self.job.db_id and title:
                 self.db.update_job_title(self.job.db_id, title)
 
@@ -1854,6 +1949,12 @@ class TranscribeWorker(QThread):
             self._update_db_status("COMPLETED")
             if self.job.db_id:
                 self.db.update_job_output(self.job.db_id, str(final_out_path))
+                self.db.update_job_progress(
+                    self.job.db_id,
+                    step="Terminé",
+                    progress_pct=100,
+                    eta_seconds=0,
+                )
             self._log(f"success output={str(final_out_path)!r}")
             self.finished_ok.emit(str(final_out_path))
         except Exception as exc:
@@ -2183,85 +2284,397 @@ class CollapsibleSection(QFrame):
         self._body.setVisible(checked)
 
 
+def _open_path(path: str | Path) -> None:
+    """Cross-platform "open this file in its default app"."""
+    p = Path(path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(p)])
+    elif sys.platform.startswith("win"):
+        os.startfile(str(p))
+    else:
+        subprocess.Popen(["xdg-open", str(p)])
+
+
+def _reveal_in_finder(path: str | Path) -> None:
+    p = Path(path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(p)] if p.is_file() else ["open", str(p)])
+    elif sys.platform.startswith("win"):
+        if p.is_file():
+            subprocess.Popen(["explorer", "/select,", str(p)])
+        else:
+            os.startfile(str(p))
+    else:
+        target = p if p.is_dir() else p.parent
+        subprocess.Popen(["xdg-open", str(target)])
+
+
+# Status enums used across DB / Library / workers. Kept loose (str) to
+# stay backwards-compatible with the older PENDING/COMPLETED/FAILED
+# values already stored in users' SQLite databases.
+JOB_RUNNING_STATES = {"RUNNING", "AUDIO_READY", "WHISPER_DONE", "IMPORTING"}
+JOB_DONE_STATES = {"COMPLETED"}
+JOB_FAILED_STATES = {"FAILED", "CANCELLED"}
+
+
 class LibraryView(QWidget):
+    """
+    The library is the canonical job dashboard: every job that's ever
+    been queued is here, with one row per file and one column per
+    artefact (compressed video, transcript, enhanced transcript, review
+    report). Running jobs show a spinner + step + ETA; completed jobs
+    expose their files via "Ouvrir" buttons that disable themselves
+    when the artefact isn't (yet) available.
+    """
+
+    COL_STATUS = 0
+    COL_FILE = 1
+    COL_COMPRESSED = 2
+    COL_TRANSCRIPT = 3
+    COL_ENHANCED = 4
+    COL_REVIEW = 5
+    COL_ACTIONS = 6
+    HEADERS = [
+        "Statut",
+        "Fichier",
+        "Compressé",
+        "Transcription",
+        "Améliorée",
+        "Rapport",
+        "Actions",
+    ]
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
     def __init__(self, db: DatabaseManager, parent: QWidget | None = None):
         super().__init__(parent)
         self.db = db
+        self._job_ids: list[int] = []
+        # Map db_id → row index so live status updates can repaint a
+        # single row without the cost of a full rebuild.
+        self._row_by_id: dict[int, int] = {}
+        self._spinner_step = 0
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 10, 0, 0)
-        
+        layout.setSpacing(8)
+
         search_box = QHBoxLayout()
+        search_box.setSpacing(6)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Rechercher un mot-clé ou un locuteur…")
         self.search_input.returnPressed.connect(self.refresh)
         btn_search = QPushButton("Chercher")
+        btn_search.setObjectName("secondaryButton")
         btn_search.clicked.connect(self.refresh)
-        search_box.addWidget(self.search_input)
-        search_box.addWidget(btn_search)
+        search_box.addWidget(self.search_input, 1)
+        search_box.addWidget(btn_search, 0)
         layout.addLayout(search_box)
-        
-        self.list = QListWidget()
-        self.list.setObjectName("libraryList")
-        self.list.itemDoubleClicked.connect(self.open_result)
-        layout.addWidget(self.list)
-        
-        self.btn_open = QPushButton("Voir résultat")
-        self.btn_open.clicked.connect(self.open_result)
 
-        # Reveal the transcript folder in Finder/Explorer so the user can
-        # open the "à vérifier.md" report, the enhanced version, or the
-        # original transcript side by side.
-        self.btn_show_folder = QPushButton("Ouvrir le dossier")
-        self.btn_show_folder.setObjectName("secondaryButton")
-        self.btn_show_folder.clicked.connect(self.show_folder)
+        self.table = QTableWidget(0, len(self.HEADERS))
+        self.table.setObjectName("libraryTable")
+        self.table.setHorizontalHeaderLabels(self.HEADERS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setShowGrid(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setWordWrap(False)
+        header = self.table.horizontalHeader()
+        # Source filename takes whatever space is left; the rest sit on a
+        # snug width so the artefact buttons line up vertically.
+        header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_STATUS, 180)
+        header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
+        # Per-column widths sized to fit the header label without
+        # cropping. "Transcription" is the longest one (~110 px in our
+        # font), the rest comfortably fit in 100.
+        artefact_widths = {
+            self.COL_COMPRESSED: 100,
+            self.COL_TRANSCRIPT: 115,
+            self.COL_ENHANCED: 100,
+            self.COL_REVIEW: 90,
+        }
+        for col, width in artefact_widths.items():
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(col, width)
+        header.setSectionResizeMode(self.COL_ACTIONS, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(self.COL_ACTIONS, 60)
+        self.table.verticalHeader().setDefaultSectionSize(54)
+        self.table.setColumnHidden(self.COL_FILE, False)
+        # A minimum so the filename never disappears entirely on very
+        # small windows; if we run out of horizontal room the table will
+        # scroll horizontally instead of clipping.
+        self.table.horizontalHeader().setMinimumSectionSize(80)
+        self.table.itemDoubleClicked.connect(self._on_double_click)
+        layout.addWidget(self.table, 1)
 
-        self.btn_restart = QPushButton("Relancer / Réparer")
-        self.btn_restart.clicked.connect(self.restart_job)
+        # Spinner ticker — repaints just the running rows so we don't
+        # rebuild the whole table every second.
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(120)
+        self._spinner_timer.timeout.connect(self._tick_spinners)
 
-        self.btn_delete = QPushButton("Supprimer")
-        self.btn_delete.setObjectName("secondaryButton")
-        self.btn_delete.clicked.connect(self.delete_entry)
-
-        actions = QHBoxLayout()
-        actions.addWidget(self.btn_open)
-        actions.addWidget(self.btn_show_folder)
-        actions.addWidget(self.btn_restart)
-        actions.addWidget(self.btn_delete)
-        layout.addLayout(actions)
-        
         self.refresh()
-        
+
+    # ------------------------------------------------------------------
+    # Building the table
+    # ------------------------------------------------------------------
+
     def refresh(self):
-        # Rebuild the list from the DB. Either a free-text search across
-        # transcript segments, or a chronological listing of recent jobs.
         query = self.search_input.text().strip()
-        self.list.clear()
-
         if query:
-            results = self.db.search_segments(query_text=query)
-            seen_jobs: dict[int, list[str]] = {}
-            for s in results:
-                job_id = s['job_id']
-                seen_jobs.setdefault(job_id, [])
-                if len(seen_jobs[job_id]) < 2:
-                    seen_jobs[job_id].append(s['text'])
-
-            for job_id, snippets in seen_jobs.items():
-                job = self.db.get_job(job_id)
-                if not job:
-                    continue
-                title = job.get('custom_title') or Path(job['source_path']).name
-                item = QListWidgetItem(f"📄 {title}\n   \"{snippets[0][:80]}…\"")
-                item.setData(Qt.UserRole, job_id)
-                self.list.addItem(item)
+            jobs = self._search_jobs(query)
         else:
-            for job in self.db.list_jobs(limit=100):
-                title = job.get('custom_title') or Path(job['source_path']).name
-                status = job['status']
-                emoji = "✅" if status == "COMPLETED" else "⏳" if status == "PENDING" else "❌"
-                item = QListWidgetItem(f"{emoji} {title}\n   Statut: {status}")
-                item.setData(Qt.UserRole, job['id'])
-                self.list.addItem(item)
+            jobs = self.db.list_jobs(limit=200)
+
+        self._job_ids = [int(job["id"]) for job in jobs]
+        self._row_by_id = {jid: i for i, jid in enumerate(self._job_ids)}
+
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(jobs))
+        for row, job in enumerate(jobs):
+            self._fill_row(row, job)
+
+        # Only run the spinner timer while at least one job is in flight.
+        if any(self._is_running(j) for j in jobs):
+            if not self._spinner_timer.isActive():
+                self._spinner_timer.start()
+        else:
+            self._spinner_timer.stop()
+
+    def _search_jobs(self, query: str) -> list[dict]:
+        """Same data as a full listing, but filtered by transcript text."""
+        results = self.db.search_segments(query_text=query)
+        seen: list[int] = []
+        for s in results:
+            job_id = int(s["job_id"])
+            if job_id not in seen:
+                seen.append(job_id)
+        jobs: list[dict] = []
+        for job_id in seen:
+            job = self.db.get_job(job_id)
+            if job:
+                jobs.append(job)
+        return jobs
+
+    def _fill_row(self, row: int, job: dict):
+        # --- Statut column ---------------------------------------------
+        status_widget = self._build_status_cell(job)
+        self.table.setCellWidget(row, self.COL_STATUS, status_widget)
+        # The hidden item carries the job id so currentItem() works for
+        # actions that don't need a widget.
+        anchor = QTableWidgetItem("")
+        anchor.setData(Qt.ItemDataRole.UserRole, int(job["id"]))
+        self.table.setItem(row, self.COL_STATUS, anchor)
+
+        # --- Source column --------------------------------------------
+        title = job.get("custom_title") or Path(job["source_path"]).name
+        file_item = QTableWidgetItem(title)
+        file_item.setToolTip(str(job["source_path"]))
+        file_item.setData(Qt.ItemDataRole.UserRole, int(job["id"]))
+        self.table.setItem(row, self.COL_FILE, file_item)
+
+        # --- Artefact columns -----------------------------------------
+        running = self._is_running(job)
+        self._set_artefact_cell(
+            row, self.COL_COMPRESSED, job.get("compressed_path"), running, "Compressé"
+        )
+        self._set_artefact_cell(
+            row, self.COL_TRANSCRIPT, job.get("transcript_path") or job.get("output_path"), running, "Transcription"
+        )
+        self._set_artefact_cell(
+            row, self.COL_ENHANCED, job.get("enhanced_transcript_path"), running, "Améliorée"
+        )
+        self._set_artefact_cell(
+            row, self.COL_REVIEW, job.get("review_path"), running, "Rapport"
+        )
+
+        # --- Actions kebab --------------------------------------------
+        actions = self._build_actions_cell(int(job["id"]))
+        self.table.setCellWidget(row, self.COL_ACTIONS, actions)
+
+    def _build_status_cell(self, job: dict) -> QWidget:
+        running = self._is_running(job)
+        completed = job.get("status") in JOB_DONE_STATES
+        failed = job.get("status") in JOB_FAILED_STATES
+
+        cell = QFrame()
+        cell.setObjectName("libraryStatusCell")
+        layout = QVBoxLayout(cell)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(2)
+
+        if running:
+            head = QLabel(f"{self.SPINNER_FRAMES[0]} En cours")
+            head.setObjectName("libraryStatusRunning")
+        elif completed:
+            head = QLabel("✅ Terminé")
+            head.setObjectName("libraryStatusDone")
+        elif failed:
+            head = QLabel("❌ Échec")
+            head.setObjectName("libraryStatusFail")
+        else:
+            head = QLabel("⏳ En attente")
+            head.setObjectName("libraryStatusPending")
+        layout.addWidget(head)
+
+        if running:
+            step = (job.get("current_step") or "").strip() or "Préparation…"
+            eta = self._format_eta(job.get("eta_seconds"))
+            sub = QLabel(f"{step}{(' · ' + eta) if eta else ''}")
+            sub.setObjectName("libraryStatusSub")
+            layout.addWidget(sub)
+        elif failed and job.get("error_message"):
+            sub = QLabel(str(job["error_message"])[:80])
+            sub.setObjectName("libraryStatusSub")
+            sub.setToolTip(str(job["error_message"]))
+            layout.addWidget(sub)
+
+        return cell
+
+    def _set_artefact_cell(
+        self,
+        row: int,
+        col: int,
+        path: str | None,
+        running: bool,
+        label: str,
+    ):
+        btn = QPushButton()
+        btn.setObjectName("artefactButton")
+        if path and Path(path).exists():
+            btn.setText("Ouvrir")
+            btn.setToolTip(str(path))
+            btn.setEnabled(True)
+            btn.clicked.connect(lambda _=False, p=str(path): _open_path(p))
+        elif running:
+            # The artefact is being produced — show a soft pending state
+            # so the user knows it's coming, not missing forever.
+            btn.setText("⏳")
+            btn.setToolTip(f"{label} en cours…")
+            btn.setEnabled(False)
+        else:
+            btn.setText("—")
+            btn.setToolTip(f"Pas de {label.lower()} disponible")
+            btn.setEnabled(False)
+
+        wrapper = QWidget()
+        wrap_layout = QHBoxLayout(wrapper)
+        wrap_layout.setContentsMargins(4, 4, 4, 4)
+        wrap_layout.addWidget(btn)
+        self.table.setCellWidget(row, col, wrapper)
+
+    def _build_actions_cell(self, job_id: int) -> QWidget:
+        btn = QToolButton()
+        btn.setObjectName("artefactButton")
+        btn.setText("⋯")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(btn)
+        menu.addAction("Ouvrir le dossier", lambda jid=job_id: self._action_show_folder(jid))
+        menu.addAction("Relancer / Réparer", lambda jid=job_id: self._action_restart(jid))
+        menu.addSeparator()
+        menu.addAction("Supprimer de la bibliothèque", lambda jid=job_id: self._action_delete(jid))
+        btn.setMenu(menu)
+
+        wrapper = QWidget()
+        wrap_layout = QHBoxLayout(wrapper)
+        wrap_layout.setContentsMargins(4, 4, 4, 4)
+        wrap_layout.addWidget(btn)
+        return wrapper
+
+    # ------------------------------------------------------------------
+    # Live updates while a job is running
+    # ------------------------------------------------------------------
+
+    def tick_running_row(self, job_id: int):
+        """
+        Called by MainWindow when the current job's progress/step
+        changes — repaints just the status cell instead of rebuilding
+        the whole table.
+        """
+        row = self._row_by_id.get(int(job_id))
+        if row is None:
+            return
+        job = self.db.get_job(int(job_id))
+        if not job:
+            return
+        self.table.setCellWidget(row, self.COL_STATUS, self._build_status_cell(job))
+        # Update artefact cells too — the transcript becomes available
+        # mid-run, so the "Ouvrir" button must light up without waiting
+        # for a full refresh.
+        running = self._is_running(job)
+        self._set_artefact_cell(
+            row, self.COL_COMPRESSED, job.get("compressed_path"), running, "Compressé"
+        )
+        self._set_artefact_cell(
+            row, self.COL_TRANSCRIPT, job.get("transcript_path") or job.get("output_path"), running, "Transcription"
+        )
+        self._set_artefact_cell(
+            row, self.COL_ENHANCED, job.get("enhanced_transcript_path"), running, "Améliorée"
+        )
+        self._set_artefact_cell(
+            row, self.COL_REVIEW, job.get("review_path"), running, "Rapport"
+        )
+        if not self._spinner_timer.isActive() and running:
+            self._spinner_timer.start()
+
+    def _tick_spinners(self):
+        self._spinner_step = (self._spinner_step + 1) % len(self.SPINNER_FRAMES)
+        any_running = False
+        for job_id, row in self._row_by_id.items():
+            job = self.db.get_job(int(job_id))
+            if not job or not self._is_running(job):
+                continue
+            any_running = True
+            cell = self.table.cellWidget(row, self.COL_STATUS)
+            if cell is None:
+                continue
+            head = cell.findChild(QLabel, "libraryStatusRunning")
+            if head:
+                head.setText(f"{self.SPINNER_FRAMES[self._spinner_step]} En cours")
+        if not any_running:
+            self._spinner_timer.stop()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_running(job: dict) -> bool:
+        return job.get("status") in JOB_RUNNING_STATES
+
+    @staticmethod
+    def _format_eta(seconds) -> str:
+        try:
+            sec = float(seconds)
+        except (TypeError, ValueError):
+            return ""
+        if sec <= 0 or sec != sec:  # NaN
+            return ""
+        return f"reste ~{format_compact_seconds(sec)}"
+
+    def _on_double_click(self, item: QTableWidgetItem):
+        # Default action when the user double-clicks a row: open the
+        # most relevant artefact (enhanced transcript > transcript >
+        # compressed > source folder).
+        if item is None:
+            return
+        job_id = item.data(Qt.ItemDataRole.UserRole)
+        if job_id is None:
+            return
+        job = self.db.get_job(int(job_id))
+        if not job:
+            return
+        for key in ("enhanced_transcript_path", "transcript_path", "compressed_path", "output_path"):
+            path = job.get(key)
+            if path and Path(path).exists():
+                _open_path(path)
+                return
+        QMessageBox.information(self, "Infos", "Aucun fichier disponible pour cette entrée.")
+
+    # ------------------------------------------------------------------
+    # Action handlers (used by the kebab menu)
+    # ------------------------------------------------------------------
 
     def _reload_main_queue(self):
         main_win = self.window()
@@ -2270,101 +2683,44 @@ class LibraryView(QWidget):
             main_win.queue_list.clear()
             main_win.load_jobs_from_db()
 
-    def restart_job(self):
-        item = self.list.currentItem()
-        if not item:
-            return
-        job_id = item.data(Qt.UserRole)
+    def _action_restart(self, job_id: int):
         self.db.update_job_status(job_id, "PENDING", "")
+        self.db.update_job_progress(job_id, step="", progress_pct=0, eta_seconds=0)
         self._reload_main_queue()
+        self.refresh()
         QMessageBox.information(self, "Relance", "La vidéo a été remise en file d'attente.")
 
-    def delete_entry(self):
-        item = self.list.currentItem()
-        if not item:
-            return
-        job_id = item.data(Qt.UserRole)
+    def _action_delete(self, job_id: int):
         confirm = QMessageBox.question(
             self,
             "Confirmer",
-            "Supprimer cette entrée de la bibliothèque ? (Le fichier de transcription ne sera pas supprimé)",
+            "Supprimer cette entrée de la bibliothèque ? Les fichiers de sortie ne seront pas effacés.",
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-
         job = self.db.get_job(job_id)
-        if job and job['workspace_dir'] and Path(job['workspace_dir']).exists():
+        if job and job.get("workspace_dir") and Path(job["workspace_dir"]).exists():
             try:
-                shutil.rmtree(job['workspace_dir'])
+                shutil.rmtree(job["workspace_dir"])
             except Exception:
                 pass
         self.db.delete_job(job_id)
         self.refresh()
         self._reload_main_queue()
 
-    def open_result(self):
-        item = self.list.currentItem()
-        if not item: return
-        job_id = item.data(Qt.UserRole)
+    def _action_show_folder(self, job_id: int):
         job = self.db.get_job(job_id)
-        out_path = job and job.get('output_path')
-        if out_path and Path(out_path).exists():
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", out_path])
-            elif sys.platform.startswith("win"):
-                os.startfile(out_path)
-            else:
-                subprocess.Popen(["xdg-open", out_path])
-        elif out_path and Path(out_path).parent.exists():
-            parent = Path(out_path).parent
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", str(parent)])
-            elif sys.platform.startswith("win"):
-                os.startfile(str(parent))
-            else:
-                subprocess.Popen(["xdg-open", str(parent)])
-            QMessageBox.information(
-                self,
-                "Fichier renommé",
-                "Le fichier référencé n'existe plus à cet emplacement. J'ouvre son dossier de sortie.",
-            )
-        else:
-            QMessageBox.information(self, "Infos", "Le fichier de transcription n'est pas encore prêt ou a été déplacé.")
-
-    def show_folder(self):
-        # Opens the parent directory of the output. The user gets all
-        # related files at once: original transcript, " - améliorée.txt",
-        # " - à vérifier.md" with the LLM's review notes.
-        item = self.list.currentItem()
-        if not item:
+        if not job:
             return
-        job_id = item.data(Qt.UserRole)
-        job = self.db.get_job(job_id)
-        out_path = job and job.get("output_path")
-        if not out_path:
-            QMessageBox.information(self, "Infos", "Pas de dossier de sortie pour cette entrée.")
-            return
-        target = Path(out_path)
-        if not target.exists() and target.parent.exists():
-            target = target.parent
-        if not target.exists():
-            QMessageBox.information(self, "Infos", f"Le dossier {target} est introuvable.")
-            return
-
-        if sys.platform == "darwin":
-            # `-R` reveals the file inside Finder; falls back to `open` for
-            # bare directories.
-            if target.is_file():
-                subprocess.Popen(["open", "-R", str(target)])
-            else:
-                subprocess.Popen(["open", str(target)])
-        elif sys.platform.startswith("win"):
-            if target.is_file():
-                subprocess.Popen(["explorer", "/select,", str(target)])
-            else:
-                os.startfile(str(target))
-        else:
-            subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
+        for key in ("transcript_path", "compressed_path", "output_path", "source_path"):
+            path = job.get(key)
+            if path and Path(path).exists():
+                _reveal_in_finder(path)
+                return
+            if path and Path(path).parent.exists():
+                _reveal_in_finder(Path(path).parent)
+                return
+        QMessageBox.information(self, "Infos", "Pas de dossier disponible pour cette entrée.")
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -2574,8 +2930,12 @@ class MainWindow(QWidget):
         # so the team's day-to-day flow stays uncluttered.
         right_col = QFrame()
         right_col.setObjectName("settingsPanel")
-        right_col.setMinimumWidth(300)
-        right_col.setMaximumWidth(390)
+        # 380 guarantees the longest checkbox label, the dropdown
+        # chevron and the QGroupBox titles all fit without cropping.
+        # 520 is a soft cap so on a 27" screen the right panel doesn't
+        # become wider than the queue/library tabs.
+        right_col.setMinimumWidth(380)
+        right_col.setMaximumWidth(520)
         right_col.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         right_layout = QVBoxLayout(right_col)
         right_layout.setContentsMargins(12, 12, 12, 12)
@@ -2619,13 +2979,17 @@ class MainWindow(QWidget):
         self.edit_suffix = QLineEdit(str(self.settings.value("suffix", "_compressed", type=str)))
         self.edit_suffix.setVisible(False)
 
+        # The checkboxes used to ride the QFormLayout's field column,
+        # which reserved the leftmost ~150px for the (empty) label and
+        # cropped the longer label "Continuer en cas d'erreur" to "…d'erreu".
+        # We span both columns by using the single-widget overload.
         self.check_continue_on_error = QCheckBox("Continuer en cas d'erreur")
         self.check_continue_on_error.setChecked(self.settings.value("continue_on_error", True, type=bool))
-        main_form.addRow("", self.check_continue_on_error)
+        main_form.addRow(self.check_continue_on_error)
 
         self.check_transcribe_after_encode = QCheckBox("Transcrire après compression")
         self.check_transcribe_after_encode.setChecked(self.settings.value("transcribe_after_encode", False, type=bool))
-        main_form.addRow("", self.check_transcribe_after_encode)
+        main_form.addRow(self.check_transcribe_after_encode)
 
         scroll_layout.addWidget(main_group)
 
@@ -2789,7 +3153,8 @@ class MainWindow(QWidget):
         splitter.addWidget(right_col)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([700, 320])
+        splitter.setSizes([800, 420])
+        splitter.setHandleWidth(1)
 
         root.addWidget(splitter, 1)
 
@@ -2845,8 +3210,10 @@ class MainWindow(QWidget):
         self.on_trim_toggled(False)
 
     def apply_style(self):
+        chevron_url = Path(resource_path("assets/chevron-down.svg")).as_posix()
+        check_url = Path(resource_path("assets/check.svg")).as_posix()
         self.setStyleSheet(
-            """
+            ("""
         QWidget {
             background: #f5f5f7;
             color: #1d1d1f;
@@ -2933,6 +3300,69 @@ class MainWindow(QWidget):
             background: #e8f2ff;
             color: #007aff;
         }
+        QTableWidget#libraryTable {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 10px;
+            gridline-color: transparent;
+            outline: none;
+            selection-background-color: #e8f2ff;
+            selection-color: #1d1d1f;
+        }
+        QTableWidget#libraryTable::item {
+            padding: 8px 10px;
+            border: none;
+            border-bottom: 1px solid #f2f2f7;
+        }
+        QTableWidget#libraryTable QHeaderView::section {
+            background: #fbfbfd;
+            border: none;
+            border-bottom: 1px solid #e5e5ea;
+            padding: 8px 10px;
+            font-weight: 600;
+            color: #3a3a3c;
+        }
+        QFrame#libraryStatusCell {
+            background: transparent;
+        }
+        QLabel#libraryStatusRunning {
+            color: #007aff;
+            font-weight: 600;
+        }
+        QLabel#libraryStatusDone {
+            color: #2e8b57;
+            font-weight: 600;
+        }
+        QLabel#libraryStatusFail {
+            color: #d93025;
+            font-weight: 600;
+        }
+        QLabel#libraryStatusPending {
+            color: #6e6e73;
+            font-weight: 600;
+        }
+        QLabel#libraryStatusSub {
+            color: #6e6e73;
+            font-size: 11px;
+        }
+        QPushButton#artefactButton, QToolButton#artefactButton {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            padding: 5px 10px;
+            font-size: 12px;
+            color: #1d1d1f;
+            min-width: 70px;
+        }
+        QPushButton#artefactButton:hover, QToolButton#artefactButton:hover {
+            background: #f2f2f7;
+        }
+        QPushButton#artefactButton:disabled {
+            background: #fbfbfd;
+            color: #b0b0b8;
+            border-color: #ececef;
+        }
+        QToolButton#artefactButton::menu-indicator { image: none; }
         QFrame#dropZone {
             background: #ffffff;
             border: 1.5px dashed #c7c7cc;
@@ -3073,7 +3503,7 @@ class MainWindow(QWidget):
             border-color: #007aff;
             color: #ffffff;
         }
-        QComboBox, QSpinBox, QTimeEdit, QLineEdit, QTextEdit {
+        QSpinBox, QTimeEdit, QLineEdit, QTextEdit {
             background: #ffffff;
             border: 1px solid #d2d2d7;
             border-radius: 9px;
@@ -3081,13 +3511,65 @@ class MainWindow(QWidget):
             min-height: 24px;
             color: #1d1d1f;
         }
+        /* QComboBox needs extra right padding so the displayed text
+           never overlaps the dropdown chevron area. */
+        QComboBox {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 9px;
+            padding: 6px 30px 6px 10px;
+            min-height: 24px;
+            color: #1d1d1f;
+        }
+        QComboBox:hover { border-color: #b8b8c0; }
         QTextEdit {
             selection-background-color: #b8d7ff;
         }
         QComboBox::drop-down {
-            border: none;
-            width: 22px;
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 26px;
+            border-left: 1px solid #ececef;
+            border-top-right-radius: 9px;
+            border-bottom-right-radius: 9px;
+            background: #fbfbfd;
         }
+        QComboBox::drop-down:hover { background: #f2f2f7; }
+        QComboBox::down-arrow {
+            image: url(__CHEVRON_URL__);
+            width: 12px;
+            height: 12px;
+        }
+        QComboBox QAbstractItemView {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            padding: 4px;
+            selection-background-color: #007aff;
+            selection-color: #ffffff;
+            outline: none;
+        }
+        QComboBox QAbstractItemView::item {
+            padding: 6px 10px;
+            border-radius: 5px;
+            min-height: 22px;
+        }
+        QCheckBox { color: #1d1d1f; spacing: 8px; }
+        QCheckBox::indicator {
+            width: 16px;
+            height: 16px;
+            border-radius: 4px;
+            border: 1px solid #c7c7cc;
+            background: #ffffff;
+        }
+        QCheckBox::indicator:checked {
+            background: #007aff;
+            border-color: #007aff;
+            image: url(__CHECK_URL__);
+        }
+        QCheckBox::indicator:hover { border-color: #007aff; }
+        QLineEdit:focus, QSpinBox:focus, QTimeEdit:focus, QTextEdit:focus,
+        QComboBox:focus { border-color: #007aff; }
         QSlider::groove:horizontal {
             height: 6px;
             background: #e5e5ea;
@@ -3146,7 +3628,9 @@ class MainWindow(QWidget):
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0px;
         }
-        """
+        """)
+            .replace("__CHEVRON_URL__", chevron_url)
+            .replace("__CHECK_URL__", check_url)
         )
 
     def _transcription_settings_payload(self) -> dict[str, str | bool]:
@@ -3870,6 +4354,11 @@ class MainWindow(QWidget):
             if job.error_message:
                 tooltip += f"\nErreur: {job.error_message}"
             item.setToolTip(tooltip)
+            # The queue is staging only — once a job is running or done
+            # it lives in the Library tab, not here. We hide rather than
+            # remove so running_index / queue_jobs indices stay valid
+            # for the existing worker plumbing.
+            item.setHidden(job.status in {"running", "done", "failed"})
 
     def refresh_all_queue_items(self):
         for idx in range(len(self.queue_jobs)):
@@ -4112,6 +4601,11 @@ class MainWindow(QWidget):
 
     def _set_running_ui(self, running: bool):
         self.is_batch_running = running
+        # A fresh batch should re-trigger the "auto-switch to library"
+        # behaviour for its first job. Otherwise users who run several
+        # batches in a row only see the switch once.
+        if running:
+            self._did_auto_switch_to_library = False
         self.btn_pick.setEnabled(not running)
         self.btn_remove.setEnabled(not running)
         self.btn_clear.setEnabled(not running)
@@ -4239,6 +4733,27 @@ class MainWindow(QWidget):
         self.refresh_queue_item(idx)
         self.queue_list.setCurrentRow(idx)
 
+        # The library is now the real workspace: as soon as a job starts,
+        # mark it RUNNING in the DB so the table can show a spinner and
+        # disable the artefact buttons until they're produced.
+        if job.db_id:
+            self.db.update_job_status(job.db_id, "RUNNING")
+            self.db.update_job_progress(
+                job.db_id,
+                step="Démarrage…",
+                progress_pct=0,
+                eta_seconds=None,
+            )
+        self.library_view.refresh()
+        # Once a job is RUNNING the user expects to watch it in the
+        # library, not stare at the queue. Auto-switch on the first job.
+        if not getattr(self, "_did_auto_switch_to_library", False):
+            try:
+                self.tabs.setCurrentWidget(self.library_view)
+            except Exception:
+                pass
+            self._did_auto_switch_to_library = True
+
         current = self.completed_count + self.failed_count + 1
         total = len(self.queue_jobs)
         self.status.setText(f"Traitement {current}/{total}: {Path(job.input_path).name}")
@@ -4328,6 +4843,13 @@ class MainWindow(QWidget):
     def on_status(self, text: str):
         self.current_job_status_text = text
         self._set_status_with_progress_context()
+        # Forward the human-readable step to the DB so the library
+        # column reflects exactly what the worker is doing right now.
+        if self.running_index is not None:
+            job = self.queue_jobs[self.running_index]
+            if job.db_id:
+                self.db.update_job_progress(job.db_id, step=text)
+                self.library_view.tick_running_row(job.db_id)
 
     def on_progress(self, pct: int):
         if self.progress.maximum() == 0:
@@ -4343,6 +4865,20 @@ class MainWindow(QWidget):
         global_pct = int(min(100, ((done + display_pct / 100.0) / total) * 100))
         self.progress_global.setValue(global_pct)
         self._set_status_with_progress_context()
+
+        # Same idea as on_status: push the percentage + ETA so the live
+        # library row stays in sync with the progress bar at the bottom.
+        if self.running_index is not None:
+            job = self.queue_jobs[self.running_index]
+            if job.db_id:
+                eta = None
+                if self.current_job_started_at is not None and 2 <= display_pct < 100:
+                    elapsed = time.monotonic() - self.current_job_started_at
+                    eta = elapsed * (100 / display_pct - 1)
+                self.db.update_job_progress(
+                    job.db_id, progress_pct=display_pct, eta_seconds=eta
+                )
+                self.library_view.tick_running_row(job.db_id)
 
     def cancel_encode(self):
         self.pending_indices.clear()
@@ -4390,6 +4926,10 @@ class MainWindow(QWidget):
         if job.db_id:
             self.db.update_job_status(job.db_id, "COMPLETED")
             self.db.update_job_output(job.db_id, out_path)
+            self.db.update_job_artefact(job.db_id, "compressed", out_path)
+            self.db.update_job_progress(
+                job.db_id, step="Compression terminée", progress_pct=100, eta_seconds=0
+            )
 
         self.refresh_queue_item(idx)
         self.progress.setRange(0, 100)

@@ -55,6 +55,10 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_text ON transcription_segments(text)")
 
     def _ensure_jobs_columns(self, conn):
+        # The library now exposes each artefact as its own button in the
+        # table view, so we track them as distinct columns instead of
+        # squeezing everything into `output_path`. `current_step` /
+        # `eta_seconds` power the live spinner during processing.
         existing = {
             row[1]
             for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
@@ -65,6 +69,15 @@ class DatabaseManager:
             "duration_whisper": "REAL",
             "duration_diarization": "REAL",
             "duration_total": "REAL",
+            # Per-artefact paths so the library shows ✓ / — for each.
+            "compressed_path": "TEXT",
+            "transcript_path": "TEXT",
+            "enhanced_transcript_path": "TEXT",
+            "review_path": "TEXT",
+            # Live progress for the in-flight job(s).
+            "current_step": "TEXT",
+            "progress_pct": "REAL",
+            "eta_seconds": "REAL",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -105,6 +118,59 @@ class DatabaseManager:
             conn.execute(
                 "UPDATE jobs SET custom_title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (title, job_id)
+            )
+
+    def update_job_artefact(self, job_id: int, kind: str, path: str):
+        """
+        Record one of the artefact paths produced by a job. Allowed kinds:
+        'compressed', 'transcript', 'enhanced_transcript', 'review'.
+        Each call lights up one column in the library table and the
+        corresponding "Ouvrir" button.
+        """
+        column = {
+            "compressed": "compressed_path",
+            "transcript": "transcript_path",
+            "enhanced_transcript": "enhanced_transcript_path",
+            "review": "review_path",
+        }.get(kind)
+        if not column:
+            raise ValueError(f"unknown artefact kind: {kind!r}")
+        with self._get_connection() as conn:
+            conn.execute(
+                f"UPDATE jobs SET {column} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (path, job_id),
+            )
+
+    def update_job_progress(
+        self,
+        job_id: int,
+        step: Optional[str] = None,
+        progress_pct: Optional[float] = None,
+        eta_seconds: Optional[float] = None,
+    ):
+        """
+        Push the current step + progress so the library table can render
+        a live status. Any field left as None keeps its previous value.
+        """
+        sets = []
+        params: list = []
+        if step is not None:
+            sets.append("current_step = ?")
+            params.append(step)
+        if progress_pct is not None:
+            sets.append("progress_pct = ?")
+            params.append(float(progress_pct))
+        if eta_seconds is not None:
+            sets.append("eta_seconds = ?")
+            params.append(float(eta_seconds))
+        if not sets:
+            return
+        sets.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(job_id)
+        with self._get_connection() as conn:
+            conn.execute(
+                f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
             )
 
     def get_job(self, job_id: int) -> Optional[dict]:
