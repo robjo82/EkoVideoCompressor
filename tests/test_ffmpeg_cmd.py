@@ -481,6 +481,14 @@ class LlmPostProcessParsingTest(unittest.TestCase):
         self.assertEqual(out["title"], "Présentation des outils RH")
         # Empty values dropped — we never want to label a SPEAKER as "".
         self.assertEqual(out["speakers"], {"SPEAKER_00": "Robin"})
+        self.assertEqual(out["technical_terms"], [])
+
+    def test_title_speakers_parses_technical_terms(self):
+        out = parse_llm_title_speakers(
+            '{"title": "Site CVR", "speakers": {}, '
+            '"technical_terms": ["Odoo", "Infomaniak", "Chat GPT"]}'
+        )
+        self.assertEqual(out["technical_terms"], ["Odoo", "Infomaniak", "Chat GPT"])
 
     def test_title_speakers_recovers_from_leading_prose(self):
         # mlx_lm sometimes prepends "Voici votre JSON :" before the object.
@@ -544,6 +552,7 @@ class LlmPostProcessParsingTest(unittest.TestCase):
         self.assertEqual(cmd[0], "/v/bin/python")
         self.assertEqual(cmd[-1], "Adèle, Odoo")
         self.assertIn("speakers", cmd[2])
+        self.assertIn("technical_terms", cmd[2])
 
     def test_build_corrections_cmd_carries_glossary(self):
         cmd = build_llm_corrections_cmd(
@@ -556,6 +565,8 @@ class LlmPostProcessParsingTest(unittest.TestCase):
         self.assertEqual(cmd[-1], "Adèle, Odoo")
         self.assertIn("Corrections", cmd[2])
         self.assertIn("Doutes", cmd[2])
+        self.assertIn("erreur phonétique", cmd[2])
+        self.assertIn("Chat GPT", cmd[2])
 
 
 if __name__ == "__main__":

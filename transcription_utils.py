@@ -437,25 +437,28 @@ try:
 Tâche : à partir de la transcription ci-dessous, propose
 - un titre court et descriptif (5 à 10 mots, sans guillemets)
 - pour chaque SPEAKER_XX présent, son prénom probable s'il est mentionné explicitement dans la transcription
+- les termes techniques / noms propres métier réellement présents ou très probablement présents
 
 Règles strictes :
 - Réponds UNIQUEMENT par un objet JSON valide, sans texte avant/après, sans markdown.
 - Chaque clé "speakers" est un identifiant SPEAKER_XX et la valeur est un prénom (ou "" si tu n'es pas sûr).
 - N'invente JAMAIS un prénom : laisse la chaîne vide en cas de doute.
 - Ne mets que les SPEAKER_XX présents dans la transcription.
+- "technical_terms" contient 0 à 20 termes, sans doublons, orthographiés proprement.
+- Priorise les termes du vocabulaire métier quand ils apparaissent même phonétiquement.
 
 Schéma exact attendu :
-{{"title": "...", "speakers": {{"SPEAKER_00": "..."}}}}
+{{"title": "...", "speakers": {{"SPEAKER_00": "..."}}, "technical_terms": ["Odoo"]}}
 
-Vocabulaire métier (à respecter dans le titre) :
+Vocabulaire métier prioritaire (orthographe à respecter partout) :
 {glossary or "(aucun)"}
 
 Transcription :
 {text}
 [/INST]"""
 
-    # Short cap — title + speakers fit comfortably in 250 tokens.
-    response = generate(model, tokenizer, prompt=prompt, max_tokens=300, verbose=False)
+    # Short cap — title + speakers + terms fit comfortably in 400 tokens.
+    response = generate(model, tokenizer, prompt=prompt, max_tokens=450, verbose=False)
     print(response)
 
 except Exception as e:
@@ -490,15 +493,29 @@ try:
 
     prompt = f"""[INST] Tu es un relecteur expert de transcriptions de réunions professionnelles françaises.
 
-Repère uniquement :
-1. Les passages où Whisper a probablement mal entendu un terme métier ou un nom propre listé dans le vocabulaire ci-dessous, et où tu peux proposer la bonne version sans inventer.
+Repère uniquement les erreurs de transcription audio, pas les maladresses orales :
+1. Les passages où Whisper a probablement mal entendu un terme métier, une marque, un logiciel, un nom propre ou un mot français évident.
 2. Les passages clairement douteux que tu signales SANS corriger.
 
 Règles strictes :
-- N'INVENTE JAMAIS de mots qui ne sont pas dans la transcription.
+- Ne corrige jamais la grammaire, le style, les répétitions, les tournures familières ou les hésitations.
+- Ne reformule jamais une phrase correcte : corrige seulement une erreur phonétique locale.
+- Une correction doit être courte, remplacer un extrait exact, et rester très proche phonétiquement.
+- Le vocabulaire métier ci-dessous est prioritaire : si un passage ressemble phonétiquement à un terme listé, propose ce terme.
+- Tu peux corriger un mot absurde vers un mot français évident si le contexte l'impose.
 - Format de sortie : markdown, exactement le format ci-dessous, rien d'autre.
 - Si rien à corriger : écris "Aucune correction." puis "Aucun doute." et stop.
-- Maximum 5 corrections + 5 doutes.
+- Maximum 10 corrections + 10 doutes.
+
+Exemples de corrections attendues :
+- "Infomaniac" -> "Infomaniak" si le contexte parle d'hébergement, mail ou nom de domaine.
+- "glasculer" -> "basculer" si le contexte parle de changer de système ou de domaine.
+- "Tchadjepté" -> "Chat GPT" si le contexte parle d'IA.
+
+Exemples interdits :
+- "Je n'ai pas de son." -> "Je n'ai pas de sonne." (faux)
+- "t'as échangé avec lui ?" -> "t'as-tu échangé avec lui ?" (correction de style)
+- "version brouillon" -> "version brouillonne" (correction grammaticale inutile)
 
 Format exact (chaque entrée sur 2 lignes) :
 
@@ -574,9 +591,10 @@ def build_llm_cmd(
 
 def parse_llm_title_speakers(stdout: str) -> dict:
     """
-    Parse a JSON {"title": ..., "speakers": {...}} blob produced by the
-    title/speakers script. Tolerates leading prose and missing trailing
-    delimiters so a slightly drifting model still gives us something.
+    Parse a JSON {"title": ..., "speakers": {...}, "technical_terms": [...]}
+    blob produced by the title/context script. Tolerates leading prose and
+    missing trailing delimiters so a slightly drifting model still gives us
+    something.
     """
     text = (stdout or "").strip()
     if not text:
@@ -646,7 +664,14 @@ def _coerce_title_speakers(payload: dict) -> dict:
             value_str = str(value).strip().strip('"').strip()
             if key_str.startswith("SPEAKER_") and value_str:
                 speakers[key_str] = value_str
-    return {"title": title, "speakers": speakers}
+    terms_raw = payload.get("technical_terms") or payload.get("terms") or []
+    terms: list[str] = []
+    if isinstance(terms_raw, list):
+        for value in terms_raw:
+            term = str(value).strip().strip('"').strip()
+            if term and term not in terms:
+                terms.append(term)
+    return {"title": title, "speakers": speakers, "technical_terms": terms[:30]}
 
 
 _CORRECTION_LINE = re.compile(

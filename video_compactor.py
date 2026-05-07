@@ -1474,7 +1474,7 @@ class TranscribeWorker(QThread):
         corrections, uncertain_passages} in one shot consistently broke the
         JSON past ~700 output tokens. We now do:
 
-        1. Short JSON call (max 300 tokens) for title + speakers — small
+        1. Short JSON call for title + speakers + technical terms — small
            enough to be reliable.
         2. Markdown call (max 900 tokens) for corrections + doubts —
            tolerant parser, a malformed line drops one entry instead of
@@ -1486,8 +1486,8 @@ class TranscribeWorker(QThread):
         if not analysis_path.exists() or not self._ensure_mlx_lm_available():
             return {}
 
-        # --- Step 1: title + speakers ----------------------------------
-        self.status.emit("Analyse: titre et interlocuteurs…")
+        # --- Step 1: title + speakers + technical terms ----------------
+        self.status.emit("Analyse: titre, interlocuteurs et termes…")
         title_cmd = build_llm_title_cmd(
             self.venv_python_path, self.text_llm_model, str(analysis_path), glossary
         )
@@ -1548,6 +1548,7 @@ class TranscribeWorker(QThread):
         return {
             "title": title_speakers.get("title", ""),
             "speakers": title_speakers.get("speakers", {}),
+            "technical_terms": title_speakers.get("technical_terms", []),
             "corrections": corrections_payload.get("corrections", []),
             "uncertain_passages": corrections_payload.get("uncertain_passages", []),
         }
@@ -1561,6 +1562,16 @@ class TranscribeWorker(QThread):
             for key, value in speakers_raw.items()
             if str(key).strip().startswith("SPEAKER_") and str(value).strip()
         }
+
+    def _technical_terms_from_payload(self, payload: dict) -> list[str]:
+        terms_raw = payload.get("technical_terms") or []
+        terms: list[str] = []
+        if isinstance(terms_raw, list):
+            for value in terms_raw:
+                term = str(value).strip()
+                if term and term not in terms:
+                    terms.append(term)
+        return terms
 
     def _apply_speaker_names(self, out_path: Path, speakers: dict[str, str]):
         if not speakers or not out_path.exists():
@@ -1699,6 +1710,10 @@ class TranscribeWorker(QThread):
                 "Tu écoutes un court extrait d'une réunion en français.\n"
                 f"Whisper hésite sur : « {question} ».\n"
                 f"Raison du doute : {reason}.{glossary_hint}\n"
+                "Compare l'audio aux termes du vocabulaire : les noms propres, marques, "
+                "logiciels et acronymes doivent être orthographiés exactement comme dans ce vocabulaire "
+                "si le son correspond. Corrige aussi les mots absurdes vers le mot français évident "
+                "quand la proximité phonétique est forte.\n"
                 "Que dit réellement la personne dans cet extrait ? "
                 "Réponds par la phrase exacte, sans commentaire."
             )
@@ -1755,6 +1770,21 @@ class TranscribeWorker(QThread):
             "",
         ]
 
+        speakers = self._speaker_names_from_payload(payload)
+        terms = self._technical_terms_from_payload(payload)
+        if speakers or terms:
+            lines += ["## Contexte détecté", ""]
+            if speakers:
+                lines.append("Interlocuteurs :")
+                for speaker_id, speaker_name in sorted(speakers.items()):
+                    lines.append(f"- `{speaker_id}` : {speaker_name}")
+                lines.append("")
+            if terms:
+                lines.append("Termes techniques :")
+                for term in terms:
+                    lines.append(f"- {term}")
+                lines.append("")
+
         if applied_corrections:
             lines += ["## Corrections appliquées", ""]
             for corr in applied_corrections:
@@ -1808,6 +1838,12 @@ class TranscribeWorker(QThread):
             return None
 
         speakers = self._speaker_names_from_payload(payload)
+        technical_terms = self._technical_terms_from_payload(payload)
+        if self.job.db_id and (speakers or technical_terms):
+            try:
+                self.db.update_job_context(self.job.db_id, speakers, technical_terms)
+            except Exception as exc:
+                self._log(f"context_persist_failed error={exc!r}")
         enhanced_text = base_text
         for speaker_id, speaker_name in speakers.items():
             enhanced_text = enhanced_text.replace(f"[{speaker_id}]", f"[{speaker_name}]")
@@ -1822,7 +1858,7 @@ class TranscribeWorker(QThread):
         clip_checks = self._run_clip_rechecks(wav_path, work_dir, uncertain)
 
         has_changes = enhanced_text != base_text or applied or speakers
-        has_review = applied or uncertain or clip_checks
+        has_review = applied or uncertain or clip_checks or speakers or technical_terms
         if has_review:
             self._write_review_file(self._review_transcript_path(out_path), payload, applied, clip_checks)
 
@@ -2959,6 +2995,7 @@ class LibraryView(QWidget):
         btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(btn)
         menu.addAction("Ouvrir le dossier", lambda jid=job_id: self._action_show_folder(jid))
+        menu.addAction("Contexte transcription…", lambda jid=job_id: self._action_edit_context(jid))
         menu.addAction("Renommer les locuteurs…", lambda jid=job_id: self._action_rename_speakers(jid))
         menu.addAction("Relancer / Réparer", lambda jid=job_id: self._action_restart(jid))
         menu.addSeparator()
@@ -3152,6 +3189,49 @@ class LibraryView(QWidget):
             ),
         )
 
+    def _action_edit_context(self, job_id: int):
+        dlg = TranscriptContextDialog(self.db, job_id, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        record = self.db.get_job(job_id) or {}
+        previous_speakers: dict[str, str] = {}
+        try:
+            loaded = json.loads(record.get("speaker_map_json") or "{}")
+            if isinstance(loaded, dict):
+                previous_speakers = {
+                    str(key).strip(): str(value).strip()
+                    for key, value in loaded.items()
+                    if str(key).strip() and str(value).strip()
+                }
+        except Exception:
+            previous_speakers = {}
+
+        speakers, terms = dlg.values()
+        try:
+            self.db.update_job_context(job_id, speakers, terms)
+        except Exception as exc:
+            QMessageBox.warning(self, "Contexte transcription", f"Enregistrement impossible: {exc}")
+            return
+
+        replacement_map = dict(speakers)
+        for speaker_id, previous_name in previous_speakers.items():
+            new_name = speakers.get(speaker_id, "")
+            if new_name and previous_name and previous_name != new_name:
+                replacement_map[previous_name] = new_name
+
+        applied_files, applied_segments = self._apply_speaker_rename(job_id, replacement_map)
+        self.refresh()
+        QMessageBox.information(
+            self,
+            "Contexte enregistré",
+            (
+                f"{len(speakers)} interlocuteur(s) et {len(terms)} terme(s) enregistrés.\n"
+                f"Fichiers mis à jour : {applied_files}\n"
+                f"Segments DB mis à jour : {applied_segments}"
+            ),
+        )
+
     def _apply_speaker_rename(self, job_id: int, mapping: dict[str, str]) -> tuple[int, int]:
         """
         Apply the SPEAKER_XX → real-name mapping to every artefact on
@@ -3272,6 +3352,17 @@ class SpeakerRenameDialog(QDialog):
         """
         names: dict[str, str] = {}
         seen_speakers: set[str] = set()
+        record = self.db.get_job(job_id) or {}
+        try:
+            stored = json.loads(record.get("speaker_map_json") or "{}")
+            if isinstance(stored, dict):
+                for key, value in stored.items():
+                    key_str = str(key).strip()
+                    if key_str.startswith("SPEAKER_"):
+                        names[key_str] = str(value).strip()
+                        seen_speakers.add(key_str)
+        except Exception:
+            pass
 
         # Collect from segments first — they have the canonical labels.
         segments = self.db.get_segments(job_id) or []
@@ -3280,7 +3371,6 @@ class SpeakerRenameDialog(QDialog):
             if sp:
                 seen_speakers.add(sp)
 
-        record = self.db.get_job(job_id) or {}
         # Also walk the produced files: a SPEAKER_XX that appeared
         # there but not in segments (e.g. a renamed enhanced file)
         # would be missed otherwise.
@@ -3295,7 +3385,7 @@ class SpeakerRenameDialog(QDialog):
             seen_speakers.update(self.SPEAKER_RE.findall(text))
 
         for sp in seen_speakers:
-            names[sp] = ""
+            names.setdefault(sp, "")
         return names
 
     def values(self) -> dict[str, str]:
@@ -3304,6 +3394,146 @@ class SpeakerRenameDialog(QDialog):
             for label, edit in self._fields.items()
             if edit.text().strip()
         }
+
+
+class TranscriptContextDialog(QDialog):
+    SPEAKER_RE = re.compile(r"SPEAKER_\d{2,}")
+
+    def __init__(self, db, job_id: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.db = db
+        self.job_id = job_id
+        self.setWindowTitle("Contexte transcription")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        head = QLabel(
+            "Vérifiez les interlocuteurs et les termes techniques relevés. "
+            "Ces éléments servent à corriger la transcription et à mieux orienter les relances."
+        )
+        head.setWordWrap(True)
+        layout.addWidget(head)
+
+        speakers = self._detect_speakers()
+        self._speaker_fields: dict[str, QLineEdit] = {}
+        speaker_group = QGroupBox("Interlocuteurs")
+        speaker_form = QFormLayout(speaker_group)
+        speaker_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        speaker_form.setHorizontalSpacing(10)
+        speaker_form.setVerticalSpacing(10)
+        if speakers:
+            for label, current in sorted(speakers.items()):
+                edit = QLineEdit(current)
+                edit.setPlaceholderText("Nom ou prénom")
+                speaker_form.addRow(label, edit)
+                self._speaker_fields[label] = edit
+        else:
+            empty = QLabel("Aucun locuteur détecté pour l'instant.")
+            empty.setObjectName("inlineHint")
+            empty.setWordWrap(True)
+            speaker_form.addRow(empty)
+        layout.addWidget(speaker_group)
+
+        terms_group = QGroupBox("Termes techniques")
+        terms_layout = QVBoxLayout(terms_group)
+        terms_layout.setContentsMargins(12, 16, 12, 12)
+        self.terms_edit = QTextEdit()
+        self.terms_edit.setAcceptRichText(False)
+        self.terms_edit.setPlaceholderText("Un terme par ligne : Odoo, Infomaniak, Chat GPT…")
+        self.terms_edit.setMinimumHeight(130)
+        self.terms_edit.setPlainText("\n".join(self._detect_terms()))
+        terms_layout.addWidget(self.terms_edit)
+        layout.addWidget(terms_group)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _record(self) -> dict:
+        return self.db.get_job(self.job_id) or {}
+
+    def _detect_speakers(self) -> dict[str, str]:
+        record = self._record()
+        names: dict[str, str] = {}
+        try:
+            stored = json.loads(record.get("speaker_map_json") or "{}")
+            if isinstance(stored, dict):
+                for key, value in stored.items():
+                    key_str = str(key).strip()
+                    if key_str.startswith("SPEAKER_"):
+                        names[key_str] = str(value).strip()
+        except Exception:
+            pass
+
+        for seg in self.db.get_segments(self.job_id) or []:
+            speaker = str(seg.get("speaker") or "").strip()
+            if speaker.startswith("SPEAKER_"):
+                names.setdefault(speaker, "")
+
+        for key in ("transcript_path", "enhanced_transcript_path", "review_path"):
+            path = record.get(key)
+            if not path:
+                continue
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            for speaker in self.SPEAKER_RE.findall(text):
+                names.setdefault(speaker, "")
+        return names
+
+    def _detect_terms(self) -> list[str]:
+        record = self._record()
+        terms: list[str] = []
+
+        def add(term: str):
+            clean = term.strip().strip("-•` ")
+            if clean and clean not in terms:
+                terms.append(clean)
+
+        try:
+            stored = json.loads(record.get("technical_terms_json") or "[]")
+            if isinstance(stored, list):
+                for term in stored:
+                    add(str(term))
+        except Exception:
+            pass
+
+        review_path = record.get("review_path")
+        if review_path and Path(review_path).exists():
+            try:
+                lines = Path(review_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                lines = []
+            in_terms = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("## "):
+                    in_terms = False
+                if stripped == "Termes techniques :":
+                    in_terms = True
+                    continue
+                if in_terms and stripped.startswith("- "):
+                    add(stripped[2:])
+        return terms
+
+    def values(self) -> tuple[dict[str, str], list[str]]:
+        speakers = {
+            label: edit.text().strip()
+            for label, edit in self._speaker_fields.items()
+            if edit.text().strip()
+        }
+        terms: list[str] = []
+        for line in self.terms_edit.toPlainText().splitlines():
+            term = line.strip().strip("-•")
+            if term and term not in terms:
+                terms.append(term)
+        return speakers, terms
 
 
 class RelaunchStepsDialog(QDialog):
@@ -3555,11 +3785,13 @@ class MainWindow(QWidget):
         header_layout.addWidget(self.btn_settings)
         root.addWidget(header)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter = self.main_splitter
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(8)
 
-        left_panel = QWidget()
+        self.left_panel = QWidget()
+        left_panel = self.left_panel
         left_panel.setMinimumWidth(0)
         left_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         left_col = QVBoxLayout(left_panel)
@@ -3572,7 +3804,8 @@ class MainWindow(QWidget):
         self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
         # TAB 1: Queue
-        queue_tab = QWidget()
+        self.queue_tab = QWidget()
+        queue_tab = self.queue_tab
         queue_tab.setMinimumWidth(0)
         queue_layout = QVBoxLayout(queue_tab)
         queue_layout.setContentsMargins(0, 10, 0, 0)
@@ -3631,7 +3864,8 @@ class MainWindow(QWidget):
         # Per-job essentials are visible by default; technical overrides
         # (resolution, bitrate, trim) are folded into a collapsible section
         # so the team's day-to-day flow stays uncluttered.
-        right_col = QFrame()
+        self.right_panel = QFrame()
+        right_col = self.right_panel
         right_col.setObjectName("settingsPanel")
         # 380 guarantees the longest checkbox label, the dropdown
         # chevron and the QGroupBox titles all fit without cropping.
@@ -3644,19 +3878,22 @@ class MainWindow(QWidget):
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(10)
 
-        scroll = QScrollArea()
+        self.settings_scroll = QScrollArea()
+        scroll = self.settings_scroll
         scroll.setObjectName("settingsScroll")
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll_body = QFrame()
+        self.settings_scroll_body = QFrame()
+        scroll_body = self.settings_scroll_body
         scroll_body.setObjectName("settingsScrollBody")
         scroll_layout = QVBoxLayout(scroll_body)
         scroll_layout.setContentsMargins(4, 4, 4, 4)
         scroll_layout.setSpacing(12)
 
         # --- Profil + sortie -----------------------------------------
-        main_group = QGroupBox("Réglages de cette vidéo")
+        self.main_settings_group = QGroupBox("Réglages de cette vidéo")
+        main_group = self.main_settings_group
         main_form = QFormLayout(main_group)
         main_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         main_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -3716,6 +3953,7 @@ class MainWindow(QWidget):
                 )
             )
         )
+
         # Compact by default; the field grows up to 140 px if the user
         # has a long glossary, but won't bury the rest of the panel.
         self.edit_transcription_prompt.setMinimumHeight(70)
@@ -4408,8 +4646,34 @@ class MainWindow(QWidget):
             self.btn_install_mlx.setVisible(not mlx_installed or self.mlx_install_worker is not None)
             self.btn_install_mlx.setText("Installation en cours…" if self.mlx_install_worker else "Installer MLX Whisper")
 
-    def _transcription_glossary(self) -> str:
-        glossary = self.edit_transcription_prompt.toPlainText().strip()
+    def _transcription_glossary(self, job: QueueJob | None = None) -> str:
+        glossary_parts: list[str] = []
+        base_glossary = self.edit_transcription_prompt.toPlainText().strip()
+        if base_glossary:
+            glossary_parts.append(base_glossary)
+
+        if job and job.db_id:
+            record = self.db.get_job(job.db_id) or {}
+            try:
+                stored_terms = json.loads(record.get("technical_terms_json") or "[]")
+                if isinstance(stored_terms, list):
+                    glossary_parts.extend(str(term).strip() for term in stored_terms if str(term).strip())
+            except Exception:
+                pass
+            try:
+                stored_speakers = json.loads(record.get("speaker_map_json") or "{}")
+                if isinstance(stored_speakers, dict):
+                    glossary_parts.extend(str(name).strip() for name in stored_speakers.values() if str(name).strip())
+            except Exception:
+                pass
+
+        glossary_lines: list[str] = []
+        for part in glossary_parts:
+            for line in str(part).splitlines():
+                clean = line.strip()
+                if clean and clean not in glossary_lines:
+                    glossary_lines.append(clean)
+        glossary = "\n".join(glossary_lines)
         if not glossary:
             return ""
         return "Vocabulaire à respecter, noms propres, clients et projets:\n" + glossary
@@ -5747,7 +6011,7 @@ class MainWindow(QWidget):
             self.transcription_model,
             self.transcription_language,
             self.transcription_format,
-            self._transcription_glossary(),
+            self._transcription_glossary(job),
             self.transcription_enhance_audio,
             self.db,
             diarization_enabled=self.transcription_diarization_enabled,

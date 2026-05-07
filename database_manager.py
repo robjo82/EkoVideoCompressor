@@ -74,6 +74,8 @@ class DatabaseManager:
             "transcript_path": "TEXT",
             "enhanced_transcript_path": "TEXT",
             "review_path": "TEXT",
+            "speaker_map_json": "TEXT",
+            "technical_terms_json": "TEXT",
             # Live progress for the in-flight job(s).
             "current_step": "TEXT",
             "progress_pct": "REAL",
@@ -118,6 +120,30 @@ class DatabaseManager:
             conn.execute(
                 "UPDATE jobs SET custom_title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (title, job_id)
+            )
+
+    def update_job_context(
+        self,
+        job_id: int,
+        speakers: Optional[Dict[str, str]] = None,
+        technical_terms: Optional[List[str]] = None,
+    ):
+        sets = []
+        params: list = []
+        if speakers is not None:
+            sets.append("speaker_map_json = ?")
+            params.append(json.dumps(speakers, ensure_ascii=False))
+        if technical_terms is not None:
+            sets.append("technical_terms_json = ?")
+            params.append(json.dumps(technical_terms, ensure_ascii=False))
+        if not sets:
+            return
+        sets.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(job_id)
+        with self._get_connection() as conn:
+            conn.execute(
+                f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?",
+                tuple(params),
             )
 
     def update_job_artefact(self, job_id: int, kind: str, path: str):
