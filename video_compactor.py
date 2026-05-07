@@ -1443,10 +1443,27 @@ class TranscribeWorker(QThread):
                 
             passage["clip_path"] = str(clip_wav)
             
-            # 2. Run multimodal AI check
+            # 2. Run multimodal AI check.
+            # Pass the meeting glossary so Qwen2-Audio knows the
+            # business terminology (proper nouns, project names, client
+            # acronyms) — without it the model has zero context for
+            # "Ekonum" / "Adèle Herbaoui" / "Captivea" and just guesses
+            # phonetically.
             question = str(passage.get("text") or "")
             reason = str(passage.get("reason") or "")
-            prompt = f"La transcription hésite sur : '{question}'. Raison : {reason}. Que dit réellement la personne dans cet extrait ?"
+            glossary_block = self.initial_prompt or ""
+            glossary_hint = (
+                f"\nVocabulaire métier attendu (priorité absolue) : {glossary_block}"
+                if glossary_block.strip()
+                else ""
+            )
+            prompt = (
+                "Tu écoutes un court extrait d'une réunion en français.\n"
+                f"Whisper hésite sur : « {question} ».\n"
+                f"Raison du doute : {reason}.{glossary_hint}\n"
+                "Que dit réellement la personne dans cet extrait ? "
+                "Réponds par la phrase exacte, sans commentaire."
+            )
             
             cmd = build_multimodal_audio_cmd(
                 venv_python_path=self.venv_python_path,
@@ -2439,8 +2456,13 @@ class LibraryView(QWidget):
         self.table.setObjectName("libraryTable")
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        # No row-selection visual: the artefact buttons + kebab menu
+        # provide all the actions per-row, and a translucent selection
+        # halo bleeding behind a "Ouvrir" button looked like a colour
+        # bug. Double-click still works for the default "open the most
+        # relevant artefact" behaviour.
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -2448,23 +2470,25 @@ class LibraryView(QWidget):
         # Source filename takes whatever space is left; the rest sit on a
         # snug width so the artefact buttons line up vertically.
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(self.COL_STATUS, 180)
+        # 220 px gives "Compression… · reste ~10m" enough horizontal
+        # room before falling back to wrap. Combined with the 64 px row
+        # height below, the sub-text always fits on at most two lines.
+        self.table.setColumnWidth(self.COL_STATUS, 220)
         header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
-        # Per-column widths sized to fit the header label without
-        # cropping. "Transcription" is the longest one (~110 px in our
-        # font), the rest comfortably fit in 100.
+        # Per-column widths sized to fit "Ouvrir" + the ↻ replay icon
+        # side by side without cropping the button label.
         artefact_widths = {
-            self.COL_COMPRESSED: 100,
-            self.COL_TRANSCRIPT: 115,
-            self.COL_ENHANCED: 100,
-            self.COL_REVIEW: 90,
+            self.COL_COMPRESSED: 132,
+            self.COL_TRANSCRIPT: 132,
+            self.COL_ENHANCED: 132,
+            self.COL_REVIEW: 132,
         }
         for col, width in artefact_widths.items():
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             self.table.setColumnWidth(col, width)
         header.setSectionResizeMode(self.COL_ACTIONS, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(self.COL_ACTIONS, 60)
-        self.table.verticalHeader().setDefaultSectionSize(54)
+        self.table.verticalHeader().setDefaultSectionSize(64)
         self.table.setColumnHidden(self.COL_FILE, False)
         # A minimum so the filename never disappears entirely on very
         # small windows; if we run out of horizontal room the table will
@@ -2508,19 +2532,38 @@ class LibraryView(QWidget):
             self._spinner_timer.stop()
 
     def _search_jobs(self, query: str) -> list[dict]:
-        """Same data as a full listing, but filtered by transcript text."""
-        results = self.db.search_segments(query_text=query)
-        seen: list[int] = []
-        for s in results:
-            job_id = int(s["job_id"])
-            if job_id not in seen:
-                seen.append(job_id)
-        jobs: list[dict] = []
-        for job_id in seen:
-            job = self.db.get_job(job_id)
-            if job:
-                jobs.append(job)
-        return jobs
+        """
+        Filter the full job listing by query. We match against:
+        - the transcript segments (full-text), so the user can find
+          a meeting by something said in it,
+        - the source filename and the LLM-derived custom_title, so
+          they can also find a meeting by its file or topic.
+
+        Previously we only hit segments, which silently returned an
+        empty list when the user searched by file name or speaker.
+        """
+        q = query.lower()
+
+        # Bag of job ids that match the segment search.
+        segment_results = self.db.search_segments(query_text=query)
+        seg_hits = {int(s["job_id"]) for s in segment_results}
+
+        # Walk the full job list once and keep anything that matches
+        # via segments OR via file path / custom_title (case-insensitive).
+        out: list[dict] = []
+        for job in self.db.list_jobs(limit=500):
+            jid = int(job["id"])
+            if jid in seg_hits:
+                out.append(job)
+                continue
+            haystacks = [
+                str(job.get("source_path") or ""),
+                str(job.get("custom_title") or ""),
+                str(Path(job.get("source_path") or "").name),
+            ]
+            if any(q in h.lower() for h in haystacks if h):
+                out.append(job)
+        return out
 
     def _fill_row(self, row: int, job: dict):
         # --- Statut column ---------------------------------------------
@@ -2541,21 +2584,23 @@ class LibraryView(QWidget):
 
         # --- Artefact columns -----------------------------------------
         running = self._is_running(job)
+        jid = int(job["id"])
         self._set_artefact_cell(
-            row, self.COL_COMPRESSED, job.get("compressed_path"), running, "Compressé"
+            row, self.COL_COMPRESSED, job.get("compressed_path"), running, "Compressé", jid
         )
         self._set_artefact_cell(
-            row, self.COL_TRANSCRIPT, job.get("transcript_path") or job.get("output_path"), running, "Transcription"
+            row, self.COL_TRANSCRIPT, job.get("transcript_path") or job.get("output_path"),
+            running, "Transcription", jid
         )
         self._set_artefact_cell(
-            row, self.COL_ENHANCED, job.get("enhanced_transcript_path"), running, "Améliorée"
+            row, self.COL_ENHANCED, job.get("enhanced_transcript_path"), running, "Améliorée", jid
         )
         self._set_artefact_cell(
-            row, self.COL_REVIEW, job.get("review_path"), running, "Rapport"
+            row, self.COL_REVIEW, job.get("review_path"), running, "Rapport", jid
         )
 
         # --- Actions kebab --------------------------------------------
-        actions = self._build_actions_cell(int(job["id"]))
+        actions = self._build_actions_cell(jid)
         self.table.setCellWidget(row, self.COL_ACTIONS, actions)
 
     def _build_status_cell(self, job: dict) -> QWidget:
@@ -2583,19 +2628,35 @@ class LibraryView(QWidget):
             head.setObjectName("libraryStatusPending")
         layout.addWidget(head)
 
+        # Sub-line wraps inside the status column so a long step label
+        # like "Compression… · reste ~10m" is readable instead of
+        # silently truncated by the cell border.
         if running:
             step = (job.get("current_step") or "").strip() or "Préparation…"
             eta = self._format_eta(job.get("eta_seconds"))
             sub = QLabel(f"{step}{(' · ' + eta) if eta else ''}")
             sub.setObjectName("libraryStatusSub")
+            sub.setWordWrap(True)
+            sub.setToolTip(sub.text())
             layout.addWidget(sub)
         elif failed and job.get("error_message"):
-            sub = QLabel(str(job["error_message"])[:80])
+            sub = QLabel(str(job["error_message"])[:120])
             sub.setObjectName("libraryStatusSub")
+            sub.setWordWrap(True)
             sub.setToolTip(str(job["error_message"]))
             layout.addWidget(sub)
 
         return cell
+
+    # Map of column → ("step kind", "human label").
+    # The "step kind" is the value passed to the smart-relaunch popup
+    # so we know which step the user wants to redo from this cell.
+    _COL_TO_STEP = {
+        2: ("compression", "Compression"),
+        3: ("transcription", "Transcription"),
+        4: ("enhanced", "Améliorée"),
+        5: ("review", "Rapport"),
+    }
 
     def _set_artefact_cell(
         self,
@@ -2604,30 +2665,54 @@ class LibraryView(QWidget):
         path: str | None,
         running: bool,
         label: str,
+        job_id: int,
     ):
-        btn = QPushButton()
-        btn.setObjectName("artefactButton")
-        if path and Path(path).exists():
-            btn.setText("Ouvrir")
-            btn.setToolTip(str(path))
-            btn.setEnabled(True)
-            btn.clicked.connect(lambda _=False, p=str(path): _open_path(p))
-        elif running:
-            # The artefact is being produced — show a soft pending state
-            # so the user knows it's coming, not missing forever.
-            btn.setText("⏳")
-            btn.setToolTip(f"{label} en cours…")
-            btn.setEnabled(False)
-        else:
-            btn.setText("—")
-            btn.setToolTip(f"Pas de {label.lower()} disponible")
-            btn.setEnabled(False)
-
         wrapper = QWidget()
         wrap_layout = QHBoxLayout(wrapper)
         wrap_layout.setContentsMargins(4, 4, 4, 4)
-        wrap_layout.addWidget(btn)
+        wrap_layout.setSpacing(4)
+
+        if path and Path(path).exists():
+            mtime = self._format_mtime(path)
+            btn = QPushButton("Ouvrir")
+            btn.setObjectName("artefactButton")
+            btn.setToolTip(f"{path}\nProduit le {mtime}" if mtime else str(path))
+            btn.clicked.connect(lambda _=False, p=str(path): _open_path(p))
+            wrap_layout.addWidget(btn, 1)
+            # Re-run icon. Single click triggers a one-step relaunch
+            # popup pre-filled with this column's step ticked.
+            kind = self._COL_TO_STEP.get(col, (None, None))[0]
+            if kind:
+                rerun = QToolButton()
+                rerun.setObjectName("artefactReplay")
+                rerun.setText("↻")
+                rerun.setToolTip(f"Relancer cette étape ({label})")
+                rerun.clicked.connect(
+                    lambda _=False, jid=job_id, k=kind: self._action_restart(jid, preselect=[k])
+                )
+                wrap_layout.addWidget(rerun, 0)
+        elif running:
+            btn = QPushButton("⏳")
+            btn.setObjectName("artefactButton")
+            btn.setToolTip(f"{label} en cours…")
+            btn.setEnabled(False)
+            wrap_layout.addWidget(btn, 1)
+        else:
+            btn = QPushButton("—")
+            btn.setObjectName("artefactButton")
+            btn.setToolTip(f"Pas de {label.lower()} disponible")
+            btn.setEnabled(False)
+            wrap_layout.addWidget(btn, 1)
+
         self.table.setCellWidget(row, col, wrapper)
+
+    @staticmethod
+    def _format_mtime(path: str) -> str:
+        try:
+            ts = Path(path).stat().st_mtime
+        except Exception:
+            return ""
+        return datetime.fromtimestamp(ts).strftime("%d/%m/%Y à %H:%M")
 
     def _build_actions_cell(self, job_id: int) -> QWidget:
         btn = QToolButton()
@@ -2636,6 +2721,7 @@ class LibraryView(QWidget):
         btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(btn)
         menu.addAction("Ouvrir le dossier", lambda jid=job_id: self._action_show_folder(jid))
+        menu.addAction("Renommer les locuteurs…", lambda jid=job_id: self._action_rename_speakers(jid))
         menu.addAction("Relancer / Réparer", lambda jid=job_id: self._action_restart(jid))
         menu.addSeparator()
         menu.addAction("Supprimer de la bibliothèque", lambda jid=job_id: self._action_delete(jid))
@@ -2668,17 +2754,19 @@ class LibraryView(QWidget):
         # mid-run, so the "Ouvrir" button must light up without waiting
         # for a full refresh.
         running = self._is_running(job)
+        jid = int(job_id)
         self._set_artefact_cell(
-            row, self.COL_COMPRESSED, job.get("compressed_path"), running, "Compressé"
+            row, self.COL_COMPRESSED, job.get("compressed_path"), running, "Compressé", jid
         )
         self._set_artefact_cell(
-            row, self.COL_TRANSCRIPT, job.get("transcript_path") or job.get("output_path"), running, "Transcription"
+            row, self.COL_TRANSCRIPT, job.get("transcript_path") or job.get("output_path"),
+            running, "Transcription", jid
         )
         self._set_artefact_cell(
-            row, self.COL_ENHANCED, job.get("enhanced_transcript_path"), running, "Améliorée"
+            row, self.COL_ENHANCED, job.get("enhanced_transcript_path"), running, "Améliorée", jid
         )
         self._set_artefact_cell(
-            row, self.COL_REVIEW, job.get("review_path"), running, "Rapport"
+            row, self.COL_REVIEW, job.get("review_path"), running, "Rapport", jid
         )
         if not self._spinner_timer.isActive() and running:
             self._spinner_timer.start()
@@ -2748,12 +2836,32 @@ class LibraryView(QWidget):
             main_win.queue_list.clear()
             main_win.load_jobs_from_db()
 
-    def _action_restart(self, job_id: int):
-        self.db.update_job_status(job_id, "PENDING", "")
-        self.db.update_job_progress(job_id, step="", progress_pct=0, eta_seconds=0)
-        self._reload_main_queue()
-        self.refresh()
-        QMessageBox.information(self, "Relance", "La vidéo a été remise en file d'attente.")
+    def _action_restart(self, job_id: int, preselect: list[str] | None = None):
+        """
+        Open the smart-relaunch popup: the user picks which steps to
+        redo (compression / transcription / améliorée / rapport). On
+        confirm we ask the MainWindow to restart the job — and we drive
+        the worker ourselves so it actually runs even when nothing
+        else is currently in the queue.
+        """
+        job = self.db.get_job(job_id)
+        if not job:
+            return
+        dlg = RelaunchStepsDialog(job, preselect=preselect or [], parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        steps = dlg.selected_steps()
+        if not steps:
+            return
+
+        main_win = self.window()
+        if hasattr(main_win, "relaunch_job_with_steps"):
+            main_win.relaunch_job_with_steps(job_id, steps)
+        else:
+            # Defensive fallback: keep the previous behaviour if we're
+            # somehow detached from the main window.
+            self.db.update_job_status(job_id, "PENDING", "")
+            self.refresh()
 
     def _action_delete(self, job_id: int):
         confirm = QMessageBox.question(
@@ -2786,6 +2894,254 @@ class LibraryView(QWidget):
                 _reveal_in_finder(Path(path).parent)
                 return
         QMessageBox.information(self, "Infos", "Pas de dossier disponible pour cette entrée.")
+
+    def _action_rename_speakers(self, job_id: int):
+        dlg = SpeakerRenameDialog(self.db, job_id, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        mapping = dlg.values()
+        if not mapping:
+            return
+        applied_files, applied_segments = self._apply_speaker_rename(job_id, mapping)
+        self.refresh()
+        QMessageBox.information(
+            self,
+            "Renommage appliqué",
+            (
+                f"{len(mapping)} locuteur(s) renommé(s).\n"
+                f"Fichiers mis à jour : {applied_files}\n"
+                f"Segments DB mis à jour : {applied_segments}"
+            ),
+        )
+
+    def _apply_speaker_rename(self, job_id: int, mapping: dict[str, str]) -> tuple[int, int]:
+        """
+        Apply the SPEAKER_XX → real-name mapping to every artefact on
+        disk and to the DB segments. Returns (files_touched, segments_touched).
+        """
+        record = self.db.get_job(job_id) or {}
+
+        def _rewrite(text: str) -> str:
+            for old, new in mapping.items():
+                # Bracketed form (most common in our render).
+                text = text.replace(f"[{old}]", f"[{new}]")
+                # Bare token, only when surrounded by word boundaries
+                # so we don't accidentally chew a substring of something.
+                text = re.sub(rf"\b{re.escape(old)}\b", new, text)
+            return text
+
+        files_touched = 0
+        for key in ("transcript_path", "enhanced_transcript_path", "review_path"):
+            path = record.get(key)
+            if not path or not Path(path).exists():
+                continue
+            try:
+                p = Path(path)
+                old = p.read_text(encoding="utf-8", errors="ignore")
+                new_text = _rewrite(old)
+                if new_text != old:
+                    p.write_text(new_text, encoding="utf-8")
+                    files_touched += 1
+            except Exception:
+                continue
+
+        # Update DB segments so the search index also reflects the
+        # renames. We load, rewrite, and re-insert via add_segments
+        # which already handles the "delete + bulk insert" pattern.
+        segments = self.db.get_segments(job_id) or []
+        seg_changed = 0
+        if segments:
+            updated = []
+            for seg in segments:
+                seg_copy = dict(seg)
+                speaker = (seg_copy.get("speaker") or "").strip()
+                if speaker in mapping:
+                    seg_copy["speaker"] = mapping[speaker]
+                    seg_changed += 1
+                # `add_segments` expects start/end/text/speaker keys.
+                seg_copy["start"] = seg_copy.get("start_time", seg_copy.get("start", 0.0))
+                seg_copy["end"] = seg_copy.get("end_time", seg_copy.get("end", 0.0))
+                updated.append(seg_copy)
+            if seg_changed:
+                self.db.add_segments(job_id, updated)
+        return files_touched, seg_changed
+
+class SpeakerRenameDialog(QDialog):
+    """
+    Lets the user replace SPEAKER_XX placeholders by real names.
+    Loads existing names from the DB, shows one editable field per
+    detected speaker, and on save rewrites every artefact + the DB
+    segments so the new names propagate everywhere.
+    """
+
+    SPEAKER_RE = re.compile(r"SPEAKER_\d{2,}")
+
+    def __init__(self, db, job_id: int, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.db = db
+        self.job_id = job_id
+        self.setWindowTitle("Renommer les locuteurs")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        head = QLabel(
+            "Indiquez le prénom (ou nom) de chaque interlocuteur. "
+            "Les remplacements seront appliqués à toute la transcription, "
+            "à la version améliorée et au rapport."
+        )
+        head.setWordWrap(True)
+        layout.addWidget(head)
+
+        speakers = self._detect_speakers(job_id)
+        self._fields: dict[str, QLineEdit] = {}
+
+        if not speakers:
+            empty = QLabel(
+                "Aucun locuteur SPEAKER_XX détecté pour cette transcription. "
+                "Active la diarisation dans Paramètres pour étiqueter les voix."
+            )
+            empty.setObjectName("inlineHint")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
+        else:
+            form = QFormLayout()
+            form.setHorizontalSpacing(10)
+            form.setVerticalSpacing(10)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            for label, current in sorted(speakers.items()):
+                edit = QLineEdit(current)
+                edit.setPlaceholderText("Prénom (laisser vide pour ne pas renommer)")
+                form.addRow(label, edit)
+                self._fields[label] = edit
+            layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Appliquer")
+        buttons.button(QDialogButtonBox.Ok).setEnabled(bool(speakers))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _detect_speakers(self, job_id: int) -> dict[str, str]:
+        """
+        Walk every available artefact + the DB segments to find
+        SPEAKER_XX tokens. Pre-fills the form with whatever name is
+        already in use (e.g. if the LLM already mapped some).
+        """
+        names: dict[str, str] = {}
+        seen_speakers: set[str] = set()
+
+        # Collect from segments first — they have the canonical labels.
+        segments = self.db.get_segments(job_id) or []
+        for seg in segments:
+            sp = (seg.get("speaker") or "").strip()
+            if sp:
+                seen_speakers.add(sp)
+
+        record = self.db.get_job(job_id) or {}
+        # Also walk the produced files: a SPEAKER_XX that appeared
+        # there but not in segments (e.g. a renamed enhanced file)
+        # would be missed otherwise.
+        for key in ("transcript_path", "enhanced_transcript_path", "review_path"):
+            path = record.get(key)
+            if not path:
+                continue
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            seen_speakers.update(self.SPEAKER_RE.findall(text))
+
+        for sp in seen_speakers:
+            names[sp] = ""
+        return names
+
+    def values(self) -> dict[str, str]:
+        return {
+            label: edit.text().strip()
+            for label, edit in self._fields.items()
+            if edit.text().strip()
+        }
+
+
+class RelaunchStepsDialog(QDialog):
+    """
+    "Relancer / Réparer" popup: lets the user pick exactly which steps
+    to redo for an existing job, with each option pre-checked when the
+    artefact is missing (so the obvious "just fix the bits that didn't
+    finish" case is one click away).
+    """
+
+    # (key, label, helper text, predicate(job) -> True if artefact exists)
+    STEPS = [
+        ("compression", "Compression", "Re-encoder la vidéo / l'audio source.", "compressed_path"),
+        ("transcription", "Transcription Whisper",
+         "Re-transcrire le média (passe Whisper + diarisation).", "transcript_path"),
+        ("enhanced", "Transcription améliorée (LLM)",
+         "Re-faire l'analyse titre + interlocuteurs + corrections.", "enhanced_transcript_path"),
+        ("review", "Réécoute IA multimodale",
+         "Re-lancer la vérification audio des passages douteux.", "review_path"),
+    ]
+
+    def __init__(self, job: dict, preselect: list[str], parent: QWidget | None = None):
+        super().__init__(parent)
+        title = job.get("custom_title") or Path(job.get("source_path") or "").name or "ce fichier"
+        self.setWindowTitle("Relancer / Réparer")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        head = QLabel(f"Quelles étapes voulez-vous relancer pour <b>{title}</b> ?")
+        head.setWordWrap(True)
+        layout.addWidget(head)
+
+        sub = QLabel(
+            "Les étapes manquantes sont cochées par défaut. "
+            "Une étape relancée écrase son fichier de sortie."
+        )
+        sub.setObjectName("inlineHint")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        self._checks: dict[str, QCheckBox] = {}
+        preselect_set = set(preselect or [])
+        for key, label, helper, artefact_col in self.STEPS:
+            row = QFrame()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 4, 0, 4)
+            row_layout.setSpacing(2)
+            cb = QCheckBox(label)
+            already = bool(job.get(artefact_col))
+            should_check = (key in preselect_set) or (not already)
+            cb.setChecked(should_check)
+            row_layout.addWidget(cb)
+            note_text = helper
+            if already:
+                note_text += "  ·  déjà produit"
+            note = QLabel(note_text)
+            note.setObjectName("inlineHint")
+            note.setIndent(24)
+            note.setWordWrap(True)
+            row_layout.addWidget(note)
+            self._checks[key] = cb
+            layout.addWidget(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Relancer")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_steps(self) -> list[str]:
+        return [key for key, cb in self._checks.items() if cb.isChecked()]
+
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -2983,6 +3339,13 @@ class MainWindow(QWidget):
         self.queue_list = QListWidget()
         self.queue_list.setObjectName("queueList")
         self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Internal-move drag-and-drop so the user can reorder pending
+        # files before starting a batch. We keep the underlying
+        # queue_jobs list in sync via the rowsMoved signal below.
+        self.queue_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.queue_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.queue_list.setMovement(QListWidget.Movement.Snap)
+        self.queue_list.model().rowsMoved.connect(self._on_queue_rows_moved)
         self.queue_list.currentRowChanged.connect(self.on_queue_selection_changed)
         queue_layout.addWidget(self.queue_list, 1)
         
@@ -3432,7 +3795,7 @@ class MainWindow(QWidget):
             padding: 5px 10px;
             font-size: 12px;
             color: #1d1d1f;
-            min-width: 70px;
+            min-width: 60px;
         }
         QPushButton#artefactButton:hover, QToolButton#artefactButton:hover {
             background: #f2f2f7;
@@ -3443,6 +3806,22 @@ class MainWindow(QWidget):
             border-color: #ececef;
         }
         QToolButton#artefactButton::menu-indicator { image: none; }
+        /* Re-run icon next to "Ouvrir" — visible but quieter so the
+           main "Ouvrir" stays the affordance the eye lands on. */
+        QToolButton#artefactReplay {
+            background: #ffffff;
+            border: 1px solid #e1e1e6;
+            border-radius: 6px;
+            padding: 4px 6px;
+            color: #6e6e73;
+            font-size: 13px;
+            min-width: 24px;
+        }
+        QToolButton#artefactReplay:hover {
+            background: #f2f2f7;
+            border-color: #d2d2d7;
+            color: #1d1d1f;
+        }
         QFrame#dropZone {
             background: #ffffff;
             border: 1.5px dashed #c7c7cc;
@@ -4450,6 +4829,39 @@ class MainWindow(QWidget):
         for idx in range(len(self.queue_jobs)):
             self.refresh_queue_item(idx)
 
+    def _on_queue_rows_moved(self, parent, start: int, end: int, dest, dest_row: int):
+        """
+        Keep self.queue_jobs in sync when the user drags an item
+        somewhere else in the queue list. Qt has already moved the
+        QListWidgetItem; we mirror the same move on the parallel
+        queue_jobs array. We never reorder while a batch is running
+        (the queue list is hidden in that mode anyway, but defensively).
+        """
+        if self.is_batch_running:
+            return
+        if start < 0 or start >= len(self.queue_jobs):
+            return
+        # Qt's contract for rowsMoved: dest_row is the index BEFORE the
+        # move, in the destination, where the item lands. When moving
+        # downward inside the same parent, the effective index is
+        # dest_row - 1.
+        target = dest_row
+        if dest_row > start:
+            target -= 1
+        if target < 0 or target >= len(self.queue_jobs) or target == start:
+            return
+        item = self.queue_jobs.pop(start)
+        self.queue_jobs.insert(target, item)
+        # The current_index should track the moved item if it was
+        # selected, otherwise stay on whatever's now at that row.
+        if self.current_index == start:
+            self.current_index = target
+        elif start < self.current_index <= target:
+            self.current_index -= 1
+        elif target <= self.current_index < start:
+            self.current_index += 1
+        self.refresh_all_queue_items()
+
     def on_queue_selection_changed(self, row: int):
         self.current_index = row
         if row < 0 or row >= len(self.queue_jobs):
@@ -4802,6 +5214,129 @@ class MainWindow(QWidget):
         self.refresh_all_queue_items()
         self._set_running_ui(True)
         self._start_next_job()
+
+    def relaunch_job_with_steps(self, job_id: int, steps: list[str]):
+        """
+        Take an existing library job, reset whatever artefacts the user
+        wants to redo, and start a single-job batch on it. Driven from
+        LibraryView's "Relancer / Réparer" popup so a relaunch actually
+        runs even when the queue is otherwise empty.
+        """
+        if self.is_batch_running:
+            QMessageBox.warning(
+                self,
+                "Traitement en cours",
+                "Un traitement est déjà en cours. Annulez-le ou attendez la fin.",
+            )
+            return
+        record = self.db.get_job(job_id)
+        if not record:
+            return
+
+        # Reconstruct a QueueJob from what the DB already knows about
+        # this entry. Settings are preserved (so the user's custom
+        # profile survives a relaunch); paths are reset for the
+        # specific steps they ticked.
+        settings = record.get("settings") or {}
+        # The settings_json was written from asdict(QueueJob(...)) at
+        # creation; coerce missing fields to defaults via the dataclass.
+        try:
+            job = QueueJob(**settings)
+        except TypeError:
+            job = QueueJob(input_path=str(record.get("source_path") or ""))
+        job.input_path = str(record.get("source_path") or job.input_path)
+        job.workspace_dir = str(record.get("workspace_dir") or "")
+        job.db_id = job_id
+        job.status = "pending"
+        job.error_message = ""
+
+        # Plan the run: which worker to dispatch and what status to
+        # leave on the DB so the resumption logic in TranscribeWorker
+        # picks up at the right step.
+        wants_compress = "compression" in steps
+        wants_transcript = "transcription" in steps
+        wants_enhanced = "enhanced" in steps
+        wants_review = "review" in steps
+
+        if wants_compress and (wants_transcript or wants_enhanced or wants_review):
+            mode = "compress_transcribe"
+            db_status = "PENDING"
+        elif wants_compress:
+            mode = "compress"
+            db_status = "PENDING"
+        elif wants_transcript:
+            mode = "transcribe"
+            db_status = "PENDING"
+        elif wants_enhanced or wants_review:
+            # Skip audio extraction + Whisper, reuse the existing
+            # artefacts and only redo the LLM passes.
+            mode = "transcribe"
+            db_status = "WHISPER_DONE"
+            # Override the output path to point at the existing
+            # transcript so TranscribeWorker doesn't write a new file.
+            existing = record.get("transcript_path") or record.get("output_path")
+            if existing:
+                job.transcript_path = existing
+        else:
+            return
+
+        # Forget the previous artefact paths the user asked to redo so
+        # the library "Ouvrir" buttons go back to "—" until the new
+        # files land.
+        if wants_compress:
+            self.db.update_job_artefact(job_id, "compressed", "")
+        if wants_transcript:
+            for kind in ("transcript", "enhanced_transcript", "review"):
+                self.db.update_job_artefact(job_id, kind, "")
+        elif wants_enhanced:
+            self.db.update_job_artefact(job_id, "enhanced_transcript", "")
+        if wants_review:
+            self.db.update_job_artefact(job_id, "review", "")
+
+        self.db.update_job_status(job_id, db_status, "")
+        self.db.update_job_progress(job_id, step="Relance demandée…", progress_pct=0, eta_seconds=None)
+
+        # When the user opted into the multimodal recheck via the popup,
+        # honour it for this run regardless of the saved setting.
+        prev_recheck = self.transcription_audio_recheck_enabled
+        if wants_review:
+            self.transcription_audio_recheck_enabled = True
+
+        # Replace the queue with this single job and kick off the
+        # appropriate batch.
+        self.queue_jobs = [job]
+        self.queue_list.clear()
+        self.queue_list.addItem(QListWidgetItem())
+        self.refresh_queue_item(0)
+        self.batch_mode = mode
+
+        out_dir = Path(self.edit_output_dir.text().strip() or str(Path.home() / "Desktop"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if mode in ("compress", "compress_transcribe") and not job.output_path:
+            job.output_path = default_out_path(job.input_path, str(out_dir), self.edit_suffix.text().strip())
+        if mode in ("transcribe", "compress_transcribe") and not job.transcript_path:
+            job.transcript_path = self._transcription_output_path(job, out_dir)
+
+        self.pending_indices = [0]
+        self.completed_count = 0
+        self.failed_count = 0
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress_global.setRange(0, 100)
+        self.progress_global.setValue(0)
+        self._set_progress_visible(True)
+        self._set_running_ui(True)
+        # Restore the user's recheck preference once the worker has
+        # captured the current value via _start_transcribe_worker.
+        self._pending_recheck_restore = (prev_recheck if wants_review else None)
+        self._start_next_job()
+        if wants_review and prev_recheck is not None:
+            # Restore the original recheck preference now that the
+            # worker has been spawned with the override value.
+            self.transcription_audio_recheck_enabled = prev_recheck
+
+        # Library refresh so the row shows "En cours…" immediately.
+        self.library_view.refresh()
 
     def _start_next_job(self):
         if not self.pending_indices:
@@ -5172,7 +5707,12 @@ def main():
     app.setApplicationName(APP_NAME)
 
     window = MainWindow()
-    window.show()
+    # Default to maximized on first launch — the library table + right
+    # settings panel breathe much better with the full screen, and the
+    # team's flow is to leave the app open for the duration of a batch.
+    # showMaximized() is honoured on macOS / Windows / X11; on Wayland
+    # it falls back to the stored geometry if the WM rejects it.
+    window.showMaximized()
     sys.exit(app.exec())
 
 
