@@ -54,7 +54,7 @@ from transcription_utils import (
     text_llm_label_for,
     transcript_output_ext,
 )
-from PySide6.QtCore import QSettings, QThread, QTime, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, QTime, QTimer, Qt, Signal
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -70,6 +70,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMenu,
@@ -680,14 +681,60 @@ def is_hf_model_cached(repo_id: str) -> bool:
     cache. We use this in Settings to show the user which models are already
     downloaded vs need a fresh pull (multi-Go).
     """
-    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
-    repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
+    repo_dir = hf_model_cache_dir(repo_id)
     if not repo_dir.exists():
         return False
     snapshots_dir = repo_dir / "snapshots"
     if snapshots_dir.exists() and any(snapshots_dir.iterdir()):
         return True
     return False
+
+
+def hf_model_cache_dir(repo_id: str) -> Path:
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    return cache_dir / f"models--{repo_id.replace('/', '--')}"
+
+
+class ModelCacheWorker(QThread):
+    finished_ok = Signal(str, str)
+    failed = Signal(str)
+
+    def __init__(self, mode: str, repo_id: str, token: str = "", parent: QObject | None = None):
+        super().__init__(parent)
+        self.mode = mode
+        self.repo_id = repo_id
+        self.token = token
+
+    def run(self):
+        try:
+            if self.mode == "delete":
+                cache_dir = hf_model_cache_dir(self.repo_id)
+                if cache_dir.exists():
+                    shutil.rmtree(cache_dir)
+                self.finished_ok.emit(self.mode, self.repo_id)
+                return
+
+            python_path = managed_venv_python_path()
+            python = str(python_path) if python_path.exists() else sys.executable
+            script = """
+import sys
+from huggingface_hub import snapshot_download
+repo_id = sys.argv[1]
+token = sys.argv[2] or None
+snapshot_download(repo_id=repo_id, token=token)
+"""
+            proc = subprocess.run(
+                [python, "-c", script, self.repo_id, self.token],
+                capture_output=True,
+                text=True,
+                timeout=None,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                raise RuntimeError(detail or f"Téléchargement impossible pour {self.repo_id}.")
+            self.finished_ok.emit(self.mode, self.repo_id)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class HuggingFaceAuthDialog(QDialog):
@@ -813,6 +860,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Paramètres")
         self.setModal(True)
+        self._model_cache_worker: ModelCacheWorker | None = None
+        self._model_controls: list[tuple[QComboBox, QPushButton, QPushButton]] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
@@ -885,7 +934,10 @@ class SettingsDialog(QDialog):
             str(transcription_settings.get("model") or DEFAULT_WHISPER_MODEL)
         )
         self.transcription_model_combo = self._build_model_combo(WHISPER_MODELS, current_whisper)
-        transcription_form.addRow("Modèle Whisper", self.transcription_model_combo)
+        transcription_form.addRow(
+            "Modèle Whisper",
+            self._build_model_cache_row(self.transcription_model_combo),
+        )
 
         # --- Text LLM (analyse, titre, locuteurs, corrections) ---------------
         # Run via mlx_lm. Default Mistral 7B is the sweet spot on M1 16 Go.
@@ -896,7 +948,10 @@ class SettingsDialog(QDialog):
             or DEFAULT_TEXT_LLM_MODEL
         )
         self.transcription_text_llm_combo = self._build_llm_combo(TEXT_LLM_MODELS, current_text_llm)
-        transcription_form.addRow("Modèle IA texte", self.transcription_text_llm_combo)
+        transcription_form.addRow(
+            "Modèle IA texte",
+            self._build_model_cache_row(self.transcription_text_llm_combo),
+        )
 
         text_llm_hint = QLabel(
             "Utilisé après transcription pour proposer un titre, identifier les "
@@ -920,14 +975,17 @@ class SettingsDialog(QDialog):
             transcription_settings.get("audio_llm_model") or DEFAULT_AUDIO_LLM_MODEL
         )
         self.transcription_audio_llm_combo = self._build_llm_combo(AUDIO_LLM_MODELS, current_audio_llm)
-        transcription_form.addRow("Modèle IA audio", self.transcription_audio_llm_combo)
+        transcription_form.addRow(
+            "Modèle IA audio",
+            self._build_model_cache_row(self.transcription_audio_llm_combo),
+        )
 
-        # Disable the audio model dropdown when the recheck step is OFF — it's
-        # only meaningful when we're actually going to call mlx_vlm.
-        def _sync_audio_combo(checked: bool):
-            self.transcription_audio_llm_combo.setEnabled(checked)
-        self.transcription_audio_recheck_check.toggled.connect(_sync_audio_combo)
-        _sync_audio_combo(self.transcription_audio_recheck_check.isChecked())
+        # The checkbox controls whether the audio model is used during a
+        # transcription. The selector stays active so users can pre-download
+        # or remove the model without enabling the recheck step.
+        self.transcription_audio_recheck_check.toggled.connect(
+            lambda _=False: self._refresh_model_cache_buttons()
+        )
 
         audio_llm_hint = QLabel(
             "Optionnel. Quand activé, l'IA réécoute des extraits courts (5-15 s) autour "
@@ -996,6 +1054,7 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+        self._refresh_model_cache_buttons()
 
         self.setMinimumWidth(720)
         self.resize(820, 600)
@@ -1046,6 +1105,7 @@ class SettingsDialog(QDialog):
         }
         QComboBox QAbstractItemView {
             background: #ffffff;
+            alternate-background-color: #ffffff;
             border: 1px solid #d2d2d7;
             border-radius: 8px;
             padding: 4px;
@@ -1055,9 +1115,15 @@ class SettingsDialog(QDialog):
             outline: none;
         }
         QComboBox QAbstractItemView::item {
+            background: #ffffff;
             padding: 6px 10px;
             border-radius: 5px;
             min-height: 22px;
+        }
+        QComboBox QAbstractItemView::item:hover,
+        QComboBox QAbstractItemView::item:selected {
+            background: #e8f2ff;
+            color: #1d1d1f;
         }
         QCheckBox { color: #1d1d1f; spacing: 8px; }
         QCheckBox::indicator {
@@ -1080,6 +1146,14 @@ class SettingsDialog(QDialog):
             color: #1d1d1f;
         }
         QPushButton:hover { background: #f2f2f7; }
+        QPushButton#modelCacheButton {
+            padding: 8px 12px;
+            min-width: 92px;
+        }
+        QPushButton#modelDeleteButton {
+            padding: 8px 12px;
+            min-width: 82px;
+        }
         QTabWidget::pane {
             border: none;
             margin-top: 10px;
@@ -1106,6 +1180,8 @@ class SettingsDialog(QDialog):
     def _build_model_combo(self, catalog: list[dict], current_id: str) -> QComboBox:
         combo = QComboBox()
         combo.setEditable(False)
+        combo.setView(self._model_combo_view(combo))
+        combo._model_catalog = catalog  # type: ignore[attr-defined]
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(34)
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1129,6 +1205,8 @@ class SettingsDialog(QDialog):
         """
         combo = QComboBox()
         combo.setEditable(False)
+        combo.setView(self._model_combo_view(combo))
+        combo._model_catalog = catalog  # type: ignore[attr-defined]
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(30)
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -1147,6 +1225,128 @@ class SettingsDialog(QDialog):
     def _model_combo_label(self, entry: dict) -> str:
         status = "téléchargé" if is_hf_model_cached(str(entry["id"])) else "à télécharger"
         return f"{entry['label']} — {status}"
+
+    def _model_combo_view(self, combo: QComboBox) -> QListView:
+        view = QListView(combo)
+        view.setAlternatingRowColors(False)
+        view.setUniformItemSizes(True)
+        view.setStyleSheet(
+            """
+            QListView {
+                background: #ffffff;
+                alternate-background-color: #ffffff;
+                color: #1d1d1f;
+                selection-background-color: #e8f2ff;
+                selection-color: #1d1d1f;
+                outline: 0;
+            }
+            QListView::item {
+                background: #ffffff;
+                color: #1d1d1f;
+                padding: 6px 10px;
+                min-height: 22px;
+            }
+            QListView::item:hover,
+            QListView::item:selected,
+            QListView::item:selected:active,
+            QListView::item:selected:!active {
+                background: #e8f2ff;
+                color: #1d1d1f;
+            }
+            """
+        )
+        return view
+
+    def _build_model_cache_row(self, combo: QComboBox) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(combo, 1)
+
+        btn_download = QPushButton("Télécharger")
+        btn_download.setObjectName("modelCacheButton")
+        btn_download.clicked.connect(lambda _=False, c=combo: self.download_selected_model(c))
+        row.addWidget(btn_download, 0)
+
+        btn_delete = QPushButton("Supprimer")
+        btn_delete.setObjectName("modelDeleteButton")
+        btn_delete.clicked.connect(lambda _=False, c=combo: self.delete_selected_model(c))
+        row.addWidget(btn_delete, 0)
+
+        combo.currentIndexChanged.connect(lambda _=0: self._refresh_model_cache_buttons())
+        self._model_controls.append((combo, btn_download, btn_delete))
+        return row
+
+    def _refresh_model_combo_labels(self, combo: QComboBox):
+        current_id = str(combo.currentData() or "")
+        catalog = getattr(combo, "_model_catalog", [])
+        combo.blockSignals(True)
+        combo.clear()
+        for entry in catalog:
+            combo.addItem(self._model_combo_label(entry), entry["id"])
+        idx = combo.findData(current_id)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        elif current_id:
+            combo.addItem(f"{current_id} — modèle actuel · cache inconnu", current_id)
+            combo.setCurrentIndex(combo.count() - 1)
+        combo.blockSignals(False)
+
+    def _refresh_model_cache_buttons(self):
+        busy = self._model_cache_worker is not None and self._model_cache_worker.isRunning()
+        for combo, btn_download, btn_delete in self._model_controls:
+            repo_id = str(combo.currentData() or "")
+            cached = bool(repo_id and is_hf_model_cached(repo_id))
+            active = combo.isEnabled() and not busy and bool(repo_id)
+            btn_download.setEnabled(active and not cached)
+            btn_delete.setEnabled(active and cached)
+
+    def _selected_model_id(self, combo: QComboBox) -> str:
+        return str(combo.currentData() or "").strip()
+
+    def download_selected_model(self, combo: QComboBox):
+        repo_id = self._selected_model_id(combo)
+        if not repo_id:
+            return
+        if is_hf_model_cached(repo_id):
+            self._refresh_model_cache_buttons()
+            return
+        self._run_model_cache_worker("download", repo_id)
+
+    def delete_selected_model(self, combo: QComboBox):
+        repo_id = self._selected_model_id(combo)
+        if not repo_id:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Supprimer le modèle",
+            f"Supprimer le cache local du modèle ?\n\n{repo_id}\n\nIl sera retéléchargé au prochain usage.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._run_model_cache_worker("delete", repo_id)
+
+    def _run_model_cache_worker(self, mode: str, repo_id: str):
+        if self._model_cache_worker and self._model_cache_worker.isRunning():
+            return
+        token = self.transcription_hf_token_edit.text().strip()
+        self._model_cache_worker = ModelCacheWorker(mode, repo_id, token, self)
+        self._model_cache_worker.finished_ok.connect(self._on_model_cache_finished)
+        self._model_cache_worker.failed.connect(self._on_model_cache_failed)
+        self._refresh_model_cache_buttons()
+        self._model_cache_worker.start()
+
+    def _on_model_cache_finished(self, mode: str, repo_id: str):
+        action = "téléchargé" if mode == "download" else "supprimé"
+        for combo, _, _ in self._model_controls:
+            self._refresh_model_combo_labels(combo)
+        self._model_cache_worker = None
+        self._refresh_model_cache_buttons()
+        QMessageBox.information(self, "Modèles", f"Modèle {action} :\n{repo_id}")
+
+    def _on_model_cache_failed(self, message: str):
+        self._model_cache_worker = None
+        self._refresh_model_cache_buttons()
+        QMessageBox.warning(self, "Modèles", f"Opération impossible :\n{message}")
 
     def pick_ffmpeg(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choisir ffmpeg", str(Path.home()), "Tous (*.*)")
@@ -2743,27 +2943,16 @@ class LibraryView(QWidget):
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setWordWrap(True)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         header = self.table.horizontalHeader()
-        # Source filename takes whatever space is left; the rest sit on a
-        # snug width so the artefact buttons line up vertically.
+        header.setStretchLastSection(False)
+        # We fit the columns ourselves on resize so the last column never
+        # slips under the right border of the table.
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
-        # Keep status compact so the filename column can breathe; running
-        # details wrap inside the cell when needed.
-        self.table.setColumnWidth(self.COL_STATUS, 148)
-        header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
-        # Per-column widths sized to fit "Ouvrir" + the ↻ replay icon
-        # side by side without cropping the button label.
-        artefact_widths = {
-            self.COL_COMPRESSED: 122,
-            self.COL_TRANSCRIPT: 122,
-            self.COL_ENHANCED: 122,
-            self.COL_REVIEW: 122,
-        }
-        for col, width in artefact_widths.items():
+        header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Fixed)
+        for col in (self.COL_COMPRESSED, self.COL_TRANSCRIPT, self.COL_ENHANCED, self.COL_REVIEW):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            self.table.setColumnWidth(col, width)
         header.setSectionResizeMode(self.COL_ACTIONS, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(self.COL_ACTIONS, 78)
         self.table.verticalHeader().setDefaultSectionSize(74)
         self.table.setColumnHidden(self.COL_FILE, False)
         # A minimum so the filename never disappears entirely on very
@@ -2772,6 +2961,7 @@ class LibraryView(QWidget):
         self.table.horizontalHeader().setMinimumSectionSize(80)
         self.table.itemDoubleClicked.connect(self._on_double_click)
         layout.addWidget(self.table, 1)
+        QTimer.singleShot(0, self._fit_columns_to_viewport)
 
         # Spinner ticker — repaints just the running rows so we don't
         # rebuild the whole table every second.
@@ -2780,6 +2970,39 @@ class LibraryView(QWidget):
         self._spinner_timer.timeout.connect(self._tick_spinners)
 
         self.refresh()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._fit_columns_to_viewport)
+
+    def _fit_columns_to_viewport(self):
+        viewport_width = max(0, self.table.viewport().width() - 8)
+        if viewport_width <= 0:
+            return
+
+        status_w = 136
+        action_w = 74
+        artefact_w = 116
+        fixed = status_w + action_w + (artefact_w * 4)
+        file_w = viewport_width - fixed
+        if file_w < 260:
+            artefact_w = 108
+            status_w = 126
+            action_w = 68
+            fixed = status_w + action_w + (artefact_w * 4)
+            file_w = max(180, viewport_width - fixed)
+
+        widths = {
+            self.COL_STATUS: status_w,
+            self.COL_FILE: file_w,
+            self.COL_COMPRESSED: artefact_w,
+            self.COL_TRANSCRIPT: artefact_w,
+            self.COL_ENHANCED: artefact_w,
+            self.COL_REVIEW: artefact_w,
+            self.COL_ACTIONS: action_w,
+        }
+        for col, width in widths.items():
+            self.table.setColumnWidth(col, max(1, width))
 
     # ------------------------------------------------------------------
     # Building the table
@@ -2948,17 +3171,21 @@ class LibraryView(QWidget):
         job_id: int,
     ):
         wrapper = QWidget()
+        wrapper.setObjectName("artefactCell")
+        wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         wrap_layout = QHBoxLayout(wrapper)
-        wrap_layout.setContentsMargins(4, 4, 4, 4)
-        wrap_layout.setSpacing(4)
+        wrap_layout.setContentsMargins(2, 4, 2, 4)
+        wrap_layout.setSpacing(0)
+        wrap_layout.addStretch(1)
 
         if path and Path(path).exists():
             mtime = self._format_mtime(path)
             btn = QPushButton("Ouvrir")
             btn.setObjectName("artefactButton")
+            btn.setFixedWidth(70)
             btn.setToolTip(f"{path}\nProduit le {mtime}" if mtime else str(path))
             btn.clicked.connect(lambda _=False, p=str(path): _open_path(p))
-            wrap_layout.addWidget(btn, 1)
+            wrap_layout.addWidget(btn, 0)
             # Re-run icon. Single click triggers a one-step relaunch
             # popup pre-filled with this column's step ticked.
             kind = self._COL_TO_STEP.get(col, (None, None))[0]
@@ -2966,6 +3193,7 @@ class LibraryView(QWidget):
                 rerun = QToolButton()
                 rerun.setObjectName("artefactReplay")
                 rerun.setText("↻")
+                rerun.setFixedWidth(30)
                 rerun.setToolTip(f"Relancer cette étape ({label})")
                 rerun.clicked.connect(
                     lambda _=False, jid=job_id, k=kind: self._action_restart(jid, preselect=[k])
@@ -2974,15 +3202,19 @@ class LibraryView(QWidget):
         elif running:
             btn = QPushButton("⏳")
             btn.setObjectName("artefactButton")
+            btn.setFixedWidth(100)
             btn.setToolTip(f"{label} en cours…")
             btn.setEnabled(False)
-            wrap_layout.addWidget(btn, 1)
+            wrap_layout.addWidget(btn, 0)
         else:
             btn = QPushButton("—")
             btn.setObjectName("artefactButton")
+            btn.setFixedWidth(100)
             btn.setToolTip(f"Pas de {label.lower()} disponible")
             btn.setEnabled(False)
-            wrap_layout.addWidget(btn, 1)
+            wrap_layout.addWidget(btn, 0)
+
+        wrap_layout.addStretch(1)
 
         self.table.setCellWidget(row, col, wrapper)
 
@@ -3010,8 +3242,10 @@ class LibraryView(QWidget):
         btn.setMenu(menu)
 
         wrapper = QWidget()
+        wrapper.setObjectName("artefactCell")
+        wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         wrap_layout = QHBoxLayout(wrapper)
-        wrap_layout.setContentsMargins(6, 4, 6, 4)
+        wrap_layout.setContentsMargins(2, 4, 2, 4)
         wrap_layout.addStretch(1)
         wrap_layout.addWidget(btn, 0)
         wrap_layout.addStretch(1)
@@ -4388,14 +4622,16 @@ class MainWindow(QWidget):
             color: #6e6e73;
             font-size: 11px;
         }
+        QWidget#artefactCell {
+            background: transparent;
+        }
         QPushButton#artefactButton, QToolButton#artefactButton {
             background: #ffffff;
             border: 1px solid #d2d2d7;
             border-radius: 8px;
-            padding: 5px 10px;
+            padding: 7px 0;
             font-size: 12px;
             color: #1d1d1f;
-            min-width: 60px;
         }
         QPushButton#artefactButton:hover, QToolButton#artefactButton:hover {
             background: #f2f2f7;
@@ -4410,12 +4646,15 @@ class MainWindow(QWidget):
            main "Ouvrir" stays the affordance the eye lands on. */
         QToolButton#artefactReplay {
             background: #ffffff;
-            border: 1px solid #e1e1e6;
-            border-radius: 6px;
-            padding: 4px 6px;
+            border: 1px solid #d2d2d7;
+            border-top-left-radius: 0;
+            border-bottom-left-radius: 0;
+            border-top-right-radius: 8px;
+            border-bottom-right-radius: 8px;
+            margin-left: -1px;
+            padding: 7px 0;
             color: #6e6e73;
             font-size: 13px;
-            min-width: 24px;
         }
         QToolButton#artefactReplay:hover {
             background: #f2f2f7;
