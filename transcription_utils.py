@@ -61,15 +61,16 @@ AUDIO_LLM_MODELS: list[dict] = [
         "label": "Qwen2-Audio 7B Instruct · 4-bit (~4 Go) — recommandé",
         "family": "Qwen-Audio",
     },
-    {
-        "id": "mlx-community/Qwen2-Audio-7B-Instruct-8bit",
-        "label": "Qwen2-Audio 7B Instruct · 8-bit (~7 Go) — qualité supérieure",
-        "family": "Qwen-Audio",
-    },
 ]
 
 DEFAULT_TEXT_LLM_MODEL = TEXT_LLM_MODELS[0]["id"]
 DEFAULT_AUDIO_LLM_MODEL = AUDIO_LLM_MODELS[0]["id"]
+
+LEGACY_AUDIO_LLM_MODEL_IDS: dict[str, str] = {
+    # This repo id was listed by mistake in v0.17.0; mlx-community only
+    # publishes the 4-bit Qwen2-Audio checkpoint.
+    "mlx-community/Qwen2-Audio-7B-Instruct-8bit": "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+}
 
 LEGACY_WHISPER_MODEL_IDS: dict[str, str] = {
     "mlx-community/whisper-large-v3": "mlx-community/whisper-large-v3-mlx",
@@ -101,6 +102,13 @@ def canonical_whisper_model_id(model_id: str) -> str:
     return LEGACY_WHISPER_MODEL_IDS.get(raw, raw)
 
 
+def canonical_audio_llm_model_id(model_id: str) -> str:
+    raw = (model_id or "").strip()
+    if not raw:
+        return DEFAULT_AUDIO_LLM_MODEL
+    return LEGACY_AUDIO_LLM_MODEL_IDS.get(raw, raw)
+
+
 def text_llm_label_for(model_id: str) -> str:
     for entry in TEXT_LLM_MODELS:
         if entry["id"] == model_id:
@@ -109,6 +117,7 @@ def text_llm_label_for(model_id: str) -> str:
 
 
 def audio_llm_label_for(model_id: str) -> str:
+    model_id = canonical_audio_llm_model_id(model_id)
     for entry in AUDIO_LLM_MODELS:
         if entry["id"] == model_id:
             return entry["label"]

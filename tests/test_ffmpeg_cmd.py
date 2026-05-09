@@ -29,6 +29,7 @@ from transcription_utils import (
     build_llm_title_cmd,
     build_mlx_whisper_cmd,
     build_multimodal_audio_cmd,
+    canonical_audio_llm_model_id,
     canonical_whisper_model_id,
     clean_whisper_segments,
     default_transcript_path,
@@ -435,6 +436,12 @@ class LlmCatalogTest(unittest.TestCase):
             "mlx-community/whisper-medium-mlx",
         )
 
+    def test_audio_legacy_model_ids_are_canonicalized(self):
+        self.assertEqual(
+            canonical_audio_llm_model_id("mlx-community/Qwen2-Audio-7B-Instruct-8bit"),
+            "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+        )
+
     def test_audio_catalog_has_required_keys(self):
         self.assertGreaterEqual(len(AUDIO_LLM_MODELS), 1)
         for entry in AUDIO_LLM_MODELS:
@@ -443,6 +450,7 @@ class LlmCatalogTest(unittest.TestCase):
             self.assertIn("family", entry)
             # The audio catalog must point at multimodal-capable repos.
             self.assertIn("Audio", entry["id"])
+            self.assertNotIn("8bit", entry["id"])
 
     def test_text_and_audio_catalogs_are_disjoint(self):
         text_ids = {e["id"] for e in TEXT_LLM_MODELS}

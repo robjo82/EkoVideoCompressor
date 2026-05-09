@@ -41,6 +41,7 @@ from transcription_utils import (
     build_llm_title_cmd,
     build_multimodal_audio_cmd,
     build_mlx_whisper_cmd,
+    canonical_audio_llm_model_id,
     canonical_whisper_model_id,
     default_transcript_path,
     parse_diarization_output,
@@ -800,11 +801,31 @@ except Exception as exc:
                         output_lines.append(str(event.get("message") or ""))
             proc.wait()
             if proc.returncode != 0:
-                detail = "".join(output_lines).strip()
+                detail = self._clean_download_error(output_lines)
                 raise RuntimeError(detail or f"Téléchargement impossible pour {self.repo_id}.")
             self.finished_ok.emit(self.mode, self.repo_id)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    @staticmethod
+    def _clean_download_error(lines: list[str]) -> str:
+        messages: list[str] = []
+        raw_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            raw_lines.append(stripped)
+            if stripped.startswith("{"):
+                try:
+                    event = json.loads(stripped)
+                except Exception:
+                    continue
+                if event.get("event") == "error" and event.get("message"):
+                    messages.append(str(event["message"]))
+        if messages:
+            return "\n".join(dict.fromkeys(messages))
+        return "\n".join(line for line in raw_lines if not line.startswith("{"))
 
 
 class HuggingFaceAuthDialog(QDialog):
@@ -1042,8 +1063,8 @@ class SettingsDialog(QDialog):
         )
         transcription_form.addRow("", self.transcription_audio_recheck_check)
 
-        current_audio_llm = str(
-            transcription_settings.get("audio_llm_model") or DEFAULT_AUDIO_LLM_MODEL
+        current_audio_llm = canonical_audio_llm_model_id(
+            str(transcription_settings.get("audio_llm_model") or DEFAULT_AUDIO_LLM_MODEL)
         )
         self.transcription_audio_llm_combo = self._build_llm_combo(AUDIO_LLM_MODELS, current_audio_llm)
         transcription_form.addRow(
@@ -1523,7 +1544,9 @@ class SettingsDialog(QDialog):
                     str(self.transcription_model_combo.currentData() or DEFAULT_WHISPER_MODEL)
                 ),
                 "text_llm_model": self._combo_model_id(self.transcription_text_llm_combo),
-                "audio_llm_model": self._combo_model_id(self.transcription_audio_llm_combo),
+                "audio_llm_model": canonical_audio_llm_model_id(
+                    self._combo_model_id(self.transcription_audio_llm_combo)
+                ),
                 "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
@@ -4113,9 +4136,9 @@ class MainWindow(QWidget):
         self.transcription_text_llm_model = str(
             self.settings.value("transcription_text_llm_model", "", type=str)
         ).strip() or legacy_llm_model or DEFAULT_TEXT_LLM_MODEL
-        self.transcription_audio_llm_model = str(
-            self.settings.value("transcription_audio_llm_model", DEFAULT_AUDIO_LLM_MODEL, type=str)
-        ).strip() or DEFAULT_AUDIO_LLM_MODEL
+        self.transcription_audio_llm_model = canonical_audio_llm_model_id(
+            str(self.settings.value("transcription_audio_llm_model", DEFAULT_AUDIO_LLM_MODEL, type=str))
+        )
         self.transcription_audio_recheck_enabled = self.settings.value(
             "transcription_audio_recheck_enabled", False, type=bool
         )
@@ -5163,7 +5186,7 @@ class MainWindow(QWidget):
         self.transcription_text_llm_model = (
             str(transcription_settings.get("text_llm_model", "")).strip() or DEFAULT_TEXT_LLM_MODEL
         )
-        self.transcription_audio_llm_model = (
+        self.transcription_audio_llm_model = canonical_audio_llm_model_id(
             str(transcription_settings.get("audio_llm_model", "")).strip() or DEFAULT_AUDIO_LLM_MODEL
         )
         self.transcription_audio_recheck_enabled = bool(
