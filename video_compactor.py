@@ -3177,7 +3177,42 @@ class LibraryView(QWidget):
         mapping = dlg.values()
         if not mapping:
             return
-        applied_files, applied_segments = self._apply_speaker_rename(job_id, mapping)
+
+        record = self.db.get_job(job_id) or {}
+        previous_speakers: dict[str, str] = {}
+        try:
+            loaded = json.loads(record.get("speaker_map_json") or "{}")
+            if isinstance(loaded, dict):
+                previous_speakers = {
+                    str(key).strip(): str(value).strip()
+                    for key, value in loaded.items()
+                    if str(key).strip() and str(value).strip()
+                }
+        except Exception:
+            previous_speakers = {}
+
+        replacement_map = dict(mapping)
+        stored_speakers = dict(previous_speakers)
+        for old_label, new_name in mapping.items():
+            if old_label.startswith("SPEAKER_"):
+                stored_speakers[old_label] = new_name
+                continue
+            matched_existing_id = False
+            for speaker_id, current_name in previous_speakers.items():
+                if current_name == old_label:
+                    replacement_map[speaker_id] = new_name
+                    stored_speakers[speaker_id] = new_name
+                    matched_existing_id = True
+            if not matched_existing_id:
+                stored_speakers[old_label] = new_name
+
+        if stored_speakers:
+            try:
+                self.db.update_job_context(job_id, stored_speakers, None)
+            except Exception:
+                pass
+
+        applied_files, applied_segments = self._apply_speaker_rename(job_id, replacement_map)
         self.refresh()
         QMessageBox.information(
             self,
@@ -3293,6 +3328,7 @@ class SpeakerRenameDialog(QDialog):
     """
 
     SPEAKER_RE = re.compile(r"SPEAKER_\d{2,}")
+    BRACKETED_LABEL_RE = re.compile(r"(?m)^\[([^\]\n]{1,80})\]\s")
 
     def __init__(self, db, job_id: int, parent: QWidget | None = None):
         super().__init__(parent)
@@ -3319,7 +3355,7 @@ class SpeakerRenameDialog(QDialog):
 
         if not speakers:
             empty = QLabel(
-                "Aucun locuteur SPEAKER_XX détecté pour cette transcription. "
+                "Aucun locuteur détecté pour cette transcription. "
                 "Active la diarisation dans Paramètres pour étiqueter les voix."
             )
             empty.setObjectName("inlineHint")
@@ -3346,58 +3382,82 @@ class SpeakerRenameDialog(QDialog):
 
     def _detect_speakers(self, job_id: int) -> dict[str, str]:
         """
-        Walk every available artefact + the DB segments to find
-        SPEAKER_XX tokens. Pre-fills the form with whatever name is
-        already in use (e.g. if the LLM already mapped some).
+        Prefer the speaker labels visible in the enhanced transcript.
+        The DB segments are the first-pass diarization labels, so they
+        are only a fallback when no produced artefact has speaker tags.
         """
-        names: dict[str, str] = {}
-        seen_speakers: set[str] = set()
         record = self.db.get_job(job_id) or {}
+        stored = self._stored_speaker_map(record)
+
+        for key in ("enhanced_transcript_path", "review_path", "transcript_path"):
+            labels = self._speaker_labels_from_file(record.get(key))
+            if labels:
+                return self._names_for_labels(labels, stored)
+
+        seen_speakers: list[str] = []
+        for seg in self.db.get_segments(job_id) or []:
+            sp = (seg.get("speaker") or "").strip()
+            if sp and sp not in seen_speakers:
+                seen_speakers.append(sp)
+        return self._names_for_labels(seen_speakers, stored)
+
+    def _stored_speaker_map(self, record: dict) -> dict[str, str]:
         try:
             stored = json.loads(record.get("speaker_map_json") or "{}")
             if isinstance(stored, dict):
-                for key, value in stored.items():
-                    key_str = str(key).strip()
-                    if key_str.startswith("SPEAKER_"):
-                        names[key_str] = str(value).strip()
-                        seen_speakers.add(key_str)
+                return {
+                    str(key).strip(): str(value).strip()
+                    for key, value in stored.items()
+                    if str(key).strip() and str(value).strip()
+                }
         except Exception:
             pass
+        return {}
 
-        # Collect from segments first — they have the canonical labels.
-        segments = self.db.get_segments(job_id) or []
-        for seg in segments:
-            sp = (seg.get("speaker") or "").strip()
-            if sp:
-                seen_speakers.add(sp)
+    def _speaker_labels_from_file(self, path: str | None) -> list[str]:
+        if not path:
+            return []
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return []
+        labels: list[str] = []
+        for raw in self.BRACKETED_LABEL_RE.findall(text):
+            label = raw.strip()
+            if label and label != "?" and label not in labels:
+                labels.append(label)
+        if labels:
+            return labels
+        for raw in self.SPEAKER_RE.findall(text):
+            label = raw.strip()
+            if label and label not in labels:
+                labels.append(label)
+        return labels
 
-        # Also walk the produced files: a SPEAKER_XX that appeared
-        # there but not in segments (e.g. a renamed enhanced file)
-        # would be missed otherwise.
-        for key in ("transcript_path", "enhanced_transcript_path", "review_path"):
-            path = record.get(key)
-            if not path:
-                continue
-            try:
-                text = Path(path).read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            seen_speakers.update(self.SPEAKER_RE.findall(text))
-
-        for sp in seen_speakers:
-            names.setdefault(sp, "")
+    def _names_for_labels(self, labels: list[str], stored: dict[str, str]) -> dict[str, str]:
+        names: dict[str, str] = {}
+        for label in labels:
+            if label.startswith("SPEAKER_"):
+                names[label] = stored.get(label, "")
+            else:
+                names[label] = stored.get(label, label)
         return names
 
     def values(self) -> dict[str, str]:
-        return {
-            label: edit.text().strip()
-            for label, edit in self._fields.items()
-            if edit.text().strip()
-        }
+        values: dict[str, str] = {}
+        for label, edit in self._fields.items():
+            value = edit.text().strip()
+            if not value:
+                continue
+            if not label.startswith("SPEAKER_") and value == label:
+                continue
+            values[label] = value
+        return values
 
 
 class TranscriptContextDialog(QDialog):
     SPEAKER_RE = re.compile(r"SPEAKER_\d{2,}")
+    BRACKETED_LABEL_RE = re.compile(r"(?m)^\[([^\]\n]{1,80})\]\s")
 
     def __init__(self, db, job_id: int, parent: QWidget | None = None):
         super().__init__(parent)
@@ -3459,32 +3519,60 @@ class TranscriptContextDialog(QDialog):
 
     def _detect_speakers(self) -> dict[str, str]:
         record = self._record()
-        names: dict[str, str] = {}
-        try:
-            stored = json.loads(record.get("speaker_map_json") or "{}")
-            if isinstance(stored, dict):
-                for key, value in stored.items():
-                    key_str = str(key).strip()
-                    if key_str.startswith("SPEAKER_"):
-                        names[key_str] = str(value).strip()
-        except Exception:
-            pass
+        stored = self._stored_speaker_map(record)
 
+        for key in ("enhanced_transcript_path", "review_path", "transcript_path"):
+            labels = self._speaker_labels_from_file(record.get(key))
+            if labels:
+                return self._names_for_labels(labels, stored)
+
+        names: dict[str, str] = {}
         for seg in self.db.get_segments(self.job_id) or []:
             speaker = str(seg.get("speaker") or "").strip()
             if speaker.startswith("SPEAKER_"):
-                names.setdefault(speaker, "")
+                names.setdefault(speaker, stored.get(speaker, ""))
+        return names
 
-        for key in ("transcript_path", "enhanced_transcript_path", "review_path"):
-            path = record.get(key)
-            if not path:
-                continue
-            try:
-                text = Path(path).read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-            for speaker in self.SPEAKER_RE.findall(text):
-                names.setdefault(speaker, "")
+    def _stored_speaker_map(self, record: dict) -> dict[str, str]:
+        try:
+            stored = json.loads(record.get("speaker_map_json") or "{}")
+            if isinstance(stored, dict):
+                return {
+                    str(key).strip(): str(value).strip()
+                    for key, value in stored.items()
+                    if str(key).strip() and str(value).strip()
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _speaker_labels_from_file(self, path: str | None) -> list[str]:
+        if not path:
+            return []
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return []
+        labels: list[str] = []
+        for raw in self.BRACKETED_LABEL_RE.findall(text):
+            label = raw.strip()
+            if label and label != "?" and label not in labels:
+                labels.append(label)
+        if labels:
+            return labels
+        for raw in self.SPEAKER_RE.findall(text):
+            label = raw.strip()
+            if label and label not in labels:
+                labels.append(label)
+        return labels
+
+    def _names_for_labels(self, labels: list[str], stored: dict[str, str]) -> dict[str, str]:
+        names: dict[str, str] = {}
+        for label in labels:
+            if label.startswith("SPEAKER_"):
+                names[label] = stored.get(label, "")
+            else:
+                names[label] = stored.get(label, label)
         return names
 
     def _detect_terms(self) -> list[str]:
