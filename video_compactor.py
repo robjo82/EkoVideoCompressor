@@ -696,6 +696,7 @@ def hf_model_cache_dir(repo_id: str) -> Path:
 
 
 class ModelCacheWorker(QThread):
+    progress = Signal(int, str)
     finished_ok = Signal(str, str)
     failed = Signal(str)
 
@@ -716,21 +717,90 @@ class ModelCacheWorker(QThread):
 
             python_path = managed_venv_python_path()
             python = str(python_path) if python_path.exists() else sys.executable
-            script = """
+            script = r'''
+import json
 import sys
-from huggingface_hub import snapshot_download
-repo_id = sys.argv[1]
-token = sys.argv[2] or None
-snapshot_download(repo_id=repo_id, token=token)
-"""
-            proc = subprocess.run(
-                [python, "-c", script, self.repo_id, self.token],
-                capture_output=True,
+
+try:
+    from huggingface_hub import snapshot_download
+    from tqdm.auto import tqdm
+
+    repo_id = sys.argv[1]
+    token = sys.argv[2] or None
+
+    class JsonTqdm(tqdm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._last_pct = -1
+            self._emit_progress(force=True)
+
+        def update(self, n=1):
+            result = super().update(n)
+            self._emit_progress()
+            return result
+
+        def close(self):
+            self._emit_progress(force=True)
+            return super().close()
+
+        def _emit_progress(self, force=False):
+            total = self.total or 0
+            current = self.n or 0
+            if total > 0:
+                pct = max(0, min(100, int((current / total) * 100)))
+            else:
+                pct = 0
+            if force or pct != self._last_pct:
+                self._last_pct = pct
+                print(
+                    json.dumps(
+                        {
+                            "event": "progress",
+                            "pct": pct,
+                            "current": current,
+                            "total": total,
+                            "label": str(self.desc or ""),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+
+    print(json.dumps({"event": "progress", "pct": 0, "label": "Préparation…"}, ensure_ascii=False), flush=True)
+    snapshot_download(repo_id=repo_id, token=token, tqdm_class=JsonTqdm)
+    print(json.dumps({"event": "progress", "pct": 100, "label": "Terminé"}, ensure_ascii=False), flush=True)
+except Exception as exc:
+    print(json.dumps({"event": "error", "message": str(exc)}, ensure_ascii=False), flush=True)
+    sys.exit(2)
+'''
+            proc = subprocess.Popen(
+                [python, "-u", "-c", script, self.repo_id, self.token],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=None,
+                bufsize=1,
             )
+            output_lines: list[str] = []
+            if proc.stdout:
+                for line in proc.stdout:
+                    output_lines.append(line)
+                    stripped = line.strip()
+                    if not stripped.startswith("{"):
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except Exception:
+                        continue
+                    if event.get("event") == "progress":
+                        self.progress.emit(
+                            int(event.get("pct") or 0),
+                            str(event.get("label") or ""),
+                        )
+                    elif event.get("event") == "error":
+                        output_lines.append(str(event.get("message") or ""))
+            proc.wait()
             if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()
+                detail = "".join(output_lines).strip()
                 raise RuntimeError(detail or f"Téléchargement impossible pour {self.repo_id}.")
             self.finished_ok.emit(self.mode, self.repo_id)
         except Exception as exc:
@@ -862,6 +932,7 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self._model_cache_worker: ModelCacheWorker | None = None
         self._model_controls: list[tuple[QComboBox, QPushButton, QPushButton]] = []
+        self._model_busy_repo_id = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
@@ -995,6 +1066,15 @@ class SettingsDialog(QDialog):
         audio_llm_hint.setWordWrap(True)
         audio_llm_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
         transcription_form.addRow("", audio_llm_hint)
+
+        self.model_cache_progress = QProgressBar()
+        self.model_cache_progress.setObjectName("modelCacheProgress")
+        self.model_cache_progress.setRange(0, 100)
+        self.model_cache_progress.setValue(0)
+        self.model_cache_progress.setTextVisible(True)
+        self.model_cache_progress.setFormat("Prêt")
+        self.model_cache_progress.setVisible(False)
+        transcription_form.addRow("", self.model_cache_progress)
 
         self.transcription_language_combo = QComboBox()
         self.transcription_language_combo.addItems(["fr", "auto", "en", "es", "de", "it"])
@@ -1154,6 +1234,19 @@ class SettingsDialog(QDialog):
             padding: 8px 12px;
             min-width: 82px;
         }
+        QProgressBar#modelCacheProgress {
+            background: #ffffff;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            min-height: 18px;
+            text-align: center;
+            color: #1d1d1f;
+            font-size: 12px;
+        }
+        QProgressBar#modelCacheProgress::chunk {
+            background: #007aff;
+            border-radius: 7px;
+        }
         QTabWidget::pane {
             border: none;
             margin-top: 10px;
@@ -1299,6 +1392,13 @@ class SettingsDialog(QDialog):
             active = combo.isEnabled() and not busy and bool(repo_id)
             btn_download.setEnabled(active and not cached)
             btn_delete.setEnabled(active and cached)
+            if busy and repo_id == self._model_busy_repo_id:
+                btn_download.setEnabled(False)
+                btn_delete.setEnabled(False)
+                btn_download.setText("Téléchargement…" if self._model_cache_worker.mode == "download" else "En cours…")
+            else:
+                btn_download.setText("Télécharger")
+                btn_delete.setText("Supprimer")
 
     def _selected_model_id(self, combo: QComboBox) -> str:
         return str(combo.currentData() or "").strip()
@@ -1329,22 +1429,49 @@ class SettingsDialog(QDialog):
         if self._model_cache_worker and self._model_cache_worker.isRunning():
             return
         token = self.transcription_hf_token_edit.text().strip()
+        self._model_busy_repo_id = repo_id
         self._model_cache_worker = ModelCacheWorker(mode, repo_id, token, self)
+        self._model_cache_worker.progress.connect(self._on_model_cache_progress)
         self._model_cache_worker.finished_ok.connect(self._on_model_cache_finished)
         self._model_cache_worker.failed.connect(self._on_model_cache_failed)
+        if mode == "download":
+            self.model_cache_progress.setRange(0, 100)
+            self.model_cache_progress.setValue(0)
+            self.model_cache_progress.setFormat(f"Téléchargement de {repo_id}… 0%")
+        else:
+            self.model_cache_progress.setRange(0, 0)
+            self.model_cache_progress.setFormat(f"Suppression de {repo_id}…")
+        self.model_cache_progress.setVisible(True)
         self._refresh_model_cache_buttons()
         self._model_cache_worker.start()
+
+    def _on_model_cache_progress(self, pct: int, label: str):
+        pct = max(0, min(100, int(pct)))
+        self.model_cache_progress.setRange(0, 100)
+        self.model_cache_progress.setValue(pct)
+        suffix = f" · {label}" if label and label not in {"None", "null"} else ""
+        self.model_cache_progress.setFormat(f"Téléchargement… {pct}%{suffix}")
 
     def _on_model_cache_finished(self, mode: str, repo_id: str):
         action = "téléchargé" if mode == "download" else "supprimé"
         for combo, _, _ in self._model_controls:
             self._refresh_model_combo_labels(combo)
         self._model_cache_worker = None
+        self._model_busy_repo_id = ""
+        self.model_cache_progress.setRange(0, 100)
+        self.model_cache_progress.setValue(100 if mode == "download" else 0)
+        self.model_cache_progress.setFormat(f"Modèle {action}")
         self._refresh_model_cache_buttons()
         QMessageBox.information(self, "Modèles", f"Modèle {action} :\n{repo_id}")
+        self.model_cache_progress.setVisible(False)
 
     def _on_model_cache_failed(self, message: str):
         self._model_cache_worker = None
+        self._model_busy_repo_id = ""
+        self.model_cache_progress.setRange(0, 100)
+        self.model_cache_progress.setValue(0)
+        self.model_cache_progress.setFormat("Échec")
+        self.model_cache_progress.setVisible(False)
         self._refresh_model_cache_buttons()
         QMessageBox.warning(self, "Modèles", f"Opération impossible :\n{message}")
 
