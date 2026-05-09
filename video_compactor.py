@@ -1049,8 +1049,9 @@ class SettingsDialog(QDialog):
             border: 1px solid #d2d2d7;
             border-radius: 8px;
             padding: 4px;
-            selection-background-color: #007aff;
-            selection-color: #ffffff;
+            color: #1d1d1f;
+            selection-background-color: #e8f2ff;
+            selection-color: #1d1d1f;
             outline: none;
         }
         QComboBox QAbstractItemView::item {
@@ -1106,16 +1107,16 @@ class SettingsDialog(QDialog):
         combo = QComboBox()
         combo.setEditable(False)
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        combo.setMinimumContentsLength(28)
+        combo.setMinimumContentsLength(34)
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for entry in catalog:
-            combo.addItem(entry["label"], entry["id"])
+            combo.addItem(self._model_combo_label(entry), entry["id"])
 
         idx = combo.findData(current_id)
         if idx >= 0:
             combo.setCurrentIndex(idx)
         elif current_id:
-            combo.addItem(f"{current_id} — modèle actuel", current_id)
+            combo.addItem(f"{current_id} — modèle actuel · cache inconnu", current_id)
             combo.setCurrentIndex(combo.count() - 1)
         return combo
 
@@ -1132,18 +1133,20 @@ class SettingsDialog(QDialog):
         combo.setMinimumContentsLength(30)
         combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         for entry in catalog:
-            cached = is_hf_model_cached(entry["id"])
-            badge = "● téléchargé" if cached else "○ à télécharger"
-            combo.addItem(f"{entry['label']}  —  {badge}", entry["id"])
+            combo.addItem(self._model_combo_label(entry), entry["id"])
 
         # Pre-select the current model (or add it if it's a custom override).
         idx = combo.findData(current_id)
         if idx >= 0:
             combo.setCurrentIndex(idx)
         elif current_id:
-            combo.addItem(f"{current_id}  —  modèle actuel", current_id)
+            combo.addItem(f"{current_id} — modèle actuel · cache inconnu", current_id)
             combo.setCurrentIndex(combo.count() - 1)
         return combo
+
+    def _model_combo_label(self, entry: dict) -> str:
+        status = "téléchargé" if is_hf_model_cached(str(entry["id"])) else "à télécharger"
+        return f"{entry['label']} — {status}"
 
     def pick_ffmpeg(self):
         path, _ = QFileDialog.getOpenFileName(self, "Choisir ffmpeg", str(Path.home()), "Tous (*.*)")
@@ -2739,30 +2742,29 @@ class LibraryView(QWidget):
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setShowGrid(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setWordWrap(False)
+        self.table.setWordWrap(True)
         header = self.table.horizontalHeader()
         # Source filename takes whatever space is left; the rest sit on a
         # snug width so the artefact buttons line up vertically.
         header.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
-        # 220 px gives "Compression… · reste ~10m" enough horizontal
-        # room before falling back to wrap. Combined with the 64 px row
-        # height below, the sub-text always fits on at most two lines.
-        self.table.setColumnWidth(self.COL_STATUS, 220)
+        # Keep status compact so the filename column can breathe; running
+        # details wrap inside the cell when needed.
+        self.table.setColumnWidth(self.COL_STATUS, 148)
         header.setSectionResizeMode(self.COL_FILE, QHeaderView.ResizeMode.Stretch)
         # Per-column widths sized to fit "Ouvrir" + the ↻ replay icon
         # side by side without cropping the button label.
         artefact_widths = {
-            self.COL_COMPRESSED: 132,
-            self.COL_TRANSCRIPT: 132,
-            self.COL_ENHANCED: 132,
-            self.COL_REVIEW: 132,
+            self.COL_COMPRESSED: 122,
+            self.COL_TRANSCRIPT: 122,
+            self.COL_ENHANCED: 122,
+            self.COL_REVIEW: 122,
         }
         for col, width in artefact_widths.items():
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             self.table.setColumnWidth(col, width)
         header.setSectionResizeMode(self.COL_ACTIONS, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(self.COL_ACTIONS, 60)
-        self.table.verticalHeader().setDefaultSectionSize(64)
+        self.table.setColumnWidth(self.COL_ACTIONS, 78)
+        self.table.verticalHeader().setDefaultSectionSize(74)
         self.table.setColumnHidden(self.COL_FILE, False)
         # A minimum so the filename never disappears entirely on very
         # small windows; if we run out of horizontal room the table will
@@ -2854,6 +2856,7 @@ class LibraryView(QWidget):
         file_item = QTableWidgetItem(title)
         file_item.setToolTip(str(job["source_path"]))
         file_item.setData(Qt.ItemDataRole.UserRole, int(job["id"]))
+        file_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.setItem(row, self.COL_FILE, file_item)
 
         # --- Artefact columns -----------------------------------------
@@ -2900,6 +2903,7 @@ class LibraryView(QWidget):
         else:
             head = QLabel("⏳ En attente")
             head.setObjectName("libraryStatusPending")
+        head.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(head)
 
         # Sub-line wraps inside the status column so a long step label
@@ -2911,12 +2915,14 @@ class LibraryView(QWidget):
             sub = QLabel(f"{step}{(' · ' + eta) if eta else ''}")
             sub.setObjectName("libraryStatusSub")
             sub.setWordWrap(True)
+            sub.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
             sub.setToolTip(sub.text())
             layout.addWidget(sub)
         elif failed and job.get("error_message"):
             sub = QLabel(str(job["error_message"])[:120])
             sub.setObjectName("libraryStatusSub")
             sub.setWordWrap(True)
+            sub.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
             sub.setToolTip(str(job["error_message"]))
             layout.addWidget(sub)
 
@@ -2992,6 +2998,7 @@ class LibraryView(QWidget):
         btn = QToolButton()
         btn.setObjectName("artefactButton")
         btn.setText("⋯")
+        btn.setFixedWidth(46)
         btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(btn)
         menu.addAction("Ouvrir le dossier", lambda jid=job_id: self._action_show_folder(jid))
@@ -3004,8 +3011,10 @@ class LibraryView(QWidget):
 
         wrapper = QWidget()
         wrap_layout = QHBoxLayout(wrapper)
-        wrap_layout.setContentsMargins(4, 4, 4, 4)
-        wrap_layout.addWidget(btn)
+        wrap_layout.setContentsMargins(6, 4, 6, 4)
+        wrap_layout.addStretch(1)
+        wrap_layout.addWidget(btn, 0)
+        wrap_layout.addStretch(1)
         return wrapper
 
     # ------------------------------------------------------------------
