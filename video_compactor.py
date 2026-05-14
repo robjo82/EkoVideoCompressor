@@ -31,6 +31,11 @@ from glossary_postprocess import (
     apply_glossary_to_segments,
     parse_glossary_terms,
 )
+from multipass import (
+    group_into_clip_ranges,
+    identify_weak_segments,
+    merge_repass_segments,
+)
 from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
 from transcription_utils import (
     AUDIO_LLM_MODELS,
@@ -1146,6 +1151,25 @@ class SettingsDialog(QDialog):
         vad_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
         transcription_form.addRow("", vad_hint)
 
+        # Two-pass: redo low-confidence Whisper segments with a
+        # stronger model. Default ON.
+        self.transcription_multipass_check = QCheckBox(
+            "Repasse qualité maximale sur les passages incertains"
+        )
+        self.transcription_multipass_check.setChecked(
+            bool(transcription_settings.get("multipass_enabled", True))
+        )
+        transcription_form.addRow("", self.transcription_multipass_check)
+        multipass_hint = QLabel(
+            "Après une première transcription rapide, les segments avec une faible "
+            "confiance sont re-transcrits avec whisper-large-v3 (non-turbo). "
+            "Repasse limitée à 30% de l'audio au maximum — sinon on conserve la "
+            "transcription rapide."
+        )
+        multipass_hint.setWordWrap(True)
+        multipass_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", multipass_hint)
+
         self.transcription_diarization_check = QCheckBox(
             "Détection des locuteurs (pyannote)"
         )
@@ -1580,6 +1604,7 @@ class SettingsDialog(QDialog):
                 ),
                 "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
                 "vad_enabled": self.transcription_vad_check.isChecked(),
+                "multipass_enabled": self.transcription_multipass_check.isChecked(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_value,
@@ -1733,6 +1758,8 @@ class TranscribeWorker(QThread):
         audio_llm_model: str = DEFAULT_AUDIO_LLM_MODEL,
         audio_recheck_enabled: bool = False,
         vad_enabled: bool = True,
+        multipass_enabled: bool = True,
+        multipass_model: str = "mlx-community/whisper-large-v3",
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -1755,6 +1782,11 @@ class TranscribeWorker(QThread):
         # users can opt out via Settings.
         self.vad_enabled = bool(vad_enabled)
         self._vad_manifest: list[dict] = []
+        # Two-pass: after the fast first pass, re-transcribe weak
+        # segments with the larger model. Defaults ON.
+        self.multipass_enabled = bool(multipass_enabled)
+        self.multipass_model = multipass_model or "mlx-community/whisper-large-v3"
+        self._repass_replaced: int = 0
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -2153,6 +2185,112 @@ class TranscribeWorker(QThread):
         seconds = max(0.0, seconds)
         return f"{seconds:.2f}".rstrip("0").rstrip(".")
 
+    def _run_repass(
+        self,
+        whisper_wav: Path,
+        work_dir: Path,
+        segments: list[dict],
+    ) -> list[dict]:
+        """
+        Confidence-triaged second pass: identify weak segments,
+        group them into clip ranges, re-transcribe each range with
+        the larger Whisper model, splice the new segments back in.
+
+        Returns the merged segment list. On any failure, returns the
+        input list unchanged (the first pass already succeeded, so
+        the user always gets *something*).
+        """
+        if not self.multipass_enabled:
+            return segments
+        if not segments or not whisper_wav.exists():
+            return segments
+
+        weak = identify_weak_segments(segments)
+        if not weak:
+            self._log("repass_skipped reason=no_weak_segments")
+            return segments
+        clip_ranges = group_into_clip_ranges(weak)
+        if not clip_ranges:
+            return segments
+        # Cap how much audio we redo. Past 30% the second-pass
+        # cost dominates and the user is probably better off
+        # picking a stronger first-pass model.
+        total_weak_seconds = sum(e - s for s, e in clip_ranges)
+        try:
+            total_audio = sum(float(seg.get("end") or 0) - float(seg.get("start") or 0) for seg in segments)
+        except Exception:
+            total_audio = 0.0
+        if total_audio > 0 and total_weak_seconds / total_audio > 0.3:
+            self._log(
+                f"repass_skipped reason=too_much_weak weak_s={total_weak_seconds:.1f} "
+                f"total_s={total_audio:.1f}"
+            )
+            return segments
+
+        self.status.emit(
+            f"Repasse haute qualité sur {len(clip_ranges)} zones "
+            f"({total_weak_seconds:.0f} s)…"
+        )
+        self._log(
+            f"repass_start ranges={len(clip_ranges)} weak_s={total_weak_seconds:.1f} "
+            f"model={self.multipass_model!r}"
+        )
+
+        new_segments: list[dict] = []
+        for idx, (cs, ce) in enumerate(clip_ranges):
+            if self._stop_requested:
+                return segments
+            clip_target = work_dir / f"repass_{idx}.json"
+            cmd = build_mlx_whisper_cmd(
+                mlx_whisper_path=self.mlx_whisper_path,
+                audio_path=str(whisper_wav),
+                output_path=str(clip_target),
+                model=self.multipass_model,
+                language=self.language,
+                output_format="json",
+                initial_prompt=self.initial_prompt,
+                condition_on_previous_text=False,
+                clip_timestamps=f"{self._format_seconds_for_clip(cs)},{self._format_seconds_for_clip(ce)}",
+            )
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=self._subprocess_env(),
+                timeout=1800,
+            )
+            if proc.returncode != 0 or not clip_target.exists():
+                self._log_process_result(
+                    "repass_clip_failed", proc.returncode, proc.stdout, proc.stderr
+                )
+                continue
+            try:
+                clip_segments = parse_whisper_json_segments(str(clip_target))
+            except Exception as exc:
+                self._log(f"repass_clip_parse_failed error={exc!r}")
+                continue
+            # `--clip-timestamps` makes Whisper emit timestamps
+            # *relative to the clip start*, so we shift them back
+            # to the source timeline.
+            for seg in clip_segments:
+                try:
+                    seg["start"] = float(seg.get("start") or 0.0) + cs
+                    seg["end"] = float(seg.get("end") or 0.0) + cs
+                except (TypeError, ValueError):
+                    continue
+            new_segments.extend(clip_segments)
+
+        if not new_segments:
+            return segments
+
+        merged, replaced = merge_repass_segments(segments, new_segments, clip_ranges)
+        self._repass_replaced = replaced
+        self._log(
+            f"repass_ok replaced={replaced} new={len(new_segments)} "
+            f"clip_ranges={len(clip_ranges)}"
+        )
+        return merged
+
     def _run_clip_rechecks(
         self,
         wav_path: Path,
@@ -2326,6 +2464,19 @@ class TranscribeWorker(QThread):
                 lines.append(f"  Réécoute Whisper : {check.get('audio_transcript') or '(vide)'}")
             lines.append("")
 
+        # Multipass second-pass replacements: useful breadcrumb so the
+        # user knows how much of the audio benefited from the
+        # higher-quality model.
+        if self._repass_replaced:
+            lines += [
+                "## Repasse qualité maximale",
+                "",
+                f"{self._repass_replaced} segment(s) re-transcrit(s) avec "
+                f"`{self.multipass_model}` après détection de faible confiance "
+                "sur la passe rapide.",
+                "",
+            ]
+
         # Phonetic-glossary substitutions: we log every word Whisper got
         # phonetically wrong and we auto-corrected from the user's
         # vocabulary. Most are silent fixes; surfacing them here lets
@@ -2391,6 +2542,7 @@ class TranscribeWorker(QThread):
             or speakers
             or technical_terms
             or self._glossary_subs
+            or self._repass_replaced
         )
         if has_review:
             self._write_review_file(self._review_transcript_path(out_path), payload, applied, clip_checks)
@@ -2726,6 +2878,17 @@ class TranscribeWorker(QThread):
                 )
                 return
 
+            # --- STEP 2bis: confidence-triaged second pass ----------------
+            # Identify segments Whisper-turbo was unsure about and
+            # redo just those with whisper-large-v3 (slower but more
+            # accurate). Runs on the trimmed VAD timeline so the
+            # repass-clip ranges align with what Whisper actually
+            # transcribed.
+            if self.multipass_enabled and not skip_whisper:
+                whisper_segments = self._run_repass(
+                    whisper_wav, work_dir, whisper_segments
+                )
+
             # If VAD trimmed the audio, Whisper's timestamps are on
             # the *trimmed* timeline. Shift them back so the user
             # sees seconds that line up with the source media.
@@ -2734,7 +2897,7 @@ class TranscribeWorker(QThread):
                     whisper_segments, self._vad_manifest
                 )
 
-            # --- STEP 2bis: phonetic glossary post-processor --------------
+            # --- STEP 2ter: phonetic glossary post-processor --------------
             # Whisper's `--initial-prompt` is a soft prior. Even when
             # the glossary names are in the prompt the decoder routinely
             # emits "MOLI" for "Mollie" or "Sudokiz" for "Sudokies".
@@ -4368,6 +4531,12 @@ class MainWindow(QWidget):
         self.transcription_vad_enabled = self.settings.value(
             "transcription_vad_enabled", True, type=bool
         )
+        # Two-pass: re-transcribe low-confidence segments with the
+        # larger Whisper model. Defaults ON (slow path is gated by
+        # the multipass module's "max 30% of audio" cap).
+        self.transcription_multipass_enabled = self.settings.value(
+            "transcription_multipass_enabled", True, type=bool
+        )
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
         self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
@@ -5321,6 +5490,7 @@ class MainWindow(QWidget):
             "audio_llm_model": self.transcription_audio_llm_model,
             "audio_recheck_enabled": self.transcription_audio_recheck_enabled,
             "vad_enabled": self.transcription_vad_enabled,
+            "multipass_enabled": self.transcription_multipass_enabled,
             "language": self.transcription_language,
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
@@ -5422,6 +5592,11 @@ class MainWindow(QWidget):
         self.transcription_vad_enabled = bool(
             transcription_settings.get("vad_enabled", self.transcription_vad_enabled)
         )
+        self.transcription_multipass_enabled = bool(
+            transcription_settings.get(
+                "multipass_enabled", self.transcription_multipass_enabled
+            )
+        )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
         self.transcription_suffix = str(transcription_settings.get("suffix", "")).strip()
@@ -5444,6 +5619,9 @@ class MainWindow(QWidget):
             self.transcription_audio_recheck_enabled,
         )
         self.settings.setValue("transcription_vad_enabled", self.transcription_vad_enabled)
+        self.settings.setValue(
+            "transcription_multipass_enabled", self.transcription_multipass_enabled
+        )
         # Drop the legacy single-key so it doesn't shadow the new ones on
         # next startup. Safe even if the key isn't there.
         self.settings.remove("transcription_llm_model")
@@ -6738,6 +6916,7 @@ class MainWindow(QWidget):
             audio_llm_model=self.transcription_audio_llm_model,
             audio_recheck_enabled=self.transcription_audio_recheck_enabled,
             vad_enabled=self.transcription_vad_enabled,
+            multipass_enabled=self.transcription_multipass_enabled,
         )
         self.worker = worker
         self._track_worker(worker)
