@@ -50,6 +50,56 @@ def default_out_path(in_path: str, out_dir: str, suffix: str) -> str:
     return str(out)
 
 
+def build_speaker_concat_cmd(
+    ffmpeg_path: str,
+    in_wav: str,
+    out_wav: str,
+    spans: list[tuple[float, float]],
+) -> list[str]:
+    """
+    Build an ffmpeg command that selects + concatenates a list of
+    ``(start, end)`` time ranges from ``in_wav`` into a single
+    ``out_wav``. Used by the per-speaker pipeline: for each
+    diarised speaker we hand Whisper a stream that contains *only*
+    their voice, so the decoder context doesn't cross speaker
+    boundaries.
+
+    The ``aselect`` filter chains range expressions joined with `+`
+    so ffmpeg keeps samples whose timestamp falls inside any span,
+    then ``asetpts=N/SR/TB`` resets the timeline so the output is a
+    contiguous WAV starting at t=0.
+    """
+    if not spans:
+        raise ValueError("build_speaker_concat_cmd needs at least one span")
+    parts = [
+        f"between(t,{start:.3f},{end:.3f})"
+        for start, end in spans
+        if end > start
+    ]
+    if not parts:
+        raise ValueError("build_speaker_concat_cmd needs at least one valid span")
+    expr = "+".join(parts)
+    afilter = f"aselect='{expr}',asetpts=N/SR/TB"
+    return [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        in_wav,
+        "-af",
+        afilter,
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        out_wav,
+    ]
+
+
 def build_ffmpeg_cmd(
     ffmpeg_path: str,
     in_path: str,

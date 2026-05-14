@@ -10,6 +10,7 @@ from ffmpeg_utils import (
     MEDIA_FILTER,
     VIDEO_EXTENSIONS,
     build_ffmpeg_cmd,
+    build_speaker_concat_cmd,
     default_out_path,
     is_audio_only_path,
 )
@@ -115,6 +116,40 @@ class BuildFfmpegCmdTest(unittest.TestCase):
         self.assertIn("00:01:00", cmd)
         self.assertIn("-to", cmd)
         self.assertIn("00:02:00", cmd)
+
+
+class BuildSpeakerConcatCmdTest(unittest.TestCase):
+    def test_aselect_filter_carries_every_span(self):
+        cmd = build_speaker_concat_cmd(
+            "/usr/local/bin/ffmpeg",
+            "/tmp/in.wav",
+            "/tmp/speaker_S0.wav",
+            [(10.0, 15.0), (50.5, 55.0)],
+        )
+        # The aselect filter must reference both ranges, joined with
+        # a `+` (logical OR). asetpts resets the timeline.
+        af = cmd[cmd.index("-af") + 1]
+        self.assertIn("between(t,10.000,15.000)", af)
+        self.assertIn("between(t,50.500,55.000)", af)
+        self.assertIn("+", af)
+        self.assertIn("asetpts=N/SR/TB", af)
+        self.assertIn("pcm_s16le", cmd)
+        self.assertIn("16000", cmd)
+        self.assertEqual(cmd[-1], "/tmp/speaker_S0.wav")
+
+    def test_raises_on_empty_spans(self):
+        with self.assertRaises(ValueError):
+            build_speaker_concat_cmd("ffmpeg", "/i.wav", "/o.wav", [])
+
+    def test_drops_invalid_spans(self):
+        # end <= start should be skipped, not crash.
+        cmd = build_speaker_concat_cmd(
+            "ffmpeg", "/i.wav", "/o.wav", [(0.0, 0.0), (5.0, 10.0), (20.0, 19.0)]
+        )
+        af = cmd[cmd.index("-af") + 1]
+        self.assertIn("between(t,5.000,10.000)", af)
+        self.assertNotIn("between(t,0.000,0.000)", af)
+        self.assertNotIn("between(t,20.000,19.000)", af)
 
 
 class TranscriptionCommandTest(unittest.TestCase):

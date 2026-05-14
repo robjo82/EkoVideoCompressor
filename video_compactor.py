@@ -23,6 +23,7 @@ from ffmpeg_utils import (
     MEDIA_FILTER,
     VIDEO_EXTENSIONS,
     build_ffmpeg_cmd,
+    build_speaker_concat_cmd,
     default_out_path,
     is_audio_only_path,
 )
@@ -35,6 +36,11 @@ from multipass import (
     group_into_clip_ranges,
     identify_weak_segments,
     merge_repass_segments,
+)
+from per_speaker import (
+    build_speaker_slices,
+    merge_speaker_segments,
+    remap_speaker_segments,
 )
 from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
 from transcription_utils import (
@@ -1170,6 +1176,26 @@ class SettingsDialog(QDialog):
         multipass_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
         transcription_form.addRow("", multipass_hint)
 
+        # Per-speaker mode: Whisper transcribes each speaker on
+        # their own audio stream. Requires diarisation + costs N
+        # extra Whisper passes. Off by default.
+        self.transcription_per_speaker_check = QCheckBox(
+            "Transcription séparée par locuteur (qualité maximale, plus lent)"
+        )
+        self.transcription_per_speaker_check.setChecked(
+            bool(transcription_settings.get("per_speaker_enabled", False))
+        )
+        transcription_form.addRow("", self.transcription_per_speaker_check)
+        per_speaker_hint = QLabel(
+            "Après la diarisation, Whisper est relancé indépendamment sur l'audio "
+            "concaténé de chaque locuteur. Empêche la contamination du contexte "
+            "entre voix. Multiplie la durée par le nombre de locuteurs — réservé "
+            "aux réunions stratégiques. Requiert la détection des locuteurs."
+        )
+        per_speaker_hint.setWordWrap(True)
+        per_speaker_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", per_speaker_hint)
+
         self.transcription_diarization_check = QCheckBox(
             "Détection des locuteurs (pyannote)"
         )
@@ -1605,6 +1631,7 @@ class SettingsDialog(QDialog):
                 "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
                 "vad_enabled": self.transcription_vad_check.isChecked(),
                 "multipass_enabled": self.transcription_multipass_check.isChecked(),
+                "per_speaker_enabled": self.transcription_per_speaker_check.isChecked(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_value,
@@ -1760,6 +1787,7 @@ class TranscribeWorker(QThread):
         vad_enabled: bool = True,
         multipass_enabled: bool = True,
         multipass_model: str = "mlx-community/whisper-large-v3",
+        per_speaker_enabled: bool = False,
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -1787,6 +1815,11 @@ class TranscribeWorker(QThread):
         self.multipass_enabled = bool(multipass_enabled)
         self.multipass_model = multipass_model or "mlx-community/whisper-large-v3"
         self._repass_replaced: int = 0
+        # Per-speaker mode: when enabled AND diarisation succeeds,
+        # we transcribe each speaker's audio independently so the
+        # decoder context never crosses speaker boundaries.
+        self.per_speaker_enabled = bool(per_speaker_enabled)
+        self._per_speaker_used: int = 0
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -2291,6 +2324,103 @@ class TranscribeWorker(QThread):
         )
         return merged
 
+    def _run_per_speaker_pass(
+        self,
+        source_wav: Path,
+        work_dir: Path,
+        turns: list[dict],
+    ) -> list[dict] | None:
+        """
+        For each diarised speaker, build a concatenated audio stream
+        containing only their turns and run Whisper on it. Each
+        resulting segment is tagged with the speaker label and
+        timestamps are mapped back to the source media timeline.
+
+        Returns the merged segment list (sorted by source-time
+        start), or ``None`` if the per-speaker step failed for any
+        reason (in which case the caller falls back to the standard
+        fusion path).
+        """
+        slices = build_speaker_slices(turns)
+        if not slices:
+            self._log("per_speaker_skipped reason=no_usable_slices")
+            return None
+
+        self.status.emit(
+            f"Transcription par locuteur ({len(slices)} voix)…"
+        )
+        self._log(
+            f"per_speaker_start speakers={len(slices)} "
+            f"durations={ {sp: round(s.duration, 1) for sp, s in slices.items()} }"
+        )
+
+        per_speaker_results: list[list[dict]] = []
+        for speaker, sl in slices.items():
+            if self._stop_requested:
+                return None
+            speaker_wav = work_dir / f"speaker_{speaker}.wav"
+            concat_cmd = build_speaker_concat_cmd(
+                self.ffmpeg_path,
+                str(source_wav),
+                str(speaker_wav),
+                sl.to_ffmpeg_segments(),
+            )
+            concat = subprocess.run(
+                concat_cmd, capture_output=True, text=True, env=self._subprocess_env()
+            )
+            if concat.returncode != 0 or not speaker_wav.exists():
+                self._log_process_result(
+                    f"per_speaker_concat_failed_{speaker}",
+                    concat.returncode,
+                    concat.stdout,
+                    concat.stderr,
+                )
+                return None
+
+            speaker_target = work_dir / f"speaker_{speaker}.whisper.json"
+            whisper_cmd = build_mlx_whisper_cmd(
+                mlx_whisper_path=self.mlx_whisper_path,
+                audio_path=str(speaker_wav),
+                output_path=str(speaker_target),
+                model=self.model,
+                language=self.language,
+                output_format="json",
+                initial_prompt=self.initial_prompt,
+                condition_on_previous_text=False,
+            )
+            proc = subprocess.run(
+                whisper_cmd,
+                capture_output=True,
+                text=True,
+                env=self._subprocess_env(),
+                timeout=3600,
+            )
+            if proc.returncode != 0 or not speaker_target.exists():
+                self._log_process_result(
+                    f"per_speaker_whisper_failed_{speaker}",
+                    proc.returncode,
+                    proc.stdout,
+                    proc.stderr,
+                )
+                return None
+            try:
+                segs = parse_whisper_json_segments(str(speaker_target))
+            except Exception as exc:
+                self._log(f"per_speaker_parse_failed speaker={speaker} error={exc!r}")
+                return None
+
+            shifted = remap_speaker_segments(segs, sl)
+            per_speaker_results.append(shifted)
+
+        merged = merge_speaker_segments(per_speaker_results)
+        if not merged:
+            self._log("per_speaker_no_segments")
+            return None
+        self._log(
+            f"per_speaker_ok speakers={len(slices)} segments={len(merged)}"
+        )
+        return merged
+
     def _run_clip_rechecks(
         self,
         wav_path: Path,
@@ -2464,6 +2594,15 @@ class TranscribeWorker(QThread):
                 lines.append(f"  Réécoute Whisper : {check.get('audio_transcript') or '(vide)'}")
             lines.append("")
 
+        if self._per_speaker_used:
+            lines += [
+                "## Transcription par locuteur",
+                "",
+                f"{self._per_speaker_used} locuteur(s) transcrit(s) "
+                "indépendamment sur leur propre flux audio.",
+                "",
+            ]
+
         # Multipass second-pass replacements: useful breadcrumb so the
         # user knows how much of the audio benefited from the
         # higher-quality model.
@@ -2543,6 +2682,7 @@ class TranscribeWorker(QThread):
             or technical_terms
             or self._glossary_subs
             or self._repass_replaced
+            or self._per_speaker_used
         )
         if has_review:
             self._write_review_file(self._review_transcript_path(out_path), payload, applied, clip_checks)
@@ -2954,7 +3094,23 @@ class TranscribeWorker(QThread):
 
                 try:
                     turns = parse_diarization_output(d_stdout)
-                    fused = assign_speakers_to_segments(whisper_segments, turns)
+                    # Per-speaker mode: redo Whisper *per speaker*
+                    # on a concatenated audio stream that contains
+                    # only their voice. Decoder context stays
+                    # coherent and we avoid mid-sentence speaker
+                    # contamination.
+                    per_speaker_segments: list[dict] | None = None
+                    if self.per_speaker_enabled and turns:
+                        per_speaker_segments = self._run_per_speaker_pass(
+                            wav_path, work_dir, turns
+                        )
+                    if per_speaker_segments:
+                        fused = per_speaker_segments
+                        self._per_speaker_used = len(
+                            {seg.get("speaker") for seg in fused}
+                        )
+                    else:
+                        fused = assign_speakers_to_segments(whisper_segments, turns)
                     analysis_segments = fused
                     rendered = render_segments_with_speakers(fused, self.output_format)
                 except Exception as exc:
@@ -4537,6 +4693,13 @@ class MainWindow(QWidget):
         self.transcription_multipass_enabled = self.settings.value(
             "transcription_multipass_enabled", True, type=bool
         )
+        # Per-speaker mode: re-transcribe each speaker on their own
+        # audio stream after diarisation. Off by default — it's
+        # slower (one Whisper pass per speaker) and only meaningful
+        # when diarisation is also enabled.
+        self.transcription_per_speaker_enabled = self.settings.value(
+            "transcription_per_speaker_enabled", False, type=bool
+        )
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
         self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
@@ -5491,6 +5654,7 @@ class MainWindow(QWidget):
             "audio_recheck_enabled": self.transcription_audio_recheck_enabled,
             "vad_enabled": self.transcription_vad_enabled,
             "multipass_enabled": self.transcription_multipass_enabled,
+            "per_speaker_enabled": self.transcription_per_speaker_enabled,
             "language": self.transcription_language,
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
@@ -5597,6 +5761,11 @@ class MainWindow(QWidget):
                 "multipass_enabled", self.transcription_multipass_enabled
             )
         )
+        self.transcription_per_speaker_enabled = bool(
+            transcription_settings.get(
+                "per_speaker_enabled", self.transcription_per_speaker_enabled
+            )
+        )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
         self.transcription_suffix = str(transcription_settings.get("suffix", "")).strip()
@@ -5621,6 +5790,10 @@ class MainWindow(QWidget):
         self.settings.setValue("transcription_vad_enabled", self.transcription_vad_enabled)
         self.settings.setValue(
             "transcription_multipass_enabled", self.transcription_multipass_enabled
+        )
+        self.settings.setValue(
+            "transcription_per_speaker_enabled",
+            self.transcription_per_speaker_enabled,
         )
         # Drop the legacy single-key so it doesn't shadow the new ones on
         # next startup. Safe even if the key isn't there.
@@ -6917,6 +7090,7 @@ class MainWindow(QWidget):
             audio_recheck_enabled=self.transcription_audio_recheck_enabled,
             vad_enabled=self.transcription_vad_enabled,
             multipass_enabled=self.transcription_multipass_enabled,
+            per_speaker_enabled=self.transcription_per_speaker_enabled,
         )
         self.worker = worker
         self._track_worker(worker)
