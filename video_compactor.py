@@ -26,6 +26,11 @@ from ffmpeg_utils import (
     default_out_path,
     is_audio_only_path,
 )
+from glossary_postprocess import (
+    GlossarySubstitution,
+    apply_glossary_to_segments,
+    parse_glossary_terms,
+)
 from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
@@ -1719,6 +1724,13 @@ class TranscribeWorker(QThread):
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
+        # Keep the raw glossary for the phonetic post-processor, which
+        # needs the original term list (not the wrapped Whisper prompt).
+        self.raw_glossary = initial_prompt or ""
+        self.glossary_terms: list[str] = parse_glossary_terms(self.raw_glossary)
+        # Track substitutions applied during the run so they can be
+        # surfaced in the review markdown.
+        self._glossary_subs: list[GlossarySubstitution] = []
         self.enhance_audio = enhance_audio
         self.diarization_enabled = diarization_enabled
         self.hf_token = hf_token
@@ -2171,6 +2183,24 @@ class TranscribeWorker(QThread):
                 lines.append(f"  Réécoute Whisper : {check.get('audio_transcript') or '(vide)'}")
             lines.append("")
 
+        # Phonetic-glossary substitutions: we log every word Whisper got
+        # phonetically wrong and we auto-corrected from the user's
+        # vocabulary. Most are silent fixes; surfacing them here lets
+        # the user sanity-check that nothing was over-corrected.
+        if self._glossary_subs:
+            lines += ["## Vocabulaire métier (corrigé automatiquement)", ""]
+            for sub in self._glossary_subs[:50]:
+                ts = (
+                    self._format_seconds_for_clip(sub.timestamp_seconds)
+                    if sub.timestamp_seconds is not None
+                    else "sans timestamp"
+                )
+                lines.append(
+                    f"- `{ts}` `{sub.original}` → `{sub.replacement}` "
+                    f"({sub.method}, confiance {sub.confidence:.2f})"
+                )
+            lines.append("")
+
         if len(lines) <= 4:
             lines.append("Aucune correction ni vérification signalée.")
         review_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -2211,7 +2241,14 @@ class TranscribeWorker(QThread):
         clip_checks = self._run_clip_rechecks(wav_path, work_dir, uncertain)
 
         has_changes = enhanced_text != base_text or applied or speakers
-        has_review = applied or uncertain or clip_checks or speakers or technical_terms
+        has_review = (
+            applied
+            or uncertain
+            or clip_checks
+            or speakers
+            or technical_terms
+            or self._glossary_subs
+        )
         if has_review:
             self._write_review_file(self._review_transcript_path(out_path), payload, applied, clip_checks)
 
@@ -2531,6 +2568,23 @@ class TranscribeWorker(QThread):
                     "La sortie brute ressemblait à une hallucination de silence."
                 )
                 return
+
+            # --- STEP 2bis: phonetic glossary post-processor --------------
+            # Whisper's `--initial-prompt` is a soft prior. Even when
+            # the glossary names are in the prompt the decoder routinely
+            # emits "MOLI" for "Mollie" or "Sudokiz" for "Sudokies".
+            # The post-processor walks every segment, fuzzy-matches each
+            # word against the glossary, and substitutes when confident.
+            if self.glossary_terms:
+                whisper_segments, subs = apply_glossary_to_segments(
+                    whisper_segments, self.glossary_terms
+                )
+                self._glossary_subs.extend(subs)
+                if subs:
+                    self._log(
+                        f"glossary_postprocess applied={len(subs)} "
+                        f"terms={len(self.glossary_terms)}"
+                    )
 
             # --- STEP 3: diarization and fusion ---------------------------
             analysis_segments = whisper_segments
