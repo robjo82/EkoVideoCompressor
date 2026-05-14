@@ -7,6 +7,7 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var settings = SettingsStore()
     @StateObject private var library = LibraryStore()
     @StateObject private var models = ModelStore()
+    @StateObject private var updater = UpdateStore()
 
     init() {
         let args = CommandLine.arguments
@@ -24,7 +25,14 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(settings)
                 .environmentObject(library)
                 .environmentObject(models)
+                .environmentObject(updater)
                 .frame(minWidth: 1180, minHeight: 760)
+                .onAppear {
+                    updater.setSettings(settings)
+                    Task {
+                        await updater.checkUpdates(proactive: true)
+                    }
+                }
         }
         .windowStyle(.titleBar)
         .commands {

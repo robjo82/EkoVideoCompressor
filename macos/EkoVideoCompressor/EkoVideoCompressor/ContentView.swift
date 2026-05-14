@@ -161,15 +161,53 @@ struct SidebarView: View {
 struct ProcessingWorkspaceView: View {
     @EnvironmentObject private var queue: QueueStore
     @EnvironmentObject private var engine: EngineProcess
+    @EnvironmentObject private var updater: UpdateStore
 
     var body: some View {
         VStack(spacing: 0) {
+            if case .available(let info) = updater.state {
+                UpdateBannerView(info: info)
+            }
             WorkflowHeaderView()
             Divider()
             QueueColumnView()
             Divider()
             StatusBarView()
         }
+    }
+}
+
+struct UpdateBannerView: View {
+    @EnvironmentObject private var updater: UpdateStore
+    var info: ReleaseInfo
+
+    var body: some View {
+        HStack {
+            Image(systemName: "sparkles")
+                .foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Une mise à jour est disponible : \(info.tag_name)")
+                    .font(.headline)
+                Text(info.name)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("En savoir plus") {
+                if let url = URL(string: info.html_url) {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            Button("Mettre à jour") {
+                Task {
+                    await updater.downloadAndPrepare(info: info)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding()
+        .background(Color.yellow.opacity(0.1))
+        .overlay(Divider(), alignment: .bottom)
     }
 }
 
@@ -534,6 +572,7 @@ struct ModelsView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var updater: UpdateStore
     @Environment(\.dismiss) private var dismiss
     @State private var hfStatus = ""
     @State private var isCheckingHF = false
@@ -550,6 +589,56 @@ struct SettingsView: View {
             .padding(22)
             Divider()
             Form {
+                Section("Mise à jour") {
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text("Version actuelle : \(updater.currentVersion)")
+                            switch updater.state {
+                            case .idle:
+                                Text("Vérifié à l'instant")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            case .checking:
+                                Text("Recherche en cours…")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            case .available(let info):
+                                Text("Version \(info.tag_name) disponible")
+                                    .font(.caption).foregroundStyle(.teal)
+                            case .upToDate:
+                                Text("Vous êtes à jour")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            case .downloading(let pct):
+                                Text("Téléchargement… \(Int(pct * 100))%")
+                                    .font(.caption).foregroundStyle(.teal)
+                            case .readyToInstall:
+                                Text("Prêt à installer")
+                                    .font(.caption).foregroundStyle(.teal)
+                            case .error(let msg):
+                                Text(msg)
+                                    .font(.caption).foregroundStyle(.red)
+                            }
+                        }
+                        Spacer()
+                        if case .readyToInstall(let url, _) = updater.state {
+                            Button("Installer et redémarrer") {
+                                updater.applyUpdate(zipURL: url)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        } else if case .available(let info) = updater.state {
+                            Button("Télécharger") {
+                                Task { await updater.downloadAndPrepare(info: info) }
+                            }
+                        } else {
+                            Button("Vérifier") {
+                                Task { await updater.checkUpdates() }
+                            }
+                            .disabled(updater.state == .checking)
+                        }
+                    }
+                    SecureField("GitHub Token (optionnel)", text: $settings.githubToken)
+                    Text("Requis seulement si le dépôt est privé.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
                 Section("Sortie") {
                     TextField("Dossier", text: $settings.outputDir)
                 }
