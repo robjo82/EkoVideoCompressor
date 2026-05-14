@@ -100,7 +100,7 @@ struct JobRequest: Codable {
     var rerun_steps: [String]
 }
 
-struct LibraryRow: Codable, Identifiable {
+struct LibraryRow: Codable, Identifiable, Equatable {
     var id: Int
     var source_path: String?
     var workspace_dir: String?

@@ -334,6 +334,8 @@ final class LibraryStore: ObservableObject {
     }
 
     func delete(_ row: LibraryRow) async {
+        let previousRows = rows
+        rows.removeAll { $0.id == row.id }
         isLoading = true
         errorMessage = nil
         let result = await EngineProcess.runCommand(
@@ -341,10 +343,11 @@ final class LibraryStore: ObservableObject {
         )
         if result.status != 0 {
             errorMessage = result.events.last?.message ?? result.rawOutput
+            rows = previousRows
             isLoading = false
             return
         }
-        await refresh()
+        isLoading = false
     }
 
     func renameSpeakers(_ row: LibraryRow, mapping: [String: String]) async {
