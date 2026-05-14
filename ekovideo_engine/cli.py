@@ -40,7 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_job = sub.add_parser("run-job")
     run_job.add_argument("--request", required=True, help="Path to a JobRequest JSON file")
 
-    sub.add_parser("library-list")
+    library_list_parser = sub.add_parser("library-list")
+    library_list_parser.add_argument("--jsonl", action="store_true")
     library_delete_parser = sub.add_parser("library-delete")
     library_delete_parser.add_argument("job_id", type=int)
 
@@ -88,7 +89,12 @@ def main(argv: list[str] | None = None) -> int:
             return EngineRunner(stdout_event_sink).run_job(request)
 
         if args.command == "library-list":
-            _print_json(library_list())
+            rows = library_list()
+            if args.jsonl:
+                for row in rows:
+                    print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            else:
+                _print_json(rows)
             return 0
 
         if args.command == "library-delete":

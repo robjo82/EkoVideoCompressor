@@ -4,6 +4,7 @@ import Foundation
 final class EngineProcess: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var events: [EngineEvent] = []
+    @Published private(set) var outputLines: [String] = []
     @Published var lastError: String?
 
     private var process: Process?
@@ -12,6 +13,7 @@ final class EngineProcess: ObservableObject {
     func run(arguments: [String], workingDirectory: URL? = nil) {
         guard !isRunning else { return }
         events.removeAll()
+        outputLines.removeAll()
         lastError = nil
 
         let process = Process()
@@ -64,6 +66,8 @@ final class EngineProcess: ObservableObject {
                 if event.event == .error {
                     lastError = event.message
                 }
+            } else {
+                outputLines.append(String(line))
             }
         }
     }

@@ -100,6 +100,21 @@ struct JobRequest: Codable {
     var rerun_steps: [String]
 }
 
+struct LibraryRow: Codable, Identifiable {
+    var id: Int
+    var source_path: String?
+    var status: String?
+    var updated_at: String?
+    var compressed_path: String?
+    var transcript_path: String?
+    var enhanced_transcript_path: String?
+    var review_path: String?
+
+    var filename: String {
+        URL(fileURLWithPath: source_path ?? "").lastPathComponent
+    }
+}
+
 struct CompressionSettings: Codable {
     var ffmpeg_path = "ffmpeg"
     var ffprobe_path = "ffprobe"
