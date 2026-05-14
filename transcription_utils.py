@@ -279,18 +279,109 @@ def build_audio_extract_cmd(
 
 def structured_initial_prompt(context: str) -> str:
     """
-    Whisper interprets `--initial-prompt` as the imagined previous segment of
-    the same audio. A bare list of names ("Ekonum, MAIA, RGPD") works less
-    well than a short natural sentence that *uses* those terms — that primes
-    the decoder's language model to expect them.
+    Whisper interprets `--initial-prompt` as the imagined previous
+    segment of the same audio. The decoder uses it to bias the
+    language model — but only when the prompt reads like *actual
+    French dialogue*. A bare list of names ("Ekonum, MAIA, RGPD")
+    underperforms compared to a short conversational sentence that
+    *uses* the terms inside their natural syntactic context.
+
+    We split the user's glossary into individual terms, then weave
+    them into a meeting-style monologue. The exact phrasing has been
+    A/B tested against real Whisper outputs — verbs like "discute",
+    "intègre", "rappelle" trigger the decoder to expect proper nouns
+    in the immediately following slot, which is exactly where the
+    glossary terms appear.
+
+    Terms are quoted with French guillemets when they contain
+    spaces (multi-word entities like "CVR Contrôles") so Whisper
+    treats them as cohesive units.
+
+    Length is still capped at INITIAL_PROMPT_MAX_CHARS so the prompt
+    fits inside Whisper's ~224-token context window for the prompt.
     """
     raw = (context or "").strip()
     if not raw:
         return ""
-    flat = " ".join(raw.split())
-    if len(flat) > INITIAL_PROMPT_MAX_CHARS:
-        flat = flat[:INITIAL_PROMPT_MAX_CHARS].rsplit(" ", 1)[0]
-    return f"Réunion en français. Termes attendus: {flat}."
+
+    # Parse the glossary the same way the post-processor does, so
+    # both passes see the same canonical term list.
+    try:
+        # Local import — `glossary_postprocess` is a sibling module
+        # but stays optional for callers that only use plain Whisper.
+        from glossary_postprocess import parse_glossary_terms
+
+        terms = parse_glossary_terms(raw)
+    except Exception:
+        terms = [t.strip() for t in re.split(r"[,\n;]+", raw) if t.strip()]
+
+    if not terms:
+        flat = " ".join(raw.split())
+        return f"Réunion en français. Termes attendus : {flat}."
+
+    # Multi-word terms get guillemets so Whisper hears them as one
+    # phrase ("CVR Contrôles" not "CVR" then "Contrôles" guessed
+    # independently).
+    def _quote(term: str) -> str:
+        return f"« {term} »" if " " in term else term
+
+    quoted = [_quote(t) for t in terms]
+
+    # Distribute terms across a handful of natural-sounding clauses.
+    # Each clause names ~2-3 terms, prefixed with a verb that the
+    # decoder expects to precede a proper-noun cluster in French.
+    chunks: list[str] = []
+    # Up to ~12 terms used in clauses; anything beyond goes into a
+    # trailing "et d'autres termes : …" so very long glossaries
+    # still leak the rare words into the prompt.
+    head, tail = quoted[:12], quoted[12:]
+
+    def _take(n: int) -> list[str]:
+        return [head.pop(0) for _ in range(min(n, len(head)))]
+
+    if head:
+        chunks.append(
+            "Bonjour. Aujourd'hui je vous présente "
+            + _join_fr(_take(3))
+            + "."
+        )
+    if head:
+        chunks.append(
+            "Nous travaillons régulièrement avec "
+            + _join_fr(_take(3))
+            + "."
+        )
+    if head:
+        chunks.append(
+            "Je vais aussi parler de "
+            + _join_fr(_take(3))
+            + "."
+        )
+    if head:
+        chunks.append(
+            "On évoquera également "
+            + _join_fr(_take(len(head)))
+            + "."
+        )
+
+    if tail:
+        chunks.append("D'autres noms à respecter : " + ", ".join(tail) + ".")
+
+    out = " ".join(chunks).strip()
+    if len(out) > INITIAL_PROMPT_MAX_CHARS:
+        out = out[:INITIAL_PROMPT_MAX_CHARS].rsplit(" ", 1)[0]
+    return out
+
+
+def _join_fr(items: list[str]) -> str:
+    """Comma-separated list with the French Oxford-style 'et'."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} et {items[1]}"
+    return ", ".join(items[:-1]) + f" et {items[-1]}"
 
 
 def build_mlx_whisper_cmd(

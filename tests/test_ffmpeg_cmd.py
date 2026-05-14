@@ -221,17 +221,31 @@ class StructuredInitialPromptTest(unittest.TestCase):
         self.assertEqual(structured_initial_prompt(""), "")
         self.assertEqual(structured_initial_prompt("   "), "")
 
-    def test_wraps_terms_in_french_priming_sentence(self):
+    def test_wraps_terms_in_contextual_french_sentence(self):
+        # The new prompt opens with a meeting greeting so the Whisper
+        # decoder treats what follows as plausible French dialogue —
+        # the LM bias is much stronger than with a bare term list.
         prompt = structured_initial_prompt("Ekonum, MAIA, RGPD")
-        self.assertTrue(prompt.startswith("Réunion en français"))
+        self.assertTrue(prompt.startswith("Bonjour."))
         self.assertIn("Ekonum", prompt)
         self.assertIn("MAIA", prompt)
         self.assertIn("RGPD", prompt)
 
-    def test_collapses_whitespace(self):
-        prompt = structured_initial_prompt("Ekonum,   MAIA\n\nRGPD")
-        self.assertNotIn("\n", prompt)
-        self.assertNotIn("  ", prompt)
+    def test_quotes_multi_word_terms_with_guillemets(self):
+        # Multi-word terms must reach Whisper as a single phonetic
+        # unit, not as two separately-decoded words.
+        prompt = structured_initial_prompt("Mollie, CVR Contrôles")
+        self.assertIn("« CVR Contrôles »", prompt)
+        self.assertIn("Mollie", prompt)
+
+    def test_handles_long_glossary_via_trailing_section(self):
+        # 15 terms — more than the 4 main clauses can absorb (each
+        # takes ~3). The tail goes into a final "D'autres noms…".
+        terms = ", ".join(f"Term{i}" for i in range(15))
+        prompt = structured_initial_prompt(terms)
+        self.assertIn("D'autres noms à respecter", prompt)
+        for i in range(15):
+            self.assertIn(f"Term{i}", prompt)
 
 
 class TranscriptTitleTest(unittest.TestCase):
