@@ -36,6 +36,13 @@ class CompressionSettings:
         return cls(**{k: v for k, v in data.items() if k in allowed})
 
 
+# Quality presets collapse "which boolean flags to enable" into a
+# single choice that the SwiftUI app exposes in a Picker. Power users
+# can still override individual flags by setting quality_preset to
+# "custom" — that mode passes the values through untouched.
+QualityPreset = Literal["fast", "balanced", "max", "custom"]
+
+
 @dataclass(slots=True)
 class TranscriptionSettings:
     mlx_whisper_path: str = ""
@@ -54,12 +61,56 @@ class TranscriptionSettings:
     multipass_enabled: bool = True
     per_speaker_enabled: bool = False
     web_enrichment_enabled: bool = False
+    # Default is "custom" so legacy callers that pass individual
+    # flags keep their semantics. The SwiftUI app explicitly sends
+    # "balanced" / "fast" / "max" to opt into the preset mapping.
+    quality_preset: QualityPreset = "custom"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":
         data = dict(raw or {})
         allowed = {field.name for field in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+        instance = cls(**{k: v for k, v in data.items() if k in allowed})
+        return apply_quality_preset(instance)
+
+
+def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSettings":
+    """Resolve the boolean flags from the ``quality_preset`` selector.
+
+    Centralising the mapping here means the SwiftUI app only needs to
+    send a single string (``"fast" / "balanced" / "max"``) and the
+    engine derives the right knobs. Custom mode (or any unknown
+    value) is a passthrough — power users keep full control.
+    """
+    preset = (settings.quality_preset or "balanced").strip().lower()
+    if preset == "fast":
+        # Pure baseline: Whisper only. No VAD, no multipass, no LLM,
+        # no diarisation. Roughly real-time on M1.
+        settings.vad_enabled = False
+        settings.multipass_enabled = False
+        settings.per_speaker_enabled = False
+        settings.audio_recheck_enabled = False
+        settings.web_enrichment_enabled = False
+    elif preset == "balanced":
+        # Default. VAD + multipass + LLM post-pass (when the venv
+        # exists). No per-speaker (it doubles the runtime).
+        settings.vad_enabled = True
+        settings.multipass_enabled = True
+        settings.per_speaker_enabled = False
+        settings.audio_recheck_enabled = False
+        settings.web_enrichment_enabled = False
+    elif preset == "max":
+        # Everything. Per-speaker Whisper + multimodal audio recheck
+        # + web enrichment. Reserved for strategic recordings the
+        # user is willing to wait several hours for.
+        settings.vad_enabled = True
+        settings.multipass_enabled = True
+        settings.per_speaker_enabled = True
+        settings.audio_recheck_enabled = True
+        settings.web_enrichment_enabled = True
+    # 'custom' (or any other value) is a passthrough — leave the
+    # individual flags as the caller set them.
+    return settings
 
 
 @dataclass(slots=True)

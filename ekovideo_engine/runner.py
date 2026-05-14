@@ -53,15 +53,21 @@ class EngineRunner:
         if request.mode in {"transcribe", "compress_transcribe"}:
             tx_results = TranscriptionPipeline(request, self.sink).run(active_source)
             results.extend(tx_results)
-            failed = [r for r in tx_results if not r.ok]
+            failed = [r for r in tx_results if not r.ok and r.name in {"audio_extract", "whisper"}]
+            # Quality steps (VAD, multipass, diarisation, llm_post) are
+            # allowed to fail without sinking the whole job — they're
+            # opt-in improvements. We only abort on the hard
+            # prerequisites: audio extract and Whisper itself.
             if failed:
                 db.update_job_status(job_id, "FAILED", failed[0].error or "Transcription failed")
                 self.sink(ErrorEvent(failed[0].error or "Transcription failed", code="transcription_failed"))
                 return 1
             for r in tx_results:
-                if r.name == "whisper" and r.artifact_path:
+                if r.name == "transcript" and r.artifact_path:
                     db.update_job_artefact(job_id, "transcript", r.artifact_path)
                     db.update_job_output(job_id, r.artifact_path)
+                elif r.name == "review" and r.artifact_path:
+                    db.update_job_artefact(job_id, "review", r.artifact_path)
             db.update_job_progress(job_id, step="Transcription terminée", progress_pct=100, eta_seconds=0)
 
         if request.mode in {"enhance", "review"}:

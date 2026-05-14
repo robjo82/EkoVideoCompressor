@@ -127,7 +127,13 @@ struct ContentView: View {
                 output_format: settings.outputFormat,
                 diarization_enabled: settings.diarizationEnabled,
                 hf_token: settings.hfToken,
-                audio_recheck_enabled: settings.audioRecheckEnabled
+                audio_recheck_enabled: settings.audioRecheckEnabled,
+                // Single source of truth: the preset string tells the
+                // engine which quality phases to run. Falls back to
+                // "balanced" if the persisted value is somehow invalid.
+                quality_preset: TranscriptionQualityPreset(
+                    rawValue: settings.qualityPreset
+                )?.rawValue ?? TranscriptionQualityPreset.balanced.rawValue
             ),
             glossary_terms: settings.glossaryTerms,
             speaker_overrides: [:],
@@ -349,6 +355,19 @@ struct RunSettingsForm: View {
                     Text("Whisper Large v3 Turbo").tag("mlx-community/whisper-large-v3-turbo")
                     Text("Whisper Large v3").tag("mlx-community/whisper-large-v3-mlx")
                     Text("Whisper Medium").tag("mlx-community/whisper-medium-mlx")
+                }
+                // Per-batch quality override. The picker mirrors the
+                // one in Settings, so the user can dial up "Maximale"
+                // for a strategic call without opening preferences.
+                Picker("Qualité", selection: $settings.qualityPreset) {
+                    ForEach(TranscriptionQualityPreset.allCases) { preset in
+                        Text(preset.displayName).tag(preset.rawValue)
+                    }
+                }
+                if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
+                    Text(preset.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
                 Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
@@ -654,9 +673,30 @@ struct SettingsView: View {
                         Text("VTT").tag("vtt")
                         Text("JSON").tag("json")
                     }
+                    // One picker replaces the previous patchwork of
+                    // VAD/multipass/per-speaker/web toggles. The engine
+                    // maps the preset string to the right combination.
+                    // Power users can still drill down via "Avancé".
+                    Picker("Qualité", selection: $settings.qualityPreset) {
+                        ForEach(TranscriptionQualityPreset.allCases) { preset in
+                            Text(preset.displayName).tag(preset.rawValue)
+                        }
+                    }
+                    if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
+                        Text(preset.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     TextField("Modèle Whisper", text: $settings.whisperModel)
+                }
+                Section("Avancé") {
                     Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
                     Toggle("Réécoute IA multimodale", isOn: $settings.audioRecheckEnabled)
+                    Text(
+                        "Ces bascules complètent le réglage Qualité. La détection des locuteurs nécessite un token Hugging Face ; la réécoute IA est expérimentale et coûteuse en temps."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
                 Section("Hugging Face") {
                     SecureField("Token Read", text: $settings.hfToken)

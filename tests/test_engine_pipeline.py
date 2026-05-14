@@ -1,0 +1,384 @@
+"""
+End-to-end tests for the engine quality pipeline.
+
+We don't run real Whisper / pyannote / mlx_lm — they're 1-4 Gb
+models we never want in CI. Instead we stub ``subprocess.run`` so
+each shell-out returns a canned response, then assert that the
+pipeline:
+
+  1. Wires the steps in the right order (audio → VAD → Whisper →
+     multipass → glossary post → LLM → write).
+  2. Applies the phonetic glossary post-processor (deterministic,
+     does NOT need subprocess stubbing — it's pure Python).
+  3. Falls back gracefully when an optional step fails.
+  4. Writes the review markdown with the steps that did fire.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import tempfile
+import unittest
+from dataclasses import dataclass
+from pathlib import Path
+from unittest.mock import patch
+
+from ekovideo_engine.events import collect_events
+from ekovideo_engine.models import JobRequest
+from ekovideo_engine.pipeline import (
+    StepResult,
+    TranscriptionPipeline,
+    _friendly_ffmpeg_error,
+)
+
+
+@dataclass
+class _StubResult:
+    """Mimic the slice of CompletedProcess our pipeline reads."""
+
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+
+
+def _make_request(workspace: Path, source: Path, **overrides) -> JobRequest:
+    tx_overrides = overrides.pop("transcription_settings", {})
+    return JobRequest.from_dict(
+        {
+            "source_path": str(source),
+            "output_dir": str(workspace),
+            "mode": "transcribe",
+            "workspace_dir": str(workspace),
+            "glossary_terms": overrides.pop("glossary_terms", []),
+            "technical_terms": overrides.pop("technical_terms", []),
+            "transcription_settings": {
+                # Disable everything that needs external models by default;
+                # individual tests opt in by overriding here.
+                "vad_enabled": False,
+                "multipass_enabled": False,
+                "diarization_enabled": False,
+                "venv_python_path": "",
+                "mlx_whisper_path": "/usr/local/bin/mlx_whisper",
+                "model": "mlx-community/whisper-large-v3-turbo",
+                "output_format": "txt",
+                "language": "fr",
+                **tx_overrides,
+            },
+        }
+    )
+
+
+def _write_canned_whisper(target: Path, segments: list[dict]) -> None:
+    target.write_text(
+        json.dumps({"segments": segments, "text": " ".join(s.get("text", "") for s in segments)}),
+        encoding="utf-8",
+    )
+
+
+class TranscriptionPipelinePortTest(unittest.TestCase):
+    """The engine used to do `audio_extract` then a single Whisper run
+    and nothing else. The port adds VAD, multipass, glossary post-pass,
+    diarisation, LLM. These tests pin the order and the wiring.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._tmp.name)
+        self.source = self.workspace / "meeting.mov"
+        self.source.write_bytes(b"fake media")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_basic_flow_writes_transcript_and_emits_artifact(self):
+        """Plumbing test: with every quality phase off and Whisper
+        stubbed, the pipeline should still produce a transcript file
+        and a 'transcript' StepResult that the runner can wire to the
+        library DB.
+        """
+        request = _make_request(self.workspace, self.source)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            # Audio extract emits the wav, Whisper emits the json.
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                wav_index = cmd.index("-progress") - 1 if "-progress" in cmd else -1
+                # Find the explicit output path (last arg) since the
+                # extract command varies.
+                wav_path = Path(cmd[-1])
+                wav_path.write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                # Output dir + name combine into the JSON path.
+                out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+                stem = cmd[cmd.index("--output-name") + 1]
+                target = out_dir / f"{stem}.json"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 2.0, "text": "Bonjour.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+
+        names = [r.name for r in results]
+        self.assertIn("audio_extract", names)
+        self.assertIn("whisper", names)
+        self.assertIn("transcript", names)
+        # All hard steps succeeded.
+        for r in results:
+            self.assertTrue(r.ok, f"step {r.name} unexpectedly failed: {r.error}")
+
+        transcript = next(r for r in results if r.name == "transcript")
+        self.assertTrue(Path(transcript.artifact_path).exists())
+        text = Path(transcript.artifact_path).read_text(encoding="utf-8")
+        self.assertIn("Bonjour", text)
+
+    def test_phonetic_glossary_rewrites_segments(self):
+        """When the user provides a glossary, mis-spellings Whisper
+        emits should be corrected before the transcript hits disk —
+        no model dependency, fully deterministic.
+        """
+        request = _make_request(
+            self.workspace,
+            self.source,
+            glossary_terms=["Mollie", "Sudokies"],
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                out_dir = Path(cmd[cmd.index("--output-dir") + 1])
+                stem = cmd[cmd.index("--output-name") + 1]
+                target = out_dir / f"{stem}.json"
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 3.0,
+                            "text": "On utilise MOLI avec Sudokiz.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+
+        transcript = next(r for r in results if r.name == "transcript")
+        text = Path(transcript.artifact_path).read_text(encoding="utf-8")
+        # Phonetic post-processor should have fixed both terms.
+        self.assertIn("Sudokies", text)
+        self.assertNotIn("Sudokiz", text)
+        # MOLI was ALL-CAPS so casing echo gives MOLLIE; the canonical
+        # term shows up in either casing.
+        self.assertTrue("Mollie" in text or "MOLLIE" in text)
+
+    def test_review_markdown_written_when_glossary_corrections_apply(self):
+        request = _make_request(
+            self.workspace, self.source, glossary_terms=["Mollie"]
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 3.0, "text": "Le module MOLI.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+
+        review = next((r for r in results if r.name == "review"), None)
+        self.assertIsNotNone(review)
+        body = Path(review.artifact_path).read_text(encoding="utf-8")
+        self.assertIn("Vocabulaire métier", body)
+        # Casing echo: "MOLI" was ALL-CAPS so the replacement becomes
+        # "MOLLIE". Both spellings are acceptable evidence that the
+        # glossary substitution made it into the report.
+        self.assertTrue("Mollie" in body or "MOLLIE" in body, body)
+
+    def test_vad_failure_does_not_kill_the_job(self):
+        """VAD is an optimisation. If silero-vad isn't installed we
+        warn and fall back to the original audio, but the job still
+        produces a transcript.
+        """
+        with tempfile.NamedTemporaryFile(suffix="-fake-python", delete=False) as fake_python:
+            fake_python.write(b"#!/bin/sh\nexit 1\n")
+        Path(fake_python.name).chmod(0o755)
+
+        request = _make_request(
+            self.workspace,
+            self.source,
+            transcription_settings={
+                "vad_enabled": True,
+                "venv_python_path": fake_python.name,
+            },
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd and cmd[0] == fake_python.name:
+                # Simulate VAD command failing.
+                return _StubResult(
+                    returncode=1, stderr="ModuleNotFoundError: silero_vad"
+                )
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 2.0, "text": "OK.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+
+        # VAD step is recorded as a failure but doesn't sink the job.
+        vad = next(r for r in results if r.name == "vad")
+        self.assertFalse(vad.ok)
+        transcript = next(r for r in results if r.name == "transcript")
+        self.assertTrue(transcript.ok)
+        self.assertTrue(Path(transcript.artifact_path).exists())
+
+    def test_audio_extract_failure_aborts(self):
+        request = _make_request(self.workspace, self.source)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            return _StubResult(returncode=1, stderr="dyld: Library not loaded: foo")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+        # Just audio_extract — nothing further should have happened.
+        self.assertEqual([r.name for r in results], ["audio_extract"])
+        self.assertFalse(results[0].ok)
+        self.assertIn("binaire ffmpeg fourni", results[0].error)
+
+
+class QualityPresetTest(unittest.TestCase):
+    """The SwiftUI app sends a single ``quality_preset`` string; the
+    engine derives the right toggles. Power users keep full control
+    via the ``"custom"`` preset (which is also the legacy default
+    so older callers don't have their config flipped from under
+    them).
+    """
+
+    def test_fast_preset_disables_every_quality_phase(self):
+        settings = JobRequest.from_dict(
+            {
+                "source_path": "/tmp/x.mov",
+                "output_dir": "/tmp",
+                "mode": "transcribe",
+                "transcription_settings": {
+                    "quality_preset": "fast",
+                    "vad_enabled": True,
+                    "multipass_enabled": True,
+                    "per_speaker_enabled": True,
+                },
+            }
+        ).transcription_settings
+        self.assertFalse(settings.vad_enabled)
+        self.assertFalse(settings.multipass_enabled)
+        self.assertFalse(settings.per_speaker_enabled)
+        self.assertFalse(settings.audio_recheck_enabled)
+
+    def test_balanced_preset_picks_safe_quality_wins(self):
+        settings = JobRequest.from_dict(
+            {
+                "source_path": "/tmp/x.mov",
+                "output_dir": "/tmp",
+                "mode": "transcribe",
+                "transcription_settings": {"quality_preset": "balanced"},
+            }
+        ).transcription_settings
+        self.assertTrue(settings.vad_enabled)
+        self.assertTrue(settings.multipass_enabled)
+        self.assertFalse(settings.per_speaker_enabled)
+
+    def test_max_preset_enables_everything(self):
+        settings = JobRequest.from_dict(
+            {
+                "source_path": "/tmp/x.mov",
+                "output_dir": "/tmp",
+                "mode": "transcribe",
+                "transcription_settings": {"quality_preset": "max"},
+            }
+        ).transcription_settings
+        self.assertTrue(settings.vad_enabled)
+        self.assertTrue(settings.multipass_enabled)
+        self.assertTrue(settings.per_speaker_enabled)
+        self.assertTrue(settings.audio_recheck_enabled)
+        self.assertTrue(settings.web_enrichment_enabled)
+
+    def test_custom_preset_passes_individual_flags_through(self):
+        settings = JobRequest.from_dict(
+            {
+                "source_path": "/tmp/x.mov",
+                "output_dir": "/tmp",
+                "mode": "transcribe",
+                "transcription_settings": {
+                    "quality_preset": "custom",
+                    "vad_enabled": False,
+                    "multipass_enabled": True,
+                    "per_speaker_enabled": True,
+                },
+            }
+        ).transcription_settings
+        self.assertFalse(settings.vad_enabled)
+        self.assertTrue(settings.multipass_enabled)
+        self.assertTrue(settings.per_speaker_enabled)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -127,6 +127,49 @@ struct CompressionSettings: Codable {
     var mono_audio = false
 }
 
+/// Single "quality" knob the user sees in Settings. The engine
+/// derives every individual toggle (VAD, multipass, per-speaker, …)
+/// from this preset, so the SwiftUI app only has to expose one
+/// picker for the 95% case.
+enum TranscriptionQualityPreset: String, Codable, CaseIterable, Identifiable {
+    /// Whisper only, no quality phases. ~real-time on M1.
+    case fast
+    /// Default. VAD + multipass + LLM enhancement. ~1.5× real-time.
+    case balanced
+    /// Per-speaker Whisper + audio recheck + web enrichment.
+    /// Reserved for strategic recordings; can take hours.
+    case max
+    /// Power user — keep the individual toggles as set, ignore the
+    /// preset. Engine treats unknown values as ``custom`` too.
+    case custom
+
+    var id: String { rawValue }
+
+    /// Human-readable name for the picker.
+    var displayName: String {
+        switch self {
+        case .fast: return "Rapide"
+        case .balanced: return "Équilibrée"
+        case .max: return "Maximale"
+        case .custom: return "Personnalisée"
+        }
+    }
+
+    /// One-line caption shown under the picker.
+    var summary: String {
+        switch self {
+        case .fast:
+            return "Whisper seul, transcription quasi temps réel. Aucune correction automatique."
+        case .balanced:
+            return "VAD + repasse haute qualité + relecture LLM. Recommandé pour la plupart des réunions."
+        case .max:
+            return "Whisper par locuteur + réécoute IA + enrichissement web. Réservé aux contenus stratégiques."
+        case .custom:
+            return "Conserve les bascules avancées telles que définies."
+        }
+    }
+}
+
 struct TranscriptionSettings: Codable {
     var mlx_whisper_path = "\(NSHomeDirectory())/Library/Application Support/EkoVideo Compressor/mlx-whisper-venv/bin/mlx_whisper"
     var model = "mlx-community/whisper-large-v3-turbo"
@@ -143,4 +186,9 @@ struct TranscriptionSettings: Codable {
     var multipass_enabled = true
     var per_speaker_enabled = false
     var web_enrichment_enabled = false
+    /// Sent as a string so the engine's ``apply_quality_preset`` can
+    /// override the individual flags from this single choice. Default
+    /// matches the engine default (``custom``) so existing app
+    /// versions keep their hand-tuned toggles working.
+    var quality_preset: String = TranscriptionQualityPreset.balanced.rawValue
 }
