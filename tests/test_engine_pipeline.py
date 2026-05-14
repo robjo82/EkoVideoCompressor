@@ -17,6 +17,7 @@ pipeline:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -304,6 +305,87 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         self.assertEqual([r.name for r in results], ["audio_extract"])
         self.assertFalse(results[0].ok)
         self.assertIn("binaire ffmpeg fourni", results[0].error)
+
+
+class SubprocessEnvAndErrorMapperTest(unittest.TestCase):
+    """Pin the two fixes that landed when a user reported the
+    'Fetching 4 files: 0%|...' dialog: the engine wasn't enriching
+    PATH for venv-side commands (so mlx_whisper crashed looking for
+    ffmpeg) and it was surfacing the raw HF download progress
+    interleaved with the actual exception, making the dialog look
+    like a stack trace.
+    """
+
+    def _make_request(self) -> JobRequest:
+        return JobRequest.from_dict(
+            {
+                "source_path": "/tmp/x.mov",
+                "output_dir": "/tmp",
+                "mode": "transcribe",
+                "compression_settings": {
+                    "ffmpeg_path": "/Applications/Eko.app/Contents/Resources/bin/ffmpeg",
+                    "ffprobe_path": "/Applications/Eko.app/Contents/Resources/bin/ffprobe",
+                },
+            }
+        )
+
+    def test_subprocess_env_prepends_bundled_bin_to_path(self):
+        from ekovideo_engine.pipeline import subprocess_env_for_request
+
+        env = subprocess_env_for_request(self._make_request())
+        self.assertIn(
+            "/Applications/Eko.app/Contents/Resources/bin",
+            env["PATH"],
+        )
+        # System PATH must still come AFTER the bundle so we never
+        # accidentally pick up a stale Homebrew binary.
+        bundled_index = env["PATH"].index(
+            "/Applications/Eko.app/Contents/Resources/bin"
+        )
+        rest = env["PATH"][bundled_index:]
+        self.assertTrue(
+            rest.startswith("/Applications/Eko.app/Contents/Resources/bin"),
+            "bundle dir must be at the front of PATH",
+        )
+
+    def test_subprocess_env_keeps_existing_path(self):
+        from ekovideo_engine.pipeline import subprocess_env_for_request
+
+        env = subprocess_env_for_request(self._make_request())
+        # Whatever the user's $PATH was, it should still be in the
+        # composed value — we prepend, never replace.
+        for shell_dir in ("/usr/bin", "/bin"):
+            if shell_dir in os.environ.get("PATH", ""):
+                self.assertIn(shell_dir, env["PATH"])
+                break
+
+    def test_tqdm_progress_lines_stripped_from_error(self):
+        from ekovideo_engine.pipeline import _clean_subprocess_stderr
+
+        raw = (
+            "Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]\n"
+            "Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 85163.53it/s]\n"
+            "Traceback (most recent call last):\n"
+            "  File 'mlx_whisper/audio.py', line 59, in load_audio\n"
+            "FileNotFoundError: [Errno 2] No such file or directory: 'ffmpeg'"
+        )
+        cleaned = _clean_subprocess_stderr(raw)
+        self.assertNotIn("Fetching", cleaned)
+        self.assertIn("FileNotFoundError", cleaned)
+        self.assertIn("ffmpeg", cleaned)
+
+    def test_friendly_error_maps_mlx_ffmpeg_not_found(self):
+        from ekovideo_engine.pipeline import _friendly_ffmpeg_error
+
+        raw = (
+            "Fetching 4 files: 100%|██████████| 4/4 [00:00<00:00, 85163.53it/s]\n"
+            "FileNotFoundError: [Errno 2] No such file or directory: 'ffmpeg'"
+        )
+        out = _friendly_ffmpeg_error(raw, "/usr/local/bin/mlx_whisper")
+        # The cleaned message should mention what failed (ffmpeg
+        # missing in PATH), not just leak the raw stack trace.
+        self.assertIn("ffmpeg", out.lower())
+        self.assertNotIn("Fetching", out)
 
 
 class QualityPresetTest(unittest.TestCase):
