@@ -49,6 +49,7 @@ from .models import (
     ProgressEvent,
     WarningEvent,
 )
+from .paths import managed_venv_python_path
 
 
 # Tqdm progress lines that ``huggingface_hub`` writes to stderr while
@@ -212,11 +213,25 @@ class TranscriptionPipeline:
     def __init__(self, request: JobRequest, sink: EventSink):
         self.request = request
         self.sink = sink
+        self._resolve_managed_python()
         # Accumulators surfaced in the review markdown.
         self._glossary_subs: list[GlossarySubstitution] = []
         self._repass_replaced: int = 0
         self._vad_manifest: list[dict] = []
         self._llm_payload: dict[str, Any] = {}
+
+    def _resolve_managed_python(self) -> None:
+        settings = self.request.transcription_settings
+        if settings.venv_python_path and Path(settings.venv_python_path).exists():
+            return
+        if (settings.quality_preset or "custom").strip().lower() not in {
+            "balanced",
+            "max",
+        }:
+            return
+        candidate = managed_venv_python_path()
+        if candidate.exists():
+            settings.venv_python_path = str(candidate)
 
     def _subprocess_env(self) -> dict[str, str]:
         return subprocess_env_for_request(self.request)
@@ -303,6 +318,17 @@ class TranscriptionPipeline:
                 ContextEvent(
                     speakers=speakers,
                     technical_terms=self._llm_payload.get("technical_terms") or [],
+                )
+            )
+
+        enhanced_path = self._write_enhanced_transcript(transcript_path, segments)
+        if enhanced_path is not None:
+            results.append(
+                StepResult(
+                    "enhanced_transcript",
+                    True,
+                    str(enhanced_path),
+                    model=self.request.transcription_settings.text_llm_model,
                 )
             )
 
@@ -846,6 +872,42 @@ class TranscriptionPipeline:
         )
         return transcript_path
 
+    def _has_quality_output(self) -> bool:
+        return bool(
+            self._glossary_subs
+            or self._repass_replaced
+            or self._vad_manifest
+            or self._llm_payload.get("corrections")
+            or self._llm_payload.get("uncertain_passages")
+            or self._llm_payload.get("speakers")
+            or self._llm_payload.get("technical_terms")
+            or self._llm_payload.get("title")
+        )
+
+    def _write_enhanced_transcript(
+        self, transcript_path: Path, segments: list[dict]
+    ) -> Path | None:
+        if not self._has_quality_output():
+            return None
+        settings = self.request.transcription_settings
+        enhanced_path = transcript_path.with_name(
+            f"{transcript_path.stem} améliorée{transcript_path.suffix}"
+        )
+        has_speakers = any(seg.get("speaker") for seg in segments)
+        if has_speakers:
+            rendered = render_segments_with_speakers(segments, settings.output_format)
+        else:
+            rendered = render_segments_plain(segments, settings.output_format)
+        enhanced_path.write_text(rendered, encoding="utf-8")
+        self.sink(
+            ArtifactEvent(
+                "enhanced_transcript",
+                str(enhanced_path),
+                model=settings.text_llm_model,
+            )
+        )
+        return enhanced_path
+
     def _write_review_markdown(
         self, transcript_path: Path, segments: list[dict]
     ) -> Path | None:
@@ -856,16 +918,7 @@ class TranscriptionPipeline:
         Returns the written path, or None when nothing was worth a
         report.
         """
-        if not (
-            self._glossary_subs
-            or self._repass_replaced
-            or self._vad_manifest
-            or self._llm_payload.get("corrections")
-            or self._llm_payload.get("uncertain_passages")
-            or self._llm_payload.get("speakers")
-            or self._llm_payload.get("technical_terms")
-            or self._llm_payload.get("title")
-        ):
+        if not self._has_quality_output():
             return None
 
         review_path = transcript_path.with_name(f"{transcript_path.stem} - à vérifier.md")

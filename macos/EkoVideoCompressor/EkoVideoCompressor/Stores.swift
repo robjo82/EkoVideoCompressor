@@ -332,6 +332,74 @@ final class LibraryStore: ObservableObject {
         }
         isLoading = false
     }
+
+    func delete(_ row: LibraryRow) async {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["library-delete", "\(row.id)"])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            isLoading = false
+            return
+        }
+        await refresh()
+    }
+
+    func renameSpeakers(_ row: LibraryRow, mapping: [String: String]) async {
+        guard let payload = jsonString(mapping) else {
+            errorMessage = "Mapping interlocuteurs invalide."
+            return
+        }
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-rename-speakers",
+                "\(row.id)",
+                "--mapping",
+                payload,
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            isLoading = false
+            return
+        }
+        await refresh()
+    }
+
+    func updateContext(_ row: LibraryRow, speakers: [String: String], technicalTerms: [String]) async {
+        guard let speakersPayload = jsonString(speakers),
+              let termsPayload = jsonString(technicalTerms) else {
+            errorMessage = "Contexte invalide."
+            return
+        }
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-update-context",
+                "\(row.id)",
+                "--speakers",
+                speakersPayload,
+                "--technical-terms",
+                termsPayload,
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            isLoading = false
+            return
+        }
+        await refresh()
+    }
+
+    private func jsonString<T: Encodable>(_ value: T) -> String? {
+        guard let data = try? JSONEncoder().encode(value) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }
 
 @MainActor

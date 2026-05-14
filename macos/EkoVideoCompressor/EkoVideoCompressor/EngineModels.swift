@@ -103,16 +103,63 @@ struct JobRequest: Codable {
 struct LibraryRow: Codable, Identifiable {
     var id: Int
     var source_path: String?
+    var workspace_dir: String?
+    var output_path: String?
+    var custom_title: String?
     var status: String?
+    var error_message: String?
     var updated_at: String?
+    var created_at: String?
     var compressed_path: String?
     var transcript_path: String?
     var enhanced_transcript_path: String?
     var review_path: String?
+    var speaker_map_json: String?
+    var technical_terms_json: String?
+    var current_step: String?
+    var progress_pct: Double?
+    var eta_seconds: Double?
 
     var filename: String {
         URL(fileURLWithPath: source_path ?? "").lastPathComponent
     }
+
+    var customTitleOrFilename: String {
+        let title = (custom_title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? filename : title
+    }
+
+    var copiedSourcePath: String? {
+        guard let workspace_dir, !workspace_dir.isEmpty,
+              let source_path, !source_path.isEmpty else { return nil }
+        return URL(fileURLWithPath: workspace_dir)
+            .appendingPathComponent(URL(fileURLWithPath: source_path).lastPathComponent)
+            .path
+    }
+
+    var speakerMap: [String: String] {
+        decodeJSONObject(speaker_map_json)
+    }
+
+    var technicalTerms: [String] {
+        decodeJSONArray(technical_terms_json)
+    }
+}
+
+private func decodeJSONObject(_ raw: String?) -> [String: String] {
+    guard let raw, let data = raw.data(using: .utf8),
+          let value = try? JSONDecoder().decode([String: String].self, from: data) else {
+        return [:]
+    }
+    return value
+}
+
+private func decodeJSONArray(_ raw: String?) -> [String] {
+    guard let raw, let data = raw.data(using: .utf8),
+          let value = try? JSONDecoder().decode([String].self, from: data) else {
+        return []
+    }
+    return value
 }
 
 struct CompressionSettings: Codable {

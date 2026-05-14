@@ -137,6 +137,7 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         self.assertIn("audio_extract", names)
         self.assertIn("whisper", names)
         self.assertIn("transcript", names)
+        self.assertNotIn("enhanced_transcript", names)
         # All hard steps succeeded.
         for r in results:
             self.assertTrue(r.ok, f"step {r.name} unexpectedly failed: {r.error}")
@@ -192,6 +193,8 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         # MOLI was ALL-CAPS so casing echo gives MOLLIE; the canonical
         # term shows up in either casing.
         self.assertTrue("Mollie" in text or "MOLLIE" in text)
+        enhanced = next(r for r in results if r.name == "enhanced_transcript")
+        self.assertTrue(Path(enhanced.artifact_path).exists())
 
     def test_review_markdown_written_when_glossary_corrections_apply(self):
         request = _make_request(
@@ -290,6 +293,36 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         transcript = next(r for r in results if r.name == "transcript")
         self.assertTrue(transcript.ok)
         self.assertTrue(Path(transcript.artifact_path).exists())
+
+    def test_managed_venv_is_used_when_swiftui_does_not_send_python_path(self):
+        with tempfile.TemporaryDirectory() as support_dir:
+            managed_python = (
+                Path(support_dir)
+                / "mlx-whisper-venv"
+                / "bin"
+                / "python"
+            )
+            managed_python.parent.mkdir(parents=True)
+            managed_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            managed_python.chmod(0o755)
+
+            request = _make_request(
+                self.workspace,
+                self.source,
+                transcription_settings={
+                    "vad_enabled": True,
+                    "venv_python_path": "",
+                    "quality_preset": "balanced",
+                },
+            )
+            events, sink = collect_events()
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": support_dir}):
+                TranscriptionPipeline(request, sink)
+
+            self.assertEqual(
+                request.transcription_settings.venv_python_path,
+                str(managed_python),
+            )
 
     def test_audio_extract_failure_aborts(self):
         request = _make_request(self.workspace, self.source)

@@ -473,7 +473,8 @@ struct DropTargetView: View {
 
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var queue: QueueStore
+    @State private var editingRow: LibraryRow?
+    @State private var rowToDelete: LibraryRow?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -496,25 +497,15 @@ struct LibraryView: View {
                     message: "Actualisez la bibliothèque pour lire les traitements depuis le moteur."
                 )
             } else {
-                Table(library.rows) {
-                    TableColumn("Fichier") { row in
-                        Text(row.filename)
-                            .lineLimit(2)
-                    }
-                    TableColumn("Statut") { row in
-                        StatusText(row.status ?? "-")
-                    }
-                    TableColumn("Mis à jour") { row in
-                        Text(row.updated_at ?? "-")
-                            .foregroundStyle(.secondary)
-                    }
-                    TableColumn("Artefacts") { row in
-                        ArtifactSummary(row: row)
-                    }
-                    TableColumn("Actions") { row in
-                        LibraryActionsView(row: row)
-                    }
+                List(library.rows) { row in
+                    LibraryJobDisclosureRow(
+                        row: row,
+                        onEditContext: { editingRow = row },
+                        onDelete: { rowToDelete = row }
+                    )
+                    .padding(.vertical, 4)
                 }
+                .listStyle(.inset)
                 .overlay(alignment: .bottomLeading) {
                     if let message = library.errorMessage, !message.isEmpty {
                         InlineErrorView(message: message)
@@ -522,6 +513,31 @@ struct LibraryView: View {
                     }
                 }
             }
+        }
+        .sheet(item: $editingRow) { row in
+            LibraryContextEditor(row: row)
+                .environmentObject(library)
+        }
+        .confirmationDialog(
+            "Supprimer ce traitement de la bibliothèque ?",
+            isPresented: Binding(
+                get: { rowToDelete != nil },
+                set: { if !$0 { rowToDelete = nil } }
+            )
+        ) {
+            Button("Supprimer", role: .destructive) {
+                if let row = rowToDelete {
+                    Task {
+                        await library.delete(row)
+                        rowToDelete = nil
+                    }
+                }
+            }
+            Button("Annuler", role: .cancel) {
+                rowToDelete = nil
+            }
+        } message: {
+            Text("Les fichiers déjà générés restent dans le dossier de travail ; seule l'entrée de bibliothèque est retirée.")
         }
         .task {
             if library.rows.isEmpty {
@@ -923,67 +939,261 @@ struct StatusText: View {
     }
 }
 
-struct ArtifactSummary: View {
-    var row: LibraryRow
+struct LibraryArtifact: Identifiable {
+    var id: String { kind }
+    var kind: String
+    var title: String
+    var path: String?
+    var canRerun: Bool = false
+}
 
-    var body: some View {
-        HStack {
-            ArtifactDot(label: "C", isPresent: !(row.compressed_path ?? "").isEmpty)
-            ArtifactDot(label: "T", isPresent: !(row.transcript_path ?? "").isEmpty)
-            ArtifactDot(label: "A", isPresent: !(row.enhanced_transcript_path ?? "").isEmpty)
-            ArtifactDot(label: "R", isPresent: !(row.review_path ?? "").isEmpty)
-        }
+extension LibraryRow {
+    var artifacts: [LibraryArtifact] {
+        [
+            LibraryArtifact(kind: "source", title: "Source copiée", path: copiedSourcePath, canRerun: true),
+            LibraryArtifact(kind: "compressed", title: "Compressé", path: compressed_path),
+            LibraryArtifact(kind: "transcript", title: "Transcription", path: transcript_path),
+            LibraryArtifact(kind: "enhanced", title: "Améliorée", path: enhanced_transcript_path),
+            LibraryArtifact(kind: "review", title: "Rapport", path: review_path),
+        ]
     }
 }
 
-struct LibraryActionsView: View {
+struct LibraryJobDisclosureRow: View {
     @EnvironmentObject private var queue: QueueStore
     var row: LibraryRow
+    var onEditContext: () -> Void
+    var onDelete: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            if let source = row.source_path, !source.isEmpty {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(row.artifacts) { artifact in
+                    ArtifactDetailRow(artifact: artifact) {
+                        if let path = artifact.path, !path.isEmpty {
+                            queue.add(urls: [URL(fileURLWithPath: path)])
+                        }
+                    }
+                }
+                if let error = row.error_message, !error.isEmpty {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                        .padding(.top, 4)
+                }
+            }
+            .padding(.top, 8)
+        } label: {
+            HStack(spacing: 14) {
+                statusIcon
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(row.customTitleOrFilename)
+                        .font(.headline)
+                        .lineLimit(2)
+                    HStack(spacing: 10) {
+                        Text(row.updated_at ?? row.created_at ?? "-")
+                        ArtifactDots(row: row)
+                        if let step = row.current_step, !step.isEmpty, row.status == "RUNNING" {
+                            Text(step)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+                StatusText(localizedStatus(row.status))
                 Button {
-                    queue.add(urls: [URL(fileURLWithPath: source)])
+                    if let path = pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path {
+                        queue.add(urls: [URL(fileURLWithPath: path)])
+                    }
                 } label: {
                     Label("Relancer", systemImage: "arrow.clockwise")
                 }
                 .labelStyle(.iconOnly)
-                .help("Ajouter ce fichier à la file")
-            }
-
-            Menu {
-                ArtifactMenuButton(title: "Compressé", path: row.compressed_path)
-                ArtifactMenuButton(title: "Transcription", path: row.transcript_path)
-                ArtifactMenuButton(title: "Améliorée", path: row.enhanced_transcript_path)
-                ArtifactMenuButton(title: "Rapport", path: row.review_path)
-                Divider()
-                if let source = row.source_path, !source.isEmpty {
-                    Button("Afficher l'original dans le Finder") {
-                        revealInFinder(source)
-                    }
+                .help("Ajouter la source copiée à la file")
+                Button(action: onEditContext) {
+                    Label("Contexte", systemImage: "person.2.badge.gearshape")
                 }
-            } label: {
-                Image(systemName: "ellipsis.circle")
+                .labelStyle(.iconOnly)
+                .help("Modifier les interlocuteurs et le vocabulaire")
+                Button(role: .destructive, action: onDelete) {
+                    Label("Supprimer", systemImage: "trash")
+                }
+                .labelStyle(.iconOnly)
+                .help("Supprimer de la bibliothèque")
             }
-            .menuStyle(.borderlessButton)
+        }
+    }
+
+    private var statusIcon: some View {
+        Image(systemName: statusIconName(row.status))
+            .foregroundStyle(statusColor(row.status))
+            .frame(width: 22)
+    }
+}
+
+struct ArtifactDots: View {
+    var row: LibraryRow
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ArtifactDot(label: "S", isPresent: pathExists(row.copiedSourcePath))
+            ArtifactDot(label: "C", isPresent: pathExists(row.compressed_path))
+            ArtifactDot(label: "T", isPresent: pathExists(row.transcript_path))
+            ArtifactDot(label: "A", isPresent: pathExists(row.enhanced_transcript_path))
+            ArtifactDot(label: "R", isPresent: pathExists(row.review_path))
         }
     }
 }
 
-struct ArtifactMenuButton: View {
-    var title: String
-    var path: String?
+struct ArtifactDetailRow: View {
+    var artifact: LibraryArtifact
+    var onRerun: () -> Void
+
+    private var existingPath: String? {
+        guard let path = artifact.path, !path.isEmpty else { return nil }
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
 
     var body: some View {
-        if let path, !path.isEmpty {
-            Button(title) {
-                openPath(path)
+        HStack(spacing: 10) {
+            ArtifactDot(label: String(artifact.title.prefix(1)), isPresent: existingPath != nil)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(artifact.title)
+                    .font(.callout.weight(.medium))
+                Text(artifactSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-        } else {
-            Button(title) {}
-                .disabled(true)
+            Spacer()
+            if let path = existingPath {
+                Button {
+                    openPath(path)
+                } label: {
+                    Label("Ouvrir", systemImage: "doc.text")
+                }
+                .labelStyle(.iconOnly)
+                .help("Ouvrir le fichier")
+                Button {
+                    revealInFinder(path)
+                } label: {
+                    Label("Finder", systemImage: "folder")
+                }
+                .labelStyle(.iconOnly)
+                .help("Afficher dans le Finder")
+            }
+            if artifact.canRerun && existingPath != nil {
+                Button(action: onRerun) {
+                    Label("Relancer", systemImage: "arrow.clockwise")
+                }
+                .labelStyle(.iconOnly)
+                .help("Relancer depuis cette source")
+            }
         }
+        .padding(.leading, 28)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if let path = existingPath {
+                revealInFinder(path)
+            }
+        }
+    }
+
+    private var artifactSubtitle: String {
+        guard let path = existingPath else { return "Non généré" }
+        let url = URL(fileURLWithPath: path)
+        let size = fileSizeLabel(path)
+        if size.isEmpty {
+            return url.lastPathComponent
+        }
+        return "\(url.lastPathComponent) · \(size)"
+    }
+}
+
+struct LibraryContextEditor: View {
+    @EnvironmentObject private var library: LibraryStore
+    @Environment(\.dismiss) private var dismiss
+    var row: LibraryRow
+    @State private var speakerText: String
+    @State private var termsText: String
+
+    init(row: LibraryRow) {
+        self.row = row
+        let speakerLines = row.speakerMap
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key) = \($0.value)" }
+            .joined(separator: "\n")
+        _speakerText = State(initialValue: speakerLines)
+        _termsText = State(initialValue: row.technicalTerms.joined(separator: "\n"))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Contexte de transcription")
+                        .font(.title.bold())
+                    Text(row.filename)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(22)
+            Divider()
+            Form {
+                Section("Interlocuteurs") {
+                    TextEditor(text: $speakerText)
+                        .font(.body.monospaced())
+                        .frame(minHeight: 150)
+                    Text("Format : SPEAKER_00 = Nom. Les fichiers texte existants sont réécrits quand un nom change.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Section("Termes techniques") {
+                    TextEditor(text: $termsText)
+                        .font(.body.monospaced())
+                        .frame(minHeight: 140)
+                    Text("Un terme par ligne. Conservé avec cette transcription et réutilisable lors d'une relance.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+            .padding()
+            Divider()
+            HStack {
+                Button("Annuler") { dismiss() }
+                Spacer()
+                Button("Enregistrer") {
+                    Task { await save() }
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(18)
+        }
+        .frame(minWidth: 680, minHeight: 560)
+    }
+
+    private func save() async {
+        let speakers = parseSpeakerLines(speakerText)
+        var renameMapping = speakers
+        for (key, oldValue) in row.speakerMap {
+            if let newValue = speakers[key], !oldValue.isEmpty, oldValue != newValue {
+                renameMapping[oldValue] = newValue
+            }
+        }
+        let terms = termsText
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !renameMapping.isEmpty {
+            await library.renameSpeakers(row, mapping: renameMapping)
+        }
+        await library.updateContext(row, speakers: speakers, technicalTerms: terms)
+        dismiss()
     }
 }
 
@@ -1046,4 +1256,68 @@ func revealInFinder(_ path: String) {
 func openHuggingFaceTokens() {
     guard let url = URL(string: "https://huggingface.co/settings/tokens") else { return }
     NSWorkspace.shared.open(url)
+}
+
+func localizedStatus(_ raw: String?) -> String {
+    switch (raw ?? "").uppercased() {
+    case "COMPLETED": return "Terminé"
+    case "RUNNING": return "En cours"
+    case "FAILED": return "Échec"
+    case "PENDING": return "En attente"
+    default: return raw ?? "-"
+    }
+}
+
+func statusIconName(_ raw: String?) -> String {
+    switch (raw ?? "").uppercased() {
+    case "COMPLETED": return "checkmark.circle.fill"
+    case "RUNNING": return "clock.arrow.circlepath"
+    case "FAILED": return "xmark.octagon.fill"
+    default: return "circle"
+    }
+}
+
+func statusColor(_ raw: String?) -> Color {
+    switch (raw ?? "").uppercased() {
+    case "COMPLETED": return .green
+    case "RUNNING": return .teal
+    case "FAILED": return .red
+    default: return .secondary
+    }
+}
+
+func fileSizeLabel(_ path: String) -> String {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          let size = attrs[.size] as? NSNumber else {
+        return ""
+    }
+    return ByteCountFormatter.string(fromByteCount: size.int64Value, countStyle: .file)
+}
+
+func pathExists(_ path: String?) -> Bool {
+    guard let path, !path.isEmpty else { return false }
+    return FileManager.default.fileExists(atPath: path)
+}
+
+func parseSpeakerLines(_ text: String) -> [String: String] {
+    var result: [String: String] = [:]
+    for line in text.split(whereSeparator: \.isNewline) {
+        let raw = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { continue }
+        let parts: [Substring]
+        if raw.contains("=") {
+            parts = raw.split(separator: "=", maxSplits: 1)
+        } else if raw.contains(":") {
+            parts = raw.split(separator: ":", maxSplits: 1)
+        } else {
+            continue
+        }
+        guard parts.count == 2 else { continue }
+        let key = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !key.isEmpty && !value.isEmpty {
+            result[key] = value
+        }
+    }
+    return result
 }

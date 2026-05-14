@@ -66,6 +66,9 @@ class EngineRunner:
                 if r.name == "transcript" and r.artifact_path:
                     db.update_job_artefact(job_id, "transcript", r.artifact_path)
                     db.update_job_output(job_id, r.artifact_path)
+                elif r.name == "enhanced_transcript" and r.artifact_path:
+                    db.update_job_artefact(job_id, "enhanced_transcript", r.artifact_path)
+                    db.update_job_output(job_id, r.artifact_path)
                 elif r.name == "review" and r.artifact_path:
                     db.update_job_artefact(job_id, "review", r.artifact_path)
             db.update_job_progress(job_id, step="Transcription terminée", progress_pct=100, eta_seconds=0)

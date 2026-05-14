@@ -104,8 +104,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "library-rename-speakers":
             mapping = _load_json_arg(args.mapping)
-            changed = library_rename_speakers(args.job_id, {str(k): str(v) for k, v in mapping.items()})
-            _print_json({"job_id": args.job_id, "segments_changed": changed})
+            result = library_rename_speakers(args.job_id, {str(k): str(v) for k, v in mapping.items()})
+            _print_json({"job_id": args.job_id, **result})
             return 0
 
         if args.command == "library-update-context":
