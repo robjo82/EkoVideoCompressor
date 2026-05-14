@@ -9,7 +9,9 @@ import unittest
 from pathlib import Path
 
 from ekovideo_engine.events import event_to_json
+from ekovideo_engine.events import collect_events
 from ekovideo_engine.models import DoneEvent, JobRequest, ProgressEvent
+from ekovideo_engine.pipeline import prepare_job_workspace
 from transcription_eval.evaluate import evaluate_case
 
 
@@ -68,6 +70,29 @@ class EngineProtocolTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             JobRequest.from_dict({"source_path": "/tmp/in.mov", "output_dir": "/tmp/out", "mode": "bad"})
+
+    def test_prepare_job_workspace_copies_source_into_technical_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "meeting.mov"
+            source.write_bytes(b"fake media")
+            request = JobRequest.from_dict(
+                {
+                    "source_path": str(source),
+                    "output_dir": str(root / "EkoVideo Compressor"),
+                    "mode": "compress_transcribe",
+                }
+            )
+            events, sink = collect_events()
+
+            workspace, copied = prepare_job_workspace(request, sink)
+
+            self.assertTrue(workspace.is_dir())
+            self.assertEqual(copied.parent, workspace)
+            self.assertEqual(copied.name, "meeting.mov")
+            self.assertEqual(copied.read_bytes(), b"fake media")
+            self.assertEqual(events[0]["event"], "artifact")
+            self.assertEqual(events[0]["kind"], "source")
 
 
 class TranscriptionEvalTest(unittest.TestCase):

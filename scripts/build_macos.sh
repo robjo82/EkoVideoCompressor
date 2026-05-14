@@ -64,22 +64,59 @@ EOF
 QT_QPA_PLATFORM=offscreen python video_compactor.py --startup-smoke-test
 python -m ekovideo_engine --startup-smoke-test
 pyinstaller --noconfirm --clean ekovideo_engine.spec
-pyinstaller --noconfirm --clean video_compactor.spec
+swift build -c release --package-path macos/EkoVideoCompressor
 
 # Ad-hoc sign so macOS treats the bundle as a stable identity across replacements.
 # Without this, an updated bundle is treated as a brand-new unsigned app and
 # Gatekeeper may refuse to relaunch — even on manual reopen — until reinstall.
 APP_BUNDLE="dist/EkoVideoCompressor.app"
+rm -rf "$APP_BUNDLE"
+mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin"
+
+SWIFT_BIN_DIR="$(swift build -c release --package-path macos/EkoVideoCompressor --show-bin-path)"
+cp "$SWIFT_BIN_DIR/EkoVideoCompressor" "$APP_BUNDLE/Contents/MacOS/EkoVideoCompressor"
+chmod +x "$APP_BUNDLE/Contents/MacOS/EkoVideoCompressor"
+
+cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>fr</string>
+  <key>CFBundleDisplayName</key>
+  <string>EkoVideoCompressor</string>
+  <key>CFBundleExecutable</key>
+  <string>EkoVideoCompressor</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.ekonum.ekovideocompressor</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>EkoVideoCompressor</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${VERSION}</string>
+  <key>CFBundleVersion</key>
+  <string>${VERSION}</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+EOF
+
+cp bin/ffmpeg bin/ffprobe "$APP_BUNDLE/Contents/Resources/bin/"
+chmod u+rw,go+r "$APP_BUNDLE/Contents/Resources/bin/ffmpeg" "$APP_BUNDLE/Contents/Resources/bin/ffprobe"
+chmod +x "$APP_BUNDLE/Contents/Resources/bin/ffmpeg" "$APP_BUNDLE/Contents/Resources/bin/ffprobe"
 ENGINE_DIR="$APP_BUNDLE/Contents/Resources/engine"
 mkdir -p "$ENGINE_DIR"
 cp "dist/ekovideo-engine" "$ENGINE_DIR/ekovideo-engine"
 chmod +x "$ENGINE_DIR/ekovideo-engine"
 
-# Compatibility for older updaters that smoke-test the bundle from a staging
-# path ending in `.app.new`. PyInstaller then fails to detect the macOS bundle
-# layout and looks for `Contents/MacOS/_internal/Python`; this symlink keeps
-# those older updaters able to install the fixed build.
-ln -sfn ../Frameworks "$APP_BUNDLE/Contents/MacOS/_internal"
+"$APP_BUNDLE/Contents/MacOS/EkoVideoCompressor" --smoke-test
 
 xattr -cr "$APP_BUNDLE" || true
 codesign --force --deep --sign - --timestamp=none "$APP_BUNDLE"

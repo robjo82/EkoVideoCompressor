@@ -46,7 +46,7 @@ final class QueueStore: ObservableObject {
 
 @MainActor
 final class SettingsStore: ObservableObject {
-    @AppStorage("outputDir") var outputDir = "\(NSHomeDirectory())/Desktop"
+    @AppStorage("outputDir") var outputDir = "\(NSHomeDirectory())/EkoVideo Compressor"
     @AppStorage("glossary") var glossary = ""
     @AppStorage("hfToken") var hfToken = ""
     @AppStorage("whisperModel") var whisperModel = "mlx-community/whisper-large-v3-turbo"

@@ -116,8 +116,8 @@ struct LibraryRow: Codable, Identifiable {
 }
 
 struct CompressionSettings: Codable {
-    var ffmpeg_path = "ffmpeg"
-    var ffprobe_path = "ffprobe"
+    var ffmpeg_path = Bundle.main.resourceURL?.appendingPathComponent("bin/ffmpeg").path ?? "ffmpeg"
+    var ffprobe_path = Bundle.main.resourceURL?.appendingPathComponent("bin/ffprobe").path ?? "ffprobe"
     var resolution = "720p"
     var fps = 12
     var crf = 28
@@ -128,7 +128,7 @@ struct CompressionSettings: Codable {
 }
 
 struct TranscriptionSettings: Codable {
-    var mlx_whisper_path = "mlx_whisper"
+    var mlx_whisper_path = "\(NSHomeDirectory())/Library/Application Support/EkoVideo Compressor/mlx-whisper-venv/bin/mlx_whisper"
     var model = "mlx-community/whisper-large-v3-turbo"
     var language = "fr"
     var output_format = "txt"

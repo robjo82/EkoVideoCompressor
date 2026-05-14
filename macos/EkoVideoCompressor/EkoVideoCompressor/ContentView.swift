@@ -30,6 +30,7 @@ struct ContentView: View {
     @EnvironmentObject private var settings: SettingsStore
     @State private var selectedSection: AppSection = .queue
     @State private var showingSettings = false
+    @State private var showingRunSetup = false
 
     var body: some View {
         NavigationSplitView {
@@ -55,7 +56,7 @@ struct ContentView: View {
                     }
 
                     Button {
-                        Task { await runQueue() }
+                        showingRunSetup = true
                     } label: {
                         Label(queue.isBatchRunning ? "En cours" : "Lancer la file", systemImage: "play.fill")
                     }
@@ -73,6 +74,14 @@ struct ContentView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView()
                 .environmentObject(settings)
+        }
+        .sheet(isPresented: $showingRunSetup) {
+            RunSetupView {
+                showingRunSetup = false
+                Task { await runQueue() }
+            }
+            .environmentObject(settings)
+            .environmentObject(engine)
         }
     }
 
@@ -157,12 +166,7 @@ struct ProcessingWorkspaceView: View {
         VStack(spacing: 0) {
             WorkflowHeaderView()
             Divider()
-            HSplitView {
-                QueueColumnView()
-                    .frame(minWidth: 520)
-                ContextInspectorView()
-                    .frame(minWidth: 330, idealWidth: 380, maxWidth: 460)
-            }
+            QueueColumnView()
             Divider()
             StatusBarView()
         }
@@ -270,6 +274,18 @@ struct ContextInspectorView: View {
     @EnvironmentObject private var engine: EngineProcess
 
     var body: some View {
+        RunSettingsForm()
+            .formStyle(.grouped)
+            .padding(.vertical, 14)
+            .padding(.trailing, 16)
+    }
+}
+
+struct RunSettingsForm: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var engine: EngineProcess
+
+    var body: some View {
         Form {
             Section("Vocabulaire de la reunion") {
                 TextEditor(text: $settings.glossary)
@@ -309,9 +325,41 @@ struct ContextInspectorView: View {
                 }
             }
         }
-        .formStyle(.grouped)
-        .padding(.vertical, 14)
-        .padding(.trailing, 16)
+    }
+}
+
+struct RunSetupView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @Environment(\.dismiss) private var dismiss
+    var onStart: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Preparer le traitement")
+                        .font(.title.bold())
+                    Text("Ces informations sont appliquees a la file au lancement.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(22)
+            Divider()
+            RunSettingsForm()
+                .environmentObject(settings)
+                .padding()
+            Divider()
+            HStack {
+                Button("Annuler") { dismiss() }
+                Spacer()
+                Button("Lancer la file") { onStart() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(18)
+        }
+        .frame(minWidth: 680, minHeight: 620)
     }
 }
 

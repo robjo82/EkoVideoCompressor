@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import subprocess
 import time
+import shutil
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,36 @@ from transcription_utils import (
 from .events import EventSink
 from .logging import append_app_log, tail_text
 from .models import ArtifactEvent, JobRequest, ProgressEvent
+
+
+def _safe_stem(value: str) -> str:
+    keep = []
+    for char in value:
+        if char.isalnum() or char in {" ", "-", "_", "."}:
+            keep.append(char)
+        else:
+            keep.append(" ")
+    cleaned = " ".join("".join(keep).split()).strip(" .-_")
+    return (cleaned or "Transcription")[:80]
+
+
+def job_workspace_dir(request: JobRequest) -> Path:
+    if request.workspace_dir:
+        return Path(request.workspace_dir)
+    root = Path(request.output_dir).expanduser()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return root / f"{stamp} - {_safe_stem(Path(request.source_path).stem)}"
+
+
+def prepare_job_workspace(request: JobRequest, sink: EventSink) -> tuple[Path, Path]:
+    workspace = job_workspace_dir(request)
+    workspace.mkdir(parents=True, exist_ok=True)
+    source = Path(request.source_path).expanduser()
+    copied_source = workspace / source.name
+    if source.exists() and source.resolve() != copied_source.resolve() and not copied_source.exists():
+        shutil.copy2(source, copied_source)
+        sink(ArtifactEvent("source", str(copied_source)))
+    return workspace, copied_source if copied_source.exists() else source
 
 
 @dataclass(slots=True)
@@ -41,7 +73,7 @@ class TranscriptionPipeline:
 
     def run(self, source_path: str) -> list[StepResult]:
         results: list[StepResult] = []
-        workspace = Path(self.request.workspace_dir or Path(source_path).with_suffix("").as_posix())
+        workspace = job_workspace_dir(self.request)
         workspace.mkdir(parents=True, exist_ok=True)
 
         wav_path = workspace / "audio.wav"
@@ -76,6 +108,10 @@ class TranscriptionPipeline:
         ts = time.monotonic()
         settings = self.request.transcription_settings
         out_dir = Path(self.request.output_dir)
+        if self.request.workspace_dir:
+            out_dir = Path(self.request.workspace_dir)
+        elif Path(self.request.output_dir).name != Path(source_path).parent.name:
+            out_dir = job_workspace_dir(self.request)
         out_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = Path(
             default_transcript_path(
@@ -139,6 +175,10 @@ class CompressionPipeline:
         ts = time.monotonic()
         settings = self.request.compression_settings
         out_dir = Path(self.request.output_dir)
+        if self.request.workspace_dir:
+            out_dir = Path(self.request.workspace_dir)
+        else:
+            out_dir = job_workspace_dir(self.request)
         out_dir.mkdir(parents=True, exist_ok=True)
         output_path = default_out_path(self.request.source_path, str(out_dir), "_compressed")
         cmd = build_ffmpeg_cmd(
