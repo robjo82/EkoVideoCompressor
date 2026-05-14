@@ -12,6 +12,7 @@ from .library import (
     library_delete,
     library_list,
     library_rename_speakers,
+    library_speaker_samples,
     library_update_context,
 )
 from .logging import export_logs_archive
@@ -48,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
     rename = sub.add_parser("library-rename-speakers")
     rename.add_argument("job_id", type=int)
     rename.add_argument("--mapping", required=True, help="JSON object or JSON file")
+
+    samples = sub.add_parser("library-speaker-samples")
+    samples.add_argument("job_id", type=int)
+    samples.add_argument("--seconds", type=float, default=8.0)
+    samples.add_argument("--jsonl", action="store_true")
 
     context = sub.add_parser("library-update-context")
     context.add_argument("job_id", type=int)
@@ -106,6 +112,15 @@ def main(argv: list[str] | None = None) -> int:
             mapping = _load_json_arg(args.mapping)
             result = library_rename_speakers(args.job_id, {str(k): str(v) for k, v in mapping.items()})
             _print_json({"job_id": args.job_id, **result})
+            return 0
+
+        if args.command == "library-speaker-samples":
+            rows = library_speaker_samples(args.job_id, seconds=args.seconds)
+            if args.jsonl:
+                for row in rows:
+                    print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            else:
+                _print_json(rows)
             return 0
 
         if args.command == "library-update-context":

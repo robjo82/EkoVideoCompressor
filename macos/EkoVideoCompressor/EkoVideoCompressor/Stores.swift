@@ -399,6 +399,23 @@ final class LibraryStore: ObservableObject {
         await refresh()
     }
 
+    func speakerSamples(_ row: LibraryRow) async -> [SpeakerSample] {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-speaker-samples",
+                "\(row.id)",
+                "--jsonl",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return []
+        }
+        return result.lines.compactMap { line in
+            try? JSONDecoder().decode(SpeakerSample.self, from: Data(line.utf8))
+        }
+    }
+
     private func jsonString<T: Encodable>(_ value: T) -> String? {
         guard let data = try? JSONEncoder().encode(value) else { return nil }
         return String(data: data, encoding: .utf8)

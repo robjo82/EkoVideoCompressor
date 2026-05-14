@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ekovideo_engine.library import database, library_rename_speakers
+from ekovideo_engine.library import database, library_rename_speakers, library_speaker_samples
 
 
 class EngineLibraryActionsTest(unittest.TestCase):
@@ -59,6 +60,39 @@ class EngineLibraryActionsTest(unittest.TestCase):
             self.assertIn("[Robin]", transcript.read_text(encoding="utf-8"))
             self.assertIn("Robin", review.read_text(encoding="utf-8"))
             self.assertIn("Robin", row["speaker_map_json"])
+
+    def test_speaker_samples_create_one_clip_per_speaker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            workspace.mkdir()
+            audio = workspace / "audio.wav"
+            audio.write_bytes(b"fake wav")
+
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                db.add_segments(
+                    job_id,
+                    [
+                        {"start": 1.0, "end": 4.0, "speaker": "SPEAKER_00", "text": "Bonjour."},
+                        {"start": 5.0, "end": 9.0, "speaker": "SPEAKER_01", "text": "Salut."},
+                    ],
+                )
+
+                def fake_run(cmd, *args, **kwargs):
+                    Path(cmd[-1]).write_bytes(b"sample")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with patch("ekovideo_engine.library.subprocess.run", side_effect=fake_run):
+                    samples = library_speaker_samples(job_id, seconds=3)
+
+            self.assertEqual([sample["speaker"] for sample in samples], ["SPEAKER_00", "SPEAKER_01"])
+            self.assertTrue(all(Path(sample["path"]).exists() for sample in samples))
 
 
 if __name__ == "__main__":

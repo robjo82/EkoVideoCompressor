@@ -146,6 +146,15 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     }
 }
 
+struct SpeakerSample: Codable, Identifiable, Equatable {
+    var speaker: String
+    var path: String
+    var start: Double
+    var duration: Double
+
+    var id: String { speaker }
+}
+
 private func decodeJSONObject(_ raw: String?) -> [String: String] {
     guard let raw, let data = raw.data(using: .utf8),
           let value = try? JSONDecoder().decode([String: String].self, from: data) else {

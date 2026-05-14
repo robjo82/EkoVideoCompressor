@@ -487,6 +487,7 @@ struct LibraryView: View {
     @State private var editingRow: LibraryRow?
     @State private var rowToDelete: LibraryRow?
     @State private var expandedJobIDs: Set<Int> = []
+    @State private var queueNotice: String?
 
     private var displayRows: [LibraryDisplayRow] {
         library.rows.flatMap { row in
@@ -580,12 +581,13 @@ struct LibraryView: View {
                         TableColumn("Actions") { displayRow in
                             if let artifact = displayRow.artifact {
                                 ArtifactInlineActions(artifact: artifact) { path in
-                                    queue.add(urls: [URL(fileURLWithPath: path)])
+                                    enqueue(path, label: "Artefact ajouté à la file d'attente")
                                 }
                             } else {
                                 LibraryTableActionsView(
                                     row: displayRow.job,
                                     onInspect: { toggleExpanded(displayRow.job) },
+                                    onRerun: { path in enqueue(path, label: "Source ajoutée à la file d'attente") },
                                     onEditContext: { editingRow = displayRow.job },
                                     onDelete: { rowToDelete = displayRow.job }
                                 )
@@ -598,6 +600,18 @@ struct LibraryView: View {
                     if let message = library.errorMessage, !message.isEmpty {
                         InlineErrorView(message: message)
                             .padding()
+                    }
+                }
+                .overlay(alignment: .bottom) {
+                    if let queueNotice {
+                        Label(queueNotice, systemImage: "checkmark.circle.fill")
+                            .font(.callout.weight(.medium))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.regularMaterial, in: Capsule())
+                            .foregroundStyle(.green)
+                            .padding(.bottom, 12)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
                 }
             }
@@ -643,6 +657,23 @@ struct LibraryView: View {
             expandedJobIDs.remove(row.id)
         } else {
             expandedJobIDs.insert(row.id)
+        }
+    }
+
+    private func enqueue(_ path: String, label: String) {
+        queue.add(urls: [URL(fileURLWithPath: path)])
+        withAnimation(.easeInOut(duration: 0.16)) {
+            queueNotice = label
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 1_700_000_000)
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if queueNotice == label {
+                        queueNotice = nil
+                    }
+                }
+            }
         }
     }
 
@@ -1084,9 +1115,9 @@ extension LibraryRow {
 }
 
 struct LibraryTableActionsView: View {
-    @EnvironmentObject private var queue: QueueStore
     var row: LibraryRow
     var onInspect: () -> Void
+    var onRerun: (String) -> Void
     var onEditContext: () -> Void
     var onDelete: () -> Void
 
@@ -1100,7 +1131,7 @@ struct LibraryTableActionsView: View {
 
             Button {
                 if let path = pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path {
-                    queue.add(urls: [URL(fileURLWithPath: path)])
+                    onRerun(path)
                 }
             } label: {
                 Label("Relancer", systemImage: "arrow.clockwise")
@@ -1201,11 +1232,17 @@ struct LibraryContextEditor: View {
     @Environment(\.dismiss) private var dismiss
     var row: LibraryRow
     @State private var speakers: [SpeakerEditRow]
+    @State private var samples: [SpeakerSample] = []
+    @State private var loadingSamples = false
+    @State private var currentSound: NSSound?
     @State private var termsText: String
 
     init(row: LibraryRow) {
         self.row = row
-        let initialSpeakers = row.speakerMap
+        let speakerMap = row.speakerMap
+        let mappedNames = Set(speakerMap.filter { $0.key != $0.value }.map(\.value))
+        let initialSpeakers = speakerMap
+            .filter { !(($0.key == $0.value) && mappedNames.contains($0.value)) }
             .sorted { $0.key < $1.key }
             .map { SpeakerEditRow(id: $0.key, name: $0.value) }
         _speakers = State(initialValue: initialSpeakers)
@@ -1233,11 +1270,25 @@ struct LibraryContextEditor: View {
                     } else {
                         ForEach($speakers) { $speaker in
                             HStack {
-                                Text(speaker.id)
-                                    .font(.body.monospaced())
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 120, alignment: .leading)
+                                if speaker.id != speaker.name {
+                                    Text(speaker.id)
+                                        .font(.body.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 120, alignment: .leading)
+                                }
                                 TextField(speaker.name.isEmpty ? speaker.id : speaker.name, text: $speaker.name)
+                                if let sample = sample(for: speaker) {
+                                    Button {
+                                        play(sample)
+                                    } label: {
+                                        Label("Écouter", systemImage: "play.circle")
+                                    }
+                                    .labelStyle(.iconOnly)
+                                    .help("Écouter un extrait de cet interlocuteur")
+                                } else if loadingSamples {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
                             }
                         }
                     }
@@ -1269,6 +1320,9 @@ struct LibraryContextEditor: View {
             .padding(18)
         }
         .frame(minWidth: 680, minHeight: 560)
+        .task {
+            await loadSamples()
+        }
     }
 
     private func save() {
@@ -1294,6 +1348,29 @@ struct LibraryContextEditor: View {
             }
             await library.updateContext(row, speakers: updatedSpeakers, technicalTerms: terms)
         }
+    }
+
+    private func loadSamples() async {
+        loadingSamples = true
+        let loaded = await library.speakerSamples(row)
+        await MainActor.run {
+            samples = loaded
+            for sample in loaded where !speakers.contains(where: { $0.id == sample.speaker }) {
+                speakers.append(SpeakerEditRow(id: sample.speaker, name: row.speakerMap[sample.speaker] ?? ""))
+            }
+            loadingSamples = false
+        }
+    }
+
+    private func sample(for speaker: SpeakerEditRow) -> SpeakerSample? {
+        samples.first { $0.speaker == speaker.id || $0.speaker == speaker.name }
+    }
+
+    private func play(_ sample: SpeakerSample) {
+        currentSound?.stop()
+        let sound = NSSound(contentsOfFile: sample.path, byReference: true)
+        currentSound = sound
+        sound?.play()
     }
 }
 

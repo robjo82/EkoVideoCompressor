@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,105 @@ def library_update_context(
     technical_terms: list[str] | None = None,
 ) -> None:
     database().update_job_context(job_id, speakers=speakers, technical_terms=technical_terms)
+
+
+def _safe_filename(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return cleaned.strip("._") or "speaker"
+
+
+def _bundled_ffmpeg_path() -> str:
+    executable = Path(sys.executable).resolve()
+    candidates = [
+        executable.parent.parent / "bin" / "ffmpeg",
+        Path(__file__).resolve().parent.parent / "bin" / "ffmpeg",
+        Path.cwd() / "bin" / "ffmpeg",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _sample_audio_source(job: dict[str, Any]) -> Path | None:
+    workspace = Path(job.get("workspace_dir") or "")
+    candidates = [
+        workspace / "audio.wav",
+    ]
+    source = job.get("source_path") or ""
+    if source and workspace:
+        candidates.append(workspace / Path(source).name)
+    if source:
+        candidates.append(Path(source))
+    compressed = job.get("compressed_path") or ""
+    if compressed:
+        candidates.append(Path(compressed))
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def library_speaker_samples(job_id: int, seconds: float = 8.0) -> list[dict[str, Any]]:
+    db = database()
+    job = db.get_job(job_id)
+    if not job:
+        raise ValueError(f"job not found: {job_id}")
+    source = _sample_audio_source(job)
+    if source is None:
+        return []
+
+    segments_by_speaker: dict[str, list[dict[str, Any]]] = {}
+    for segment in db.get_segments(job_id):
+        speaker = str(segment.get("speaker") or "").strip()
+        if not speaker:
+            continue
+        segments_by_speaker.setdefault(speaker, []).append(segment)
+
+    sample_dir = Path(job.get("workspace_dir") or source.parent) / "speaker_samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _bundled_ffmpeg_path()
+    samples: list[dict[str, Any]] = []
+    for speaker, segments in sorted(segments_by_speaker.items()):
+        segment = max(
+            segments,
+            key=lambda item: float(item.get("end_time") or 0) - float(item.get("start_time") or 0),
+        )
+        start = max(float(segment.get("start_time") or 0) - 0.2, 0)
+        end = float(segment.get("end_time") or start + seconds)
+        duration = max(min(seconds, end - start + 0.4), 1.0)
+        out_path = sample_dir / f"{_safe_filename(speaker)}.wav"
+        if not out_path.exists():
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(source),
+                "-t",
+                f"{duration:.3f}",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(out_path),
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if out_path.exists():
+            samples.append(
+                {
+                    "speaker": speaker,
+                    "path": str(out_path),
+                    "start": start,
+                    "duration": duration,
+                }
+            )
+    return samples
 
 
 def _job_artifact_paths(job: dict[str, Any]) -> list[Path]:
