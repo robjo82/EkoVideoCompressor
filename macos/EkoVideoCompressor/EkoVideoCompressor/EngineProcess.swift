@@ -11,7 +11,13 @@ final class EngineProcess: ObservableObject {
     private let decoder = JSONDecoder()
 
     func run(arguments: [String], workingDirectory: URL? = nil) {
-        guard !isRunning else { return }
+        Task {
+            _ = await runAndWait(arguments: arguments, workingDirectory: workingDirectory)
+        }
+    }
+
+    func runAndWait(arguments: [String], workingDirectory: URL? = nil) async -> Int32 {
+        guard !isRunning else { return -1 }
         events.removeAll()
         outputLines.removeAll()
         lastError = nil
@@ -37,20 +43,28 @@ final class EngineProcess: ObservableObject {
             }
         }
 
-        process.terminationHandler = { [weak self] _ in
-            output.fileHandleForReading.readabilityHandler = nil
-            guard let self else { return }
-            Task { @MainActor [self] in
-                self.isRunning = false
-                self.process = nil
+        return await withCheckedContinuation { continuation in
+            process.terminationHandler = { [weak self] process in
+                output.fileHandleForReading.readabilityHandler = nil
+                guard let self else {
+                    continuation.resume(returning: process.terminationStatus)
+                    return
+                }
+                Task { @MainActor [self] in
+                    self.isRunning = false
+                    self.process = nil
+                    continuation.resume(returning: process.terminationStatus)
+                }
             }
-        }
 
-        do {
-            try process.run()
-        } catch {
-            isRunning = false
-            lastError = error.localizedDescription
+            do {
+                try process.run()
+            } catch {
+                isRunning = false
+                self.process = nil
+                lastError = error.localizedDescription
+                continuation.resume(returning: -1)
+            }
         }
     }
 

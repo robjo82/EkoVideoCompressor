@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
 enum AppSection: String, CaseIterable, Hashable {
@@ -54,11 +55,11 @@ struct ContentView: View {
                     }
 
                     Button {
-                        runFirstJob()
+                        Task { await runQueue() }
                     } label: {
-                        Label(engine.isRunning ? "En cours" : "Lancer", systemImage: "play.fill")
+                        Label(queue.isBatchRunning ? "En cours" : "Lancer la file", systemImage: "play.fill")
                     }
-                    .disabled(queue.items.isEmpty || engine.isRunning)
+                    .disabled(queue.items.isEmpty || queue.isBatchRunning)
 
                     Button {
                         showingSettings = true
@@ -85,17 +86,36 @@ struct ContentView: View {
         }
     }
 
-    private func runFirstJob() {
-        guard let item = queue.items.first else { return }
+    private func runQueue() async {
+        guard !queue.items.isEmpty else { return }
+        queue.isBatchRunning = true
+        queue.resetPending()
+        let items = queue.items
+
+        for item in items {
+            if Task.isCancelled { break }
+            queue.update(item.id, status: "En cours", progress: 0)
+            let exitCode = await runJob(item)
+            if exitCode == 0 {
+                queue.update(item.id, status: "Termine", progress: 100)
+            } else {
+                queue.update(item.id, status: "Erreur", progress: 0)
+            }
+        }
+        queue.isBatchRunning = false
+    }
+
+    private func runJob(_ item: QueueItem) async -> Int32 {
         let request = JobRequest(
             source_path: item.sourceURL.path,
             workspace_dir: "",
             output_dir: settings.outputDir,
-            mode: "compress_transcribe",
+            mode: settings.processingMode,
             profile: "Reunion equilibree",
             compression_settings: CompressionSettings(),
             transcription_settings: TranscriptionSettings(
                 model: settings.whisperModel,
+                output_format: settings.outputFormat,
                 diarization_enabled: settings.diarizationEnabled,
                 hf_token: settings.hfToken,
                 audio_recheck_enabled: settings.audioRecheckEnabled
@@ -109,9 +129,10 @@ struct ContentView: View {
         do {
             let data = try JSONEncoder().encode(request)
             try data.write(to: url)
-            engine.run(arguments: EngineProcess.defaultPythonArguments(["run-job", "--request", url.path]))
+            return await engine.runAndWait(arguments: EngineProcess.defaultPythonArguments(["run-job", "--request", url.path]))
         } catch {
             engine.lastError = error.localizedDescription
+            return -1
         }
     }
 }
@@ -163,6 +184,7 @@ struct WorkflowHeaderView: View {
                 }
                 Spacer()
                 SummaryBadge(title: "\(queue.items.count)", subtitle: "fichier(s)")
+                SummaryBadge(title: queue.isBatchRunning ? "ON" : "OFF", subtitle: "file")
                 SummaryBadge(title: settings.glossaryTerms.isEmpty ? "0" : "\(settings.glossaryTerms.count)", subtitle: "termes")
             }
             HStack(spacing: 10) {
@@ -227,11 +249,17 @@ struct QueueRowView: View {
                     .lineLimit(1)
             }
             Spacer()
-            Text(item.status)
-                .font(.caption.weight(.medium))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.quaternary, in: Capsule())
+            VStack(alignment: .trailing, spacing: 5) {
+                Text(item.status)
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.quaternary, in: Capsule())
+                if item.status == "En cours" {
+                    ProgressView(value: item.progress / 100.0)
+                        .frame(width: 82)
+                }
+            }
         }
         .padding(.vertical, 6)
     }
@@ -252,6 +280,17 @@ struct ContextInspectorView: View {
             }
 
             Section("Transcription") {
+                Picker("Action", selection: $settings.processingMode) {
+                    Text("Compresser + transcrire").tag("compress_transcribe")
+                    Text("Transcrire seulement").tag("transcribe")
+                    Text("Compresser seulement").tag("compress")
+                }
+                Picker("Format", selection: $settings.outputFormat) {
+                    Text("Texte").tag("txt")
+                    Text("SRT").tag("srt")
+                    Text("VTT").tag("vtt")
+                    Text("JSON").tag("json")
+                }
                 Picker("Modele", selection: $settings.whisperModel) {
                     Text("Whisper Large v3 Turbo").tag("mlx-community/whisper-large-v3-turbo")
                     Text("Whisper Large v3").tag("mlx-community/whisper-large-v3-mlx")
@@ -318,6 +357,7 @@ struct DropTargetView: View {
 
 struct LibraryView: View {
     @EnvironmentObject private var engine: EngineProcess
+    @EnvironmentObject private var queue: QueueStore
 
     private var rows: [LibraryRow] {
         engine.outputLines.compactMap { line in
@@ -357,6 +397,9 @@ struct LibraryView: View {
                     }
                     TableColumn("Artefacts") { row in
                         ArtifactSummary(row: row)
+                    }
+                    TableColumn("Actions") { row in
+                        LibraryActionsView(row: row)
                     }
                 }
             }
@@ -410,6 +453,9 @@ struct ModelsView: View {
                     TableColumn("Etat") { row in
                         StatusText(row.cached ? "Telecharge" : "A telecharger")
                     }
+                    TableColumn("Actions") { row in
+                        ModelActionsView(row: row)
+                    }
                 }
             }
         }
@@ -439,6 +485,17 @@ struct SettingsView: View {
                     TextField("Dossier", text: $settings.outputDir)
                 }
                 Section("Transcription") {
+                    Picker("Action", selection: $settings.processingMode) {
+                        Text("Compresser + transcrire").tag("compress_transcribe")
+                        Text("Transcrire seulement").tag("transcribe")
+                        Text("Compresser seulement").tag("compress")
+                    }
+                    Picker("Format", selection: $settings.outputFormat) {
+                        Text("Texte").tag("txt")
+                        Text("SRT").tag("srt")
+                        Text("VTT").tag("vtt")
+                        Text("JSON").tag("json")
+                    }
                     TextField("Modele Whisper", text: $settings.whisperModel)
                     Toggle("Detection des locuteurs", isOn: $settings.diarizationEnabled)
                     Toggle("Reecoute IA multimodale", isOn: $settings.audioRecheckEnabled)
@@ -602,6 +659,92 @@ struct ArtifactSummary: View {
     }
 }
 
+struct LibraryActionsView: View {
+    @EnvironmentObject private var queue: QueueStore
+    var row: LibraryRow
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let source = row.source_path, !source.isEmpty {
+                Button {
+                    queue.add(urls: [URL(fileURLWithPath: source)])
+                } label: {
+                    Label("Relancer", systemImage: "arrow.clockwise")
+                }
+                .labelStyle(.iconOnly)
+                .help("Ajouter ce fichier a la file")
+            }
+
+            Menu {
+                ArtifactMenuButton(title: "Compresse", path: row.compressed_path)
+                ArtifactMenuButton(title: "Transcription", path: row.transcript_path)
+                ArtifactMenuButton(title: "Amelioree", path: row.enhanced_transcript_path)
+                ArtifactMenuButton(title: "Rapport", path: row.review_path)
+                Divider()
+                if let source = row.source_path, !source.isEmpty {
+                    Button("Afficher l'original dans le Finder") {
+                        revealInFinder(source)
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+        }
+    }
+}
+
+struct ArtifactMenuButton: View {
+    var title: String
+    var path: String?
+
+    var body: some View {
+        if let path, !path.isEmpty {
+            Button(title) {
+                openPath(path)
+            }
+        } else {
+            Button(title) {}
+                .disabled(true)
+        }
+    }
+}
+
+struct ModelActionsView: View {
+    @EnvironmentObject private var engine: EngineProcess
+    var row: ModelRow
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if row.cached {
+                Button {
+                    engine.run(arguments: EngineProcess.defaultPythonArguments(["model-delete", row.id]))
+                } label: {
+                    Label("Supprimer", systemImage: "trash")
+                }
+                .labelStyle(.iconOnly)
+                .help("Supprimer le modele local")
+            } else {
+                Button {
+                    engine.run(arguments: EngineProcess.defaultPythonArguments(["model-download", row.id]))
+                } label: {
+                    Label("Telecharger", systemImage: "arrow.down.circle")
+                }
+                .labelStyle(.iconOnly)
+                .help("Pre-telecharger le modele")
+            }
+            Button {
+                revealInFinder(row.cache_dir)
+            } label: {
+                Label("Cache", systemImage: "folder")
+            }
+            .labelStyle(.iconOnly)
+            .help("Afficher le dossier de cache")
+        }
+        .disabled(engine.isRunning)
+    }
+}
+
 struct ArtifactDot: View {
     var label: String
     var isPresent: Bool
@@ -613,4 +756,12 @@ struct ArtifactDot: View {
             .background(isPresent ? Color.teal : Color.secondary.opacity(0.18), in: Circle())
             .foregroundStyle(isPresent ? .white : .secondary)
     }
+}
+
+func openPath(_ path: String) {
+    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+}
+
+func revealInFinder(_ path: String) {
+    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
 }
