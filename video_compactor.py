@@ -31,6 +31,7 @@ from glossary_postprocess import (
     apply_glossary_to_segments,
     parse_glossary_terms,
 )
+from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
 from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
@@ -140,6 +141,11 @@ DIARIZATION_PIP_PACKAGES = ["torch", "torchaudio", "pyannote.audio>=3.1"]
 # pulled in if the user opts into the multimodal re-listen step.
 TEXT_LLM_PIP_PACKAGES = ["mlx-lm"]
 MULTIMODAL_LLM_PIP_PACKAGES = ["mlx-vlm"]
+# Silero VAD pre-filters non-speech segments before Whisper. Tiny model
+# (~2 Mo), CPU-friendly, no extra runtime dependency beyond torch which
+# is already pulled by the diarisation install. We probe + auto-install
+# lazily so users who never enable VAD don't pay the cost.
+VAD_PIP_PACKAGES = ["silero-vad"]
 
 PROFILE_PRESETS = {
     "Réunion rapide": {
@@ -1120,6 +1126,26 @@ class SettingsDialog(QDialog):
         self.transcription_enhance_check.setChecked(bool(transcription_settings.get("enhance_audio", True)))
         transcription_form.addRow("", self.transcription_enhance_check)
 
+        # Voice-activity detection (Silero). Defaults ON: it's a ~2 Mo
+        # model that runs in seconds on CPU, and it eliminates an
+        # entire class of Whisper hallucinations on phone recordings
+        # by skipping the IVR / hold music / silence sections.
+        self.transcription_vad_check = QCheckBox(
+            "Filtrer les zones non-parlées avant transcription (VAD)"
+        )
+        self.transcription_vad_check.setChecked(
+            bool(transcription_settings.get("vad_enabled", True))
+        )
+        transcription_form.addRow("", self.transcription_vad_check)
+        vad_hint = QLabel(
+            "Détecte les zones de parole avec Silero VAD et ne transmet que celles-ci "
+            "à Whisper. Recommandé pour les enregistrements téléphoniques et les "
+            "réunions avec de longs silences."
+        )
+        vad_hint.setWordWrap(True)
+        vad_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", vad_hint)
+
         self.transcription_diarization_check = QCheckBox(
             "Détection des locuteurs (pyannote)"
         )
@@ -1553,6 +1579,7 @@ class SettingsDialog(QDialog):
                     self._combo_model_id(self.transcription_audio_llm_combo)
                 ),
                 "audio_recheck_enabled": self.transcription_audio_recheck_check.isChecked(),
+                "vad_enabled": self.transcription_vad_check.isChecked(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_value,
@@ -1705,6 +1732,7 @@ class TranscribeWorker(QThread):
         text_llm_model: str = DEFAULT_TEXT_LLM_MODEL,
         audio_llm_model: str = DEFAULT_AUDIO_LLM_MODEL,
         audio_recheck_enabled: bool = False,
+        vad_enabled: bool = True,
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -1721,6 +1749,12 @@ class TranscribeWorker(QThread):
         self.text_llm_model = text_llm_model or DEFAULT_TEXT_LLM_MODEL
         self.audio_llm_model = audio_llm_model or DEFAULT_AUDIO_LLM_MODEL
         self.audio_recheck_enabled = bool(audio_recheck_enabled)
+        # Silero VAD trims non-speech regions (IVR, hold music, long
+        # silences) before Whisper, which kills a whole class of
+        # hallucinations on phone-call recordings. On by default —
+        # users can opt out via Settings.
+        self.vad_enabled = bool(vad_enabled)
+        self._vad_manifest: list[dict] = []
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -1832,6 +1866,115 @@ class TranscribeWorker(QThread):
             return False
         self._mlx_vlm_available = True
         return True
+
+    def _ensure_vad_available(self) -> bool:
+        """
+        Probe / install silero-vad. Tiny model (~2 Mo), reuses the
+        torch wheel that diarisation already pulls. The probe result
+        is cached on the worker instance.
+        """
+        cache = getattr(self, "_vad_available", None)
+        if cache is not None:
+            return cache
+        if not self.venv_python_path or not Path(self.venv_python_path).exists():
+            self._vad_available = False
+            return False
+        probe = subprocess.run(
+            [self.venv_python_path, "-c", "import silero_vad, torch"],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if probe.returncode == 0:
+            self._vad_available = True
+            return True
+
+        self.status.emit("Installation du VAD (silero-vad)…")
+        install = subprocess.run(
+            [
+                self.venv_python_path,
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                *VAD_PIP_PACKAGES,
+            ],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if install.returncode != 0:
+            self._log_process_result(
+                "vad_install_failed", install.returncode, install.stdout, install.stderr
+            )
+            self._vad_available = False
+            return False
+        # Silero needs torch>=1.12. If diarisation hasn't been
+        # installed yet we won't have torch — try a probe and pull it.
+        probe2 = subprocess.run(
+            [self.venv_python_path, "-c", "import silero_vad, torch"],
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+        )
+        if probe2.returncode != 0:
+            self._log_process_result(
+                "vad_torch_missing", probe2.returncode, probe2.stdout, probe2.stderr
+            )
+            install_torch = subprocess.run(
+                [self.venv_python_path, "-m", "pip", "install", "--upgrade", "torch"],
+                capture_output=True,
+                text=True,
+                env=self._subprocess_env(),
+            )
+            if install_torch.returncode != 0:
+                self._vad_available = False
+                return False
+        self._vad_available = True
+        return True
+
+    def _run_vad_filter(self, in_wav: Path, work_dir: Path) -> tuple[Path, list[dict]]:
+        """
+        Run Silero VAD on ``in_wav``. On success returns
+        ``(trimmed_wav, manifest)`` where ``trimmed_wav`` contains
+        only the speech regions and ``manifest`` lets us shift
+        Whisper timestamps back to the source timeline. On failure or
+        empty detection, returns the original WAV with an empty
+        manifest so the rest of the pipeline keeps working.
+        """
+        if not self._ensure_vad_available():
+            self._log("vad_skipped reason=unavailable")
+            return in_wav, []
+        trimmed = work_dir / "audio.vad.wav"
+        cmd = build_vad_cmd(self.venv_python_path, str(in_wav), str(trimmed))
+        self._log(f"vad_start cmd={_command_for_log(cmd)!r}")
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            timeout=900,
+        )
+        if proc.returncode != 0:
+            self._log_process_result("vad_failed", proc.returncode, proc.stdout, proc.stderr)
+            return in_wav, []
+        try:
+            payload = parse_vad_manifest(proc.stdout)
+        except Exception as exc:
+            self._log(f"vad_parse_failed error={exc!r}")
+            return in_wav, []
+        spans = payload.get("spans") or []
+        if not spans or not trimmed.exists():
+            self._log("vad_empty using_original_wav")
+            return in_wav, []
+        total = payload.get("total_seconds") or 0
+        kept = payload.get("trimmed_seconds") or 0
+        ratio = (kept / total) if total else 0
+        self._log(
+            f"vad_ok spans={len(spans)} total_s={total:.1f} kept_s={kept:.1f} "
+            f"ratio={ratio:.2f}"
+        )
+        return trimmed, spans
 
     def _run_llm_post_process(self, analysis_path: Path, glossary: str) -> dict:
         """
@@ -2434,6 +2577,20 @@ class TranscribeWorker(QThread):
                 )
                 self.status.emit("Détection des locuteurs ignorée (token Hugging Face ou installation manquante).")
 
+            # --- STEP 1bis: VAD (silero) ----------------------------------
+            # Trim non-speech regions BEFORE Whisper. On phone-call
+            # recordings this kills the IVR / hold-music section that
+            # Whisper would otherwise spend 30-40% of its compute on
+            # producing hallucinated "Merci de rester en ligne…" loops.
+            # We keep a manifest so we can shift Whisper's timestamps
+            # back to the source-media timeline.
+            whisper_wav = wav_path
+            self._vad_manifest = []
+            if self.vad_enabled and self.venv_python_path:
+                self.status.emit("Pré-filtrage de la voix (VAD)…")
+                whisper_wav, manifest = self._run_vad_filter(wav_path, work_dir)
+                self._vad_manifest = manifest
+
             # Always keep a JSON Whisper intermediate so we can validate and
             # filter hallucinated segments before rendering the user-facing
             # transcript. This is essential for long recordings with noisy
@@ -2445,7 +2602,7 @@ class TranscribeWorker(QThread):
 
             # --- STEP 2: MLX Whisper --------------------------------------
             t_step = time.monotonic()
-            skip_whisper = (self.job.status in {"WHISPER_DONE", "COMPLETED"} 
+            skip_whisper = (self.job.status in {"WHISPER_DONE", "COMPLETED"}
                            and whisper_target.exists())
             if skip_whisper:
                 try:
@@ -2457,11 +2614,11 @@ class TranscribeWorker(QThread):
                     whisper_target.unlink(missing_ok=True)
                     skip_whisper = False
                     self._log("resumption discard=unreadable_whisper_json")
-            
+
             if not skip_whisper:
                 cmd = build_mlx_whisper_cmd(
                     mlx_whisper_path=self.mlx_whisper_path,
-                    audio_path=str(wav_path),
+                    audio_path=str(whisper_wav),
                     output_path=str(whisper_target),
                     model=self.model,
                     language=self.language,
@@ -2568,6 +2725,14 @@ class TranscribeWorker(QThread):
                     "La sortie brute ressemblait à une hallucination de silence."
                 )
                 return
+
+            # If VAD trimmed the audio, Whisper's timestamps are on
+            # the *trimmed* timeline. Shift them back so the user
+            # sees seconds that line up with the source media.
+            if self._vad_manifest:
+                whisper_segments = remap_segments_to_source(
+                    whisper_segments, self._vad_manifest
+                )
 
             # --- STEP 2bis: phonetic glossary post-processor --------------
             # Whisper's `--initial-prompt` is a soft prior. Even when
@@ -4196,6 +4361,13 @@ class MainWindow(QWidget):
         self.transcription_audio_recheck_enabled = self.settings.value(
             "transcription_audio_recheck_enabled", False, type=bool
         )
+        # Voice-activity detection (Silero) defaults ON: tiny model,
+        # huge quality win on phone-call recordings (kills IVR
+        # transcription loops and ~20-30% of compute spent on
+        # non-speech).
+        self.transcription_vad_enabled = self.settings.value(
+            "transcription_vad_enabled", True, type=bool
+        )
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
         self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
@@ -5148,6 +5320,7 @@ class MainWindow(QWidget):
             "text_llm_model": self.transcription_text_llm_model,
             "audio_llm_model": self.transcription_audio_llm_model,
             "audio_recheck_enabled": self.transcription_audio_recheck_enabled,
+            "vad_enabled": self.transcription_vad_enabled,
             "language": self.transcription_language,
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
@@ -5246,6 +5419,9 @@ class MainWindow(QWidget):
         self.transcription_audio_recheck_enabled = bool(
             transcription_settings.get("audio_recheck_enabled", False)
         )
+        self.transcription_vad_enabled = bool(
+            transcription_settings.get("vad_enabled", self.transcription_vad_enabled)
+        )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
         self.transcription_suffix = str(transcription_settings.get("suffix", "")).strip()
@@ -5267,6 +5443,7 @@ class MainWindow(QWidget):
             "transcription_audio_recheck_enabled",
             self.transcription_audio_recheck_enabled,
         )
+        self.settings.setValue("transcription_vad_enabled", self.transcription_vad_enabled)
         # Drop the legacy single-key so it doesn't shadow the new ones on
         # next startup. Safe even if the key isn't there.
         self.settings.remove("transcription_llm_model")
@@ -6560,6 +6737,7 @@ class MainWindow(QWidget):
             text_llm_model=self.transcription_text_llm_model,
             audio_llm_model=self.transcription_audio_llm_model,
             audio_recheck_enabled=self.transcription_audio_recheck_enabled,
+            vad_enabled=self.transcription_vad_enabled,
         )
         self.worker = worker
         self._track_worker(worker)
