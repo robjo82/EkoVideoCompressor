@@ -79,6 +79,25 @@ Cette passe utilise par défaut `mlx-community/Mistral-7B-Instruct-v0.3-4bit` po
 
 Le fichier brut Whisper reste disponible. Si des améliorations fiables existent, l'app écrit un second fichier `- améliorée`.
 
+## Architecture moteur / SwiftUI
+
+Le moteur métier est désormais exposé par un package Python headless
+`ekovideo_engine`. Il parle en JSONL pour permettre à l'interface SwiftUI
+native de piloter les traitements sans dépendre de PySide.
+
+Commandes utiles :
+
+```bash
+python -m ekovideo_engine --smoke-test
+python -m ekovideo_engine model-list
+python -m ekovideo_engine library-list
+python -m transcription_eval.evaluate --min-score 0.95
+```
+
+Pendant la migration, l'interface PySide reste disponible et le build macOS
+embarque aussi l'exécutable `Contents/Resources/engine/ekovideo-engine`.
+La nouvelle base SwiftUI est dans `macos/EkoVideoCompressor`.
+
 ## Détection des locuteurs (diarisation)
 
 Pour identifier qui parle quand dans une réunion à plusieurs voix, l'app utilise pyannote.audio. Setup en une fois par poste :

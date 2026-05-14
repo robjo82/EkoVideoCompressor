@@ -1,0 +1,23 @@
+{
+  "name": "symphonat_mollie_phone_call",
+  "expected_terms": [
+    "Mollie",
+    "Klarna",
+    "Odoo",
+    "Sudokies",
+    "Arnaud Maire",
+    "Robin Joseph"
+  ],
+  "expected_speakers": [
+    "Robin",
+    "Arnaud Maire"
+  ],
+  "forbidden_substrings": [
+    "je Mollie savoir",
+    "demande par Mollie",
+    "passer Romain",
+    "Les Romain sont Mollie",
+    "[Philippe] (00:03:"
+  ],
+  "transcript": "[Robin] (00:02:52) Oui, bonjour Monsieur Maire. Robin Joseph, Ekonum. Vous m'avez contacte hier suite a un echange avec Juliette de chez Mollie. Je voulais savoir dans quelle mesure vous utilisez Odoo.\n[Arnaud Maire] (00:03:14) On a travaille avec Sudokies sur Montauban. Notre probleme est de proposer Klarna sur le site web."
+}

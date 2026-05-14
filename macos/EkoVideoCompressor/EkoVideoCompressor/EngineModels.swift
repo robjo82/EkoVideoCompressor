@@ -1,0 +1,131 @@
+import Foundation
+
+enum EngineEventKind: String, Codable {
+    case progress
+    case artifact
+    case context
+    case warning
+    case error
+    case done
+}
+
+struct EngineEvent: Codable, Identifiable {
+    var id = UUID()
+    let event: EngineEventKind
+    let ts: String?
+    let step: String?
+    let pct: Double?
+    let eta_seconds: Double?
+    let message: String?
+    let kind: String?
+    let path: String?
+    let model: String?
+    let code: String?
+    let speakers: [String: String]?
+    let technical_terms: [String]?
+    let summary: [String: JSONValue]?
+
+    enum CodingKeys: String, CodingKey {
+        case event
+        case ts
+        case step
+        case pct
+        case eta_seconds
+        case message
+        case kind
+        case path
+        case model
+        case code
+        case speakers
+        case technical_terms
+        case summary
+    }
+}
+
+enum JSONValue: Codable, Equatable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([String: JSONValue].self) {
+            self = .object(value)
+        } else {
+            self = .array(try container.decode([JSONValue].self))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value):
+            try container.encode(value)
+        case .number(let value):
+            try container.encode(value)
+        case .bool(let value):
+            try container.encode(value)
+        case .object(let value):
+            try container.encode(value)
+        case .array(let value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+struct JobRequest: Codable {
+    var source_path: String
+    var workspace_dir: String
+    var output_dir: String
+    var mode: String
+    var profile: String
+    var compression_settings: CompressionSettings
+    var transcription_settings: TranscriptionSettings
+    var glossary_terms: [String]
+    var speaker_overrides: [String: String]
+    var technical_terms: [String]
+    var rerun_steps: [String]
+}
+
+struct CompressionSettings: Codable {
+    var ffmpeg_path = "ffmpeg"
+    var ffprobe_path = "ffprobe"
+    var resolution = "720p"
+    var fps = 12
+    var crf = 28
+    var audio_bitrate = "128k"
+    var preset = "medium"
+    var speech_enhance = true
+    var mono_audio = false
+}
+
+struct TranscriptionSettings: Codable {
+    var mlx_whisper_path = "mlx_whisper"
+    var model = "mlx-community/whisper-large-v3-turbo"
+    var language = "fr"
+    var output_format = "txt"
+    var suffix = ""
+    var enhance_audio = true
+    var diarization_enabled = false
+    var hf_token = ""
+    var text_llm_model = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+    var audio_llm_model = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+    var audio_recheck_enabled = false
+    var vad_enabled = true
+    var multipass_enabled = true
+    var per_speaker_enabled = false
+    var web_enrichment_enabled = false
+}

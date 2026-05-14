@@ -24,6 +24,17 @@ jobs:
           brew update
           brew install ffmpeg
 
+      - name: Run Python tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m unittest discover -s tests
+          python -m ekovideo_engine --smoke-test
+          python -m transcription_eval.evaluate --min-score 0.95
+
+      - name: Build SwiftUI shell
+        run: swift build --package-path macos/EkoVideoCompressor
+
       - name: Build app bundle
         env:
           APP_VERSION: dev-${{ github.run_number }}

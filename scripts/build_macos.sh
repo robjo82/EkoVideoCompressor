@@ -62,12 +62,18 @@ cat > _build_version.py <<EOF
 APP_VERSION = "${VERSION}"
 EOF
 QT_QPA_PLATFORM=offscreen python video_compactor.py --startup-smoke-test
+python -m ekovideo_engine --startup-smoke-test
+pyinstaller --noconfirm --clean ekovideo_engine.spec
 pyinstaller --noconfirm --clean video_compactor.spec
 
 # Ad-hoc sign so macOS treats the bundle as a stable identity across replacements.
 # Without this, an updated bundle is treated as a brand-new unsigned app and
 # Gatekeeper may refuse to relaunch — even on manual reopen — until reinstall.
 APP_BUNDLE="dist/EkoVideoCompressor.app"
+ENGINE_DIR="$APP_BUNDLE/Contents/Resources/engine"
+mkdir -p "$ENGINE_DIR"
+cp "dist/ekovideo-engine" "$ENGINE_DIR/ekovideo-engine"
+chmod +x "$ENGINE_DIR/ekovideo-engine"
 
 # Compatibility for older updaters that smoke-test the bundle from a staging
 # path ending in `.app.new`. PyInstaller then fails to detect the macOS bundle
