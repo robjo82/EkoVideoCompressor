@@ -135,6 +135,21 @@ class ApplyGlossaryToTextTest(unittest.TestCase):
         self.assertEqual(new, text)
         self.assertEqual(subs, [])
 
+    def test_does_not_inject_short_glossary_names_everywhere(self):
+        text = (
+            "Les commandes sont validées avec un paiement sécurisé. "
+            "J'ai reçu sa demande par mail et Juliette a répondu à Philippe."
+        )
+        new, subs = apply_glossary_to_text(text, ["Romain", "Mollie"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_does_not_rewrite_robin_to_romain(self):
+        text = "Robin Joseph rappelle le client."
+        new, subs = apply_glossary_to_text(text, ["Romain"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
     def test_multi_word_terms(self):
         text = "On gère les CVR Controles depuis Albi."
         new, subs = apply_glossary_to_text(text, ["CVR Contrôles"])

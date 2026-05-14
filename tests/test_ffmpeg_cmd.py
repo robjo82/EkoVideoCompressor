@@ -34,6 +34,8 @@ from transcription_utils import (
     canonical_whisper_model_id,
     clean_whisper_segments,
     default_transcript_path,
+    filter_speaker_names_by_context,
+    is_phone_hold_boilerplate_text,
     parse_diarization_output,
     parse_llm_corrections_markdown,
     parse_llm_title_speakers,
@@ -404,6 +406,23 @@ class FuseAndRenderTest(unittest.TestCase):
 
         self.assertEqual(len(clean_whisper_segments(repeated)), 2)
 
+    def test_clean_whisper_segments_drops_phone_hold_boilerplate(self):
+        text = (
+            "Bienvenue à Symphonat. Toute l'équipe vous remercie de votre appel "
+            "et vous invite à patienter quelques instants. "
+            "Un correspondant va vous répondre. Merci de rester en ligne."
+        )
+        self.assertTrue(is_phone_hold_boilerplate_text(text))
+        self.assertEqual(clean_whisper_segments([{"text": text, "compression_ratio": 1.0}]), [])
+
+    def test_phone_hold_filter_keeps_real_business_speech(self):
+        text = (
+            "Oui bonjour Monsieur Maire, je vous rappelais pour savoir "
+            "dans quelle mesure vous utilisez Odoo avec Mollie."
+        )
+        self.assertFalse(is_phone_hold_boilerplate_text(text))
+        self.assertEqual(len(clean_whisper_segments([{"text": text, "compression_ratio": 1.0}])), 1)
+
     def test_render_plain_segments_has_no_speaker_placeholder(self):
         out = render_segments_plain([
             {"start": 0.0, "end": 2.0, "text": "Bonjour"},
@@ -521,6 +540,37 @@ class LlmCatalogTest(unittest.TestCase):
         custom = "user-org/Some-Custom-Model"
         self.assertEqual(text_llm_label_for(custom), custom)
         self.assertEqual(audio_llm_label_for(custom), custom)
+
+
+class SpeakerNameContextFilterTest(unittest.TestCase):
+    def test_drops_phone_transfer_name_conflict(self):
+        transcript = "\n".join(
+            [
+                "[SPEAKER_01] (00:01:00) Sainte-Ferrande, Philippe, bonjour.",
+                "[Robin] (00:02:52) Oui, bonjour Monsieur Maire.",
+                "[SPEAKER_01] (00:02:53) Bonjour, oui.",
+            ]
+        )
+        out = filter_speaker_names_by_context(
+            transcript,
+            {"SPEAKER_01": "Philippe"},
+            ["Arnaud Maire", "Robin Joseph"],
+        )
+        self.assertEqual(out, {})
+
+    def test_keeps_compatible_phone_transfer_name(self):
+        transcript = "\n".join(
+            [
+                "[Robin] (00:02:52) Oui, bonjour Monsieur Maire.",
+                "[SPEAKER_01] (00:02:53) Bonjour, oui.",
+            ]
+        )
+        out = filter_speaker_names_by_context(
+            transcript,
+            {"SPEAKER_01": "Arnaud"},
+            ["Arnaud Maire", "Robin Joseph"],
+        )
+        self.assertEqual(out, {"SPEAKER_01": "Arnaud"})
 
 
 class LlmPostProcessParsingTest(unittest.TestCase):

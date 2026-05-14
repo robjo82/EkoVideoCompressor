@@ -298,6 +298,36 @@ def _phonetic_distance(key_a: str, key_b: str) -> int:
     return _levenshtein(key_a, key_b, limit=3)
 
 
+def _surface_letters(value: str) -> str:
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def _surface_close_enough(a: str, b: str, *, max_ratio: float = 0.34) -> bool:
+    """
+    Guardrail for the fuzzy phonetic tier. French phonetic keys collide
+    surprisingly easily after vowel folding: "commande" and "Romain" are
+    one phonetic edit apart, but the written words are clearly unrelated.
+
+    We therefore require both:
+      - same first 3 letters for medium/long words, or same first 2 for
+        short words;
+      - a small surface edit distance.
+
+    This still allows real ASR variants like "MOLLE" -> "Mollie", while
+    blocking glossary terms from invading ordinary French words.
+    """
+    surface_a = _surface_letters(a)
+    surface_b = _surface_letters(b)
+    if not surface_a or not surface_b:
+        return False
+    prefix_len = 2 if min(len(surface_a), len(surface_b)) <= 4 else 3
+    if surface_a[:prefix_len] != surface_b[:prefix_len]:
+        return False
+    max_len = max(len(surface_a), len(surface_b))
+    budget = max(1, int(max_len * max_ratio))
+    return _levenshtein(surface_a, surface_b, limit=budget) <= budget
+
+
 def _match_score(
     transcript_word: str,
     entry_surface: str,
@@ -338,15 +368,19 @@ def _match_score(
     # guards against very different surfaces colliding via aggressive
     # folding.
     if transcript_key == entry_key:
-        surface_a = re.sub(r"[^a-z]", "", surface.lower())
-        surface_b = re.sub(r"[^a-z]", "", entry_surface.lower())
+        surface_a = _surface_letters(surface)
+        surface_b = _surface_letters(entry_surface)
         budget = max(2, max(len(surface_a), len(surface_b)) // 2)
         if _levenshtein(surface_a, surface_b, limit=budget) <= budget:
             return (True, 0.95, "phonetic")
         return (False, 0.0, "")
 
     # Tier 2: keys 1 edit apart and entry key not super short.
-    if len(entry_key) >= 4 and _phonetic_distance(transcript_key, entry_key) == 1:
+    if (
+        len(entry_key) >= 4
+        and _phonetic_distance(transcript_key, entry_key) == 1
+        and _surface_close_enough(surface, entry_surface)
+    ):
         return (True, 0.8, "edit")
 
     return (False, 0.0, "")

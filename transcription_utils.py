@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Iterable
 
@@ -122,6 +123,130 @@ def audio_llm_label_for(model_id: str) -> str:
         if entry["id"] == model_id:
             return entry["label"]
     return model_id
+
+
+_TRANSCRIPT_SPEAKER_LINE_RE = re.compile(
+    r"^\[(?P<speaker>[^\]\n]+)\]\s+\((?P<timestamp>\d{1,2}:\d{2}(?::\d{2})?)\)\s*(?P<text>.*)$"
+)
+
+
+def _fold_for_matching(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+    return normalized.lower()
+
+
+def _name_tokens(value: str) -> list[str]:
+    return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,}", value or "")
+
+
+def _timestamp_text_to_seconds(value: str) -> float:
+    parts = [int(p) for p in (value or "0:00").split(":")]
+    if len(parts) == 2:
+        return float(parts[0] * 60 + parts[1])
+    if len(parts) == 3:
+        return float(parts[0] * 3600 + parts[1] * 60 + parts[2])
+    return 0.0
+
+
+def _person_aliases_from_terms(glossary_terms: list[str]) -> dict[str, set[str]]:
+    """
+    Extract likely person names from glossary terms.
+
+    "Arnaud Maire" becomes {"arnaud": {"maire"}}. We intentionally
+    only use multi-token terms so a bare glossary word like "Mollie"
+    cannot affect speaker identity validation.
+    """
+    people: dict[str, set[str]] = {}
+    for term in glossary_terms or []:
+        tokens = _name_tokens(term)
+        if len(tokens) < 2:
+            continue
+        first = _fold_for_matching(tokens[0])
+        if not first:
+            continue
+        aliases = {_fold_for_matching(tok) for tok in tokens[1:] if len(tok) >= 3}
+        if aliases:
+            people.setdefault(first, set()).update(aliases)
+    return people
+
+
+def filter_speaker_names_by_context(
+    transcript_text: str,
+    speakers: dict[str, str],
+    glossary_terms: list[str],
+    *,
+    neighbor_window_seconds: float = 10.0,
+) -> dict[str, str]:
+    """
+    Drop risky global speaker renames when a diarization label appears
+    to cover multiple people after a phone transfer.
+
+    Real failure this guards against:
+      - SPEAKER_01 says "Sainte-Ferrande, Philippe, bonjour" at reception.
+      - The same diarization label is later assigned to the transferred
+        contact, who answers after "Monsieur Maire".
+      - A global SPEAKER_01 -> Philippe rename then mislabels Arnaud Maire.
+
+    If the glossary contains a full person name such as "Arnaud Maire",
+    and a speaker label mapped to another first name replies immediately
+    after being addressed by that surname, we leave the label unrenamed
+    instead of applying a wrong name everywhere.
+    """
+    if not transcript_text or not speakers:
+        return dict(speakers or {})
+
+    people = _person_aliases_from_terms(glossary_terms)
+    if not people:
+        return dict(speakers)
+
+    rows: list[dict] = []
+    for line in transcript_text.splitlines():
+        match = _TRANSCRIPT_SPEAKER_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        rows.append(
+            {
+                "speaker": match.group("speaker").strip(),
+                "time": _timestamp_text_to_seconds(match.group("timestamp")),
+                "text": match.group("text") or "",
+            }
+        )
+    if not rows:
+        return dict(speakers)
+
+    filtered = dict(speakers)
+    for idx, row in enumerate(rows):
+        speaker_id = row["speaker"]
+        mapped_name = filtered.get(speaker_id)
+        if not mapped_name:
+            continue
+        mapped_first_tokens = _name_tokens(mapped_name)
+        if not mapped_first_tokens:
+            continue
+        mapped_first = _fold_for_matching(mapped_first_tokens[0])
+
+        # Look at the immediately surrounding turns. If another speaker
+        # addresses this turn with a surname from the glossary that belongs
+        # to a different first name, the diarization label is ambiguous.
+        for other in rows[max(0, idx - 2) : min(len(rows), idx + 3)]:
+            if other is row or other["speaker"] == speaker_id:
+                continue
+            if abs(float(other["time"]) - float(row["time"])) > neighbor_window_seconds:
+                continue
+            folded_text = _fold_for_matching(other["text"])
+            for first, aliases in people.items():
+                if first == mapped_first:
+                    continue
+                for alias in aliases:
+                    if re.search(rf"\b(?:m\.|monsieur)\s+(?:le\s+)?{re.escape(alias)}\b", folded_text):
+                        filtered.pop(speaker_id, None)
+                        break
+                if speaker_id not in filtered:
+                    break
+            if speaker_id not in filtered:
+                break
+    return filtered
 
 # Whisper's `--initial-prompt` is fed to the decoder as a fake prefix; the
 # model truncates anything beyond ~224 tokens, so the prompt must be tight
@@ -433,6 +558,16 @@ def build_mlx_whisper_cmd(
 _TEXT_SIGNAL_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]")
 _ONLY_PUNCTUATION_RE = re.compile(r"^[\s.…·!?;:,\\/_|()\\[\\]{}'\"`+-]+$")
 _SPACE_RE = re.compile(r"\s+")
+_PHONE_HOLD_MARKERS = (
+    "merci de votre appel",
+    "merci de rester en ligne",
+    "patienter quelques instants",
+    "un correspondant va vous repondre",
+    "votre appel est en attente",
+    "cours de transfert",
+    "nous allons y donner suite",
+    "bienvenue a",
+)
 
 
 def _normalize_segment_text(text: str) -> str:
@@ -440,6 +575,27 @@ def _normalize_segment_text(text: str) -> str:
     normalized = normalized.replace("’", "'").replace("…", "...")
     normalized = re.sub(r"[^a-z0-9à-öø-ÿ']+", " ", normalized)
     return _SPACE_RE.sub(" ", normalized).strip()
+
+
+def is_phone_hold_boilerplate_text(text: str) -> bool:
+    """
+    Detect stock IVR / hold-line speech.
+
+    Silero VAD cannot remove these passages because they are spoken
+    audio, not silence. For meeting/call notes they are almost always
+    noise, and they poison downstream diarization + speaker naming.
+    """
+    normalized = _fold_for_matching(_normalize_segment_text(text))
+    if not normalized:
+        return False
+    hits = sum(1 for marker in _PHONE_HOLD_MARKERS if marker in normalized)
+    if hits >= 2:
+        return True
+    if normalized.count("merci de rester en ligne") >= 2:
+        return True
+    if normalized.count("un correspondant va vous repondre") >= 2:
+        return True
+    return False
 
 
 def is_hallucinated_whisper_segment(segment: dict) -> bool:
@@ -452,6 +608,8 @@ def is_hallucinated_whisper_segment(segment: dict) -> bool:
         return True
 
     normalized = _normalize_segment_text(text)
+    if is_phone_hold_boilerplate_text(normalized):
+        return True
     if normalized in {
         "sous titrage st 501",
         "sous titres realises par la communaute d'amara org",
@@ -543,6 +701,8 @@ Règles strictes :
 - Réponds UNIQUEMENT par un objet JSON valide, sans texte avant/après, sans markdown.
 - Chaque clé "speakers" est un identifiant SPEAKER_XX et la valeur est un prénom (ou "" si tu n'es pas sûr).
 - N'invente JAMAIS un prénom : laisse la chaîne vide en cas de doute.
+- Si un même SPEAKER_XX semble contenir plusieurs personnes (standard téléphonique, transfert, mauvaise diarisation), laisse sa valeur vide.
+- Ne renomme pas un SPEAKER_XX d'après une seule formule d'accueil si le même label répond ensuite à un autre nom.
 - Ne mets que les SPEAKER_XX présents dans la transcription.
 - "technical_terms" contient 0 à 20 termes, sans doublons, orthographiés proprement.
 - Priorise les termes du vocabulaire métier quand ils apparaissent même phonétiquement.

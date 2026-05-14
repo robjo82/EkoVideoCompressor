@@ -62,6 +62,7 @@ from transcription_utils import (
     canonical_audio_llm_model_id,
     canonical_whisper_model_id,
     default_transcript_path,
+    filter_speaker_names_by_context,
     parse_diarization_output,
     parse_llm_corrections_markdown,
     parse_llm_title_speakers,
@@ -2762,7 +2763,11 @@ class TranscribeWorker(QThread):
             self._log(f"enhancement_read_failed error={exc!r}")
             return None
 
-        speakers = self._speaker_names_from_payload(payload)
+        speakers_raw = self._speaker_names_from_payload(payload)
+        speakers = filter_speaker_names_by_context(base_text, speakers_raw, self.glossary_terms)
+        if speakers_raw and speakers != speakers_raw:
+            removed = sorted(set(speakers_raw) - set(speakers))
+            self._log(f"speaker_mapping_filtered removed={removed!r}")
         technical_terms = self._technical_terms_from_payload(payload)
         if self.job.db_id and (speakers or technical_terms):
             try:
