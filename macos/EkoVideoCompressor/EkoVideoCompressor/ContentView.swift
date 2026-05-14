@@ -149,7 +149,8 @@ struct ContentView: View {
             glossary_terms: settings.glossaryTerms,
             speaker_overrides: [:],
             technical_terms: [],
-            rerun_steps: []
+            rerun_steps: [],
+            delete_source_after_copy: settings.deleteSourceAfterCopy
         )
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ekovideo-job.json")
         do {
@@ -347,6 +348,13 @@ struct RunSettingsForm: View {
                     .font(.body.monospaced())
                     .frame(minHeight: 150)
                 Text("\(settings.glossaryTerms.count) terme(s) transmis au moteur.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Fichiers") {
+                Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
+                Text("Le moteur copie d'abord l'original dans le dossier de travail. Si cette option est active, seul le fichier à son emplacement d'origine est supprimé.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
@@ -820,6 +828,10 @@ struct SettingsView: View {
 
                 Section("Sortie") {
                     TextField("Dossier", text: $settings.outputDir)
+                    Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
+                    Text("L'original est supprimé uniquement après sa copie dans le dossier de travail.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Section("Transcription") {
                     Picker("Action", selection: $settings.processingMode) {

@@ -98,6 +98,7 @@ struct JobRequest: Codable {
     var speaker_overrides: [String: String]
     var technical_terms: [String]
     var rerun_steps: [String]
+    var delete_source_after_copy: Bool
 }
 
 struct LibraryRow: Codable, Identifiable, Equatable {

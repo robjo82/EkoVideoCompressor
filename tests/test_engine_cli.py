@@ -95,6 +95,31 @@ class EngineProtocolTest(unittest.TestCase):
             self.assertEqual(events[0]["event"], "artifact")
             self.assertEqual(events[0]["kind"], "source")
 
+    def test_prepare_job_workspace_can_delete_original_after_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "meeting.mov"
+            source.write_bytes(b"fake media")
+            request = JobRequest.from_dict(
+                {
+                    "source_path": str(source),
+                    "output_dir": str(root / "EkoVideo Compressor"),
+                    "mode": "compress_transcribe",
+                    "delete_source_after_copy": True,
+                }
+            )
+            events, sink = collect_events()
+
+            workspace, copied = prepare_job_workspace(request, sink)
+
+            self.assertFalse(source.exists())
+            self.assertTrue(copied.exists())
+            self.assertEqual(copied.parent, workspace)
+            self.assertEqual(copied.read_bytes(), b"fake media")
+            self.assertEqual(events[0]["event"], "artifact")
+            self.assertEqual(events[1]["event"], "progress")
+            self.assertEqual(events[1]["step"], "source_cleanup")
+
     def test_eta_smoothing_counts_down_from_job_estimate(self):
         events = []
         sink = EtaSmoothingSink(lambda event: events.append(event.to_dict()), 60)

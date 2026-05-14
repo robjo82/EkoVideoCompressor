@@ -127,6 +127,7 @@ class JobRequest:
     technical_terms: list[str] = field(default_factory=list)
     rerun_steps: list[str] = field(default_factory=list)
     library_job_id: int | None = None
+    delete_source_after_copy: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "JobRequest":
@@ -159,6 +160,7 @@ class JobRequest:
             technical_terms=[str(x) for x in data.get("technical_terms") or []],
             rerun_steps=[str(x) for x in data.get("rerun_steps") or []],
             library_job_id=data.get("library_job_id"),
+            delete_source_after_copy=bool(data.get("delete_source_after_copy") or False),
         )
 
     def to_dict(self) -> dict[str, Any]:

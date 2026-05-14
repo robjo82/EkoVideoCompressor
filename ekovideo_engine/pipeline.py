@@ -180,6 +180,23 @@ def prepare_job_workspace(request: JobRequest, sink: EventSink) -> tuple[Path, P
     ):
         shutil.copy2(source, copied_source)
         sink(ArtifactEvent("source", str(copied_source)))
+        if request.delete_source_after_copy:
+            try:
+                source.unlink()
+                sink(
+                    ProgressEvent(
+                        "source_cleanup",
+                        100,
+                        "Fichier source supprimé de son emplacement d'origine",
+                    )
+                )
+            except OSError as exc:
+                sink(
+                    WarningEvent(
+                        f"Le fichier source a été copié, mais n'a pas pu être supprimé : {exc}",
+                        code="source_delete_failed",
+                    )
+                )
     return workspace, copied_source if copied_source.exists() else source
 
 
