@@ -11,7 +11,7 @@ from pathlib import Path
 from ekovideo_engine.events import event_to_json
 from ekovideo_engine.events import collect_events
 from ekovideo_engine.models import DoneEvent, JobRequest, ProgressEvent
-from ekovideo_engine.pipeline import prepare_job_workspace
+from ekovideo_engine.pipeline import _friendly_ffmpeg_error, prepare_job_workspace
 from transcription_eval.evaluate import evaluate_case
 
 
@@ -103,6 +103,37 @@ class TranscriptionEvalTest(unittest.TestCase):
         self.assertEqual(result.forbidden_hits, [])
         self.assertEqual(result.missing_speakers, [])
         self.assertEqual(result.score, 1.0)
+
+
+class FriendlyFfmpegErrorTest(unittest.TestCase):
+    """The dyld error a broken Homebrew-linked bundle produced in
+    v0.13.0+ was rendered verbatim in the SwiftUI UI, leaving users
+    staring at a stack trace. The mapper substitutes a human-readable
+    explanation while keeping the technical fingerprint in the log
+    for debugging.
+    """
+
+    def test_translates_library_not_loaded(self):
+        raw = (
+            "dyld[12560]: Library not loaded: "
+            "/opt/homebrew/Cellar/ffmpeg/8.1.1/lib/libavdevice.62.dylib\n"
+            "  Referenced from: /Applications/EkoVideoCompressor.app/.../ffmpeg"
+        )
+        out = _friendly_ffmpeg_error(raw, "/Applications/.../ffmpeg")
+        self.assertIn("binaire ffmpeg fourni", out)
+        self.assertIn("Réinstallez", out)
+        # The technical fingerprint survives so a support exchange has
+        # something to grep for.
+        self.assertIn("Library not loaded", out)
+
+    def test_passes_through_real_ffmpeg_errors(self):
+        raw = "Invalid data found when processing input"
+        out = _friendly_ffmpeg_error(raw, "/usr/bin/ffmpeg")
+        self.assertEqual(out, raw)
+
+    def test_falls_back_when_stderr_is_empty(self):
+        out = _friendly_ffmpeg_error("", "/usr/bin/ffmpeg")
+        self.assertIn("/usr/bin/ffmpeg", out)
 
 
 if __name__ == "__main__":

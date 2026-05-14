@@ -19,10 +19,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Homebrew ffmpeg
-        run: |
-          brew update
-          brew install ffmpeg
+      # We deliberately don't `brew install ffmpeg` anymore — the
+      # Homebrew binary dylib-links into /opt/homebrew/Cellar/* which
+      # never matches a user's environment. We pull a static, notarised
+      # binary from evermeet.cx instead. The fetch script also runs an
+      # otool -L verification that fails the build if any non-system
+      # dylib reference slips in.
+      - name: Fetch static ffmpeg / ffprobe
+        run: scripts/fetch_static_ffmpeg.sh
 
       - name: Run Python tests
         run: |

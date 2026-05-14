@@ -33,24 +33,16 @@ source "$VENV_DIR/bin/activate"
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-mkdir -p bin
-if command -v ffmpeg >/dev/null 2>&1; then
-  rm -f bin/ffmpeg
-  cp "$(command -v ffmpeg)" bin/ffmpeg
-else
-  echo "ffmpeg introuvable dans PATH" >&2
-  exit 1
-fi
-
-if command -v ffprobe >/dev/null 2>&1; then
-  rm -f bin/ffprobe
-  cp "$(command -v ffprobe)" bin/ffprobe
-else
-  echo "ffprobe introuvable dans PATH" >&2
-  exit 1
-fi
-
-chmod +x bin/ffmpeg bin/ffprobe
+# Fetch static, notarised ffmpeg + ffprobe from evermeet.cx. The old
+# code did `cp $(command -v ffmpeg) bin/ffmpeg`, which on a Homebrew
+# install grabs a binary that dynamically references
+# /opt/homebrew/Cellar/ffmpeg/<version>/lib/*. End users never have
+# the exact same dylib paths, so they hit dyld errors like:
+#   Library not loaded: libavdevice.62.dylib
+# The static evermeet.cx builds only depend on macOS system frameworks,
+# so the bundle becomes truly self-contained. Verifier inside the
+# script aborts the build if any forbidden dylib reference slips in.
+FORCE=1 scripts/fetch_static_ffmpeg.sh
 
 export APP_VERSION="$VERSION"
 cleanup() {

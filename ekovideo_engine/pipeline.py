@@ -23,6 +23,29 @@ from .logging import append_app_log, tail_text
 from .models import ArtifactEvent, JobRequest, ProgressEvent
 
 
+def _friendly_ffmpeg_error(raw: str, binary_path: str) -> str:
+    """Translate the cryptic dyld message that surfaces when the
+    bundled ffmpeg is dynamically linked against Homebrew dylibs that
+    don't exist on the user's machine.
+
+    Without this, users see only ``rc=-6 error="dyld[..]: Library not
+    loaded: /opt/homebrew/Cellar/ffmpeg/8.1.1/lib/libavdevice.62.dylib"``
+    which is essentially a debugging stack trace. The hint below tells
+    them why the app is broken and what to do.
+    """
+    if not raw:
+        return f"ffmpeg ({binary_path}) a échoué sans message d'erreur."
+    if "Library not loaded" in raw or "dyld" in raw.lower():
+        return (
+            "Le binaire ffmpeg fourni avec l'application est cassé : il "
+            "dépend de bibliothèques absentes de votre machine. "
+            "Réinstallez la dernière version d'EkoVideoCompressor pour "
+            "corriger le problème. "
+            f"(Détail technique : {raw.strip().splitlines()[0]})"
+        )
+    return raw
+
+
 def _safe_stem(value: str) -> str:
     keep = []
     for char in value:
@@ -97,8 +120,9 @@ class TranscriptionPipeline:
         proc = subprocess.run(cmd, capture_output=True, text=True)
         duration = time.monotonic() - ts
         if proc.returncode != 0 or not wav_path.exists():
-            message = tail_text(proc.stderr or proc.stdout)
-            append_app_log(f"engine_audio_extract_failed rc={proc.returncode} error={message!r}")
+            raw = tail_text(proc.stderr or proc.stdout)
+            message = _friendly_ffmpeg_error(raw, cmd[0])
+            append_app_log(f"engine_audio_extract_failed rc={proc.returncode} error={raw!r}")
             return StepResult("audio_extract", False, duration_seconds=duration, error=message)
         self.sink(ArtifactEvent("audio_wav", str(wav_path)))
         self.sink(ProgressEvent("audio_extract", 100, "Audio ready"))
@@ -107,10 +131,16 @@ class TranscriptionPipeline:
     def _run_whisper(self, wav_path: Path) -> StepResult:
         ts = time.monotonic()
         settings = self.request.transcription_settings
-        out_dir = Path(self.request.output_dir)
+        # The earlier branch tested
+        # `Path(self.request.output_dir).name != Path(source_path).parent.name`
+        # — but `source_path` is never bound in this scope so any
+        # transcription job without workspace_dir crashed with a
+        # NameError before Whisper even ran. We resolve the output
+        # directory deterministically from the request: explicit
+        # workspace_dir wins, otherwise we mint a stamped folder.
         if self.request.workspace_dir:
             out_dir = Path(self.request.workspace_dir)
-        elif Path(self.request.output_dir).name != Path(source_path).parent.name:
+        else:
             out_dir = job_workspace_dir(self.request)
         out_dir.mkdir(parents=True, exist_ok=True)
         transcript_path = Path(
@@ -200,8 +230,9 @@ class CompressionPipeline:
         proc = subprocess.run(cmd, capture_output=True, text=True)
         duration = time.monotonic() - ts
         if proc.returncode != 0 or not Path(output_path).exists():
-            message = tail_text(proc.stderr or proc.stdout)
-            append_app_log(f"engine_compress_failed rc={proc.returncode} error={message!r}")
+            raw = tail_text(proc.stderr or proc.stdout)
+            message = _friendly_ffmpeg_error(raw, cmd[0])
+            append_app_log(f"engine_compress_failed rc={proc.returncode} error={raw!r}")
             return StepResult("compression", False, duration_seconds=duration, error=message)
         self.sink(ArtifactEvent("compressed", output_path))
         self.sink(ProgressEvent("compression", 100, "Compression ready"))
