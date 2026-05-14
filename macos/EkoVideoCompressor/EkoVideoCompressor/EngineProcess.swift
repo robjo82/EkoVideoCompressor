@@ -29,16 +29,18 @@ final class EngineProcess: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in
-                self?.consumeOutput(text)
+            guard let self else { return }
+            Task { @MainActor [self] in
+                self.consumeOutput(text)
             }
         }
 
         process.terminationHandler = { [weak self] _ in
             output.fileHandleForReading.readabilityHandler = nil
-            Task { @MainActor in
-                self?.isRunning = false
-                self?.process = nil
+            guard let self else { return }
+            Task { @MainActor [self] in
+                self.isRunning = false
+                self.process = nil
             }
         }
 
@@ -86,3 +88,5 @@ final class EngineProcess: ObservableObject {
         return args
     }
 }
+
+extension EngineProcess: @unchecked Sendable {}
