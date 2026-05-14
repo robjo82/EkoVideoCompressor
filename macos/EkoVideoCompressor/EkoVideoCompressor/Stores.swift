@@ -64,7 +64,7 @@ final class SettingsStore: ObservableObject {
     }
 }
 
-struct ReleaseInfo: Codable {
+struct ReleaseInfo: Codable, Equatable {
     var tag_name: String
     var name: String
     var html_url: String
@@ -238,7 +238,7 @@ exit 0
     }
 
     private func quote(_ s: String) -> String {
-        "'\\(s.replacingOccurrences(of: "'", with: "'\\\\''"))'"
+        "\"'\\(s.replacingOccurrences(of: \"'\", with: \"'\\\\''\"))'\""
     }
 
     private func isNewer(_ remoteTag: String) -> Bool {
