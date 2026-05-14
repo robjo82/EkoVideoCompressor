@@ -1,5 +1,12 @@
 import Foundation
 
+struct EngineCommandResult {
+    var status: Int32
+    var events: [EngineEvent]
+    var lines: [String]
+    var rawOutput: String
+}
+
 @MainActor
 final class EngineProcess: ObservableObject {
     @Published private(set) var isRunning = false
@@ -72,18 +79,56 @@ final class EngineProcess: ObservableObject {
         process?.terminate()
     }
 
+    static func runCommand(arguments: [String], workingDirectory: URL? = nil) async -> EngineCommandResult {
+        let executableURL = await MainActor.run { engineExecutableURL() }
+        let output = await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.currentDirectoryURL = workingDirectory
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+            } catch {
+                return (Int32(-1), error.localizedDescription)
+            }
+        }.value
+        let parsed = parseOutput(output.1)
+        return EngineCommandResult(
+            status: output.0,
+            events: parsed.events,
+            lines: parsed.lines,
+            rawOutput: output.1
+        )
+    }
+
     private func consumeOutput(_ text: String) {
+        let parsed = Self.parseOutput(text)
+        events.append(contentsOf: parsed.events)
+        outputLines.append(contentsOf: parsed.lines)
+        if let errorEvent = parsed.events.last(where: { $0.event == .error }) {
+            lastError = errorEvent.message
+        }
+    }
+
+    private static func parseOutput(_ text: String) -> (events: [EngineEvent], lines: [String]) {
+        let decoder = JSONDecoder()
+        var events: [EngineEvent] = []
+        var lines: [String] = []
         for line in text.split(separator: "\n") {
             guard let data = String(line).data(using: .utf8) else { continue }
             if let event = try? decoder.decode(EngineEvent.self, from: data) {
                 events.append(event)
-                if event.event == .error {
-                    lastError = event.message
-                }
             } else {
-                outputLines.append(String(line))
+                lines.append(String(line))
             }
         }
+        return (events, lines)
     }
 
     static func engineExecutableURL() -> URL {

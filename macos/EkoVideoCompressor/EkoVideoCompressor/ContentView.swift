@@ -10,8 +10,8 @@ enum AppSection: String, CaseIterable, Hashable {
     var title: String {
         switch self {
         case .queue: "Traitements"
-        case .library: "Bibliotheque"
-        case .models: "Modeles"
+        case .library: "Bibliothèque"
+        case .models: "Modèles"
         }
     }
 
@@ -65,7 +65,7 @@ struct ContentView: View {
                     Button {
                         showingSettings = true
                     } label: {
-                        Label("Reglages", systemImage: "gearshape")
+                        Label("Réglages", systemImage: "gearshape")
                     }
                     .keyboardShortcut(",", modifiers: .command)
                 }
@@ -106,7 +106,7 @@ struct ContentView: View {
             queue.update(item.id, status: "En cours", progress: 0)
             let exitCode = await runJob(item)
             if exitCode == 0 {
-                queue.update(item.id, status: "Termine", progress: 100)
+                queue.update(item.id, status: "Terminé", progress: 100)
             } else {
                 queue.update(item.id, status: "Erreur", progress: 0)
             }
@@ -120,7 +120,7 @@ struct ContentView: View {
             workspace_dir: "",
             output_dir: settings.outputDir,
             mode: settings.processingMode,
-            profile: "Reunion equilibree",
+            profile: "Réunion équilibrée",
             compression_settings: CompressionSettings(),
             transcription_settings: TranscriptionSettings(
                 model: settings.whisperModel,
@@ -181,7 +181,7 @@ struct WorkflowHeaderView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Preparer une transcription")
+                    Text("Préparer une transcription")
                         .font(.largeTitle.bold())
                     Text("Ajoutez les fichiers, renseignez le vocabulaire utile, puis lancez le traitement.")
                         .foregroundStyle(.secondary)
@@ -213,7 +213,7 @@ struct QueueColumnView: View {
                 EmptyStateView(
                     title: "Aucun fichier",
                     systemImage: "movie.stack",
-                    message: "Deposez un enregistrement ou utilisez le bouton Ajouter dans la barre d'outils."
+                    message: "Déposez un enregistrement ou utilisez le bouton Ajouter dans la barre d'outils."
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -287,7 +287,7 @@ struct RunSettingsForm: View {
 
     var body: some View {
         Form {
-            Section("Vocabulaire de la reunion") {
+            Section("Vocabulaire de la réunion") {
                 TextEditor(text: $settings.glossary)
                     .font(.body.monospaced())
                     .frame(minHeight: 150)
@@ -307,13 +307,24 @@ struct RunSettingsForm: View {
                     Text("VTT").tag("vtt")
                     Text("JSON").tag("json")
                 }
-                Picker("Modele", selection: $settings.whisperModel) {
+                Picker("Modèle", selection: $settings.whisperModel) {
                     Text("Whisper Large v3 Turbo").tag("mlx-community/whisper-large-v3-turbo")
                     Text("Whisper Large v3").tag("mlx-community/whisper-large-v3-mlx")
                     Text("Whisper Medium").tag("mlx-community/whisper-medium-mlx")
                 }
-                Toggle("Detection des locuteurs", isOn: $settings.diarizationEnabled)
-                Toggle("Reecoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
+                Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
+            }
+
+            Section("Hugging Face") {
+                SecureField("Token Read", text: $settings.hfToken)
+                Button {
+                    openHuggingFaceTokens()
+                } label: {
+                    Label("Créer ou gérer le token", systemImage: "person.crop.circle.badge.key")
+                }
+                Text("Requis pour pyannote quand la détection des locuteurs est activée.")
+                    .foregroundStyle(.secondary)
             }
 
             Section("Sortie") {
@@ -337,9 +348,9 @@ struct RunSetupView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Preparer le traitement")
+                    Text("Préparer le traitement")
                         .font(.title.bold())
-                    Text("Ces informations sont appliquees a la file au lancement.")
+                    Text("Ces informations sont appliquées à la file au lancement.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -380,9 +391,9 @@ struct DropTargetView: View {
                     Image(systemName: "square.and.arrow.down")
                         .font(.system(size: 30, weight: .medium))
                         .foregroundStyle(.teal)
-                    Text("Deposez vos enregistrements")
+                    Text("Déposez vos enregistrements")
                         .font(.title3.weight(.semibold))
-                    Text("Videos et audios sont acceptes. La file reste modifiable pendant le traitement.")
+                    Text("Vidéos et audios sont acceptés. La file reste modifiable pendant le traitement.")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -404,34 +415,31 @@ struct DropTargetView: View {
 }
 
 struct LibraryView: View {
-    @EnvironmentObject private var engine: EngineProcess
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var queue: QueueStore
-
-    private var rows: [LibraryRow] {
-        engine.outputLines.compactMap { line in
-            try? JSONDecoder().decode(LibraryRow.self, from: Data(line.utf8))
-        }
-    }
 
     var body: some View {
         VStack(spacing: 0) {
             ListHeaderView(
-                title: "Bibliotheque",
+                title: "Bibliothèque",
                 subtitle: "Retrouvez les compressions, transcriptions et rapports produits.",
                 actionTitle: "Actualiser",
                 actionSystemImage: "arrow.clockwise"
             ) {
-                engine.run(arguments: EngineProcess.defaultPythonArguments(["library-list", "--jsonl"]))
+                Task { await library.refresh() }
             }
             Divider()
-            if rows.isEmpty {
+            if library.isLoading && library.rows.isEmpty {
+                ProgressView("Chargement de la bibliothèque…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if library.rows.isEmpty {
                 EmptyStateView(
-                    title: "Aucun element charge",
+                    title: "Aucun élément chargé",
                     systemImage: "tray",
-                    message: "Actualisez la bibliotheque pour lire les traitements depuis le moteur."
+                    message: "Actualisez la bibliothèque pour lire les traitements depuis le moteur."
                 )
             } else {
-                Table(rows) {
+                Table(library.rows) {
                     TableColumn("Fichier") { row in
                         Text(row.filename)
                             .lineLimit(2)
@@ -439,7 +447,7 @@ struct LibraryView: View {
                     TableColumn("Statut") { row in
                         StatusText(row.status ?? "-")
                     }
-                    TableColumn("Mis a jour") { row in
+                    TableColumn("Mis à jour") { row in
                         Text(row.updated_at ?? "-")
                             .foregroundStyle(.secondary)
                     }
@@ -450,45 +458,48 @@ struct LibraryView: View {
                         LibraryActionsView(row: row)
                     }
                 }
+                .overlay(alignment: .bottomLeading) {
+                    if let message = library.errorMessage, !message.isEmpty {
+                        InlineErrorView(message: message)
+                            .padding()
+                    }
+                }
             }
         }
         .task {
-            if engine.outputLines.isEmpty {
-                engine.run(arguments: EngineProcess.defaultPythonArguments(["library-list", "--jsonl"]))
+            if library.rows.isEmpty {
+                await library.refresh()
             }
         }
     }
 }
 
 struct ModelsView: View {
-    @EnvironmentObject private var engine: EngineProcess
-
-    private var rows: [ModelRow] {
-        engine.outputLines.compactMap { line in
-            try? JSONDecoder().decode(ModelRow.self, from: Data(line.utf8))
-        }
-    }
+    @EnvironmentObject private var models: ModelStore
 
     var body: some View {
         VStack(spacing: 0) {
             ListHeaderView(
-                title: "Modeles locaux",
-                subtitle: "Telechargez les modeles avant une reunion pour eviter les surprises.",
+                title: "Modèles locaux",
+                subtitle: "Téléchargez les modèles avant une réunion pour éviter les surprises.",
                 actionTitle: "Actualiser",
                 actionSystemImage: "arrow.clockwise"
             ) {
-                engine.run(arguments: EngineProcess.defaultPythonArguments(["model-list", "--jsonl"]))
+                Task { await models.refresh() }
             }
             Divider()
-            if rows.isEmpty {
+            if models.isLoading && models.models.isEmpty {
+                ProgressView("Chargement des modèles…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if models.models.isEmpty {
                 EmptyStateView(
-                    title: "Catalogue non charge",
+                    title: "Catalogue non chargé",
                     systemImage: "shippingbox",
-                    message: "Actualisez pour afficher les modeles Whisper, texte et audio."
+                    message: "Actualisez pour afficher les modèles Whisper, texte et audio."
                 )
             } else {
-                Table(rows) {
-                    TableColumn("Modele") { row in
+                Table(models.models) {
+                    TableColumn("Modèle") { row in
                         VStack(alignment: .leading) {
                             Text(row.label)
                                 .font(.headline)
@@ -498,17 +509,25 @@ struct ModelsView: View {
                         }
                     }
                     TableColumn("Famille", value: \.family)
-                    TableColumn("Etat") { row in
-                        StatusText(row.cached ? "Telecharge" : "A telecharger")
+                    TableColumn("État") { row in
+                        StatusText(row.cached ? "Téléchargé" : "À télécharger")
                     }
                     TableColumn("Actions") { row in
                         ModelActionsView(row: row)
                     }
                 }
+                .overlay(alignment: .bottomLeading) {
+                    if let message = models.errorMessage, !message.isEmpty {
+                        InlineErrorView(message: message)
+                            .padding()
+                    }
+                }
             }
         }
         .task {
-            engine.run(arguments: EngineProcess.defaultPythonArguments(["model-list", "--jsonl"]))
+            if models.models.isEmpty {
+                await models.refresh()
+            }
         }
     }
 }
@@ -516,11 +535,13 @@ struct ModelsView: View {
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
+    @State private var hfStatus = ""
+    @State private var isCheckingHF = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("Reglages")
+                Text("Réglages")
                     .font(.title.bold())
                 Spacer()
                 Button("OK") { dismiss() }
@@ -544,14 +565,40 @@ struct SettingsView: View {
                         Text("VTT").tag("vtt")
                         Text("JSON").tag("json")
                     }
-                    TextField("Modele Whisper", text: $settings.whisperModel)
-                    Toggle("Detection des locuteurs", isOn: $settings.diarizationEnabled)
-                    Toggle("Reecoute IA multimodale", isOn: $settings.audioRecheckEnabled)
+                    TextField("Modèle Whisper", text: $settings.whisperModel)
+                    Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                    Toggle("Réécoute IA multimodale", isOn: $settings.audioRecheckEnabled)
                 }
                 Section("Hugging Face") {
-                    SecureField("Token", text: $settings.hfToken)
+                    SecureField("Token Read", text: $settings.hfToken)
+                    HStack {
+                        Button {
+                            openHuggingFaceTokens()
+                        } label: {
+                            Label("Créer ou gérer le token", systemImage: "person.crop.circle.badge.key")
+                        }
+                        Button {
+                            Task { await checkHuggingFaceAccess() }
+                        } label: {
+                            if isCheckingHF {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("Vérifier l'accès", systemImage: "checkmark.shield")
+                            }
+                        }
+                        .disabled(settings.hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCheckingHF)
+                    }
+                    if !hfStatus.isEmpty {
+                        Text(hfStatus)
+                            .font(.callout)
+                            .foregroundStyle(hfStatus.hasPrefix("OK") ? .green : .secondary)
+                    } else {
+                        Text("Requis pour la détection des locuteurs pyannote. L'app vérifie le token et l'acceptation des conditions des modèles.")
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Section("Vocabulaire conserve") {
+                Section("Vocabulaire conservé") {
                     TextEditor(text: $settings.glossary)
                         .frame(minHeight: 130)
                 }
@@ -561,6 +608,46 @@ struct SettingsView: View {
         }
         .frame(minWidth: 620, minHeight: 520)
     }
+
+    private func checkHuggingFaceAccess() async {
+        isCheckingHF = true
+        defer { isCheckingHF = false }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["hf-check", "--token", settings.hfToken])
+        )
+        if result.status != 0 {
+            hfStatus = result.events.last?.message ?? result.rawOutput
+            return
+        }
+        guard let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(HuggingFaceCheckResponse.self, from: data) else {
+            hfStatus = "Réponse Hugging Face illisible."
+            return
+        }
+        let missing = payload.checks.filter { !$0.ok }
+        if missing.isEmpty {
+            let name = payload.account.name ?? payload.account.fullname ?? "compte connecté"
+            hfStatus = "OK · \(name) · accès pyannote vérifié."
+        } else {
+            let labels = missing.map(\.label).joined(separator: ", ")
+            hfStatus = "Accès incomplet : \(labels). Ouvrez Hugging Face et acceptez les conditions."
+        }
+    }
+}
+
+private struct HuggingFaceCheckResponse: Decodable {
+    var account: HuggingFaceAccount
+    var checks: [HuggingFaceModelCheck]
+}
+
+private struct HuggingFaceAccount: Decodable {
+    var name: String?
+    var fullname: String?
+}
+
+private struct HuggingFaceModelCheck: Decodable {
+    var label: String
+    var ok: Bool
 }
 
 struct StatusBarView: View {
@@ -576,7 +663,7 @@ struct StatusBarView: View {
                 ProgressView(value: progress.map { $0 / 100.0 })
                     .frame(width: 120)
             }
-            Text(engine.lastError ?? engine.events.last?.message ?? "Pret.")
+            Text(engine.lastError ?? engine.events.last?.message ?? "Prêt.")
                 .lineLimit(1)
             Spacer()
             if engine.isRunning {
@@ -652,6 +739,19 @@ struct EmptyStateView: View {
     }
 }
 
+struct InlineErrorView: View {
+    var message: String
+
+    var body: some View {
+        Label(message, systemImage: "exclamationmark.triangle")
+            .font(.callout)
+            .lineLimit(3)
+            .padding(10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+            .foregroundStyle(.red)
+    }
+}
+
 struct StepPill: View {
     var index: Int
     var title: String
@@ -720,13 +820,13 @@ struct LibraryActionsView: View {
                     Label("Relancer", systemImage: "arrow.clockwise")
                 }
                 .labelStyle(.iconOnly)
-                .help("Ajouter ce fichier a la file")
+                .help("Ajouter ce fichier à la file")
             }
 
             Menu {
-                ArtifactMenuButton(title: "Compresse", path: row.compressed_path)
+                ArtifactMenuButton(title: "Compressé", path: row.compressed_path)
                 ArtifactMenuButton(title: "Transcription", path: row.transcript_path)
-                ArtifactMenuButton(title: "Amelioree", path: row.enhanced_transcript_path)
+                ArtifactMenuButton(title: "Améliorée", path: row.enhanced_transcript_path)
                 ArtifactMenuButton(title: "Rapport", path: row.review_path)
                 Divider()
                 if let source = row.source_path, !source.isEmpty {
@@ -759,27 +859,27 @@ struct ArtifactMenuButton: View {
 }
 
 struct ModelActionsView: View {
-    @EnvironmentObject private var engine: EngineProcess
+    @EnvironmentObject private var models: ModelStore
     var row: ModelRow
 
     var body: some View {
         HStack(spacing: 6) {
             if row.cached {
                 Button {
-                    engine.run(arguments: EngineProcess.defaultPythonArguments(["model-delete", row.id]))
+                    Task { await models.delete(row) }
                 } label: {
                     Label("Supprimer", systemImage: "trash")
                 }
                 .labelStyle(.iconOnly)
-                .help("Supprimer le modele local")
+                .help("Supprimer le modèle local")
             } else {
                 Button {
-                    engine.run(arguments: EngineProcess.defaultPythonArguments(["model-download", row.id]))
+                    Task { await models.download(row) }
                 } label: {
-                    Label("Telecharger", systemImage: "arrow.down.circle")
+                    Label("Télécharger", systemImage: "arrow.down.circle")
                 }
                 .labelStyle(.iconOnly)
-                .help("Pre-telecharger le modele")
+                .help("Pré-télécharger le modèle")
             }
             Button {
                 revealInFinder(row.cache_dir)
@@ -789,7 +889,7 @@ struct ModelActionsView: View {
             .labelStyle(.iconOnly)
             .help("Afficher le dossier de cache")
         }
-        .disabled(engine.isRunning)
+        .disabled(models.isLoading)
     }
 }
 
@@ -812,4 +912,9 @@ func openPath(_ path: String) {
 
 func revealInFinder(_ path: String) {
     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+}
+
+func openHuggingFaceTokens() {
+    guard let url = URL(string: "https://huggingface.co/settings/tokens") else { return }
+    NSWorkspace.shared.open(url)
 }

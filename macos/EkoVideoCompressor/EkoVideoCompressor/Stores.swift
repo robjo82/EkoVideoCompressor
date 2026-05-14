@@ -65,19 +65,73 @@ final class SettingsStore: ObservableObject {
 
 @MainActor
 final class LibraryStore: ObservableObject {
-    @Published var rows: [[String: JSONValue]] = []
+    @Published var rows: [LibraryRow] = []
+    @Published var isLoading = false
+    @Published var errorMessage: String?
 
-    func refresh(using engine: EngineProcess) {
-        engine.run(arguments: EngineProcess.defaultPythonArguments(["library-list"]))
+    func refresh() async {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["library-list", "--jsonl"])
+        )
+        if result.status != 0 {
+            errorMessage = result.rawOutput
+        }
+        rows = result.lines.compactMap { line in
+            try? JSONDecoder().decode(LibraryRow.self, from: Data(line.utf8))
+        }
+        isLoading = false
     }
 }
 
 @MainActor
 final class ModelStore: ObservableObject {
     @Published var models: [ModelRow] = []
+    @Published var isLoading = false
+    @Published var errorMessage: String?
 
-    func load(using engine: EngineProcess) {
-        engine.run(arguments: EngineProcess.defaultPythonArguments(["model-list", "--jsonl"]))
+    func refresh() async {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["model-list", "--jsonl"])
+        )
+        if result.status != 0 {
+            errorMessage = result.rawOutput
+        }
+        models = result.lines.compactMap { line in
+            try? JSONDecoder().decode(ModelRow.self, from: Data(line.utf8))
+        }
+        isLoading = false
+    }
+
+    func download(_ row: ModelRow) async {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["model-download", row.id])
+        )
+        if result.status != 0 {
+            errorMessage = result.rawOutput
+            isLoading = false
+            return
+        }
+        await refresh()
+    }
+
+    func delete(_ row: ModelRow) async {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["model-delete", row.id])
+        )
+        if result.status != 0 {
+            errorMessage = result.rawOutput
+            isLoading = false
+            return
+        }
+        await refresh()
     }
 }
 

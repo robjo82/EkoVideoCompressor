@@ -5,6 +5,8 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var engine = EngineProcess()
     @StateObject private var queue = QueueStore()
     @StateObject private var settings = SettingsStore()
+    @StateObject private var library = LibraryStore()
+    @StateObject private var models = ModelStore()
 
     init() {
         let args = CommandLine.arguments
@@ -20,6 +22,8 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(engine)
                 .environmentObject(queue)
                 .environmentObject(settings)
+                .environmentObject(library)
+                .environmentObject(models)
                 .frame(minWidth: 1180, minHeight: 760)
         }
         .windowStyle(.titleBar)
