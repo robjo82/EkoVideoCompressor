@@ -12,6 +12,8 @@ final class EngineProcess: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var events: [EngineEvent] = []
     @Published private(set) var outputLines: [String] = []
+    @Published private(set) var runStartedAt: Date?
+    @Published private(set) var runFinishedAt: Date?
     @Published var lastError: String?
 
     private var process: Process?
@@ -27,6 +29,8 @@ final class EngineProcess: ObservableObject {
         guard !isRunning else { return -1 }
         events.removeAll()
         outputLines.removeAll()
+        runStartedAt = nil
+        runFinishedAt = nil
         lastError = nil
 
         let process = Process()
@@ -39,6 +43,7 @@ final class EngineProcess: ObservableObject {
         process.standardError = output
         self.process = process
         isRunning = true
+        runStartedAt = Date()
 
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
@@ -59,6 +64,7 @@ final class EngineProcess: ObservableObject {
                 }
                 Task { @MainActor [self] in
                     self.isRunning = false
+                    self.runFinishedAt = Date()
                     self.process = nil
                     continuation.resume(returning: process.terminationStatus)
                 }
@@ -68,6 +74,7 @@ final class EngineProcess: ObservableObject {
                 try process.run()
             } catch {
                 isRunning = false
+                runFinishedAt = Date()
                 self.process = nil
                 lastError = error.localizedDescription
                 continuation.resume(returning: -1)

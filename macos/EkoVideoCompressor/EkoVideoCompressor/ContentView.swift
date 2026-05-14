@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -941,26 +942,57 @@ private struct HuggingFaceModelCheck: Decodable {
 struct StatusBarView: View {
     @EnvironmentObject private var engine: EngineProcess
 
+    private var latestProgressEvent: EngineEvent? {
+        engine.events.last(where: { $0.event == .progress })
+    }
+
     private var progress: Double? {
-        engine.events.last(where: { $0.event == .progress })?.pct
+        latestProgressEvent?.pct
+    }
+
+    private func statusText(now: Date) -> String {
+        let message = engine.lastError ?? latestProgressEvent?.message ?? engine.events.last?.message ?? "Prêt."
+        guard engine.isRunning, let startedAt = engine.runStartedAt else {
+            return message
+        }
+
+        var parts = [message, "écoulé \(formatDuration(now.timeIntervalSince(startedAt)))"]
+        if let eta = latestProgressEvent?.eta_seconds, eta.isFinite, eta > 0 {
+            parts.append("reste ~\(formatDuration(eta))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let total = max(Int(seconds.rounded()), 0)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        if hours > 0 {
+            return "\(hours):\(String(format: "%02d", minutes)):\(String(format: "%02d", seconds))"
+        }
+        return "\(minutes):\(String(format: "%02d", seconds))"
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            if engine.isRunning {
-                ProgressView(value: progress.map { $0 / 100.0 })
-                    .frame(width: 120)
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            HStack(spacing: 10) {
+                if engine.isRunning {
+                    ProgressView(value: progress.map { $0 / 100.0 })
+                        .frame(width: 120)
+                }
+                Text(statusText(now: timeline.date))
+                    .lineLimit(1)
+                    .monospacedDigit()
+                Spacer()
+                if engine.isRunning {
+                    Button("Annuler") { engine.cancel() }
+                }
             }
-            Text(engine.lastError ?? engine.events.last?.message ?? "Prêt.")
-                .lineLimit(1)
-            Spacer()
-            if engine.isRunning {
-                Button("Annuler") { engine.cancel() }
-            }
+            .font(.callout)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
         }
-        .font(.callout)
-        .padding(.horizontal, 18)
-        .padding(.vertical, 10)
     }
 }
 

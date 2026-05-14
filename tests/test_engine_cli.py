@@ -12,6 +12,7 @@ from ekovideo_engine.events import event_to_json
 from ekovideo_engine.events import collect_events
 from ekovideo_engine.models import DoneEvent, JobRequest, ProgressEvent
 from ekovideo_engine.pipeline import _friendly_ffmpeg_error, prepare_job_workspace
+from ekovideo_engine.runner import EtaSmoothingSink
 from transcription_eval.evaluate import evaluate_case
 
 
@@ -93,6 +94,25 @@ class EngineProtocolTest(unittest.TestCase):
             self.assertEqual(copied.read_bytes(), b"fake media")
             self.assertEqual(events[0]["event"], "artifact")
             self.assertEqual(events[0]["kind"], "source")
+
+    def test_eta_smoothing_counts_down_from_job_estimate(self):
+        events = []
+        sink = EtaSmoothingSink(lambda event: events.append(event.to_dict()), 60)
+
+        sink(ProgressEvent("audio_extract", 0, "Extracting audio"))
+        sink.started_at -= 10
+        sink(ProgressEvent("whisper", 0, "Transcribing"))
+
+        self.assertGreater(events[0]["eta_seconds"], events[1]["eta_seconds"])
+        self.assertLessEqual(events[0]["eta_seconds"], 60)
+
+    def test_eta_smoothing_stays_empty_without_history(self):
+        events = []
+        sink = EtaSmoothingSink(lambda event: events.append(event.to_dict()), None)
+
+        sink(ProgressEvent("audio_extract", 0, "Extracting audio"))
+
+        self.assertIsNone(events[0]["eta_seconds"])
 
 
 class TranscriptionEvalTest(unittest.TestCase):
