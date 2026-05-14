@@ -51,22 +51,101 @@ from .models import (
 )
 
 
-def _friendly_ffmpeg_error(raw: str, binary_path: str) -> str:
-    """Translate the cryptic dyld message that surfaces when the
-    bundled ffmpeg is dynamically linked against Homebrew dylibs that
-    don't exist on the user's machine.
+# Tqdm progress lines that ``huggingface_hub`` writes to stderr while
+# downloading model weights. They're not errors, but they end up in
+# the same stderr buffer the engine surfaces to the UI when the
+# subsequent command actually fails — making the dialog read like a
+# wall of meaningless progress bars.
+_TQDM_FETCHING_RE = re.compile(
+    r"^Fetching\s+\d+\s+files?:.*$", re.MULTILINE
+)
+
+
+def _clean_subprocess_stderr(raw: str) -> str:
+    """Strip tqdm-style progress lines + collapse runs of blank lines.
+
+    Anything the model loader prints during a normal HF download is
+    noise from the user's point of view; we surface the actual
+    Python exception that follows.
     """
     if not raw:
+        return raw
+    cleaned = _TQDM_FETCHING_RE.sub("", raw)
+    # Drop runs of blank lines that the regex leaves behind.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _friendly_ffmpeg_error(raw: str, binary_path: str) -> str:
+    """Translate cryptic ffmpeg failure modes into actionable French.
+
+    Two failure modes show up in the wild:
+
+    1. Bundled binary dynamically linked against Homebrew dylibs that
+       don't exist on a user's machine — the original v0.13.0 dyld
+       error.
+    2. ``mlx_whisper`` itself fork-execs ``ffmpeg`` from ``$PATH`` to
+       decode the input audio. When the user's PATH has no ffmpeg
+       (we ship our own under Contents/Resources/bin) the venv-side
+       Python raises ``FileNotFoundError: 'ffmpeg'`` deep inside
+       ``mlx_whisper/audio.py``. The fix at the call site is to
+       pass an enriched ``env``; the message here helps when the
+       diagnosis path is still useful.
+    """
+    cleaned = _clean_subprocess_stderr(raw)
+    if not cleaned:
         return f"ffmpeg ({binary_path}) a échoué sans message d'erreur."
-    if "Library not loaded" in raw or "dyld" in raw.lower():
+    if "Library not loaded" in cleaned or "dyld" in cleaned.lower():
         return (
             "Le binaire ffmpeg fourni avec l'application est cassé : il "
             "dépend de bibliothèques absentes de votre machine. "
             "Réinstallez la dernière version d'EkoVideoCompressor pour "
             "corriger le problème. "
-            f"(Détail technique : {raw.strip().splitlines()[0]})"
+            f"(Détail technique : {cleaned.splitlines()[0]})"
         )
-    return raw
+    if "No such file or directory: 'ffmpeg'" in cleaned or (
+        "FileNotFoundError" in cleaned and "ffmpeg" in cleaned
+    ):
+        return (
+            "Whisper a tenté d'appeler ffmpeg mais ne l'a pas trouvé. "
+            "Cela ne devrait plus arriver depuis la version courante "
+            "— signalez-le si vous le voyez. "
+            "(Détail technique : FileNotFoundError sur ffmpeg dans mlx_whisper.)"
+        )
+    return cleaned
+
+
+def subprocess_env_for_request(request: JobRequest) -> dict[str, str]:
+    """Build a PATH that includes the bundle's ``bin/`` directory.
+
+    Critical for ``mlx_whisper`` and friends: the Python package
+    internally fork-execs ``ffmpeg`` to decode the input audio
+    (``mlx_whisper/audio.py::load_audio``). If ``$PATH`` doesn't
+    carry ffmpeg, we crash deep inside the venv with a
+    ``FileNotFoundError: 'ffmpeg'`` even though we ship the binary
+    alongside the engine. Prepending the bundled ``bin/`` directory
+    makes the lookup succeed without polluting the user's
+    environment.
+
+    Same logic applies to pyannote (via torchaudio) and to any
+    future tool that shells out to ffprobe.
+    """
+    env = os.environ.copy()
+    candidates: list[str] = []
+    for path in (
+        request.compression_settings.ffmpeg_path,
+        request.compression_settings.ffprobe_path,
+    ):
+        if path:
+            parent = str(Path(path).parent)
+            if parent and parent not in candidates:
+                candidates.append(parent)
+    if candidates:
+        existing = env.get("PATH", "")
+        env["PATH"] = (
+            os.pathsep.join([*candidates, existing]) if existing else os.pathsep.join(candidates)
+        )
+    return env
 
 
 def _safe_stem(value: str) -> str:
@@ -138,6 +217,9 @@ class TranscriptionPipeline:
         self._repass_replaced: int = 0
         self._vad_manifest: list[dict] = []
         self._llm_payload: dict[str, Any] = {}
+
+    def _subprocess_env(self) -> dict[str, str]:
+        return subprocess_env_for_request(self.request)
 
     # ------------------------------------------------------------------
     # Public orchestrator
@@ -244,7 +326,9 @@ class TranscriptionPipeline:
             speech_enhance=settings.enhance_audio,
         )
         self.sink(ProgressEvent("audio_extract", 0, "Extracting audio"))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, env=self._subprocess_env()
+        )
         duration = time.monotonic() - ts
         if proc.returncode != 0 or not wav_path.exists():
             raw = tail_text(proc.stderr or proc.stdout)
@@ -287,7 +371,13 @@ class TranscriptionPipeline:
         trimmed = workspace / "audio.vad.wav"
         cmd = build_vad_cmd(venv_python, str(wav_path), str(trimmed))
         self.sink(ProgressEvent("vad", 0, "Filtering non-speech regions"))
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            env=self._subprocess_env(),
+        )
         duration = time.monotonic() - ts
         if proc.returncode != 0:
             self.sink(
@@ -359,11 +449,21 @@ class TranscriptionPipeline:
             condition_on_previous_text=False,
         )
         self.sink(ProgressEvent("whisper", 0, f"Running Whisper ({settings.model})"))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        # env= prepends the bundle's bin/ to PATH so mlx_whisper's
+        # internal subprocess.run(["ffmpeg", ...]) call from
+        # mlx_whisper/audio.py:load_audio() actually finds the
+        # binary. Without this, the venv-side Python raises
+        # FileNotFoundError('ffmpeg'), mlx_whisper's cli.py main()
+        # catches it and exits cleanly (rc=0) — and our pipeline
+        # only notices because whisper.json never appears.
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, env=self._subprocess_env()
+        )
         duration = time.monotonic() - ts
         if proc.returncode != 0 or not whisper_json.exists():
-            message = tail_text(proc.stderr or proc.stdout)
-            append_app_log(f"engine_whisper_failed rc={proc.returncode} error={message!r}")
+            raw = tail_text(proc.stderr or proc.stdout)
+            message = _friendly_ffmpeg_error(raw, cmd[0])
+            append_app_log(f"engine_whisper_failed rc={proc.returncode} error={raw!r}")
             return (
                 StepResult(
                     "whisper",
@@ -452,7 +552,13 @@ class TranscriptionPipeline:
                 condition_on_previous_text=False,
                 clip_timestamps=f"{cs:.2f},{ce:.2f}",
             )
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=self._subprocess_env(),
+            )
             if proc.returncode != 0 or not target.exists():
                 append_app_log(
                     f"engine_multipass_clip_failed rc={proc.returncode} "
@@ -535,7 +641,9 @@ class TranscriptionPipeline:
         ts = time.monotonic()
         settings = self.request.transcription_settings
         cmd = build_diarization_cmd(settings.venv_python_path, str(wav_path))
-        env = os.environ.copy()
+        # Build on top of the bundle's PATH so pyannote / torchaudio
+        # can shell out to ffmpeg without finding nothing on $PATH.
+        env = self._subprocess_env()
         env["HF_TOKEN"] = settings.hf_token
         self.sink(ProgressEvent("diarisation", 0, "Detecting speakers"))
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=3600)
@@ -624,7 +732,13 @@ class TranscriptionPipeline:
             venv_python, settings.text_llm_model, str(analysis_path), glossary_text
         )
         self.sink(ProgressEvent("llm_title", 0, "LLM: title + speakers"))
-        title_proc = subprocess.run(title_cmd, capture_output=True, text=True, timeout=900)
+        title_proc = subprocess.run(
+            title_cmd,
+            capture_output=True,
+            text=True,
+            timeout=900,
+            env=self._subprocess_env(),
+        )
         if title_proc.returncode == 0:
             try:
                 title_payload = parse_llm_title_speakers(title_proc.stdout)
@@ -642,7 +756,13 @@ class TranscriptionPipeline:
             venv_python, settings.text_llm_model, str(analysis_path), glossary_text
         )
         self.sink(ProgressEvent("llm_corrections", 50, "LLM: corrections + doubts"))
-        corr_proc = subprocess.run(corr_cmd, capture_output=True, text=True, timeout=1800)
+        corr_proc = subprocess.run(
+            corr_cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            env=self._subprocess_env(),
+        )
         if corr_proc.returncode == 0:
             try:
                 corr_payload = parse_llm_corrections_markdown(corr_proc.stdout)
@@ -876,7 +996,12 @@ class CompressionPipeline:
             audio_only=is_audio_only_path(self.request.source_path),
         )
         self.sink(ProgressEvent("compression", 0, "Running FFmpeg"))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=subprocess_env_for_request(self.request),
+        )
         duration = time.monotonic() - ts
         if proc.returncode != 0 or not Path(output_path).exists():
             raw = tail_text(proc.stderr or proc.stdout)
