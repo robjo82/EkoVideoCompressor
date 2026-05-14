@@ -88,6 +88,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>EkoVideoCompressor</string>
   <key>CFBundleExecutable</key>
   <string>EkoVideoCompressor</string>
+  <key>CFBundleIconFile</key>
+  <string>EkoVideoCompressor</string>
   <key>CFBundleIdentifier</key>
   <string>com.ekonum.ekovideocompressor</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -108,6 +110,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
+cp EkoVideoCompressor.icns "$APP_BUNDLE/Contents/Resources/"
 cp bin/ffmpeg bin/ffprobe "$APP_BUNDLE/Contents/Resources/bin/"
 chmod u+rw,go+r "$APP_BUNDLE/Contents/Resources/bin/ffmpeg" "$APP_BUNDLE/Contents/Resources/bin/ffprobe"
 chmod +x "$APP_BUNDLE/Contents/Resources/bin/ffmpeg" "$APP_BUNDLE/Contents/Resources/bin/ffprobe"

@@ -79,7 +79,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='EkoVideoCompressor.app',
-    icon=None,
+    icon='EkoVideoCompressor.icns',
     bundle_identifier='com.ekonum.ekovideocompressor',
     info_plist={
         "CFBundleDisplayName": "EkoVideoCompressor",
