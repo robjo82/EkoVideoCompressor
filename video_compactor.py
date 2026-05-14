@@ -43,6 +43,7 @@ from per_speaker import (
     remap_speaker_segments,
 )
 from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
+from web_context import enrich_glossary_via_web
 from transcription_utils import (
     AUDIO_LLM_MODELS,
     DEFAULT_AUDIO_LLM_MODEL,
@@ -1196,6 +1197,26 @@ class SettingsDialog(QDialog):
         per_speaker_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
         transcription_form.addRow("", per_speaker_hint)
 
+        # Web enrichment: opt-in network access to enrich the
+        # glossary with proper nouns discovered in the transcript.
+        self.transcription_web_enrichment_check = QCheckBox(
+            "Enrichir le vocabulaire via une recherche web (opt-in)"
+        )
+        self.transcription_web_enrichment_check.setChecked(
+            bool(transcription_settings.get("web_enrichment_enabled", False))
+        )
+        transcription_form.addRow("", self.transcription_web_enrichment_check)
+        web_hint = QLabel(
+            "Quand activé, les noms propres détectés dans les premières "
+            "minutes de la transcription sont confirmés via DuckDuckGo et "
+            "ajoutés automatiquement au vocabulaire métier. Améliore les "
+            "noms d'entreprises, produits ou personnes que l'utilisateur "
+            "n'avait pas listés. Nécessite un accès internet pour ce job."
+        )
+        web_hint.setWordWrap(True)
+        web_hint.setStyleSheet("color: #6e6e73; font-size: 12px;")
+        transcription_form.addRow("", web_hint)
+
         self.transcription_diarization_check = QCheckBox(
             "Détection des locuteurs (pyannote)"
         )
@@ -1632,6 +1653,7 @@ class SettingsDialog(QDialog):
                 "vad_enabled": self.transcription_vad_check.isChecked(),
                 "multipass_enabled": self.transcription_multipass_check.isChecked(),
                 "per_speaker_enabled": self.transcription_per_speaker_check.isChecked(),
+                "web_enrichment_enabled": self.transcription_web_enrichment_check.isChecked(),
                 "language": self.transcription_language_combo.currentText(),
                 "format": self.transcription_format_combo.currentText(),
                 "suffix": self.transcription_suffix_value,
@@ -1788,6 +1810,7 @@ class TranscribeWorker(QThread):
         multipass_enabled: bool = True,
         multipass_model: str = "mlx-community/whisper-large-v3",
         per_speaker_enabled: bool = False,
+        web_enrichment_enabled: bool = False,
     ):
         super().__init__()
         self.ffmpeg_path = ffmpeg_path
@@ -1820,6 +1843,11 @@ class TranscribeWorker(QThread):
         # decoder context never crosses speaker boundaries.
         self.per_speaker_enabled = bool(per_speaker_enabled)
         self._per_speaker_used: int = 0
+        # Web enrichment: query DuckDuckGo for proper nouns mentioned
+        # early in the transcript, and feed the confirmed ones back
+        # as enriched glossary terms. Strict opt-in (network access).
+        self.web_enrichment_enabled = bool(web_enrichment_enabled)
+        self._web_enrichments: list[dict] = []
         # Wrap the user's "Contexte" in a French priming sentence so Whisper
         # treats the listed terms as expected vocabulary, not a token salad.
         self.initial_prompt = structured_initial_prompt(initial_prompt)
@@ -2324,6 +2352,68 @@ class TranscribeWorker(QThread):
         )
         return merged
 
+    def _run_web_enrichment(self, segments: list[dict]) -> int:
+        """
+        Look up proper nouns from the first few minutes of the
+        transcript on DuckDuckGo. Confirmed entities are appended to
+        the worker's glossary terms so the next phonetic pass and
+        the LLM correction step see them.
+
+        Returns the number of new terms added. Runs synchronously
+        (a few HTTP round-trips, each capped at 6 s) — the per-
+        request timeout + the global query budget make worst-case
+        latency bounded.
+        """
+        if not self.web_enrichment_enabled:
+            return 0
+        # First ~4 minutes is typically enough to capture every
+        # participant's name + the project / product names.
+        snippet_parts: list[str] = []
+        cumulative = 0.0
+        for seg in segments:
+            try:
+                start = float(seg.get("start") or 0.0)
+            except (TypeError, ValueError):
+                start = 0.0
+            if start > 240.0:
+                break
+            text = str(seg.get("text") or "").strip()
+            if text:
+                snippet_parts.append(text)
+                cumulative = start
+        snippet = " ".join(snippet_parts)
+        if not snippet:
+            return 0
+
+        self.status.emit("Recherche en ligne pour enrichir le vocabulaire…")
+        try:
+            results = enrich_glossary_via_web(snippet, list(self.glossary_terms))
+        except Exception as exc:
+            self._log(f"web_enrichment_failed error={exc!r}")
+            return 0
+
+        added = 0
+        for r in results:
+            term = r.confirmed_term.strip()
+            if not term:
+                continue
+            existing_keys = {t.lower() for t in self.glossary_terms}
+            if term.lower() in existing_keys:
+                continue
+            self.glossary_terms.append(term)
+            self._web_enrichments.append({
+                "candidate": r.candidate,
+                "term": term,
+                "citation": r.citation,
+                "snippet": r.snippet,
+            })
+            added += 1
+        self._log(
+            f"web_enrichment_done added={added} kept={len(self._web_enrichments)} "
+            f"glossary_size={len(self.glossary_terms)}"
+        )
+        return added
+
     def _run_per_speaker_pass(
         self,
         source_wav: Path,
@@ -2603,6 +2693,25 @@ class TranscribeWorker(QThread):
                 "",
             ]
 
+        if self._web_enrichments:
+            lines += [
+                "## Vocabulaire enrichi via le web",
+                "",
+                f"{len(self._web_enrichments)} terme(s) confirmé(s) en ligne "
+                "et ajouté(s) au vocabulaire :",
+                "",
+            ]
+            for entry in self._web_enrichments[:30]:
+                citation = (entry.get("citation") or "").strip()
+                line = f"- **{entry['term']}**"
+                if citation:
+                    line += f" — _{citation}_"
+                lines.append(line)
+                snippet = (entry.get("snippet") or "").strip()
+                if snippet:
+                    lines.append(f"  {snippet}")
+            lines.append("")
+
         # Multipass second-pass replacements: useful breadcrumb so the
         # user knows how much of the audio benefited from the
         # higher-quality model.
@@ -2683,6 +2792,7 @@ class TranscribeWorker(QThread):
             or self._glossary_subs
             or self._repass_replaced
             or self._per_speaker_used
+            or self._web_enrichments
         )
         if has_review:
             self._write_review_file(self._review_transcript_path(out_path), payload, applied, clip_checks)
@@ -3017,6 +3127,14 @@ class TranscribeWorker(QThread):
                     "La sortie brute ressemblait à une hallucination de silence."
                 )
                 return
+
+            # --- STEP 2a: web glossary enrichment (opt-in) ----------------
+            # Look up proper nouns mentioned early in the transcript
+            # to grow the glossary with names the user didn't think
+            # to type. The new terms boost the phonetic post-pass
+            # below and the LLM corrections after diarisation.
+            if self.web_enrichment_enabled:
+                self._run_web_enrichment(whisper_segments)
 
             # --- STEP 2bis: confidence-triaged second pass ----------------
             # Identify segments Whisper-turbo was unsure about and
@@ -4700,6 +4818,12 @@ class MainWindow(QWidget):
         self.transcription_per_speaker_enabled = self.settings.value(
             "transcription_per_speaker_enabled", False, type=bool
         )
+        # Web enrichment: opt-in. The user's team is the only
+        # consumer of this app, so we trust them with the
+        # privacy/network trade-off — but defaults still OFF.
+        self.transcription_web_enrichment_enabled = self.settings.value(
+            "transcription_web_enrichment_enabled", False, type=bool
+        )
         self.transcription_language = str(self.settings.value("transcription_language", "fr", type=str)).strip() or "fr"
         self.transcription_format = str(self.settings.value("transcription_format", "txt", type=str)).strip() or "txt"
         self.transcription_suffix = str(self.settings.value("transcription_suffix", "", type=str)).strip()
@@ -5655,6 +5779,7 @@ class MainWindow(QWidget):
             "vad_enabled": self.transcription_vad_enabled,
             "multipass_enabled": self.transcription_multipass_enabled,
             "per_speaker_enabled": self.transcription_per_speaker_enabled,
+            "web_enrichment_enabled": self.transcription_web_enrichment_enabled,
             "language": self.transcription_language,
             "format": self.transcription_format,
             "suffix": self.transcription_suffix,
@@ -5766,6 +5891,11 @@ class MainWindow(QWidget):
                 "per_speaker_enabled", self.transcription_per_speaker_enabled
             )
         )
+        self.transcription_web_enrichment_enabled = bool(
+            transcription_settings.get(
+                "web_enrichment_enabled", self.transcription_web_enrichment_enabled
+            )
+        )
         self.transcription_language = str(transcription_settings.get("language", "fr")).strip() or "fr"
         self.transcription_format = str(transcription_settings.get("format", "txt")).strip() or "txt"
         self.transcription_suffix = str(transcription_settings.get("suffix", "")).strip()
@@ -5794,6 +5924,10 @@ class MainWindow(QWidget):
         self.settings.setValue(
             "transcription_per_speaker_enabled",
             self.transcription_per_speaker_enabled,
+        )
+        self.settings.setValue(
+            "transcription_web_enrichment_enabled",
+            self.transcription_web_enrichment_enabled,
         )
         # Drop the legacy single-key so it doesn't shadow the new ones on
         # next startup. Safe even if the key isn't there.
@@ -7091,6 +7225,7 @@ class MainWindow(QWidget):
             vad_enabled=self.transcription_vad_enabled,
             multipass_enabled=self.transcription_multipass_enabled,
             per_speaker_enabled=self.transcription_per_speaker_enabled,
+            web_enrichment_enabled=self.transcription_web_enrichment_enabled,
         )
         self.worker = worker
         self._track_worker(worker)
