@@ -55,6 +55,10 @@ final class SettingsStore: ObservableObject {
     @AppStorage("outputFormat") var outputFormat = "txt"
     @AppStorage("audioRecheckEnabled") var audioRecheckEnabled = false
     @AppStorage("diarizationEnabled") var diarizationEnabled = false
+    /// Single user-facing quality knob. Replaces the previous handful
+    /// of toggles (VAD / multipass / per-speaker / web). The engine
+    /// derives the real flags from the preset string at job time.
+    @AppStorage("qualityPreset") var qualityPreset = TranscriptionQualityPreset.balanced.rawValue
 
     var glossaryTerms: [String] {
         glossary
