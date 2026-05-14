@@ -174,7 +174,6 @@ final class UpdateStore: ObservableObject {
 
     func applyUpdate(zipURL: URL) {
         let tmpDir = zipURL.deletingLastPathComponent()
-        let ditto = "/usr/bin/ditto"
         let pid = ProcessInfo.processInfo.processIdentifier
         let targetAppPath = Bundle.main.bundlePath
         let fallbackApp = "\(NSHomeDirectory())/Applications/EkoVideoCompressor.app"
@@ -186,40 +185,55 @@ final class UpdateStore: ObservableObject {
         
         let scriptContent = """
 #!/bin/bash
-set -u
+# EkoVideo Update Script
 LOG_PATH=\(quote(logPath))
 exec >> "$LOG_PATH" 2>&1
-echo "=== EkoVideo updater $(date) ==="
+
+echo "=== EkoVideo Swift Updater $(date) ==="
 PID=\(pid)
 NEW_APP_ZIP=\(quote(zipURL.path))
 TMP_DIR=\(quote(tmpDir.path))
 TARGET_APP=\(quote(targetAppPath))
 FALLBACK_APP=\(quote(fallbackApp))
 
-echo "New app zip: $NEW_APP_ZIP"
-echo "Target app: $TARGET_APP"
+echo "PID to wait for: $PID"
+echo "Zip: $NEW_APP_ZIP"
+echo "Target: $TARGET_APP"
 
+# Wait for the app to exit
+echo "Waiting for app (PID $PID) to exit..."
+while kill -0 "$PID" 2>/dev/null; do
+    sleep 0.5
+done
+
+echo "Extracting update..."
 /usr/bin/ditto -x -k --noqtn "$NEW_APP_ZIP" "$TMP_DIR"
 NEW_APP=$(find "$TMP_DIR" -name "EkoVideoCompressor.app" -type d | head -n 1)
 
 if [ -z "$NEW_APP" ]; then
-    echo "App bundle not found in archive"
+    echo "Error: EkoVideoCompressor.app not found in zip"
     exit 1
 fi
 
-echo "Waiting for PID $PID to exit..."
-while kill -0 "$PID" 2>/dev/null; do sleep 0.5; done
+echo "Installing to $TARGET_APP..."
+if [ -w "$TARGET_APP" ] || [ ! -e "$TARGET_APP" ]; then
+    rm -rf "$TARGET_APP"
+    cp -R "$NEW_APP" "$TARGET_APP"
+    INSTALL_PATH="$TARGET_APP"
+elif [ -w "$(dirname "$FALLBACK_APP")" ]; then
+    echo "Target app not writable, trying fallback: $FALLBACK_APP"
+    rm -rf "$FALLBACK_APP"
+    mkdir -p "$(dirname "$FALLBACK_APP")"
+    cp -R "$NEW_APP" "$FALLBACK_APP"
+    INSTALL_PATH="$FALLBACK_APP"
+else
+    echo "Error: No writable install path found."
+    exit 1
+fi
 
-echo "Replacing app..."
-# We move target to trash-like or just delete
-rm -rf "$TARGET_APP"
-cp -R "$NEW_APP" "$TARGET_APP"
-
-echo "Cleanup..."
-rm -rf "$TMP_DIR"
-
-echo "Restarting..."
-open "$TARGET_APP"
+echo "Restarting app from $INSTALL_PATH..."
+open "$INSTALL_PATH"
+echo "Update complete."
 exit 0
 """
         do {
@@ -229,8 +243,15 @@ exit 0
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/bash")
             process.arguments = [scriptPath.path]
-            try process.run()
             
+            // Start the process in a new session to ensure it survives app exit
+            // On macOS, we can use 'nohup' or just trust that a backgrounded bash survives.
+            // But better: use a separate process group if possible.
+            // Simplified: launch via /usr/bin/nohup
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")
+            process.arguments = ["/bin/bash", scriptPath.path]
+            
+            try process.run()
             Foundation.exit(0)
         } catch {
             state = .error("Échec du lancement du script de mise à jour: \\(error.localizedDescription)")
@@ -238,7 +259,7 @@ exit 0
     }
 
     private func quote(_ s: String) -> String {
-        "\"'\\(s.replacingOccurrences(of: \"'\", with: \"'\\\\''\"))'\""
+        "'" + s.replacingOccurrences(of: "'", with: "'\\\\''") + "'"
     }
 
     private func isNewer(_ remoteTag: String) -> Bool {
