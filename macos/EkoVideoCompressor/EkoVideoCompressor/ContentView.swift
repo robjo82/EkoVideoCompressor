@@ -486,7 +486,17 @@ struct LibraryView: View {
     @EnvironmentObject private var queue: QueueStore
     @State private var editingRow: LibraryRow?
     @State private var rowToDelete: LibraryRow?
-    @State private var inspectedRow: LibraryRow?
+    @State private var expandedJobIDs: Set<Int> = []
+
+    private var displayRows: [LibraryDisplayRow] {
+        library.rows.flatMap { row in
+            var rows = [LibraryDisplayRow(job: row)]
+            if expandedJobIDs.contains(row.id) {
+                rows.append(contentsOf: row.artifacts.map { LibraryDisplayRow(job: row, artifact: $0) })
+            }
+            return rows
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -510,57 +520,78 @@ struct LibraryView: View {
                 )
             } else {
                 VStack(spacing: 0) {
-                    Table(library.rows) {
-                        TableColumn("Fichier") { row in
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(row.customTitleOrFilename)
-                                    .font(.headline)
+                    Table(displayRows) {
+                        TableColumn("Fichier") { displayRow in
+                            if let artifact = displayRow.artifact {
+                                ArtifactTreeNameCell(artifact: artifact)
+                            } else {
+                                HStack(spacing: 8) {
+                                    Button {
+                                        toggleExpanded(displayRow.job)
+                                    } label: {
+                                        Image(systemName: expandedJobIDs.contains(displayRow.job.id) ? "chevron.down" : "chevron.right")
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .frame(width: 18)
+                                    Text(displayRow.job.customTitleOrFilename)
+                                        .font(.headline)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                }
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    toggleExpanded(displayRow.job)
+                                }
+                            }
+                        }
+                        .width(min: 360, ideal: 520)
+
+                        TableColumn("Statut") { displayRow in
+                            if displayRow.artifact == nil {
+                                Image(systemName: statusIconName(displayRow.job.status))
+                                    .foregroundStyle(statusColor(displayRow.job.status))
+                                    .help(localizedStatus(displayRow.job.status))
+                            }
+                        }
+                        .width(min: 54, ideal: 64, max: 80)
+
+                        TableColumn("Mis à jour") { displayRow in
+                            if displayRow.artifact == nil {
+                                Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
+                                    .foregroundStyle(.secondary)
                                     .lineLimit(2)
-                                Text(row.filename)
+                            }
+                        }
+                        .width(min: 140, ideal: 170)
+
+                        TableColumn("Artefacts") { displayRow in
+                            if let artifact = displayRow.artifact {
+                                Text(artifactSubtitle(artifact))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
-                            }
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                inspectedRow = row
+                            } else {
+                                ArtifactDots(row: displayRow.job)
                             }
                         }
-                        TableColumn("Statut") { row in
-                            HStack(spacing: 6) {
-                                Image(systemName: statusIconName(row.status))
-                                    .foregroundStyle(statusColor(row.status))
-                                StatusText(localizedStatus(row.status))
-                            }
-                        }
-                        TableColumn("Mis à jour") { row in
-                            Text(row.updated_at ?? row.created_at ?? "-")
-                                .foregroundStyle(.secondary)
-                        }
-                        TableColumn("Artefacts") { row in
-                            ArtifactDots(row: row)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    inspectedRow = row
+                        .width(min: 190, ideal: 240)
+
+                        TableColumn("Actions") { displayRow in
+                            if let artifact = displayRow.artifact {
+                                ArtifactInlineActions(artifact: artifact) { path in
+                                    queue.add(urls: [URL(fileURLWithPath: path)])
                                 }
+                            } else {
+                                LibraryTableActionsView(
+                                    row: displayRow.job,
+                                    onInspect: { toggleExpanded(displayRow.job) },
+                                    onEditContext: { editingRow = displayRow.job },
+                                    onDelete: { rowToDelete = displayRow.job }
+                                )
+                            }
                         }
-                        TableColumn("Actions") { row in
-                            LibraryTableActionsView(
-                                row: row,
-                                onInspect: { inspectedRow = row },
-                                onEditContext: { editingRow = row },
-                                onDelete: { rowToDelete = row }
-                            )
-                        }
-                    }
-                    if let row = currentInspectedRow {
-                        Divider()
-                        LibraryArtifactPanel(row: row) { path in
-                            queue.add(urls: [URL(fileURLWithPath: path)])
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(Color(nsColor: .controlBackgroundColor))
+                        .width(min: 120, ideal: 150)
                     }
                 }
                 .overlay(alignment: .bottomLeading) {
@@ -602,18 +633,29 @@ struct LibraryView: View {
             }
         }
         .onChange(of: library.rows) { rows in
-            guard let inspectedRow else { return }
-            if let updated = rows.first(where: { $0.id == inspectedRow.id }) {
-                self.inspectedRow = updated
-            } else {
-                self.inspectedRow = nil
-            }
+            let validIDs = Set(rows.map(\.id))
+            expandedJobIDs = expandedJobIDs.intersection(validIDs)
         }
     }
 
-    private var currentInspectedRow: LibraryRow? {
-        guard let inspectedRow else { return nil }
-        return library.rows.first(where: { $0.id == inspectedRow.id }) ?? inspectedRow
+    private func toggleExpanded(_ row: LibraryRow) {
+        if expandedJobIDs.contains(row.id) {
+            expandedJobIDs.remove(row.id)
+        } else {
+            expandedJobIDs.insert(row.id)
+        }
+    }
+
+    private func artifactSubtitle(_ artifact: LibraryArtifact) -> String {
+        guard let path = existingPath(for: artifact) else { return "Non généré" }
+        let url = URL(fileURLWithPath: path)
+        let size = fileSizeLabel(path)
+        return size.isEmpty ? url.lastPathComponent : "\(url.lastPathComponent) · \(size)"
+    }
+
+    private func existingPath(for artifact: LibraryArtifact) -> String? {
+        guard let path = artifact.path, !path.isEmpty else { return nil }
+        return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 }
 
@@ -1009,12 +1051,24 @@ struct StatusText: View {
     }
 }
 
-struct LibraryArtifact: Identifiable {
+struct LibraryArtifact: Identifiable, Equatable {
     var id: String { kind }
     var kind: String
     var title: String
     var path: String?
     var canRerun: Bool = false
+}
+
+struct LibraryDisplayRow: Identifiable, Equatable {
+    var job: LibraryRow
+    var artifact: LibraryArtifact?
+
+    var id: String {
+        if let artifact {
+            return "\(job.id)-\(artifact.kind)"
+        }
+        return "\(job.id)"
+    }
 }
 
 extension LibraryRow {
@@ -1069,152 +1123,62 @@ struct LibraryTableActionsView: View {
     }
 }
 
-struct LibraryArtifactPanel: View {
-    var row: LibraryRow
-    var onRerun: (String) -> Void
+struct ArtifactTreeNameCell: View {
+    var artifact: LibraryArtifact
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Artefacts")
-                    .font(.headline)
-                Text(row.customTitleOrFilename)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer()
-            }
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
-                ForEach(row.artifacts) { artifact in
-                    GridRow {
-                        ArtifactDot(label: String(artifact.title.prefix(1)), isPresent: existingPath(for: artifact) != nil)
-                        Text(artifact.title)
-                            .font(.callout.weight(.medium))
-                        Text(artifactSubtitle(artifact))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                        HStack(spacing: 6) {
-                            if let path = existingPath(for: artifact) {
-                                Button {
-                                    openPath(path)
-                                } label: {
-                                    Label("Ouvrir", systemImage: "doc.text")
-                                }
-                                .labelStyle(.iconOnly)
-                                .help("Ouvrir le fichier")
-                                Button {
-                                    revealInFinder(path)
-                                } label: {
-                                    Label("Finder", systemImage: "folder")
-                                }
-                                .labelStyle(.iconOnly)
-                                .help("Afficher dans le Finder")
-                                if artifact.canRerun {
-                                    Button {
-                                        onRerun(path)
-                                    } label: {
-                                        Label("Relancer", systemImage: "arrow.clockwise")
-                                    }
-                                    .labelStyle(.iconOnly)
-                                    .help("Relancer depuis cette source")
-                                }
-                            }
-                        }
-                        .frame(minWidth: 88, alignment: .leading)
-                    }
-                }
-            }
+        HStack(spacing: 8) {
+            Spacer()
+                .frame(width: 26)
+            ArtifactDot(label: String(artifact.title.prefix(1)), isPresent: pathExists(artifact.path))
+            Text(artifact.title)
+                .font(.callout)
+                .foregroundStyle(pathExists(artifact.path) ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
     }
+}
 
-    private func existingPath(for artifact: LibraryArtifact) -> String? {
+struct ArtifactInlineActions: View {
+    var artifact: LibraryArtifact
+    var onRerun: (String) -> Void
+
+    private var existingPath: String? {
         guard let path = artifact.path, !path.isEmpty else { return nil }
         return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
-    private func artifactSubtitle(_ artifact: LibraryArtifact) -> String {
-        guard let path = existingPath(for: artifact) else { return "Non généré" }
-        let url = URL(fileURLWithPath: path)
-        let size = fileSizeLabel(path)
-        if size.isEmpty {
-            return url.lastPathComponent
-        }
-        return "\(url.lastPathComponent) · \(size)"
-    }
-}
-
-struct LibraryJobDisclosureRow: View {
-    @EnvironmentObject private var queue: QueueStore
-    var row: LibraryRow
-    var onEditContext: () -> Void
-    var onDelete: () -> Void
-
     var body: some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(row.artifacts) { artifact in
-                    ArtifactDetailRow(artifact: artifact) {
-                        if let path = artifact.path, !path.isEmpty {
-                            queue.add(urls: [URL(fileURLWithPath: path)])
-                        }
-                    }
-                }
-                if let error = row.error_message, !error.isEmpty {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .lineLimit(3)
-                        .padding(.top, 4)
-                }
-            }
-            .padding(.top, 8)
-        } label: {
-            HStack(spacing: 14) {
-                statusIcon
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(row.customTitleOrFilename)
-                        .font(.headline)
-                        .lineLimit(2)
-                    HStack(spacing: 10) {
-                        Text(row.updated_at ?? row.created_at ?? "-")
-                        ArtifactDots(row: row)
-                        if let step = row.current_step, !step.isEmpty, row.status == "RUNNING" {
-                            Text(step)
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                Spacer()
-                StatusText(localizedStatus(row.status))
+        HStack(spacing: 6) {
+            if let path = existingPath {
                 Button {
-                    if let path = pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path {
-                        queue.add(urls: [URL(fileURLWithPath: path)])
-                    }
+                    openPath(path)
                 } label: {
-                    Label("Relancer", systemImage: "arrow.clockwise")
+                    Label("Ouvrir", systemImage: "doc.text")
                 }
                 .labelStyle(.iconOnly)
-                .help("Ajouter la source copiée à la file")
-                Button(action: onEditContext) {
-                    Label("Contexte", systemImage: "person.2.badge.gearshape")
+                .help("Ouvrir le fichier")
+
+                Button {
+                    revealInFinder(path)
+                } label: {
+                    Label("Finder", systemImage: "folder")
                 }
                 .labelStyle(.iconOnly)
-                .help("Modifier les interlocuteurs et le vocabulaire")
-                Button(role: .destructive, action: onDelete) {
-                    Label("Supprimer", systemImage: "trash")
+                .help("Afficher dans le Finder")
+
+                if artifact.canRerun {
+                    Button {
+                        onRerun(path)
+                    } label: {
+                        Label("Relancer", systemImage: "arrow.clockwise")
+                    }
+                    .labelStyle(.iconOnly)
+                    .help("Relancer depuis cette source")
                 }
-                .labelStyle(.iconOnly)
-                .help("Supprimer de la bibliothèque")
             }
         }
-    }
-
-    private var statusIcon: some View {
-        Image(systemName: statusIconName(row.status))
-            .foregroundStyle(statusColor(row.status))
-            .frame(width: 22)
     }
 }
 
@@ -1229,71 +1193,6 @@ struct ArtifactDots: View {
             ArtifactDot(label: "A", isPresent: pathExists(row.enhanced_transcript_path))
             ArtifactDot(label: "R", isPresent: pathExists(row.review_path))
         }
-    }
-}
-
-struct ArtifactDetailRow: View {
-    var artifact: LibraryArtifact
-    var onRerun: () -> Void
-
-    private var existingPath: String? {
-        guard let path = artifact.path, !path.isEmpty else { return nil }
-        return FileManager.default.fileExists(atPath: path) ? path : nil
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            ArtifactDot(label: String(artifact.title.prefix(1)), isPresent: existingPath != nil)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(artifact.title)
-                    .font(.callout.weight(.medium))
-                Text(artifactSubtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            Spacer()
-            if let path = existingPath {
-                Button {
-                    openPath(path)
-                } label: {
-                    Label("Ouvrir", systemImage: "doc.text")
-                }
-                .labelStyle(.iconOnly)
-                .help("Ouvrir le fichier")
-                Button {
-                    revealInFinder(path)
-                } label: {
-                    Label("Finder", systemImage: "folder")
-                }
-                .labelStyle(.iconOnly)
-                .help("Afficher dans le Finder")
-            }
-            if artifact.canRerun && existingPath != nil {
-                Button(action: onRerun) {
-                    Label("Relancer", systemImage: "arrow.clockwise")
-                }
-                .labelStyle(.iconOnly)
-                .help("Relancer depuis cette source")
-            }
-        }
-        .padding(.leading, 28)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if let path = existingPath {
-                revealInFinder(path)
-            }
-        }
-    }
-
-    private var artifactSubtitle: String {
-        guard let path = existingPath else { return "Non généré" }
-        let url = URL(fileURLWithPath: path)
-        let size = fileSizeLabel(path)
-        if size.isEmpty {
-            return url.lastPathComponent
-        }
-        return "\(url.lastPathComponent) · \(size)"
     }
 }
 
@@ -1338,7 +1237,7 @@ struct LibraryContextEditor: View {
                                     .font(.body.monospaced())
                                     .foregroundStyle(.secondary)
                                     .frame(width: 120, alignment: .leading)
-                                TextField("Nom", text: $speaker.name)
+                                TextField(speaker.name.isEmpty ? speaker.id : speaker.name, text: $speaker.name)
                             }
                         }
                     }
@@ -1362,7 +1261,7 @@ struct LibraryContextEditor: View {
                 Button("Annuler") { dismiss() }
                 Spacer()
                 Button("Enregistrer") {
-                    Task { await save() }
+                    save()
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
@@ -1372,7 +1271,7 @@ struct LibraryContextEditor: View {
         .frame(minWidth: 680, minHeight: 560)
     }
 
-    private func save() async {
+    private func save() {
         let updatedSpeakers = Dictionary(
             uniqueKeysWithValues: speakers.map {
                 ($0.id, $0.name.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -1388,11 +1287,13 @@ struct LibraryContextEditor: View {
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        if !renameMapping.isEmpty {
-            await library.renameSpeakers(row, mapping: renameMapping)
-        }
-        await library.updateContext(row, speakers: updatedSpeakers, technicalTerms: terms)
         dismiss()
+        Task {
+            if !renameMapping.isEmpty {
+                await library.renameSpeakers(row, mapping: renameMapping)
+            }
+            await library.updateContext(row, speakers: updatedSpeakers, technicalTerms: terms)
+        }
     }
 }
 
