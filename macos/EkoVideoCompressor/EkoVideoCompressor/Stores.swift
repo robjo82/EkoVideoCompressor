@@ -55,12 +55,14 @@ final class SettingsStore: ObservableObject {
     @AppStorage("outputFormat") var outputFormat = "txt"
     @AppStorage("audioRecheckEnabled") var audioRecheckEnabled = false
     @AppStorage("diarizationEnabled") var diarizationEnabled = false
-    /// User-declared expected speaker count. 0 means "let pyannote
-    /// decide" (the legacy behaviour). When > 0 we forward the same
-    /// value as both min and max to pyannote — pinning the exact
-    /// count gives the cleanest diarisation we've measured on
-    /// 4-6 person meetings.
-    @AppStorage("expectedSpeakerCount") var expectedSpeakerCount = 0
+    /// User-declared expected speaker count for the *next* run.
+    ///
+    /// This one is deliberately **not** ``@AppStorage`` — the value
+    /// is per-meeting, not a long-term preference. A 4-person
+    /// meeting today shouldn't carry "4" into next week's 6-person
+    /// meeting. The Run Setup sheet surfaces it; nothing else
+    /// touches it. 0 means "let pyannote estimate".
+    @Published var expectedSpeakerCount: Int = 0
     @AppStorage("deleteSourceAfterCopy") var deleteSourceAfterCopy = false
     /// Single user-facing quality knob. Replaces the previous handful
     /// of toggles (VAD / multipass / per-speaker / web). The engine
