@@ -133,7 +133,8 @@ class EngineRunner:
                 active_source = result.artifact_path
 
         if request.mode in {"transcribe", "compress_transcribe"}:
-            tx_results = TranscriptionPipeline(request, sink).run(active_source)
+            pipeline = TranscriptionPipeline(request, sink)
+            tx_results = pipeline.run(active_source)
             results.extend(tx_results)
             failed = [r for r in tx_results if not r.ok and r.name in {"audio_extract", "whisper"}]
             # Quality steps (VAD, multipass, diarisation, llm_post) are
@@ -154,6 +155,20 @@ class EngineRunner:
                     db.update_job_output(job_id, r.artifact_path)
                 elif r.name == "review" and r.artifact_path:
                     db.update_job_artefact(job_id, "review", r.artifact_path)
+            # Persist segments + context so the library's rename
+            # sheet has speakers to show and ``library_speaker_samples``
+            # can cut audio extracts. Without these calls the
+            # ``transcription_segments`` table and ``speaker_map_json``
+            # column stay empty and the sheet renders "Aucun
+            # interlocuteur détecté" on every run.
+            if pipeline.final_segments:
+                db.add_segments(job_id, pipeline.final_segments)
+            if pipeline.final_speaker_map or pipeline.final_technical_terms:
+                db.update_job_context(
+                    job_id,
+                    speakers=pipeline.final_speaker_map or None,
+                    technical_terms=pipeline.final_technical_terms or None,
+                )
             db.update_job_progress(job_id, step="Transcription terminée", progress_pct=100, eta_seconds=0)
 
         if request.mode in {"enhance", "review"}:

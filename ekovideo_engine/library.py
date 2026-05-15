@@ -35,6 +35,101 @@ def library_update_context(
     database().update_job_context(job_id, speakers=speakers, technical_terms=technical_terms)
 
 
+# Matches "[SPEAKER_00]", "[Robin]", "[Marie Dupont]" — a bracketed
+# token at the start of a line followed by either a space or the end
+# of the prefix. The renderer never produces any other shape, so
+# this is sufficient on every artefact we emit. We still cap the
+# inner text at 60 chars so a stray "[note: ...]" inside a paragraph
+# can't masquerade as a speaker label.
+_SPEAKER_PREFIX_RE = re.compile(r"^\s*\[(?P<label>[^\]\n]{1,60})\]", re.MULTILINE)
+
+
+def _discover_speakers_from_text(text: str) -> list[str]:
+    """Extract speaker labels from a rendered transcript file.
+
+    Walks the text and returns each distinct bracket-prefixed token
+    in first-seen order. ``SPEAKER_NN`` placeholders survive verbatim;
+    friendly names (``Robin``, ``Marie``) survive too — the caller
+    can then decide whether they should be treated as already-named
+    or as a placeholder to re-edit.
+    """
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for match in _SPEAKER_PREFIX_RE.finditer(text or ""):
+        label = match.group("label").strip()
+        if not label or label.lower() in {"speaker", "intervenant"}:
+            continue
+        if label in seen_set:
+            continue
+        seen_set.add(label)
+        seen.append(label)
+    return seen
+
+
+def library_discover_speakers(job_id: int) -> dict[str, str]:
+    """Backfill ``speaker_map_json`` from artefact files.
+
+    The new pipeline persists segments + the speaker map on every
+    run, but jobs that completed before that fix have empty DB
+    columns. The SwiftUI rename sheet then shows "Aucun
+    interlocuteur détecté" — a frustrating dead-end given the
+    speakers are literally visible in the transcript file.
+
+    This helper walks every artefact path on disk, extracts the
+    bracket-prefixed labels, merges them with whatever ``speaker_map_json``
+    already contains, and writes the result back so the sheet has
+    something to render.
+
+    Returns the resulting map (placeholder → friendly name, "" when
+    the label is still an opaque SPEAKER_NN).
+    """
+    db = database()
+    job = db.get_job(job_id)
+    if not job:
+        raise ValueError(f"job not found: {job_id}")
+
+    existing_raw = (job.get("speaker_map_json") or "").strip()
+    existing: dict[str, str] = {}
+    if existing_raw:
+        try:
+            payload = json.loads(existing_raw)
+            if isinstance(payload, dict):
+                existing = {str(k): str(v) for k, v in payload.items()}
+        except json.JSONDecodeError:
+            existing = {}
+
+    discovered: list[str] = []
+    for path in _job_artifact_paths(job):
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for label in _discover_speakers_from_text(text):
+            if label not in discovered:
+                discovered.append(label)
+
+    if not discovered and not existing:
+        return {}
+
+    merged: dict[str, str] = dict(existing)
+    for label in discovered:
+        if label in merged:
+            continue
+        # SPEAKER_NN placeholders get an empty value so the sheet
+        # renders an editable field. Friendly names get themselves
+        # so the user sees the current display name and can tweak.
+        if label.upper().startswith("SPEAKER_"):
+            merged[label] = ""
+        else:
+            merged[label] = label
+
+    if merged != existing:
+        db.update_job_context(job_id, speakers=merged)
+    return merged
+
+
 def _safe_filename(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return cleaned.strip("._") or "speaker"

@@ -10,6 +10,7 @@ from .events import stdout_event_sink
 from .hf import hf_check
 from .library import (
     library_delete,
+    library_discover_speakers,
     library_list,
     library_rename_speakers,
     library_speaker_samples,
@@ -54,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     samples.add_argument("job_id", type=int)
     samples.add_argument("--seconds", type=float, default=8.0)
     samples.add_argument("--jsonl", action="store_true")
+
+    # Backfill the speaker list for old jobs whose pipeline didn't
+    # persist segments or speaker_map_json. The SwiftUI rename sheet
+    # calls this when its locally-known list is empty, so users can
+    # still edit speakers on jobs that completed before the
+    # persistence fix.
+    discover = sub.add_parser("library-discover-speakers")
+    discover.add_argument("job_id", type=int)
 
     context = sub.add_parser("library-update-context")
     context.add_argument("job_id", type=int)
@@ -128,6 +137,11 @@ def main(argv: list[str] | None = None) -> int:
             technical_terms = _load_json_arg(args.technical_terms)
             library_update_context(args.job_id, speakers=speakers, technical_terms=technical_terms)
             _print_json({"job_id": args.job_id, "updated": True})
+            return 0
+
+        if args.command == "library-discover-speakers":
+            speakers = library_discover_speakers(args.job_id)
+            _print_json({"job_id": args.job_id, "speakers": speakers})
             return 0
 
         if args.command == "model-list":

@@ -361,6 +361,49 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         review_text = Path(review.artifact_path).read_text(encoding="utf-8")
         self.assertIn("## Corrections LLM appliquées", review_text)
 
+    def test_pipeline_exposes_final_segments_and_speakers(self):
+        """The runner needs the pipeline's final segment list +
+        speaker map to populate the library DB. Pin those exposed
+        attributes — without them the rename-speakers sheet shows
+        "Aucun interlocuteur détecté" on every run.
+        """
+        request = _make_request(self.workspace, self.source)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 3.0, "text": "Bonjour.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            pipeline.run(str(self.source))
+
+        # Whisper alone (no diarisation) means no speaker labels.
+        # The segments are still surfaced so the runner can persist
+        # them; the speaker map is empty, which the runner then
+        # leaves untouched.
+        self.assertEqual(len(pipeline.final_segments), 1)
+        self.assertEqual(pipeline.final_segments[0]["text"], "Bonjour.")
+        self.assertEqual(pipeline.final_speaker_map, {})
+
     def test_review_markdown_written_when_glossary_corrections_apply(self):
         request = _make_request(
             self.workspace, self.source, glossary_terms=["Mollie"]
