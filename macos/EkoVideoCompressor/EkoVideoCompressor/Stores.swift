@@ -55,6 +55,12 @@ final class SettingsStore: ObservableObject {
     @AppStorage("outputFormat") var outputFormat = "txt"
     @AppStorage("audioRecheckEnabled") var audioRecheckEnabled = false
     @AppStorage("diarizationEnabled") var diarizationEnabled = false
+    /// User-declared expected speaker count. 0 means "let pyannote
+    /// decide" (the legacy behaviour). When > 0 we forward the same
+    /// value as both min and max to pyannote — pinning the exact
+    /// count gives the cleanest diarisation we've measured on
+    /// 4-6 person meetings.
+    @AppStorage("expectedSpeakerCount") var expectedSpeakerCount = 0
     @AppStorage("deleteSourceAfterCopy") var deleteSourceAfterCopy = false
     /// Single user-facing quality knob. Replaces the previous handful
     /// of toggles (VAD / multipass / per-speaker / web). The engine

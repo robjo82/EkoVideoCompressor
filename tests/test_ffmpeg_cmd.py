@@ -263,10 +263,36 @@ class StructuredInitialPromptTest(unittest.TestCase):
         # decoder treats what follows as plausible French dialogue —
         # the LM bias is much stronger than with a bare term list.
         prompt = structured_initial_prompt("Ekonum, MAIA, RGPD")
-        self.assertTrue(prompt.startswith("Bonjour."))
+        # Default opening is the generic "Réunion professionnelle en
+        # français." that the prompt builder emits when no explicit
+        # ``meeting_context`` was passed.
+        self.assertTrue(
+            prompt.startswith("Réunion professionnelle en français"),
+            f"got: {prompt!r}",
+        )
         self.assertIn("Ekonum", prompt)
         self.assertIn("MAIA", prompt)
         self.assertIn("RGPD", prompt)
+
+    def test_inserts_expected_speaker_names_when_provided(self):
+        # When the caller declares known speakers up front (typically
+        # from ``JobRequest.speaker_overrides``), they appear in a
+        # "Participants : …" clause so Whisper sees the orthography it
+        # should reproduce every time the speaker introduces themselves.
+        prompt = structured_initial_prompt(
+            "Ekonum",
+            expected_speaker_names=["Robin", "David", "Ophélie"],
+        )
+        self.assertIn("Participants :", prompt)
+        self.assertIn("Robin", prompt)
+        self.assertIn("Ophélie", prompt)
+
+    def test_uses_custom_meeting_context_when_supplied(self):
+        prompt = structured_initial_prompt(
+            "Odoo",
+            meeting_context="Réunion sur la migration Visiotech",
+        )
+        self.assertTrue(prompt.startswith("Réunion sur la migration Visiotech"))
 
     def test_quotes_multi_word_terms_with_guillemets(self):
         # Multi-word terms must reach Whisper as a single phonetic
@@ -302,9 +328,27 @@ class DiarizationCommandTest(unittest.TestCase):
         cmd = build_diarization_cmd("/path/to/venv/bin/python", "/tmp/audio.wav")
         self.assertEqual(cmd[0], "/path/to/venv/bin/python")
         self.assertEqual(cmd[1], "-c")
-        self.assertEqual(cmd[-1], "/tmp/audio.wav")
+        # Audio path lands at index 3 (after the script body). The
+        # trailing two slots carry the min/max speaker hints — empty
+        # strings when no hint was supplied, which pyannote then
+        # interprets as "let the model decide".
+        self.assertEqual(cmd[3], "/tmp/audio.wav")
+        self.assertEqual(cmd[4], "")
+        self.assertEqual(cmd[5], "")
         # The inline script must reference the diarisation pipeline by ID.
         self.assertIn("speaker-diarization-3.1", cmd[2])
+
+    def test_build_diarization_cmd_passes_speaker_hints(self):
+        # When the caller knows the meeting size, pyannote should
+        # receive both bounds so its clustering stops under-segmenting.
+        cmd = build_diarization_cmd(
+            "/venv/bin/python",
+            "/tmp/audio.wav",
+            min_speakers=3,
+            max_speakers=5,
+        )
+        self.assertEqual(cmd[-2], "3")
+        self.assertEqual(cmd[-1], "5")
 
     def test_parse_diarization_output_handles_well_formed_json(self):
         payload = json.dumps({"turns": [

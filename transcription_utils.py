@@ -402,7 +402,12 @@ def build_audio_extract_cmd(
     return cmd
 
 
-def structured_initial_prompt(context: str) -> str:
+def structured_initial_prompt(
+    context: str,
+    *,
+    expected_speaker_names: list[str] | None = None,
+    meeting_context: str = "",
+) -> str:
     """
     Whisper interprets `--initial-prompt` as the imagined previous
     segment of the same audio. The decoder uses it to bias the
@@ -422,75 +427,110 @@ def structured_initial_prompt(context: str) -> str:
     spaces (multi-word entities like "CVR Contrôles") so Whisper
     treats them as cohesive units.
 
+    When ``expected_speaker_names`` is provided (typically the
+    values of ``JobRequest.speaker_overrides``), a "Participants : …"
+    clause is prepended so the decoder primes the same orthography
+    every time the speaker introduces themselves. This is what saves
+    "Adèle" from becoming "Adel" / "Adèle" / "Ali" across the meeting.
+
+    ``meeting_context`` is an optional short sentence the caller can
+    use to tell Whisper what the meeting is about ("Réunion sur Odoo
+    et la migration Visiotech"). Whisper uses it as semantic prior;
+    omit it if the glossary already conveys the topic.
+
     Length is still capped at INITIAL_PROMPT_MAX_CHARS so the prompt
     fits inside Whisper's ~224-token context window for the prompt.
     """
     raw = (context or "").strip()
-    if not raw:
-        return ""
 
     # Parse the glossary the same way the post-processor does, so
     # both passes see the same canonical term list.
-    try:
-        # Local import — `glossary_postprocess` is a sibling module
-        # but stays optional for callers that only use plain Whisper.
-        from glossary_postprocess import parse_glossary_terms
+    terms: list[str] = []
+    if raw:
+        try:
+            # Local import — `glossary_postprocess` is a sibling module
+            # but stays optional for callers that only use plain Whisper.
+            from glossary_postprocess import parse_glossary_terms
 
-        terms = parse_glossary_terms(raw)
-    except Exception:
-        terms = [t.strip() for t in re.split(r"[,\n;]+", raw) if t.strip()]
+            terms = parse_glossary_terms(raw)
+        except Exception:
+            terms = [t.strip() for t in re.split(r"[,\n;]+", raw) if t.strip()]
 
-    if not terms:
+    # De-dupe + filter the speaker names. We don't enforce any
+    # particular casing — the caller usually passes user-typed first
+    # names ("Robin", "David"), and Whisper benefits from seeing the
+    # exact orthography it should reproduce.
+    speakers: list[str] = []
+    seen_speakers: set[str] = set()
+    for name in expected_speaker_names or []:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen_speakers:
+            continue
+        seen_speakers.add(key)
+        speakers.append(cleaned)
+
+    if not raw and not speakers and not meeting_context.strip():
+        return ""
+
+    if not terms and not speakers and not meeting_context.strip():
         flat = " ".join(raw.split())
         return f"Réunion en français. Termes attendus : {flat}."
 
-    # Multi-word terms get guillemets so Whisper hears them as one
-    # phrase ("CVR Contrôles" not "CVR" then "Contrôles" guessed
-    # independently).
-    def _quote(term: str) -> str:
-        return f"« {term} »" if " " in term else term
-
-    quoted = [_quote(t) for t in terms]
-
-    # Distribute terms across a handful of natural-sounding clauses.
-    # Each clause names ~2-3 terms, prefixed with a verb that the
-    # decoder expects to precede a proper-noun cluster in French.
     chunks: list[str] = []
-    # Up to ~12 terms used in clauses; anything beyond goes into a
-    # trailing "et d'autres termes : …" so very long glossaries
-    # still leak the rare words into the prompt.
-    head, tail = quoted[:12], quoted[12:]
 
-    def _take(n: int) -> list[str]:
-        return [head.pop(0) for _ in range(min(n, len(head)))]
+    ctx_line = (meeting_context or "").strip()
+    if ctx_line:
+        # Add a trailing dot when the caller didn't bother — keeps
+        # the rendered prompt looking like real prose.
+        if not ctx_line.endswith((".", "!", "?")):
+            ctx_line = ctx_line + "."
+        chunks.append(ctx_line)
+    else:
+        chunks.append("Réunion professionnelle en français.")
 
-    if head:
+    if speakers:
         chunks.append(
-            "Bonjour. Aujourd'hui je vous présente "
-            + _join_fr(_take(3))
-            + "."
-        )
-    if head:
-        chunks.append(
-            "Nous travaillons régulièrement avec "
-            + _join_fr(_take(3))
-            + "."
-        )
-    if head:
-        chunks.append(
-            "Je vais aussi parler de "
-            + _join_fr(_take(3))
-            + "."
-        )
-    if head:
-        chunks.append(
-            "On évoquera également "
-            + _join_fr(_take(len(head)))
-            + "."
+            "Participants : " + _join_fr(speakers[:6]) + "."
         )
 
-    if tail:
-        chunks.append("D'autres noms à respecter : " + ", ".join(tail) + ".")
+    if terms:
+        # Multi-word terms get guillemets so Whisper hears them as one
+        # phrase ("CVR Contrôles" not "CVR" then "Contrôles" guessed
+        # independently).
+        def _quote(term: str) -> str:
+            return f"« {term} »" if " " in term else term
+
+        quoted = [_quote(t) for t in terms]
+        # Distribute terms across a handful of natural-sounding clauses.
+        # Each clause names ~2-3 terms, prefixed with a verb that the
+        # decoder expects to precede a proper-noun cluster in French.
+        head, tail = quoted[:12], quoted[12:]
+
+        def _take(n: int) -> list[str]:
+            return [head.pop(0) for _ in range(min(n, len(head)))]
+
+        if head:
+            chunks.append(
+                "Aujourd'hui je vous présente " + _join_fr(_take(3)) + "."
+            )
+        if head:
+            chunks.append(
+                "Nous travaillons régulièrement avec " + _join_fr(_take(3)) + "."
+            )
+        if head:
+            chunks.append(
+                "Je vais aussi parler de " + _join_fr(_take(3)) + "."
+            )
+        if head:
+            chunks.append(
+                "On évoquera également " + _join_fr(_take(len(head))) + "."
+            )
+
+        if tail:
+            chunks.append("D'autres noms à respecter : " + ", ".join(tail) + ".")
 
     out = " ".join(chunks).strip()
     if len(out) > INITIAL_PROMPT_MAX_CHARS:
@@ -1006,6 +1046,23 @@ import os
 import sys
 
 audio_path = sys.argv[1]
+# Optional speaker-count hints. "" means "let pyannote decide", which
+# matches the previous behaviour. Passing a tight (min, max) bracket
+# dramatically improves attribution on under-segmented recordings —
+# pyannote tends to merge speakers when left to estimate freely.
+min_speakers_arg = sys.argv[2] if len(sys.argv) > 2 else ""
+max_speakers_arg = sys.argv[3] if len(sys.argv) > 3 else ""
+
+def _parse_int(value):
+    try:
+        v = int(str(value).strip())
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+min_speakers = _parse_int(min_speakers_arg)
+max_speakers = _parse_int(max_speakers_arg)
+
 hf_token = os.environ.get("HF_TOKEN", "")
 if not hf_token:
     print(json.dumps({"error": "HF_TOKEN not set"}))
@@ -1056,7 +1113,21 @@ except Exception:
     pass
 
 try:
-    diar = pipeline(audio_path)
+    # Pyannote's clustering tends to over-merge similar voices when
+    # no count constraint is given. We pass the hints when available
+    # and fall back to a hint-less call when the underlying pipeline
+    # rejects the kwargs (older versions, or commercial SDK variants
+    # that don't forward them).
+    pipeline_kwargs = {}
+    if min_speakers is not None:
+        pipeline_kwargs["min_speakers"] = min_speakers
+    if max_speakers is not None:
+        pipeline_kwargs["max_speakers"] = max_speakers
+    try:
+        diar = pipeline(audio_path, **pipeline_kwargs) if pipeline_kwargs else pipeline(audio_path)
+    except TypeError:
+        # Hint kwargs not understood — replay without them.
+        diar = pipeline(audio_path)
 except Exception as exc:
     print(json.dumps({"error": f"diarization failed: {exc}"}))
     sys.exit(5)
@@ -1114,8 +1185,155 @@ print(json.dumps({"turns": turns}))
 '''
 
 
-def build_diarization_cmd(venv_python_path: str, wav_path: str) -> list[str]:
-    return [venv_python_path, "-c", _DIARIZATION_SCRIPT, wav_path]
+def build_diarization_cmd(
+    venv_python_path: str,
+    wav_path: str,
+    *,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> list[str]:
+    """Assemble the python command that runs pyannote inside the
+    managed venv.
+
+    ``min_speakers`` / ``max_speakers`` constrain pyannote's
+    clustering. They default to ``None`` (let the model decide). Pass
+    them whenever the caller knows the meeting size — pyannote tends
+    to under-segment when free to estimate alone, merging two real
+    voices into a single SPEAKER_NN cluster. Tight bounds turn the
+    sub-segmentation knob the other way.
+    """
+    return [
+        venv_python_path,
+        "-c",
+        _DIARIZATION_SCRIPT,
+        wav_path,
+        "" if min_speakers is None else str(int(min_speakers)),
+        "" if max_speakers is None else str(int(max_speakers)),
+    ]
+
+
+def fuse_micro_turns(
+    turns: list[dict],
+    *,
+    min_duration: float = 0.4,
+) -> list[dict]:
+    """Merge speaker turns shorter than ``min_duration`` into the
+    surrounding turn that's most likely the same speaker.
+
+    Pyannote happily emits 100-300 ms turns when one participant
+    nods in the middle of another's sentence. The downstream
+    ``assign_speakers_to_segments`` then attributes a chunk of
+    speech to that nodder, producing the classic
+    "[Robin] Bah ouais. [David] OK." mid-sentence cut.
+
+    Rules:
+      - A turn shorter than ``min_duration`` is merged into the
+        adjacent turn (before or after) belonging to the same
+        speaker, when one exists within 1 s.
+      - Otherwise it's absorbed by whichever neighbour is *closer*,
+        extending that neighbour's end (or start) to cover the gap.
+      - Turns are sorted by ``start`` before processing — pyannote
+        usually returns them in order but we don't rely on it.
+    """
+    if not turns:
+        return []
+    if min_duration <= 0:
+        return list(turns)
+
+    items = sorted(
+        (dict(t) for t in turns),
+        key=lambda t: (float(t.get("start") or 0), float(t.get("end") or 0)),
+    )
+
+    # Pass 1: merge a micro-turn with a same-speaker neighbour when
+    # one is nearby. Walk the list with explicit indices because we
+    # mutate during iteration.
+    i = 0
+    while i < len(items):
+        t = items[i]
+        start = float(t.get("start") or 0)
+        end = float(t.get("end") or 0)
+        if end - start >= min_duration:
+            i += 1
+            continue
+        speaker = t.get("speaker")
+        # Look ±1 turn for the same speaker within a 1 s gap.
+        prev_idx = i - 1 if i > 0 else None
+        next_idx = i + 1 if i + 1 < len(items) else None
+        merged_into: int | None = None
+        if prev_idx is not None:
+            p = items[prev_idx]
+            if p.get("speaker") == speaker and start - float(p.get("end") or 0) <= 1.0:
+                p["end"] = max(float(p.get("end") or 0), end)
+                merged_into = prev_idx
+        if merged_into is None and next_idx is not None:
+            n = items[next_idx]
+            if n.get("speaker") == speaker and float(n.get("start") or 0) - end <= 1.0:
+                n["start"] = min(float(n.get("start") or 0), start)
+                merged_into = next_idx
+        if merged_into is not None:
+            items.pop(i)
+            # Don't advance i — the next item is now at our index.
+            continue
+        i += 1
+
+    # Pass 2: absorb remaining micro-turns into the closer neighbour
+    # so the time-axis stays gap-free.
+    i = 0
+    while i < len(items):
+        t = items[i]
+        start = float(t.get("start") or 0)
+        end = float(t.get("end") or 0)
+        if end - start >= min_duration:
+            i += 1
+            continue
+        prev_idx = i - 1 if i > 0 else None
+        next_idx = i + 1 if i + 1 < len(items) else None
+        if prev_idx is None and next_idx is None:
+            # Single tiny turn in the recording — keep it; better
+            # than dropping the only label we have.
+            i += 1
+            continue
+        prev_gap = (
+            start - float(items[prev_idx].get("end") or 0)
+            if prev_idx is not None
+            else float("inf")
+        )
+        next_gap = (
+            float(items[next_idx].get("start") or 0) - end
+            if next_idx is not None
+            else float("inf")
+        )
+        if prev_gap <= next_gap and prev_idx is not None:
+            items[prev_idx]["end"] = max(
+                float(items[prev_idx].get("end") or 0), end
+            )
+        elif next_idx is not None:
+            items[next_idx]["start"] = min(
+                float(items[next_idx].get("start") or 0), start
+            )
+        items.pop(i)
+        # Same as pass 1: stay on this index.
+
+    # Pass 3: collapse adjacent same-speaker turns. Pyannote
+    # occasionally splits a continuous monologue into 3-5 turns when
+    # the speaker pauses to breathe. Rendering all of them produces
+    # ``[Robin] foo. [Robin] bar. [Robin] baz.`` instead of one
+    # paragraph. We merge any pair separated by a gap of ≤ 1 s.
+    j = 1
+    while j < len(items):
+        prev = items[j - 1]
+        cur = items[j]
+        prev_end = float(prev.get("end") or 0)
+        cur_start = float(cur.get("start") or 0)
+        same_speaker = prev.get("speaker") == cur.get("speaker")
+        if same_speaker and cur_start - prev_end <= 1.0:
+            prev["end"] = max(prev_end, float(cur.get("end") or 0))
+            items.pop(j)
+            continue
+        j += 1
+
+    return items
 
 
 def parse_diarization_output(stdout: str) -> list[dict]:

@@ -17,6 +17,12 @@ from glossary_postprocess import (
     apply_glossary_to_segments,
     parse_glossary_terms,
 )
+from llm_chunking import chunk_transcript_for_llm, dedupe_corrections
+from llm_corrections import (
+    AppliedCorrection,
+    RejectedCorrection,
+    apply_llm_corrections_to_text,
+)
 from multipass import (
     group_into_clip_ranges,
     identify_weak_segments,
@@ -30,6 +36,7 @@ from transcription_utils import (
     build_llm_title_cmd,
     build_mlx_whisper_cmd,
     default_transcript_path,
+    fuse_micro_turns,
     parse_diarization_output,
     parse_llm_corrections_markdown,
     parse_llm_title_speakers,
@@ -236,6 +243,11 @@ class TranscriptionPipeline:
         self._repass_replaced: int = 0
         self._vad_manifest: list[dict] = []
         self._llm_payload: dict[str, Any] = {}
+        # LLM corrections actually applied vs rejected, captured so
+        # the review report can show "12 corrections appliquées, 3
+        # refusées (raison: not_found / too_distant / low_confidence)".
+        self._llm_corrections_applied: list[AppliedCorrection] = []
+        self._llm_corrections_rejected: list[RejectedCorrection] = []
 
     def _resolve_managed_python(self) -> None:
         settings = self.request.transcription_settings
@@ -252,6 +264,34 @@ class TranscriptionPipeline:
 
     def _subprocess_env(self) -> dict[str, str]:
         return subprocess_env_for_request(self.request)
+
+    def _expected_speaker_names(self) -> list[str]:
+        """Names the caller declared up front (in ``speaker_overrides``).
+
+        Whisper benefits from seeing them in the ``initial-prompt`` so
+        the decoder produces a consistent orthography every time the
+        speaker introduces themselves.
+
+        ``speaker_overrides`` maps SPEAKER_NN → real name, so we want
+        the values. Empty/blank entries are filtered out — they mean
+        "the user hasn't decided yet", not "force an empty name".
+        """
+        overrides = self.request.speaker_overrides or {}
+        return [name for name in overrides.values() if (name or "").strip()]
+
+    def _meeting_context(self) -> str:
+        """Short topic line surfaced to Whisper as semantic prior.
+
+        We currently derive it from ``JobRequest.profile`` ("Réunion
+        équilibrée", etc.). Empty / generic profiles fall through to
+        the default "Réunion professionnelle en français." that the
+        prompt builder emits when nothing was provided.
+        """
+        profile = (self.request.profile or "").strip()
+        generic = {"", "default", "reunion equilibree", "Reunion equilibree"}
+        if profile in generic or profile.lower() in {p.lower() for p in generic}:
+            return ""
+        return profile
 
     # ------------------------------------------------------------------
     # Public orchestrator
@@ -488,7 +528,11 @@ class TranscriptionPipeline:
             model=settings.model,
             language=settings.language,
             output_format="json",
-            initial_prompt=structured_initial_prompt(glossary),
+            initial_prompt=structured_initial_prompt(
+                glossary,
+                expected_speaker_names=self._expected_speaker_names(),
+                meeting_context=self._meeting_context(),
+            ),
             condition_on_previous_text=False,
         )
         self.sink(ProgressEvent("whisper", 0, f"Running Whisper ({settings.model})"))
@@ -591,7 +635,11 @@ class TranscriptionPipeline:
                 model=repass_model,
                 language=settings.language,
                 output_format="json",
-                initial_prompt=structured_initial_prompt(glossary),
+                initial_prompt=structured_initial_prompt(
+                    glossary,
+                    expected_speaker_names=self._expected_speaker_names(),
+                    meeting_context=self._meeting_context(),
+                ),
                 condition_on_previous_text=False,
                 clip_timestamps=f"{cs:.2f},{ce:.2f}",
             )
@@ -683,7 +731,20 @@ class TranscriptionPipeline:
     def _run_diarisation(self, wav_path: Path) -> tuple[StepResult | None, list[dict]]:
         ts = time.monotonic()
         settings = self.request.transcription_settings
-        cmd = build_diarization_cmd(settings.venv_python_path, str(wav_path))
+        cmd = build_diarization_cmd(
+            settings.venv_python_path,
+            str(wav_path),
+            min_speakers=(
+                settings.expected_min_speakers
+                if settings.expected_min_speakers > 0
+                else None
+            ),
+            max_speakers=(
+                settings.expected_max_speakers
+                if settings.expected_max_speakers > 0
+                else None
+            ),
+        )
         # Build on top of the bundle's PATH so pyannote / torchaudio
         # can shell out to ffmpeg without finding nothing on $PATH.
         env = self._subprocess_env()
@@ -721,6 +782,16 @@ class TranscriptionPipeline:
                 ),
                 [],
             )
+        # Pyannote emits sub-second turns on back-channels ("hm",
+        # "ouais") that otherwise produce nonsensical speaker
+        # switches mid-sentence. Fuse them into the surrounding turn
+        # before propagating downstream.
+        raw_turn_count = len(turns)
+        turns = fuse_micro_turns(
+            turns,
+            min_duration=settings.min_speaker_turn_seconds,
+        )
+        fused_dropped = raw_turn_count - len(turns)
         speakers_seen = sorted({turn["speaker"] for turn in turns})
         self.sink(
             ProgressEvent(
@@ -734,7 +805,11 @@ class TranscriptionPipeline:
                 "diarisation",
                 True,
                 duration_seconds=duration,
-                metrics={"speakers": len(speakers_seen), "turns": len(turns)},
+                metrics={
+                    "speakers": len(speakers_seen),
+                    "turns": len(turns),
+                    "micro_turns_fused": fused_dropped,
+                },
             ),
             turns,
         )
@@ -795,31 +870,67 @@ class TranscriptionPipeline:
             )
 
         # ---- corrections + doubts (markdown) -------------------------
-        corr_cmd = build_llm_corrections_cmd(
-            venv_python, settings.text_llm_model, str(analysis_path), glossary_text
-        )
-        self.sink(ProgressEvent("llm_corrections", 50, "LLM: corrections + doubts"))
-        corr_proc = subprocess.run(
-            corr_cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            env=self._subprocess_env(),
-        )
-        if corr_proc.returncode == 0:
-            try:
-                corr_payload = parse_llm_corrections_markdown(corr_proc.stdout)
-                payload["corrections"] = corr_payload.get("corrections") or []
-                payload["uncertain_passages"] = (
-                    corr_payload.get("uncertain_passages") or []
+        # The embedded LLM script truncates its input at 30 000 chars,
+        # which silently drops the second half of any meeting beyond
+        # ~30 minutes. We chunk the rendered transcript ourselves with
+        # an overlap so every minute of the meeting gets a correction
+        # pass, and we dedup across overlapping chunks so the user
+        # never sees the same fix twice.
+        chunks = chunk_transcript_for_llm(analysis_text)
+        all_corrections: list[dict] = []
+        all_uncertain: list[dict] = []
+        for chunk in chunks:
+            chunk_path = (
+                analysis_path
+                if chunk.total == 1
+                else analysis_path.with_name(
+                    f"{analysis_path.stem}.chunk{chunk.index + 1:02d}.txt"
                 )
-            except Exception as exc:
-                append_app_log(f"engine_llm_corrections_parse_failed error={exc!r}")
-        else:
-            append_app_log(
-                f"engine_llm_corrections_failed rc={corr_proc.returncode} "
-                f"stderr={tail_text(corr_proc.stderr)!r}"
             )
+            if chunk.total > 1:
+                chunk_path.write_text(chunk.text, encoding="utf-8")
+            corr_cmd = build_llm_corrections_cmd(
+                venv_python,
+                settings.text_llm_model,
+                str(chunk_path),
+                glossary_text,
+            )
+            # Linear progress across the chunks so the SwiftUI bar
+            # moves on long meetings instead of sitting at 50 %.
+            pct = 50 + int(50 * chunk.index / max(chunk.total, 1))
+            self.sink(
+                ProgressEvent(
+                    "llm_corrections",
+                    pct,
+                    f"LLM: corrections + doubts ({chunk.index + 1}/{chunk.total})",
+                )
+            )
+            corr_proc = subprocess.run(
+                corr_cmd,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=self._subprocess_env(),
+            )
+            if corr_proc.returncode == 0:
+                try:
+                    corr_payload = parse_llm_corrections_markdown(corr_proc.stdout)
+                    all_corrections.extend(corr_payload.get("corrections") or [])
+                    all_uncertain.extend(corr_payload.get("uncertain_passages") or [])
+                except Exception as exc:
+                    append_app_log(
+                        f"engine_llm_corrections_parse_failed chunk={chunk.index} "
+                        f"error={exc!r}"
+                    )
+            else:
+                append_app_log(
+                    f"engine_llm_corrections_failed chunk={chunk.index} "
+                    f"rc={corr_proc.returncode} "
+                    f"stderr={tail_text(corr_proc.stderr)!r}"
+                )
+
+        payload["corrections"] = dedupe_corrections(all_corrections)
+        payload["uncertain_passages"] = dedupe_corrections(all_uncertain)
 
         self.sink(ProgressEvent("llm_corrections", 100, "LLM enhancement done"))
         self._llm_payload = payload
@@ -904,6 +1015,18 @@ class TranscriptionPipeline:
     def _write_enhanced_transcript(
         self, transcript_path: Path, segments: list[dict]
     ) -> Path | None:
+        """Render an ``- améliorée`` file that actually carries the
+        LLM corrections.
+
+        Before this change, ``améliorée.txt`` was byte-identical to
+        the base transcript: the review report listed corrections,
+        but no file ever applied them, forcing the user to copy/paste
+        edits manually. The substitutions are now applied here through
+        the safe ``apply_llm_corrections_to_text`` (confidence +
+        Levenshtein + literal-presence guardrails). The base file
+        stays untouched so the user can always diff the two and audit
+        what the LLM changed.
+        """
         if not self._has_quality_output():
             return None
         settings = self.request.transcription_settings
@@ -915,6 +1038,18 @@ class TranscriptionPipeline:
             rendered = render_segments_with_speakers(segments, settings.output_format)
         else:
             rendered = render_segments_plain(segments, settings.output_format)
+
+        # Apply the LLM corrections to the rendered text. We skip the
+        # heavier substitution path when there's nothing to do — the
+        # function would short-circuit anyway, but bailing here keeps
+        # the audit list clean ("no corrections were even attempted").
+        corrections = self._llm_payload.get("corrections") or []
+        if corrections:
+            outcome = apply_llm_corrections_to_text(rendered, corrections)
+            rendered = outcome.text
+            self._llm_corrections_applied = outcome.applied
+            self._llm_corrections_rejected = outcome.rejected
+
         enhanced_path.write_text(rendered, encoding="utf-8")
         self.sink(
             ArtifactEvent(
@@ -1004,17 +1139,56 @@ class TranscriptionPipeline:
                 )
             lines.append("")
 
-        corrections = self._llm_payload.get("corrections") or []
-        if corrections:
-            lines += ["## Corrections proposées par le LLM", ""]
-            for c in corrections[:25]:
+        # Report applied corrections vs rejected ones in two sections
+        # so the user can see (a) what landed in ``améliorée``, and
+        # (b) what we deliberately refused, with the reason. Falling
+        # back to the raw ``corrections`` list keeps backwards
+        # compatibility for older runs that pre-date the apply path.
+        applied = self._llm_corrections_applied
+        rejected = self._llm_corrections_rejected
+        if applied:
+            lines += ["## Corrections LLM appliquées", ""]
+            for c in applied[:40]:
+                occ = f" ×{c.occurrences}" if c.occurrences > 1 else ""
+                reason = f" — {c.reason}" if c.reason else ""
                 lines.append(
-                    f"- `{c.get('timestamp', '—')}` `{c.get('original')}` → "
-                    f"`{c.get('replacement')}` "
-                    f"(confiance {float(c.get('confidence', 0)):.2f}) — "
-                    f"{c.get('reason', 'contexte')}"
+                    f"- `{c.timestamp or '—'}` `{c.original}` → "
+                    f"`{c.replacement}`{occ}{reason}"
                 )
             lines.append("")
+        if rejected:
+            lines += [
+                "## Corrections LLM refusées",
+                "",
+                "Refusées par garde-fou pour ne pas dénaturer le texte ou "
+                "rejouer un quote inexistant.",
+                "",
+            ]
+            reason_label = {
+                "not_found": "quote absente du texte",
+                "too_distant": "écart trop large (réécriture)",
+                "low_confidence": "confiance trop basse",
+                "empty": "champ vide",
+            }
+            for r in rejected[:40]:
+                label = reason_label.get(r.reason, r.reason)
+                lines.append(
+                    f"- `{r.timestamp or '—'}` `{r.original}` → "
+                    f"`{r.replacement}` ({label})"
+                )
+            lines.append("")
+        if not applied and not rejected:
+            raw_corrections = self._llm_payload.get("corrections") or []
+            if raw_corrections:
+                lines += ["## Corrections proposées par le LLM", ""]
+                for c in raw_corrections[:25]:
+                    lines.append(
+                        f"- `{c.get('timestamp', '—')}` `{c.get('original')}` → "
+                        f"`{c.get('replacement')}` "
+                        f"(confiance {float(c.get('confidence', 0)):.2f}) — "
+                        f"{c.get('reason', 'contexte')}"
+                    )
+                lines.append("")
 
         doubts = self._llm_payload.get("uncertain_passages") or []
         if doubts:

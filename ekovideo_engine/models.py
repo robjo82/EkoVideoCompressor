@@ -65,6 +65,18 @@ class TranscriptionSettings:
     # flags keep their semantics. The SwiftUI app explicitly sends
     # "balanced" / "fast" / "max" to opt into the preset mapping.
     quality_preset: QualityPreset = "custom"
+    # Speaker-count hints forwarded to pyannote. Left at 0 they fall
+    # back to "let the model decide" — which under-segments most of
+    # the time. The SwiftUI app surfaces these as an optional input
+    # under the diarisation toggle ("nombre d'intervenants attendu").
+    expected_min_speakers: int = 0
+    expected_max_speakers: int = 0
+    # Pyannote happily emits 100-300 ms turns when one participant
+    # back-channels ("hm", "ouais") in the middle of another's
+    # sentence. Anything shorter than this gets folded into the
+    # surrounding turn so the transcript stops jumping speaker every
+    # other word.
+    min_speaker_turn_seconds: float = 0.4
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":

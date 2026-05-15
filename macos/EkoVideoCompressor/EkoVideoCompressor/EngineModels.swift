@@ -248,4 +248,11 @@ struct TranscriptionSettings: Codable {
     /// matches the engine default (``custom``) so existing app
     /// versions keep their hand-tuned toggles working.
     var quality_preset: String = TranscriptionQualityPreset.balanced.rawValue
+    /// Speaker-count hints forwarded to pyannote. 0 means "let the
+    /// model decide" — but in practice that under-segments most
+    /// meetings, merging two real voices into a single SPEAKER_NN
+    /// cluster. When the user knows the meeting size, passing both
+    /// bounds gives the cleanest diarisation we've measured.
+    var expected_min_speakers: Int = 0
+    var expected_max_speakers: Int = 0
 }
