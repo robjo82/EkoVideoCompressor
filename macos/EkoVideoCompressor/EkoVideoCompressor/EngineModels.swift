@@ -156,6 +156,26 @@ struct SpeakerSample: Codable, Identifiable, Equatable {
     var id: String { speaker }
 }
 
+/// Disk-usage preview shown in the deletion sheet so the user can
+/// see exactly which files (and how many bytes) they're about to
+/// free before confirming a "supprimer + dossier de travail".
+struct WorkspaceUsage: Codable, Equatable {
+    var workspace_dir: String
+    var files: [WorkspaceFile]
+    var total_bytes: Int64
+}
+
+struct WorkspaceFile: Codable, Identifiable, Equatable {
+    var path: String
+    var name: String
+    var size: Int64
+    var label: String
+
+    /// SwiftUI ``Identifiable`` conformance. The absolute path is
+    /// unique within a workspace so it doubles as the row key.
+    var id: String { path }
+}
+
 private func decodeJSONObject(_ raw: String?) -> [String: String] {
     guard let raw, let data = raw.data(using: .utf8),
           let value = try? JSONDecoder().decode([String: String].self, from: data) else {

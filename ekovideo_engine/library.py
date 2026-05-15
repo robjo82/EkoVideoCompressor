@@ -23,8 +23,204 @@ def library_list(limit: int = 1000, status: str | None = None) -> list[dict[str,
     return database().list_jobs(limit=limit, status=status)
 
 
-def library_delete(job_id: int) -> None:
-    database().delete_job(job_id)
+def library_delete(job_id: int, *, remove_files: bool = False) -> dict[str, Any]:
+    """Remove a job from the library DB and optionally wipe its
+    on-disk workspace.
+
+    ``remove_files=False`` (the default, and the legacy behaviour)
+    only drops the row — every artefact stays on disk, which is what
+    the user wants when they're cleaning up the library view but
+    still need the transcripts.
+
+    ``remove_files=True`` additionally deletes the workspace
+    directory recursively, freeing the disk space the job
+    consumed. We refuse to delete anything that isn't a child of the
+    workspace path (so a malformed DB row can't trick us into
+    rm -rf'ing the home folder).
+
+    Returns a small audit dict describing what happened: the
+    ``workspace_dir`` that was removed (or considered), the number
+    of files dropped, and the cumulative byte count. The SwiftUI
+    layer surfaces this so the user sees "Économie : 1,2 Go" after
+    confirming.
+    """
+    db = database()
+    summary: dict[str, Any] = {
+        "job_id": job_id,
+        "workspace_dir": "",
+        "files_removed": 0,
+        "bytes_removed": 0,
+        "workspace_removed": False,
+    }
+    if remove_files:
+        job = db.get_job(job_id)
+        workspace = (job or {}).get("workspace_dir") or ""
+        if workspace:
+            summary["workspace_dir"] = workspace
+            removed_files, removed_bytes = _safely_remove_workspace(workspace)
+            summary["files_removed"] = removed_files
+            summary["bytes_removed"] = removed_bytes
+            summary["workspace_removed"] = removed_files > 0
+    db.delete_job(job_id)
+    return summary
+
+
+def _safely_remove_workspace(workspace_dir: str) -> tuple[int, int]:
+    """Delete ``workspace_dir`` recursively and return (file_count,
+    bytes_freed).
+
+    The workspace lives under the user-chosen output directory (the
+    SwiftUI "Dossier" setting), not under our managed library data
+    dir, so we can't enforce a strict ancestor check. Instead we
+    apply three permissive but defensive rules:
+
+    1. The path must exist and be a directory.
+    2. It must sit at least 3 levels deep (so we never rm a root
+       like ``/`` or ``/Users``).
+    3. It must contain at least one engine-produced marker — ``audio.wav``,
+       ``whisper.json``, a ``- à vérifier.md`` file, or a ``- améliorée``
+       transcript. This protects against a malformed DB row pointing
+       at, say, ``~/Documents``: the dir exists, sits deep enough,
+       but doesn't look like an Eko workspace, so we refuse to touch
+       it.
+
+    Any failure returns (0, 0) and leaves disk alone.
+    """
+    path = Path(workspace_dir).expanduser()
+    if not path.exists() or not path.is_dir():
+        return (0, 0)
+    if len(path.resolve().parts) < 4:
+        return (0, 0)
+    if not _looks_like_engine_workspace(path):
+        return (0, 0)
+
+    file_count = 0
+    bytes_freed = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file() or child.is_symlink():
+                file_count += 1
+                try:
+                    bytes_freed += child.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            continue
+    shutil.rmtree(path, ignore_errors=True)
+    return (file_count, bytes_freed)
+
+
+def _looks_like_engine_workspace(path: Path) -> bool:
+    """Heuristic: refuse to ``rmtree`` something that doesn't carry
+    the fingerprints of an engine run.
+
+    The engine writes ``audio.wav`` first thing on every transcription
+    job, ``whisper.json`` once Whisper finishes, and a ``- à vérifier.md``
+    review file whenever the quality stack ran. Any of those proves
+    we're looking at our own folder. ``speaker_samples/`` is another
+    Eko-only directory we emit. If none of them exist the folder is
+    almost certainly user content we'd rather leave alone.
+    """
+    if (path / "audio.wav").exists():
+        return True
+    if (path / "whisper.json").exists():
+        return True
+    if (path / "speaker_samples").is_dir():
+        return True
+    for child in path.iterdir():
+        name = child.name
+        if name.endswith(" - à vérifier.md"):
+            return True
+        if " améliorée" in name:
+            return True
+    return False
+
+
+# Friendly labels shown alongside each file in the deletion sheet. The
+# mapping is deliberately small and conservative — anything we don't
+# recognise gets surfaced as "Autre" so the user still sees it and
+# decides whether the size is worth keeping.
+_WORKSPACE_FILE_LABELS: tuple[tuple[str, str], ...] = (
+    ("audio.vad.wav", "Audio filtré (VAD)"),
+    ("audio.wav", "Audio extrait"),
+    ("whisper.json", "Sortie Whisper (JSON)"),
+    ("transcript_for_local_analysis.txt", "Transcription pour le LLM"),
+    ("speaker_samples", "Extraits audio par locuteur"),
+)
+
+
+def _label_for_workspace_path(path: Path, workspace: Path) -> str:
+    name = path.name
+    suffix = path.suffix.lower()
+    for fragment, label in _WORKSPACE_FILE_LABELS:
+        if name == fragment or fragment in path.relative_to(workspace).parts:
+            return label
+    if suffix in {".txt", ".srt", ".vtt", ".tsv"}:
+        return "Transcription"
+    if suffix == ".md":
+        return "Rapport à vérifier"
+    if suffix in {".mov", ".mp4", ".m4v", ".mkv"}:
+        return "Vidéo compressée"
+    if suffix in {".wav", ".m4a", ".mp3"}:
+        return "Audio"
+    if suffix == ".json":
+        return "Données moteur (JSON)"
+    return "Autre"
+
+
+def library_workspace_usage(job_id: int) -> dict[str, Any]:
+    """Describe what would be freed if the workspace got deleted.
+
+    Returns:
+      ``workspace_dir`` — the resolved path (empty string when no
+      workspace is recorded or it doesn't exist).
+      ``files`` — list of {path, name, size, label} dicts, sorted
+      by descending size so the user immediately sees the heavy
+      hitters (typically ``audio.wav`` or the compressed video).
+      ``total_bytes`` — cumulative size of every file we'd remove.
+
+    The SwiftUI deletion sheet uses this to render the "Économie
+    réalisée" preview before the user confirms.
+    """
+    db = database()
+    job = db.get_job(job_id)
+    out: dict[str, Any] = {
+        "workspace_dir": "",
+        "files": [],
+        "total_bytes": 0,
+    }
+    if not job:
+        return out
+    workspace_str = (job.get("workspace_dir") or "").strip()
+    if not workspace_str:
+        return out
+    workspace = Path(workspace_str).expanduser()
+    if not workspace.exists() or not workspace.is_dir():
+        return out
+    out["workspace_dir"] = str(workspace)
+
+    entries: list[dict[str, Any]] = []
+    total = 0
+    for child in workspace.rglob("*"):
+        try:
+            if not (child.is_file() or child.is_symlink()):
+                continue
+            size = child.stat().st_size if child.is_file() else 0
+        except OSError:
+            continue
+        total += size
+        entries.append(
+            {
+                "path": str(child),
+                "name": child.name,
+                "size": size,
+                "label": _label_for_workspace_path(child, workspace),
+            }
+        )
+    entries.sort(key=lambda item: item["size"], reverse=True)
+    out["files"] = entries
+    out["total_bytes"] = total
+    return out
 
 
 def library_update_context(

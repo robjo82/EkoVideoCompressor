@@ -655,26 +655,9 @@ struct LibraryView: View {
             LibraryContextEditor(row: row)
                 .environmentObject(library)
         }
-        .confirmationDialog(
-            "Supprimer ce traitement de la bibliothèque ?",
-            isPresented: Binding(
-                get: { rowToDelete != nil },
-                set: { if !$0 { rowToDelete = nil } }
-            )
-        ) {
-            Button("Supprimer", role: .destructive) {
-                if let row = rowToDelete {
-                    Task {
-                        await library.delete(row)
-                        rowToDelete = nil
-                    }
-                }
-            }
-            Button("Annuler", role: .cancel) {
-                rowToDelete = nil
-            }
-        } message: {
-            Text("Les fichiers déjà générés restent dans le dossier de travail ; seule l'entrée de bibliothèque est retirée.")
+        .sheet(item: $rowToDelete) { row in
+            LibraryDeletionSheet(row: row)
+                .environmentObject(library)
         }
         .task {
             if library.rows.isEmpty {
@@ -1472,6 +1455,200 @@ struct LibraryContextEditor: View {
 struct SpeakerEditRow: Identifiable, Equatable {
     var id: String
     var name: String
+}
+
+/// Sheet shown when the user clicks "Supprimer" on a library row.
+///
+/// Two outcomes:
+/// - Drop the library row only (legacy default): every artefact
+///   stays where it is on disk.
+/// - Also wipe the workspace directory: the sheet lists every file
+///   we're about to delete + their cumulative size so the user sees
+///   exactly the disk economy they're realising. Files are sorted
+///   biggest first so the noisy parts (``audio.wav``, the compressed
+///   video) jump out immediately.
+struct LibraryDeletionSheet: View {
+    @EnvironmentObject private var library: LibraryStore
+    @Environment(\.dismiss) private var dismiss
+    let row: LibraryRow
+
+    @State private var usage: WorkspaceUsage?
+    @State private var loading = true
+    @State private var removeFiles = false
+    @State private var working = false
+
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        f.includesUnit = true
+        return f
+    }()
+
+    private var fileCount: Int { usage?.files.count ?? 0 }
+    private var totalBytes: Int64 { usage?.total_bytes ?? 0 }
+    private var hasWorkspace: Bool {
+        guard let usage else { return false }
+        return !usage.workspace_dir.isEmpty && !usage.files.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Supprimer ce traitement")
+                        .font(.title.bold())
+                    Text(row.customTitleOrFilename)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+            }
+            .padding(22)
+            Divider()
+
+            Group {
+                if loading {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Inspection du dossier de travail…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    deletionBody
+                }
+            }
+            .padding(22)
+
+            Divider()
+            HStack {
+                Button("Annuler") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(role: .destructive) {
+                    confirm()
+                } label: {
+                    Text(primaryButtonLabel)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(working)
+            }
+            .padding(18)
+        }
+        .frame(minWidth: 560, idealWidth: 620, minHeight: 420)
+        .task {
+            usage = await library.workspaceUsage(row)
+            loading = false
+        }
+    }
+
+    private var primaryButtonLabel: String {
+        if removeFiles && hasWorkspace {
+            return "Supprimer + libérer \(formatted(totalBytes))"
+        }
+        return "Supprimer l'entrée"
+    }
+
+    @ViewBuilder
+    private var deletionBody: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(
+                "L'entrée disparaît de la bibliothèque dans tous les cas. Vous pouvez aussi "
+                + "libérer le dossier de travail si vous n'avez plus besoin des fichiers générés."
+            )
+            .foregroundStyle(.secondary)
+
+            if hasWorkspace {
+                Toggle(isOn: $removeFiles) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Supprimer aussi le dossier de travail")
+                            .fontWeight(.medium)
+                        Text("\(fileCount) fichier\(fileCount > 1 ? "s" : "") · \(formatted(totalBytes)) à libérer")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                if removeFiles {
+                    workspaceFileList
+                }
+            } else {
+                Text("Aucun fichier de travail détecté pour cette entrée (déjà nettoyé ou jamais produit).")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var workspaceFileList: some View {
+        let files = usage?.files ?? []
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Fichiers concernés")
+                    .font(.callout.weight(.medium))
+                Spacer()
+                if let path = usage?.workspace_dir, !path.isEmpty {
+                    Button("Afficher le dossier") {
+                        revealInFinder(path)
+                    }
+                    .controlSize(.small)
+                    .buttonStyle(.borderless)
+                }
+            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(files) { file in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(file.name)
+                                    .font(.callout)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(file.label)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(formatted(file.size))
+                                .font(.callout.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 3)
+                        Divider()
+                    }
+                }
+            }
+            .frame(minHeight: 140, maxHeight: 220)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.secondary.opacity(0.2))
+            }
+        }
+    }
+
+    private func confirm() {
+        working = true
+        let shouldRemoveFiles = removeFiles && hasWorkspace
+        Task {
+            await library.delete(row, removeFiles: shouldRemoveFiles)
+            await MainActor.run {
+                working = false
+                dismiss()
+            }
+        }
+    }
+
+    private func formatted(_ bytes: Int64) -> String {
+        Self.byteFormatter.string(fromByteCount: bytes)
+    }
 }
 
 struct ModelActionsView: View {
