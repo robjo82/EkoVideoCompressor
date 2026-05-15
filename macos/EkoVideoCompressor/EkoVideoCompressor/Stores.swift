@@ -425,6 +425,32 @@ final class LibraryStore: ObservableObject {
         }
     }
 
+    /// Backfill the speaker map for jobs that completed before the
+    /// pipeline started persisting it. The engine walks the artefact
+    /// files on disk, extracts every bracketed prefix
+    /// (``[SPEAKER_00]``, ``[Robin]``, etc.), and writes the merged
+    /// list to ``speaker_map_json``. Returns the resulting map
+    /// without touching ``rows`` — callers compose it with whatever
+    /// they already have.
+    func discoverSpeakers(_ row: LibraryRow) async -> [String: String] {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-discover-speakers",
+                "\(row.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return [:]
+        }
+        guard let data = result.rawOutput.data(using: .utf8) else { return [:] }
+        struct Payload: Decodable { var speakers: [String: String] }
+        if let payload = try? JSONDecoder().decode(Payload.self, from: data) {
+            return payload.speakers
+        }
+        return [:]
+    }
+
     private func jsonString<T: Encodable>(_ value: T) -> String? {
         guard let data = try? JSONEncoder().encode(value) else { return nil }
         return String(data: data, encoding: .utf8)

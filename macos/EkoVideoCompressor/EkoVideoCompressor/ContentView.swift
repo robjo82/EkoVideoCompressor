@@ -1422,6 +1422,25 @@ struct LibraryContextEditor: View {
 
     private func loadSamples() async {
         loadingSamples = true
+        // For jobs that ran on the new pipeline the speaker list
+        // came in via the LibraryRow's ``speakerMap``. For older
+        // jobs (or jobs that ran before the pipeline persistence
+        // fix) we ask the engine to backfill it by parsing the
+        // artefact files on disk — that way the sheet never shows
+        // "Aucun interlocuteur détecté" when the transcript clearly
+        // contains them.
+        var seededFromDiscovery = false
+        if speakers.isEmpty {
+            let discovered = await library.discoverSpeakers(row)
+            if !discovered.isEmpty {
+                await MainActor.run {
+                    speakers = discovered
+                        .sorted { $0.key < $1.key }
+                        .map { SpeakerEditRow(id: $0.key, name: $0.value) }
+                }
+                seededFromDiscovery = true
+            }
+        }
         let loaded = await library.speakerSamples(row)
         await MainActor.run {
             samples = loaded
@@ -1429,6 +1448,12 @@ struct LibraryContextEditor: View {
                 speakers.append(SpeakerEditRow(id: sample.speaker, name: row.speakerMap[sample.speaker] ?? ""))
             }
             loadingSamples = false
+            // No need to surface the discovery to the user — the
+            // sheet just shows speakers now. We keep
+            // ``seededFromDiscovery`` around for a possible future
+            // telemetry hook ("how often is the backfill needed?")
+            // without bloating the UX right now.
+            _ = seededFromDiscovery
         }
     }
 

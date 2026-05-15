@@ -248,6 +248,29 @@ class TranscriptionPipeline:
         # refusées (raison: not_found / too_distant / low_confidence)".
         self._llm_corrections_applied: list[AppliedCorrection] = []
         self._llm_corrections_rejected: list[RejectedCorrection] = []
+        # End-of-run artefacts the runner picks up to persist into
+        # the library DB. Exposed as attributes (not StepResult
+        # payloads) so we can carry richer data without bloating the
+        # public step contract:
+        #
+        # ``final_segments`` — the segment list as written to disk,
+        #   timestamped on the source timeline, with speaker labels
+        #   when diarisation ran. The runner inserts them into
+        #   ``transcription_segments`` so the rename-speakers sheet
+        #   can iterate over the speakers and cut audio samples.
+        #
+        # ``final_speaker_map`` — every speaker label discovered in
+        #   ``final_segments``, mapped to the friendly name when the
+        #   LLM identified one (otherwise an empty string). Persisted
+        #   to ``speaker_map_json``; the sheet renders one row per
+        #   key so the user can fill in the names manually even when
+        #   the LLM stayed silent.
+        #
+        # ``final_technical_terms`` — same idea, persisted to
+        #   ``technical_terms_json``.
+        self.final_segments: list[dict] = []
+        self.final_speaker_map: dict[str, str] = {}
+        self.final_technical_terms: list[str] = []
 
     def _resolve_managed_python(self) -> None:
         settings = self.request.transcription_settings
@@ -371,12 +394,6 @@ class TranscriptionPipeline:
             transcript_path = self._write_transcript(
                 segments, workspace, force_path=transcript_path
             )
-            self.sink(
-                ContextEvent(
-                    speakers=speakers,
-                    technical_terms=self._llm_payload.get("technical_terms") or [],
-                )
-            )
 
         enhanced_path = self._write_enhanced_transcript(transcript_path, segments)
         if enhanced_path is not None:
@@ -393,7 +410,73 @@ class TranscriptionPipeline:
         review_path = self._write_review_markdown(transcript_path, segments)
         if review_path is not None:
             results.append(StepResult("review", True, str(review_path)))
+
+        # --- step 7: expose end-of-run context to the runner ----------
+        # The runner persists these into the library DB so the
+        # SwiftUI rename-speakers sheet finds the speaker list even
+        # when the LLM didn't identify a single name. Building the
+        # map from the final segments instead of from the LLM payload
+        # guarantees the placeholders survive every code path: pure
+        # diarisation, LLM-renamed, LLM-skipped, LLM-failed.
+        self.final_segments = segments
+        self.final_speaker_map = self._build_speaker_map(
+            segments, llm_speakers=speakers
+        )
+        self.final_technical_terms = list(
+            self._llm_payload.get("technical_terms") or []
+        )
+        # Always emit a ContextEvent — the SwiftUI app uses it to
+        # surface live speaker hints in the queue view. Empty values
+        # are fine: the sheet renders one row per placeholder either
+        # way.
+        if self.final_speaker_map or self.final_technical_terms:
+            self.sink(
+                ContextEvent(
+                    speakers=self.final_speaker_map,
+                    technical_terms=self.final_technical_terms,
+                )
+            )
         return results
+
+    def _build_speaker_map(
+        self,
+        segments: list[dict],
+        *,
+        llm_speakers: dict[str, str],
+    ) -> dict[str, str]:
+        """Collect every speaker label appearing in ``segments`` and
+        pair it with the friendly name from ``llm_speakers`` when one
+        is available. Otherwise the value is "" — that's the signal
+        the SwiftUI sheet needs to render an editable row.
+
+        ``llm_speakers`` may also already have been *applied* to the
+        segments (the rename pass rewrites the ``speaker`` field in
+        place). In that case we map the friendly name to itself, so
+        the rename sheet still shows a row the user can tweak.
+        """
+        labels: list[str] = []
+        seen: set[str] = set()
+        for seg in segments:
+            label = str(seg.get("speaker") or "").strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
+        if not labels:
+            return {}
+        names: dict[str, str] = {}
+        for label in labels:
+            # Prefer the LLM mapping when available; fall back to the
+            # label itself if it's clearly a real name (no SPEAKER_NN
+            # prefix) so the sheet shows the friendly value pre-filled.
+            mapped = (llm_speakers.get(label) or "").strip()
+            if mapped:
+                names[label] = mapped
+            elif label.upper().startswith("SPEAKER_"):
+                names[label] = ""
+            else:
+                names[label] = label
+        return names
 
     # ------------------------------------------------------------------
     # Step 1 — audio extract
