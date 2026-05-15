@@ -9,10 +9,13 @@ from unittest.mock import patch
 
 from ekovideo_engine.library import (
     _discover_speakers_from_text,
+    _looks_like_engine_workspace,
     database,
+    library_delete,
     library_discover_speakers,
     library_rename_speakers,
     library_speaker_samples,
+    library_workspace_usage,
 )
 
 
@@ -185,6 +188,137 @@ class DiscoverSpeakersTest(unittest.TestCase):
             # The friendly name was visible in the transcript so it
             # also gets a row, mapped to itself.
             self.assertEqual(merged["Robin"], "Robin")
+
+
+class WorkspaceUsageTest(unittest.TestCase):
+    def test_lists_files_sorted_by_size_with_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "20260514 - Test"
+            workspace.mkdir(parents=True)
+            (workspace / "audio.wav").write_bytes(b"\x00" * 5000)
+            (workspace / "whisper.json").write_text("{}", encoding="utf-8")
+            (workspace / "Présentation.txt").write_text(
+                "[SPEAKER_00] Bonjour.\n", encoding="utf-8"
+            )
+
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                usage = library_workspace_usage(job_id)
+
+            self.assertEqual(usage["workspace_dir"], str(workspace))
+            # Biggest file first so the deletion sheet surfaces the
+            # heavy hitters at the top.
+            sizes = [item["size"] for item in usage["files"]]
+            self.assertEqual(sizes, sorted(sizes, reverse=True))
+            # Heuristic labels turn obscure filenames into something
+            # the user can recognise without opening Finder.
+            audio = next(item for item in usage["files"] if item["name"] == "audio.wav")
+            self.assertEqual(audio["label"], "Audio extrait")
+            text = next(item for item in usage["files"] if item["name"].endswith(".txt"))
+            self.assertEqual(text["label"], "Transcription")
+            # Total bytes matches the sum of every listed file.
+            self.assertEqual(usage["total_bytes"], sum(sizes))
+
+    def test_usage_returns_empty_when_workspace_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "never-created"
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(missing),
+                    settings={},
+                )
+                usage = library_workspace_usage(job_id)
+            self.assertEqual(usage["files"], [])
+            self.assertEqual(usage["total_bytes"], 0)
+
+
+class DeleteWithFilesTest(unittest.TestCase):
+    def _make_workspace(self, parent: Path) -> Path:
+        ws = parent / "20260514 - Test"
+        ws.mkdir(parents=True)
+        # Use real markers so ``_looks_like_engine_workspace`` says yes.
+        (ws / "audio.wav").write_bytes(b"\x00" * 200)
+        (ws / "whisper.json").write_text("{}", encoding="utf-8")
+        (ws / "Présentation.txt").write_text("hi", encoding="utf-8")
+        return ws
+
+    def test_remove_files_wipes_workspace_and_returns_byte_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = self._make_workspace(root)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                summary = library_delete(job_id, remove_files=True)
+
+            self.assertFalse(workspace.exists())
+            self.assertTrue(summary["workspace_removed"])
+            self.assertGreater(summary["files_removed"], 0)
+            self.assertGreater(summary["bytes_removed"], 0)
+
+    def test_default_delete_keeps_workspace_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = self._make_workspace(root)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                summary = library_delete(job_id)  # no remove_files
+
+            self.assertTrue(workspace.exists())
+            self.assertFalse(summary["workspace_removed"])
+
+    def test_refuses_to_remove_dir_that_does_not_look_like_workspace(self):
+        # Critical safety net: if the DB points at a folder full of
+        # the user's own content (no audio.wav, no whisper.json, etc.)
+        # we must refuse to nuke it even when ``remove_files=True``.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_folder = root / "Documents"
+            user_folder.mkdir()
+            (user_folder / "important.docx").write_bytes(b"x" * 500)
+
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(user_folder),
+                    settings={},
+                )
+                summary = library_delete(job_id, remove_files=True)
+
+            self.assertTrue(user_folder.exists())
+            self.assertTrue((user_folder / "important.docx").exists())
+            self.assertFalse(summary["workspace_removed"])
+
+    def test_workspace_heuristic_matches_review_or_enhanced_files(self):
+        # A workspace that only carries the review markdown (because
+        # the LLM didn't run successfully, but the review file did
+        # land) is still ours and should be removable.
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "20260514 - Test"
+            ws.mkdir()
+            (ws / "Présentation - à vérifier.md").write_text(
+                "report", encoding="utf-8"
+            )
+            self.assertTrue(_looks_like_engine_workspace(ws))
 
 
 if __name__ == "__main__":

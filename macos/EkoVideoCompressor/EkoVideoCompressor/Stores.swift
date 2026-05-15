@@ -342,13 +342,17 @@ final class LibraryStore: ObservableObject {
         isLoading = false
     }
 
-    func delete(_ row: LibraryRow) async {
+    func delete(_ row: LibraryRow, removeFiles: Bool = false) async {
         let previousRows = rows
         rows.removeAll { $0.id == row.id }
         isLoading = true
         errorMessage = nil
+        var args = ["library-delete", "\(row.id)"]
+        if removeFiles {
+            args.append("--remove-files")
+        }
         let result = await EngineProcess.runCommand(
-            arguments: EngineProcess.defaultPythonArguments(["library-delete", "\(row.id)"])
+            arguments: EngineProcess.defaultPythonArguments(args)
         )
         if result.status != 0 {
             errorMessage = result.events.last?.message ?? result.rawOutput
@@ -357,6 +361,26 @@ final class LibraryStore: ObservableObject {
             return
         }
         isLoading = false
+    }
+
+    /// Preview what would be freed if the workspace got deleted.
+    /// Used by the deletion sheet to show the file list + total size
+    /// before the user confirms. Returns ``nil`` on engine error so
+    /// the caller can fall back to a simpler "just drop the row"
+    /// dialog instead of blocking on a stale path.
+    func workspaceUsage(_ row: LibraryRow) async -> WorkspaceUsage? {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-workspace-usage",
+                "\(row.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return nil
+        }
+        guard let data = result.rawOutput.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(WorkspaceUsage.self, from: data)
     }
 
     func renameSpeakers(_ row: LibraryRow, mapping: [String: String]) async {

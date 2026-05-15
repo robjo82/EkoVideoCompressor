@@ -15,6 +15,7 @@ from .library import (
     library_rename_speakers,
     library_speaker_samples,
     library_update_context,
+    library_workspace_usage,
 )
 from .logging import export_logs_archive
 from .model_cache import delete_model, download_model, model_catalog
@@ -46,6 +47,20 @@ def build_parser() -> argparse.ArgumentParser:
     library_list_parser.add_argument("--jsonl", action="store_true")
     library_delete_parser = sub.add_parser("library-delete")
     library_delete_parser.add_argument("job_id", type=int)
+    # Opt-in flag: also wipe the workspace dir on disk. Without this
+    # we only drop the DB row (legacy behaviour). With it, the
+    # engine returns an audit summary listing files removed + bytes
+    # freed, which the SwiftUI sheet surfaces as "Économie : X Mo".
+    library_delete_parser.add_argument(
+        "--remove-files",
+        action="store_true",
+        help="Also delete the workspace directory on disk.",
+    )
+
+    # Quick disk-usage preview so the SwiftUI sheet can show "what
+    # will be freed" before the user clicks Supprimer.
+    usage = sub.add_parser("library-workspace-usage")
+    usage.add_argument("job_id", type=int)
 
     rename = sub.add_parser("library-rename-speakers")
     rename.add_argument("job_id", type=int)
@@ -113,8 +128,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "library-delete":
-            library_delete(args.job_id)
-            _print_json({"deleted": args.job_id})
+            summary = library_delete(args.job_id, remove_files=args.remove_files)
+            _print_json({"deleted": args.job_id, **summary})
+            return 0
+
+        if args.command == "library-workspace-usage":
+            _print_json(library_workspace_usage(args.job_id))
             return 0
 
         if args.command == "library-rename-speakers":
