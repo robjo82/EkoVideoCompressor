@@ -144,7 +144,13 @@ struct ContentView: View {
                 // "balanced" if the persisted value is somehow invalid.
                 quality_preset: TranscriptionQualityPreset(
                     rawValue: settings.qualityPreset
-                )?.rawValue ?? TranscriptionQualityPreset.balanced.rawValue
+                )?.rawValue ?? TranscriptionQualityPreset.balanced.rawValue,
+                // When the user has declared an expected speaker
+                // count, forward it as both bounds so pyannote pins
+                // the cluster count instead of guessing low. ``0``
+                // (the default) leaves pyannote on autopilot.
+                expected_min_speakers: settings.expectedSpeakerCount,
+                expected_max_speakers: settings.expectedSpeakerCount
             ),
             glossary_terms: settings.glossaryTerms,
             speaker_overrides: [:],
@@ -389,6 +395,26 @@ struct RunSettingsForm: View {
                         .foregroundStyle(.secondary)
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                if settings.diarizationEnabled {
+                    Stepper(
+                        value: $settings.expectedSpeakerCount,
+                        in: 0...12
+                    ) {
+                        HStack {
+                            Text("Nombre d'intervenants attendu")
+                            Spacer()
+                            Text(
+                                settings.expectedSpeakerCount == 0
+                                    ? "Auto"
+                                    : "\(settings.expectedSpeakerCount)"
+                            )
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("0 = laisse pyannote estimer. Renseigner cette valeur quand vous la connaissez réduit fortement les attributions erronées.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
             }
 
@@ -863,6 +889,23 @@ struct SettingsView: View {
                 }
                 Section("Avancé") {
                     Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                    if settings.diarizationEnabled {
+                        Stepper(
+                            value: $settings.expectedSpeakerCount,
+                            in: 0...12
+                        ) {
+                            HStack {
+                                Text("Nombre d'intervenants attendu")
+                                Spacer()
+                                Text(
+                                    settings.expectedSpeakerCount == 0
+                                        ? "Auto"
+                                        : "\(settings.expectedSpeakerCount)"
+                                )
+                                .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                     Toggle("Réécoute IA multimodale", isOn: $settings.audioRecheckEnabled)
                     Text(
                         "Ces bascules complètent le réglage Qualité. La détection des locuteurs nécessite un token Hugging Face ; la réécoute IA est expérimentale et coûteuse en temps."

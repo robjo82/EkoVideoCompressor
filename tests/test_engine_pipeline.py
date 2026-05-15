@@ -196,6 +196,171 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         enhanced = next(r for r in results if r.name == "enhanced_transcript")
         self.assertTrue(Path(enhanced.artifact_path).exists())
 
+    def test_pipeline_forwards_expected_speakers_to_pyannote(self):
+        """Pin that the SwiftUI ``expected_speaker_count`` field
+        actually reaches the diarisation subprocess. Pyannote
+        under-segments aggressively when left to estimate on its own,
+        so the user's hint must survive the JSON round-trip into the
+        pipeline command builder.
+        """
+        fake_python = tempfile.NamedTemporaryFile(
+            suffix="-fake-python", delete=False
+        )
+        fake_python.write(b"#!/bin/sh\nexit 0\n")
+        fake_python.close()
+        Path(fake_python.name).chmod(0o755)
+
+        request = _make_request(
+            self.workspace,
+            self.source,
+            transcription_settings={
+                "venv_python_path": fake_python.name,
+                "vad_enabled": False,
+                "multipass_enabled": False,
+                "diarization_enabled": True,
+                "hf_token": "fake-token",
+                "expected_min_speakers": 4,
+                "expected_max_speakers": 4,
+            },
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        diarisation_cmds: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 2.0, "text": "Bonjour.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            if cmd and cmd[0] == fake_python.name:
+                script = cmd[2] if len(cmd) > 2 else ""
+                if "speaker-diarization" in script:
+                    diarisation_cmds.append(list(cmd))
+                    # Return an empty-turn JSON so the downstream
+                    # speaker-assignment path is exercised without
+                    # producing noise.
+                    return _StubResult(
+                        returncode=0, stdout='{"turns": []}'
+                    )
+                # Title + corrections LLM calls — return empty.
+                if "title" in script.lower() or "speakers" in script.lower():
+                    return _StubResult(
+                        returncode=0,
+                        stdout='{"title":"","speakers":{},"technical_terms":[]}',
+                    )
+                return _StubResult(returncode=0, stdout="")
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            pipeline.run(str(self.source))
+
+        self.assertEqual(len(diarisation_cmds), 1)
+        cmd = diarisation_cmds[0]
+        # The last two args are the speaker hints we pinned.
+        self.assertEqual(cmd[-2], "4")
+        self.assertEqual(cmd[-1], "4")
+
+    def test_llm_corrections_actually_land_in_enhanced_file(self):
+        """The previous pipeline listed LLM corrections in the
+        review report but wrote the ``améliorée`` transcript byte-
+        identical to the raw one. Pin the new behaviour: the LLM
+        substitutions land in ``améliorée``, the base file stays
+        untouched (so the user can diff), and the review section
+        shifts from "proposées" to "appliquées".
+        """
+        fake_python = tempfile.NamedTemporaryFile(
+            suffix="-fake-python", delete=False
+        )
+        fake_python.write(b"#!/bin/sh\nexit 0\n")
+        fake_python.close()
+        Path(fake_python.name).chmod(0o755)
+
+        request = _make_request(
+            self.workspace,
+            self.source,
+            transcription_settings={
+                # LLM gate keys on venv_python_path existing.
+                "venv_python_path": fake_python.name,
+                "vad_enabled": False,
+                "multipass_enabled": False,
+            },
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0,
+                            "end": 3.0,
+                            "text": "Bonjour, ici Sudokiz.",
+                            "avg_logprob": -0.1,
+                            "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            # The LLM is called via the fake python interpreter; we
+            # branch on the script body to know which call this is.
+            if cmd and cmd[0] == fake_python.name:
+                script = cmd[2] if len(cmd) > 2 else ""
+                if "title" in script.lower() or "speakers" in script.lower():
+                    return _StubResult(
+                        returncode=0,
+                        stdout='{"title":"Test","speakers":{},"technical_terms":[]}',
+                    )
+                # Otherwise it's the corrections call.
+                stdout = (
+                    "# Corrections\n"
+                    '- [00:00:01] "Sudokiz" -> "Sudokies" (raison: glossaire)\n'
+                    "# Doutes\n"
+                )
+                return _StubResult(returncode=0, stdout=stdout)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+
+        base = next(r for r in results if r.name == "transcript")
+        enhanced = next(r for r in results if r.name == "enhanced_transcript")
+        base_text = Path(base.artifact_path).read_text(encoding="utf-8")
+        enhanced_text = Path(enhanced.artifact_path).read_text(encoding="utf-8")
+        # Base transcript stays as Whisper produced it.
+        self.assertIn("Sudokiz", base_text)
+        # Enhanced transcript carries the LLM substitution.
+        self.assertIn("Sudokies", enhanced_text)
+        self.assertNotIn("Sudokiz", enhanced_text)
+
+        review = next(r for r in results if r.name == "review")
+        review_text = Path(review.artifact_path).read_text(encoding="utf-8")
+        self.assertIn("## Corrections LLM appliquées", review_text)
+
     def test_review_markdown_written_when_glossary_corrections_apply(self):
         request = _make_request(
             self.workspace, self.source, glossary_terms=["Mollie"]
