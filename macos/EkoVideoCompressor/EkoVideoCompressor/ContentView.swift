@@ -889,26 +889,9 @@ struct SettingsView: View {
                 }
                 Section("Avancé") {
                     Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
-                    if settings.diarizationEnabled {
-                        Stepper(
-                            value: $settings.expectedSpeakerCount,
-                            in: 0...12
-                        ) {
-                            HStack {
-                                Text("Nombre d'intervenants attendu")
-                                Spacer()
-                                Text(
-                                    settings.expectedSpeakerCount == 0
-                                        ? "Auto"
-                                        : "\(settings.expectedSpeakerCount)"
-                                )
-                                .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
                     Toggle("Réécoute IA multimodale", isOn: $settings.audioRecheckEnabled)
                     Text(
-                        "Ces bascules complètent le réglage Qualité. La détection des locuteurs nécessite un token Hugging Face ; la réécoute IA est expérimentale et coûteuse en temps."
+                        "Ces bascules complètent le réglage Qualité. La détection des locuteurs nécessite un token Hugging Face ; la réécoute IA est expérimentale et coûteuse en temps. Le nombre d'intervenants attendu se règle au lancement de chaque traitement."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
