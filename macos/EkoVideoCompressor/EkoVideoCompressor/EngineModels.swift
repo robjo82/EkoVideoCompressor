@@ -120,6 +120,10 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     var current_step: String?
     var progress_pct: Double?
     var eta_seconds: Double?
+    /// Workspace size at completion. NULL on legacy rows that
+    /// finished before the column existed — the library renders "—"
+    /// for those instead of "0 octets".
+    var total_bytes: Int64?
 
     var filename: String {
         URL(fileURLWithPath: source_path ?? "").lastPathComponent

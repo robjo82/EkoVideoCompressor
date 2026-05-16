@@ -80,6 +80,11 @@ class DatabaseManager:
             "current_step": "TEXT",
             "progress_pct": "REAL",
             "eta_seconds": "REAL",
+            # Total bytes consumed by the workspace dir, snapshotted
+            # at job completion. NULL for legacy rows that finished
+            # before this column existed; the SwiftUI library shows
+            # "—" for those instead of "0".
+            "total_bytes": "INTEGER",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -113,6 +118,19 @@ class DatabaseManager:
             conn.execute(
                 "UPDATE jobs SET duration_ffmpeg = ?, duration_whisper = ?, duration_diarization = ?, duration_total = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (ffmpeg, whisper, diarization, total, job_id)
+            )
+
+    def update_job_total_bytes(self, job_id: int, total_bytes: int) -> None:
+        """Snapshot the workspace size at the end of a successful job.
+
+        The library's hidden "Poids" column reads from this. Rows
+        from before the column existed stay at NULL — we only
+        backfill on the next successful run for that job.
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET total_bytes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (int(total_bytes), job_id),
             )
 
     def update_job_title(self, job_id: int, title: str):
