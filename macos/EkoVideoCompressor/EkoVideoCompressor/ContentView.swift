@@ -1,5 +1,5 @@
 @preconcurrency import AVFoundation
-import Foundation
+@preconcurrency import Foundation
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -626,21 +626,33 @@ final class AudioPreviewPlayer: ObservableObject {
     private func installObserver() {
         guard let player else { return }
         let interval = CMTime(seconds: 0.25, preferredTimescale: 4)
+        // ``addPeriodicTimeObserver`` invokes its closure on the
+        // ``DispatchQueue`` we hand it, but Swift 6 strict
+        // concurrency can't infer that ``.main`` aligns with the
+        // ``@MainActor`` isolation of this store. Hopping through
+        // ``MainActor.assumeIsolated`` lets the mutations stay
+        // synchronous (no extra Task hop) while satisfying the
+        // checker — we already know we're on the main queue.
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: interval, queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            guard let current = self.currentSeconds,
-                  let total = self.totalSeconds, total > 0 else { return }
-            self.progress = min(max(current / total, 0), 1)
-            // Auto-reset when playback finished — keeps the UI
-            // honest about whether anything's currently playing.
-            if current >= total - 0.05 {
-                self.player?.seek(to: .zero)
-                self.player?.pause()
-                self.isPlaying = false
-                self.progress = 0
+            MainActor.assumeIsolated {
+                self?.tick()
             }
+        }
+    }
+
+    private func tick() {
+        guard let current = currentSeconds,
+              let total = totalSeconds, total > 0 else { return }
+        progress = min(max(current / total, 0), 1)
+        // Auto-reset when playback finished — keeps the UI
+        // honest about whether anything's currently playing.
+        if current >= total - 0.05 {
+            player?.seek(to: .zero)
+            player?.pause()
+            isPlaying = false
+            progress = 0
         }
     }
 }
