@@ -31,6 +31,7 @@ from odoo_client import (
     OdooConfig,
     OdooError,
     fetch_partner,
+    search_meeting_events,
     search_partners,
     test_connection as odoo_test_connection,
 )
@@ -135,6 +136,25 @@ def build_parser() -> argparse.ArgumentParser:
     odoo_search.add_argument("--query", required=True)
     odoo_search.add_argument("--limit", type=int, default=25)
     odoo_search.add_argument("--jsonl", action="store_true")
+
+    # Discovers calendar.event records around a given moment so the
+    # SwiftUI Run Setup can suggest "is this meeting one of those?"
+    # without forcing the user to type the title from scratch.
+    odoo_meetings = sub.add_parser("odoo-search-meetings")
+    _add_odoo_args(odoo_meetings)
+    odoo_meetings.add_argument(
+        "--near",
+        help="ISO 8601 datetime to bracket the search around. Defaults to now (UTC).",
+        default="",
+    )
+    odoo_meetings.add_argument(
+        "--window-hours",
+        type=float,
+        default=2.0,
+        help="Half-width of the search bracket (default 2 h).",
+    )
+    odoo_meetings.add_argument("--limit", type=int, default=10)
+    odoo_meetings.add_argument("--jsonl", action="store_true")
 
     link_profile = sub.add_parser("library-link-speaker-profile")
     link_profile.add_argument("profile_id", type=int)
@@ -274,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command in {
-            "odoo-test", "odoo-search-partners",
+            "odoo-test", "odoo-search-partners", "odoo-search-meetings",
         }:
             config = OdooConfig(
                 url=args.url,
@@ -286,6 +306,33 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "odoo-test":
                     payload = odoo_test_connection(config)
                     _print_json(payload)
+                    return 0
+                if args.command == "odoo-search-meetings":
+                    near = None
+                    raw_near = (args.near or "").strip()
+                    if raw_near:
+                        # Tolerate the trailing "Z" SwiftUI emits.
+                        try:
+                            near = datetime.fromisoformat(raw_near.replace("Z", "+00:00"))
+                        except ValueError as exc:
+                            _print_json(
+                                {
+                                    "ok": False,
+                                    "error": f"Date '--near' invalide : {exc}",
+                                }
+                            )
+                            return 1
+                    meetings = search_meeting_events(
+                        config,
+                        near=near,
+                        window_hours=args.window_hours,
+                        limit=args.limit,
+                    )
+                    if args.jsonl:
+                        for row in meetings:
+                            print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+                    else:
+                        _print_json(meetings)
                     return 0
                 # odoo-search-partners
                 rows = search_partners(config, args.query, limit=args.limit)

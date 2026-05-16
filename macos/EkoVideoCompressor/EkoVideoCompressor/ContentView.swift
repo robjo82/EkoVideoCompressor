@@ -35,6 +35,7 @@ struct ContentView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var models: ModelStore
+    @EnvironmentObject private var odoo: OdooStore
     @State private var selectedSection: AppSection = .queue
     @State private var showingSettings = false
     @State private var showingRunSetup = false
@@ -94,6 +95,7 @@ struct ContentView: View {
             .environmentObject(settings)
             .environmentObject(engine)
             .environmentObject(queue)
+            .environmentObject(odoo)
         }
         .task {
             guard !didPreloadSecondaryData else { return }
@@ -181,12 +183,29 @@ struct ContentView: View {
     }
 
     private func runJob(_ item: QueueItem) async -> Int32 {
+        // Names suggested by an Odoo calendar event (or typed by
+        // hand) ride in ``speaker_overrides`` keyed on themselves
+        // — the engine's initial-prompt builder pulls them as
+        // ``expected_speaker_names`` so Whisper biases toward those
+        // first names without forcing a SPEAKER_NN assignment.
+        var overrides: [String: String] = [:]
+        for name in item.expectedSpeakerNames {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                overrides[trimmed] = trimmed
+            }
+        }
+        // Per-file Odoo meeting title becomes the ``profile`` — the
+        // engine's ``_meeting_context`` helper reads that and
+        // injects it as a one-line "Réunion sur X" prefix into the
+        // Whisper initial prompt.
+        let profile = item.odooMeetingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = JobRequest(
             source_path: item.sourceURL.path,
             workspace_dir: "",
             output_dir: settings.outputDir,
             mode: settings.processingMode,
-            profile: "Réunion équilibrée",
+            profile: profile.isEmpty ? "Réunion équilibrée" : profile,
             compression_settings: CompressionSettings(),
             transcription_settings: TranscriptionSettings(
                 model: settings.whisperModel,
@@ -194,24 +213,14 @@ struct ContentView: View {
                 diarization_enabled: settings.diarizationEnabled,
                 hf_token: settings.hfToken,
                 audio_recheck_enabled: settings.audioRecheckEnabled,
-                // Single source of truth: the preset string tells the
-                // engine which quality phases to run. Falls back to
-                // "balanced" if the persisted value is somehow invalid.
                 quality_preset: TranscriptionQualityPreset(
                     rawValue: settings.qualityPreset
                 )?.rawValue ?? TranscriptionQualityPreset.balanced.rawValue,
-                // When the user has declared an expected speaker
-                // count, forward it as both bounds so pyannote pins
-                // the cluster count instead of guessing low. ``0``
-                // (the default) leaves pyannote on autopilot.
-                // Per-file knob now lives on the QueueItem; the
-                // SettingsStore equivalent is gone. 0 still means
-                // "let pyannote estimate".
                 expected_min_speakers: item.expectedSpeakerCount,
                 expected_max_speakers: item.expectedSpeakerCount
             ),
             glossary_terms: settings.glossaryTerms,
-            speaker_overrides: [:],
+            speaker_overrides: overrides,
             technical_terms: item.focusNote.map { [$0] } ?? [],
             rerun_steps: [],
             delete_source_after_copy: settings.deleteSourceAfterCopy
@@ -462,11 +471,16 @@ struct RunBatchSettingsForm: View {
 /// 5 meetings where remembering "wait who was in the second one
 /// again?" used to mean opening Finder, hitting space, repeating.
 struct PerFileSetupPanel: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var odoo: OdooStore
     @Binding var item: QueueItem
     let index: Int
     let total: Int
 
     @StateObject private var player = AudioPreviewPlayer()
+    @State private var suggestionsLoading = false
+    @State private var suggestions: [OdooMeetingSuggestion] = []
+    @State private var lastSuggestionsKey: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -537,11 +551,22 @@ struct PerFileSetupPanel: View {
                 .lineLimit(2...4)
                 .textFieldStyle(.roundedBorder)
             }
+
+            if settings.odooConfigured {
+                OdooMeetingSuggestionsSection(
+                    item: $item,
+                    suggestions: suggestions,
+                    loading: suggestionsLoading
+                )
+            }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .task(id: item.sourceURL) {
+            await loadMeetingSuggestions()
+        }
         .onChange(of: index) { _ in
             // User stepped to another file — kill the previous
             // audio so it doesn't keep playing over the new
@@ -549,6 +574,162 @@ struct PerFileSetupPanel: View {
             player.stop()
         }
         .onDisappear { player.stop() }
+    }
+
+    /// Bracket the file's modification time and ask Odoo for any
+    /// ``calendar.event`` records that touch that window. The
+    /// fetch is keyed on the URL so we only query once per file
+    /// per sheet — flipping back to the same file with Précédent /
+    /// Suivant doesn't re-hit the network.
+    private func loadMeetingSuggestions() async {
+        guard settings.odooConfigured else {
+            suggestions = []
+            return
+        }
+        let key = item.sourceURL.path
+        if key == lastSuggestionsKey { return }
+        lastSuggestionsKey = key
+        suggestions = []
+        suggestionsLoading = true
+        defer { suggestionsLoading = false }
+        // mtime of the recording typically ≈ end of the meeting.
+        // We ask for a generous window (2 h before / 30 min after)
+        // so a recording renamed slightly after the fact still
+        // matches the event Odoo holds.
+        let fileDate = (try? item.sourceURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            ?? Date()
+        let found = await odoo.searchMeetings(near: fileDate, windowHours: 2.5, limit: 8)
+        await MainActor.run {
+            suggestions = found
+        }
+    }
+}
+
+/// Renders the Odoo calendar suggestions inside ``PerFileSetupPanel``.
+/// Hidden when nothing was found (no signal, no clutter); shows the
+/// "appliquer" button per row so the user picks the meeting that
+/// matches their recording.
+struct OdooMeetingSuggestionsSection: View {
+    @Binding var item: QueueItem
+    let suggestions: [OdooMeetingSuggestion]
+    let loading: Bool
+
+    private var attachedMeetingId: Int? {
+        // We don't persist the linkage on the QueueItem (the
+        // attendees + title already capture the intent), but we
+        // can still recognise "already applied" by checking
+        // whether the speaker names match the suggestion's
+        // attendees.
+        for meeting in suggestions {
+            let attendeeNames = Set(meeting.attendees.map(\.name))
+            let pickedNames = Set(item.expectedSpeakerNames)
+            if !attendeeNames.isEmpty && pickedNames == attendeeNames {
+                return meeting.id
+            }
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "calendar")
+                    .foregroundStyle(.teal)
+                Text("Suggestions Odoo")
+                    .font(.callout.weight(.medium))
+                if loading {
+                    ProgressView().controlSize(.small)
+                }
+                Spacer()
+            }
+            if !loading && suggestions.isEmpty {
+                Text("Aucune réunion Odoo détectée autour de la date du fichier.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(suggestions) { meeting in
+                OdooMeetingSuggestionRow(
+                    meeting: meeting,
+                    attached: attachedMeetingId == meeting.id,
+                    onApply: { apply(meeting) },
+                    onClear: clear
+                )
+            }
+        }
+    }
+
+    private func apply(_ meeting: OdooMeetingSuggestion) {
+        item.expectedSpeakerNames = meeting.attendees.map(\.name)
+        // Trust pyannote's clustering if the user picked a meeting
+        // that doesn't list attendees; otherwise pin the count.
+        if !meeting.attendees.isEmpty {
+            item.expectedSpeakerCount = meeting.attendees.count
+        }
+        item.odooMeetingTitle = meeting.name
+    }
+
+    private func clear() {
+        item.expectedSpeakerNames = []
+        item.odooMeetingTitle = ""
+    }
+}
+
+struct OdooMeetingSuggestionRow: View {
+    let meeting: OdooMeetingSuggestion
+    let attached: Bool
+    let onApply: () -> Void
+    let onClear: () -> Void
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if !meeting.start.isEmpty {
+            parts.append(meeting.start)
+        }
+        if meeting.attendee_count > 0 {
+            parts.append("\(meeting.attendee_count) participant\(meeting.attendee_count > 1 ? "s" : "")")
+        }
+        if let related = meeting.related_object, !related.name.isEmpty {
+            parts.append(related.name)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(meeting.name.isEmpty ? "(sans titre)" : meeting.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                if !meeting.attendees.isEmpty {
+                    Text(meeting.attendees.map(\.name).joined(separator: ", "))
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
+            }
+            Spacer()
+            if attached {
+                Button(role: .destructive, action: onClear) {
+                    Label("Détacher", systemImage: "xmark.circle")
+                }
+                .controlSize(.small)
+            } else {
+                Button(action: onApply) {
+                    Label("Utiliser", systemImage: "checkmark.circle")
+                }
+                .controlSize(.small)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
     }
 }
 
