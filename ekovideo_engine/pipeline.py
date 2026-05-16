@@ -309,6 +309,72 @@ class TranscriptionPipeline:
         overrides = self.request.speaker_overrides or {}
         return [name for name in overrides.values() if (name or "").strip()]
 
+    def _fetch_odoo_context_blob(self) -> str:
+        """Pull the linked Odoo object's chatter, format it for the
+        LLM, return the resulting blob.
+
+        Triggered only when ``request.odoo_context_ref`` is fully
+        populated (model + id + credentials). Failures are silent —
+        we surface a warning event so the SwiftUI status bar shows
+        "Contexte Odoo indisponible", but the LLM step then runs
+        without the bonus context rather than failing the whole job.
+        """
+        ref = self.request.odoo_context_ref
+        if not ref or not ref.is_actionable():
+            return ""
+        # Lazy imports: ``odoo_client`` already lives at the repo
+        # root so the import works in every test config, but keeping
+        # it lazy means a missing-credentials run pays zero import
+        # cost on the hot path.
+        from odoo_client import (
+            OdooConfig,
+            OdooError,
+            fetch_object_chatter,
+        )
+
+        self.sink(
+            ProgressEvent(
+                "odoo_context", 0,
+                f"Récupération du contexte Odoo ({ref.model})",
+            )
+        )
+        config = OdooConfig(
+            url=ref.url,
+            database=ref.database,
+            login=ref.login,
+            api_key=ref.api_key,
+        )
+        try:
+            payload = fetch_object_chatter(config, ref.model, ref.record_id)
+        except OdooError as exc:
+            self.sink(
+                WarningEvent(
+                    f"Contexte Odoo indisponible : {exc}",
+                    code="odoo_context_failed",
+                )
+            )
+            append_app_log(
+                f"engine_odoo_context_failed model={ref.model!r} "
+                f"id={ref.record_id} error={exc!r}"
+            )
+            return ""
+        summary = str(payload.get("summary") or "")
+        if not summary:
+            self.sink(
+                ProgressEvent(
+                    "odoo_context", 100,
+                    "Contexte Odoo: aucun message à exploiter",
+                )
+            )
+            return ""
+        self.sink(
+            ProgressEvent(
+                "odoo_context", 100,
+                f"Contexte Odoo récupéré ({len(payload.get('messages') or [])} message(s))",
+            )
+        )
+        return summary
+
     def _meeting_context(self) -> str:
         """Short topic line surfaced to Whisper as semantic prior.
 
@@ -1212,6 +1278,12 @@ class TranscriptionPipeline:
             [*self.request.glossary_terms, *self.request.technical_terms]
         )
 
+        # Optional Odoo chatter context. Fetched once per job, here
+        # rather than at Run Setup time so the user's UI never
+        # blocks on a slow Odoo. Failures are silent — the LLM step
+        # then proceeds without the bonus context.
+        odoo_context_blob = self._fetch_odoo_context_blob()
+
         ts = time.monotonic()
         payload: dict[str, Any] = {}
 
@@ -1264,6 +1336,7 @@ class TranscriptionPipeline:
                 settings.text_llm_model,
                 str(chunk_path),
                 glossary_text,
+                odoo_context_blob,
             )
             # Linear progress across the chunks so the SwiftUI bar
             # moves on long meetings instead of sitting at 50 %.

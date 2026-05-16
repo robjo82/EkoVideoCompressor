@@ -200,6 +200,21 @@ struct ContentView: View {
         // injects it as a one-line "Réunion sur X" prefix into the
         // Whisper initial prompt.
         let profile = item.odooMeetingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Build the optional Odoo context payloads — only when the
+        // user actually picked a meeting in Run Setup. The credentials
+        // ride alongside the model+id so the engine can fire the
+        // chatter fetch on its own during the LLM step.
+        var contextRef: OdooContextRef? = nil
+        if let related = item.odooContextRef, settings.odooConfigured {
+            contextRef = OdooContextRef(
+                model: related.model,
+                record_id: related.record_id,
+                url: settings.odooUrl,
+                database: settings.odooDatabase,
+                login: settings.odooLogin,
+                api_key: settings.odooApiKey
+            )
+        }
         let request = JobRequest(
             source_path: item.sourceURL.path,
             workspace_dir: "",
@@ -223,7 +238,9 @@ struct ContentView: View {
             speaker_overrides: overrides,
             technical_terms: item.focusNote.map { [$0] } ?? [],
             rerun_steps: [],
-            delete_source_after_copy: settings.deleteSourceAfterCopy
+            delete_source_after_copy: settings.deleteSourceAfterCopy,
+            odoo_context_ref: contextRef,
+            odoo_meeting_metadata: item.odooMeeting
         )
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ekovideo-job.json")
         do {
@@ -567,7 +584,7 @@ struct PerFileSetupPanel: View {
         .task(id: item.sourceURL) {
             await loadMeetingSuggestions()
         }
-        .onChange(of: index) { _ in
+        .onChange(of: index) { _, _ in
             // User stepped to another file — kill the previous
             // audio so it doesn't keep playing over the new
             // selection.
@@ -666,11 +683,35 @@ struct OdooMeetingSuggestionsSection: View {
             item.expectedSpeakerCount = meeting.attendees.count
         }
         item.odooMeetingTitle = meeting.name
+        item.odooMeeting = OdooMeetingMetadata(
+            event_id: meeting.id,
+            event_name: meeting.name,
+            attendees: meeting.attendees,
+            related: meeting.related_object
+        )
+        // ``related_object`` is what the engine's LLM step fetches
+        // the chatter for. We forward just the model + id at this
+        // stage; the credentials are stitched in later (in
+        // ``runJob``) so they don't sit on the SwiftUI struct.
+        if let related = meeting.related_object {
+            item.odooContextRef = OdooContextRef(
+                model: related.model,
+                record_id: related.id,
+                url: "",
+                database: "",
+                login: "",
+                api_key: ""
+            )
+        } else {
+            item.odooContextRef = nil
+        }
     }
 
     private func clear() {
         item.expectedSpeakerNames = []
         item.odooMeetingTitle = ""
+        item.odooMeeting = nil
+        item.odooContextRef = nil
     }
 }
 
@@ -746,11 +787,13 @@ final class AudioPreviewPlayer: ObservableObject {
     private var currentURL: URL?
     private var timeObserver: Any?
 
-    deinit {
-        if let player = self.player, let token = self.timeObserver {
-            player.removeTimeObserver(token)
-        }
-    }
+    // No ``deinit`` cleanup: Swift 6 makes deinit nonisolated and
+    // ``timeObserver`` is ``Any?`` (non-Sendable), so removing it
+    // there isn't allowed. ``stop()`` always runs before this
+    // store is dropped (we call it from .onDisappear and on every
+    // file swap inside Run Setup), and AVPlayer cleans up its
+    // observers when the object itself deinitialises, so leaking
+    // a stale token isn't a concern.
 
     var elapsedFormatted: String? {
         guard let seconds = currentSeconds else { return nil }
@@ -2040,6 +2083,11 @@ struct LibraryContextEditor: View {
                                         .foregroundStyle(.secondary)
                                         .padding(.leading, speaker.id != speaker.name ? 128 : 0)
                                 }
+                                if let attendees = unusedAttendees(for: speaker),
+                                   !attendees.isEmpty {
+                                    odooAttendeeChips(for: $speaker, attendees: attendees)
+                                        .padding(.leading, speaker.id != speaker.name ? 128 : 0)
+                                }
                             }
                         }
                     }
@@ -2217,6 +2265,67 @@ struct LibraryContextEditor: View {
               let utterances = sample.utterance_count,
               let totalDuration = sample.total_duration else { return nil }
         return "\(utterances) prise\(utterances > 1 ? "s" : "") de parole · \(durationLabel(totalDuration)) de parole"
+    }
+
+    /// Attendees from the Odoo meeting paired with this job whose
+    /// names aren't already used by another speaker row. Returned
+    /// only for rows that still carry a SPEAKER_NN placeholder or
+    /// an empty name — once the user has typed a name the chips
+    /// disappear so the sheet doesn't keep pestering them.
+    private func unusedAttendees(for speaker: SpeakerEditRow) -> [OdooMeetingAttendee]? {
+        guard let meeting = row.odooMeeting, !meeting.attendees.isEmpty else { return nil }
+        let typedName = speaker.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Skip rows already named — the user has decided. We only
+        // want to surface hints when there's still a placeholder
+        // staring at them.
+        let placeholderLooking = typedName.isEmpty
+            || typedName.uppercased().hasPrefix("SPEAKER_")
+            || typedName == speaker.id
+        guard placeholderLooking else { return nil }
+        // Filter out attendees already attached to another row so
+        // we don't suggest the same name on two clusters.
+        let claimed: Set<String> = Set(
+            speakers
+                .filter { $0.id != speaker.id }
+                .map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        return meeting.attendees.filter { attendee in
+            let lowered = attendee.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !lowered.isEmpty && !claimed.contains(lowered)
+        }
+    }
+
+    /// Renders one chip per remaining attendee. Click → fills the
+    /// text field, so the user confirms with a single tap instead
+    /// of typing the full name.
+    @ViewBuilder
+    private func odooAttendeeChips(
+        for speaker: Binding<SpeakerEditRow>,
+        attendees: [OdooMeetingAttendee]
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "calendar.badge.checkmark")
+                .foregroundStyle(.teal)
+                .font(.caption)
+            Text("Réunion Odoo :")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(attendees) { attendee in
+                Button {
+                    speaker.wrappedValue.name = attendee.name
+                } label: {
+                    Text(attendee.name)
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(.teal.opacity(0.15), in: Capsule())
+                .help(attendee.company.isEmpty ? attendee.email : "\(attendee.company) · \(attendee.email)")
+            }
+            Spacer()
+        }
     }
 
     private func durationLabel(_ seconds: Double) -> String {

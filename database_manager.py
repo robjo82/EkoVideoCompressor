@@ -113,6 +113,15 @@ class DatabaseManager:
             # before this column existed; the SwiftUI library shows
             # "—" for those instead of "0".
             "total_bytes": "INTEGER",
+            # Odoo meeting context the user paired with the job in
+            # Run Setup. JSON shape:
+            #   {"event_id": int, "event_name": str,
+            #    "attendees": [{id, name, email, company}],
+            #    "related": {model, id, name}?}
+            # Read at rename-sheet time so the chips can suggest
+            # one-click attribution of an SPEAKER_NN cluster to an
+            # invitee.
+            "odoo_meeting_json": "TEXT",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -167,6 +176,18 @@ class DatabaseManager:
             conn.execute(
                 "UPDATE jobs SET duration_ffmpeg = ?, duration_whisper = ?, duration_diarization = ?, duration_total = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (ffmpeg, whisper, diarization, total, job_id)
+            )
+
+    def update_job_odoo_meeting(self, job_id: int, payload: Optional[dict]) -> None:
+        """Persist the Odoo meeting metadata the user paired with
+        the job. ``None`` clears the column (used when the user
+        detaches a meeting after launch — Layer 3 suggestions then
+        disappear from the rename sheet)."""
+        blob = json.dumps(payload, ensure_ascii=False) if payload else None
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET odoo_meeting_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (blob, job_id),
             )
 
     def update_job_total_bytes(self, job_id: int, total_bytes: int) -> None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import ssl
 import urllib.error
@@ -33,6 +34,7 @@ __all__ = [
     "OdooConnectionError",
     "OdooAuthError",
     "test_connection",
+    "fetch_object_chatter",
     "search_meeting_events",
     "search_partners",
     "fetch_partner",
@@ -583,3 +585,197 @@ def search_meeting_events(
             )
         meeting["attendees"] = attendees
     return stripped
+
+
+# ---------------------------------------------------------------------------
+# Object chatter (Layer 2 — semantic context for the LLM)
+# ---------------------------------------------------------------------------
+
+
+# Strip every HTML tag the Odoo chatter ships with. ``mail.message.body``
+# is rich HTML (``<p>``, ``<a>``, etc.) which adds noise to the LLM
+# prompt budget for zero benefit; the LLM works better on plain text.
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITY_RE = re.compile(r"&(?:nbsp|amp|lt|gt|quot|#\d+);")
+_WS_RUN_RE = re.compile(r"[ \t]+")
+_NL_RUN_RE = re.compile(r"\n{3,}")
+
+
+def _html_to_text(raw: str) -> str:
+    if not raw:
+        return ""
+    text = _HTML_TAG_RE.sub("", str(raw))
+    # Translate the handful of HTML entities that crop up in Odoo
+    # bodies. Anything beyond ``&nbsp; &amp; &lt; &gt; &quot;`` and
+    # numeric refs is rare enough to ignore — the LLM tolerates it.
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace(
+        "&lt;", "<"
+    ).replace("&gt;", ">").replace("&quot;", '"')
+    text = _HTML_ENTITY_RE.sub("", text)
+    text = _WS_RUN_RE.sub(" ", text)
+    text = _NL_RUN_RE.sub("\n\n", text)
+    return text.strip()
+
+
+# Fields we ask ``mail.message.read`` for. Author is a Many2one we
+# unpack via the same shape as ``parent_id`` elsewhere.
+_MESSAGE_FIELDS = (
+    "id",
+    "date",
+    "author_id",
+    "subject",
+    "body",
+    "message_type",
+)
+
+
+def fetch_object_chatter(
+    config: OdooConfig,
+    model: str,
+    record_id: int,
+    *,
+    limit: int = 20,
+) -> dict:
+    """Pull a slim snapshot of an Odoo object's chatter.
+
+    Returns
+    -------
+    ``{display_name, model, id, fetched_at, summary, messages}`` —
+    or an empty payload (``messages=[]``) when the record doesn't
+    exist or the user's API key lacks read access.
+
+    ``summary`` is a 1-2 sentence flattening of the most recent
+    messages, ready to drop straight into the Whisper / LLM prompt
+    (≤ 2 000 chars) without further processing on the SwiftUI side.
+    """
+    clean_model = (model or "").strip()
+    if not clean_model or not record_id:
+        return {
+            "display_name": "",
+            "model": clean_model,
+            "id": int(record_id or 0),
+            "summary": "",
+            "messages": [],
+            "fetched_at": _format_odoo_datetime(datetime.now(timezone.utc)),
+        }
+
+    # 1. Resolve display_name + message_ids on the record itself.
+    try:
+        records = _json2_call(
+            config,
+            clean_model,
+            "read",
+            {
+                "ids": [int(record_id)],
+                "fields": ["id", "display_name", "message_ids"],
+            },
+        )
+    except OdooError:
+        records = []
+    if not isinstance(records, list) or not records:
+        return {
+            "display_name": "",
+            "model": clean_model,
+            "id": int(record_id),
+            "summary": "",
+            "messages": [],
+            "fetched_at": _format_odoo_datetime(datetime.now(timezone.utc)),
+        }
+    head = records[0]
+    display_name = str(head.get("display_name") or "")
+    message_ids = head.get("message_ids") or []
+    if not isinstance(message_ids, list):
+        message_ids = []
+
+    if not message_ids:
+        return {
+            "display_name": display_name,
+            "model": clean_model,
+            "id": int(record_id),
+            "summary": "",
+            "messages": [],
+            "fetched_at": _format_odoo_datetime(datetime.now(timezone.utc)),
+        }
+
+    # 2. Pull the N most-recent messages. Odoo gives us message_ids
+    #    in chronological order so we slice the tail and reverse for
+    #    a "newest first" reading shape.
+    tail_ids = [int(m) for m in message_ids[-max(1, int(limit)):]]
+    raw_messages: list[dict] = []
+    try:
+        records = _json2_call(
+            config,
+            "mail.message",
+            "read",
+            {
+                "ids": tail_ids,
+                "fields": list(_MESSAGE_FIELDS),
+            },
+        )
+        if isinstance(records, list):
+            raw_messages = [r for r in records if isinstance(r, dict)]
+    except OdooError:
+        raw_messages = []
+
+    cleaned: list[dict] = []
+    for msg in sorted(raw_messages, key=lambda r: str(r.get("date") or ""), reverse=True):
+        author_name = ""
+        author = msg.get("author_id")
+        if isinstance(author, (list, tuple)) and len(author) >= 2:
+            author_name = str(author[1])
+        cleaned.append(
+            {
+                "id": int(msg.get("id") or 0),
+                "date": str(msg.get("date") or ""),
+                "author": author_name,
+                "subject": str(msg.get("subject") or "") if msg.get("subject") else "",
+                "body": _html_to_text(msg.get("body") or ""),
+                "type": str(msg.get("message_type") or ""),
+            }
+        )
+
+    summary = _build_chatter_summary(display_name, cleaned)
+
+    return {
+        "display_name": display_name,
+        "model": clean_model,
+        "id": int(record_id),
+        "summary": summary,
+        "messages": cleaned,
+        "fetched_at": _format_odoo_datetime(datetime.now(timezone.utc)),
+    }
+
+
+def _build_chatter_summary(display_name: str, messages: list[dict]) -> str:
+    """Compose a compact, prompt-ready paragraph the LLM can read.
+
+    Format: ``<display_name> — <author1> (date) : <first 220 chars>``
+    repeated for each message, capped at ~1 800 chars so a long
+    chatter doesn't blow the prompt budget.
+    """
+    if not messages:
+        return ""
+    header = display_name.strip()
+    chunks: list[str] = []
+    budget = 1800
+    used = len(header) + 4  # for ``", ".join`` + trailing dot
+    for msg in messages:
+        body = (msg.get("body") or "").strip()
+        if not body:
+            continue
+        snippet = body[:220].rsplit(" ", 1)[0] if len(body) > 220 else body
+        author = (msg.get("author") or "Anonyme").strip()
+        date = (msg.get("date") or "").strip()
+        pieces: list[str] = []
+        if date:
+            pieces.append(date)
+        pieces.append(author)
+        prefix = " — ".join(pieces)
+        rendered = f"{prefix} : {snippet}"
+        if used + len(rendered) + 2 > budget:
+            break
+        chunks.append(rendered)
+        used += len(rendered) + 2
+    if not chunks:
+        return ""
+    return (header + ". " if header else "") + " ".join(chunks)
