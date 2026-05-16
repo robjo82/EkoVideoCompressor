@@ -522,6 +522,10 @@ struct LibraryView: View {
     @State private var rowToDelete: LibraryRow?
     @State private var expandedJobIDs: Set<Int> = []
     @State private var queueNotice: String?
+    @AppStorage("libraryShowsSpeakersColumn")
+    private var showsSpeakersColumn = false
+    @AppStorage("libraryShowsProjectSizeColumn")
+    private var showsProjectSizeColumn = false
     /// Sort order driving the table — defaults to most-recently
     /// updated first, mirroring what the engine returns from
     /// ``library_list``. Columns toggle between ascending and
@@ -529,13 +533,6 @@ struct LibraryView: View {
     @State private var sortOrder: [KeyPathComparator<LibraryDisplayRow>] = [
         .init(\.sortableUpdatedAt, order: .reverse),
     ]
-    /// Per-column visibility + ordering state. ``@AppStorage`` so
-    /// the user's chosen layout survives a relaunch. Speakers and
-    /// total size start hidden because they're situational; the
-    /// user opts in via the header context menu (right-click on any
-    /// header).
-    @AppStorage("libraryColumnCustomization")
-    private var columnCustomization = TableColumnCustomization<LibraryDisplayRow>()
     private var sortedRows: [LibraryRow] {
         // Pull the parent jobs and sort by whichever key the user
         // picked on the header. Children (artefact rows) follow
@@ -556,16 +553,33 @@ struct LibraryView: View {
         }
     }
 
+    private var libraryHeader: some View {
+        HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Bibliothèque")
+                    .font(.largeTitle.bold())
+                Text("Retrouvez les compressions, transcriptions et rapports produits.")
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Menu {
+                Toggle("Interlocuteurs", isOn: $showsSpeakersColumn)
+                Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
+            } label: {
+                Label("Colonnes", systemImage: "tablecells")
+            }
+            Button {
+                Task { await library.refresh() }
+            } label: {
+                Label("Actualiser", systemImage: "arrow.clockwise")
+            }
+        }
+        .padding(24)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            ListHeaderView(
-                title: "Bibliothèque",
-                subtitle: "Retrouvez les compressions, transcriptions et rapports produits.",
-                actionTitle: "Actualiser",
-                actionSystemImage: "arrow.clockwise"
-            ) {
-                Task { await library.refresh() }
-            }
+            libraryHeader
             Divider()
             if library.isLoading && library.rows.isEmpty {
                 ProgressView("Chargement de la bibliothèque…")
@@ -580,8 +594,7 @@ struct LibraryView: View {
                 VStack(spacing: 0) {
                     Table(
                         displayRows,
-                        sortOrder: $sortOrder,
-                        columnCustomization: $columnCustomization
+                        sortOrder: $sortOrder
                     ) {
                         TableColumn("Fichier", value: \.sortableTitle) { displayRow in
                             if let artifact = displayRow.artifact {
@@ -608,24 +621,17 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 360, ideal: 520)
-                        .customizationID("filename")
-                        // The user's primary anchor — keep it
-                        // visible no matter what they toggle.
-                        .disabledCustomizationBehavior(.visibility)
 
                         TableColumn("Statut", value: \.sortableStatus) { displayRow in
                             if displayRow.artifact == nil {
-                                // Centered horizontally so the icon
-                                // sits under its column title, not
-                                // pinned to the leading edge.
                                 Image(systemName: statusIconName(displayRow.job.status))
                                     .foregroundStyle(statusColor(displayRow.job.status))
                                     .help(localizedStatus(displayRow.job.status))
-                                    .frame(maxWidth: .infinity, alignment: .center)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.leading, 8)
                             }
                         }
                         .width(min: 54, ideal: 64, max: 80)
-                        .customizationID("status")
 
                         TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
                             if displayRow.artifact == nil {
@@ -635,7 +641,6 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 140, ideal: 170)
-                        .customizationID("updatedAt")
 
                         TableColumn("Artefacts") { displayRow in
                             if let artifact = displayRow.artifact {
@@ -648,36 +653,27 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 190, ideal: 240)
-                        .customizationID("artefacts")
 
-                        // Hidden by default — the user opts in via
-                        // the header context menu. Renders the
-                        // friendly speaker names with a "+N" suffix
-                        // when there are too many to fit.
-                        TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
-                            if displayRow.artifact == nil {
-                                SpeakerListingCell(names: displayRow.job.displayedSpeakerNames)
+                        if showsSpeakersColumn {
+                            TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
+                                if displayRow.artifact == nil {
+                                    SpeakerListingCell(names: displayRow.job.displayedSpeakerNames)
+                                }
                             }
+                            .width(min: 160, ideal: 220)
                         }
-                        .width(min: 160, ideal: 220)
-                        .customizationID("speakers")
-                        .defaultVisibility(.hidden)
 
-                        // Workspace size, also hidden by default —
-                        // useful when the user hunts for what's
-                        // eating their disk but noisy in everyday
-                        // use.
-                        TableColumn("Poids", value: \.sortableTotalBytes) { displayRow in
-                            if displayRow.artifact == nil {
-                                Text(displayRow.displayedTotalBytes)
-                                    .font(.callout.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                    .frame(maxWidth: .infinity, alignment: .trailing)
+                        if showsProjectSizeColumn {
+                            TableColumn("Poids", value: \.sortableTotalBytes) { displayRow in
+                                if displayRow.artifact == nil {
+                                    Text(displayRow.displayedTotalBytes)
+                                        .font(.callout.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .trailing)
+                                }
                             }
+                            .width(min: 80, ideal: 100, max: 140)
                         }
-                        .width(min: 80, ideal: 100, max: 140)
-                        .customizationID("totalBytes")
-                        .defaultVisibility(.hidden)
 
                         TableColumn("Actions") { displayRow in
                             if let artifact = displayRow.artifact {
@@ -695,8 +691,6 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 120, ideal: 150)
-                        .customizationID("actions")
-                        .disabledCustomizationBehavior(.visibility)
                     }
                 }
                 .overlay(alignment: .bottomLeading) {

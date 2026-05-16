@@ -140,6 +140,20 @@ def _connection_error_message(exc: BaseException) -> str:
     return f"Connexion à Odoo impossible : {exc}"
 
 
+def _tls_diagnostics() -> str:
+    paths = ssl.get_default_verify_paths()
+    diagnostics = {
+        "openssl": ssl.OPENSSL_VERSION,
+        "cafile": paths.cafile,
+        "capath": paths.capath,
+        "openssl_cafile_env": paths.openssl_cafile_env,
+        "openssl_cafile": paths.openssl_cafile,
+        "openssl_capath_env": paths.openssl_capath_env,
+        "openssl_capath": paths.openssl_capath,
+    }
+    return " ".join(f"{key}={value!r}" for key, value in diagnostics.items())
+
+
 def _error_message_from_payload(payload: Any) -> str:
     if isinstance(payload, dict):
         data = payload.get("data")
@@ -206,11 +220,14 @@ def _json2_call(
             ) from exc
         raise OdooError(f"Erreur Odoo HTTP {exc.code} : {message}") from exc
     except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError, socket.timeout) as exc:
+        is_certificate_error = _is_certificate_error(exc)
+        extra = f" tls={tail_text(_tls_diagnostics(), 1200)!r}" if is_certificate_error else ""
         append_app_log(
             "odoo_json2_connection_error "
             f"host={host!r} model={model!r} method={method!r} "
-            f"certificate_error={_is_certificate_error(exc)} "
+            f"certificate_error={is_certificate_error} "
             f"error_chain={tail_text(_exception_chain(exc), 2000)!r}"
+            f"{extra}"
         )
         raise OdooConnectionError(_connection_error_message(exc)) from exc
 

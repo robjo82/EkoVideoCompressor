@@ -170,6 +170,7 @@ class Json2CallTest(unittest.TestCase):
 
         self.assertIn("Certificat TLS Odoo invalide", str(ctx.exception))
         self.assertTrue(any("certificate_error=True" in call.args[0] for call in log.call_args_list))
+        self.assertTrue(any("tls=" in call.args[0] for call in log.call_args_list))
 
     def test_certificate_detection_walks_urlerror_reason(self):
         cert_error = urllib.error.URLError(
