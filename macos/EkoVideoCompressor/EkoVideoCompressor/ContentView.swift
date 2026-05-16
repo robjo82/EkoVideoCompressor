@@ -943,6 +943,9 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
+                Section("Voix mémorisées") {
+                    SpeakerProfilesSection()
+                }
                 Section("Hugging Face") {
                     SecureField("Token Read", text: $settings.hfToken)
                     HStack {
@@ -1665,6 +1668,82 @@ struct SpeakerEditRow: Identifiable, Equatable {
 ///   exactly the disk economy they're realising. Files are sorted
 ///   biggest first so the noisy parts (``audio.wav``, the compressed
 ///   video) jump out immediately.
+/// Lists the voice profiles the engine has accumulated from past
+/// renames. The user can drop one — useful when a colleague leaves
+/// or when an early enrollment got the wrong audio. The list is
+/// short on purpose; the engine handles the matching invisibly,
+/// the panel only exists for the rare cases where the user wants
+/// to override that.
+struct SpeakerProfilesSection: View {
+    @EnvironmentObject private var library: LibraryStore
+    @State private var profiles: [SpeakerProfile] = []
+    @State private var loading = false
+    @State private var pendingDelete: SpeakerProfile?
+
+    var body: some View {
+        Group {
+            if loading && profiles.isEmpty {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Chargement…").foregroundStyle(.secondary)
+                }
+            } else if profiles.isEmpty {
+                Text("Aucune voix mémorisée pour l'instant. Renommer un locuteur après une transcription enregistre automatiquement sa voix pour la prochaine réunion.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(profiles) { profile in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(profile.name)
+                                .font(.callout.weight(.medium))
+                            Text("\(profile.sample_count) extrait(s)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button(role: .destructive) {
+                            pendingDelete = profile
+                        } label: {
+                            Label("Supprimer", systemImage: "trash")
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .help("Oublier cette voix")
+                    }
+                }
+            }
+        }
+        .task {
+            await reload()
+        }
+        .confirmationDialog(
+            "Oublier cette voix ?",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            presenting: pendingDelete
+        ) { profile in
+            Button("Supprimer", role: .destructive) {
+                Task {
+                    await library.deleteSpeakerProfile(profile)
+                    await reload()
+                }
+            }
+            Button("Annuler", role: .cancel) {}
+        } message: { profile in
+            Text("La prochaine fois que \(profile.name) parlera dans une réunion, l'app demandera à nouveau confirmation au lieu de pré-remplir le nom.")
+        }
+    }
+
+    private func reload() async {
+        loading = true
+        profiles = await library.listSpeakerProfiles()
+        loading = false
+    }
+}
+
 struct LibraryDeletionSheet: View {
     @EnvironmentObject private var library: LibraryStore
     @Environment(\.dismiss) private var dismiss

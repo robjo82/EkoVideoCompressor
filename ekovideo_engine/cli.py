@@ -10,8 +10,11 @@ from .events import stdout_event_sink
 from .hf import hf_check
 from .library import (
     library_delete,
+    library_delete_speaker_profile,
     library_discover_speakers,
     library_list,
+    library_list_speaker_profiles,
+    library_recognize_speakers,
     library_rename_speakers,
     library_speaker_samples,
     library_update_context,
@@ -78,6 +81,22 @@ def build_parser() -> argparse.ArgumentParser:
     # persistence fix.
     discover = sub.add_parser("library-discover-speakers")
     discover.add_argument("job_id", type=int)
+
+    # Speaker enrollment store. The pipeline matches new clusters
+    # against this store automatically, but the user can also list /
+    # delete profiles via the SwiftUI settings panel.
+    list_profiles = sub.add_parser("library-list-speaker-profiles")
+    list_profiles.add_argument("--jsonl", action="store_true")
+
+    delete_profile = sub.add_parser("library-delete-speaker-profile")
+    profile_group = delete_profile.add_mutually_exclusive_group(required=True)
+    profile_group.add_argument("--id", type=int, dest="profile_id")
+    profile_group.add_argument("--name", type=str)
+
+    # Re-run recognition on an existing job (e.g. after the user
+    # added a new profile and wants to back-fill an older meeting).
+    recognise = sub.add_parser("library-recognize-speakers")
+    recognise.add_argument("job_id", type=int)
 
     context = sub.add_parser("library-update-context")
     context.add_argument("job_id", type=int)
@@ -161,6 +180,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "library-discover-speakers":
             speakers = library_discover_speakers(args.job_id)
             _print_json({"job_id": args.job_id, "speakers": speakers})
+            return 0
+
+        if args.command == "library-list-speaker-profiles":
+            rows = library_list_speaker_profiles()
+            if args.jsonl:
+                for row in rows:
+                    print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            else:
+                _print_json(rows)
+            return 0
+
+        if args.command == "library-delete-speaker-profile":
+            removed = library_delete_speaker_profile(
+                profile_id=args.profile_id, name=args.name
+            )
+            _print_json(
+                {
+                    "deleted": bool(removed),
+                    "profile_id": args.profile_id,
+                    "name": args.name,
+                }
+            )
+            return 0
+
+        if args.command == "library-recognize-speakers":
+            speakers = library_recognize_speakers(args.job_id)
+            _print_json({"job_id": args.job_id, "recognized": speakers})
             return 0
 
         if args.command == "model-list":

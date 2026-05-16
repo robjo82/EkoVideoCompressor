@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import os
 import subprocess
 import tempfile
@@ -12,11 +14,16 @@ from ekovideo_engine.library import (
     _looks_like_engine_workspace,
     database,
     library_delete,
+    library_delete_speaker_profile,
     library_discover_speakers,
+    library_enroll_speakers_for_job,
+    library_list_speaker_profiles,
+    library_recognize_speakers,
     library_rename_speakers,
     library_speaker_samples,
     library_workspace_usage,
 )
+from speaker_recognition import decode_embedding, encode_embedding
 
 
 class EngineLibraryActionsTest(unittest.TestCase):
@@ -361,6 +368,240 @@ class JobTotalBytesPersistenceTest(unittest.TestCase):
                 rows = db.list_jobs(limit=10)
                 self.assertEqual(rows[0]["id"], job_id)
                 self.assertIsNone(rows[0]["total_bytes"])
+
+
+class SpeakerEnrollmentTest(unittest.TestCase):
+    """Cover the round-trip from rename → embedding → match.
+
+    The pyannote subprocess is mocked because pulling 200 MB of
+    weights into CI would be insane. We pin the contract on every
+    moving part either side of the shell-out.
+    """
+
+    _job_counter = 0
+
+    def _seed_job(self, root: Path, *, with_diar_audio: bool = True) -> tuple[int, Path]:
+        # Each call needs its own workspace dir, otherwise a second
+        # _seed_job inside the same test trips ``mkdir(exist_ok=False)``.
+        SpeakerEnrollmentTest._job_counter += 1
+        workspace = root / f"work-{SpeakerEnrollmentTest._job_counter}"
+        workspace.mkdir(parents=True)
+        # ``_diarisation_audio_path`` looks for these markers in
+        # order; touching either is enough for the helper to return
+        # a real path.
+        if with_diar_audio:
+            (workspace / "audio.diar.wav").write_bytes(b"riff fake")
+        else:
+            (workspace / "audio.wav").write_bytes(b"riff fake")
+
+        # The library's _venv_python helper reads the venv path off
+        # settings_json. Point it at a fake interpreter so the
+        # subprocess.run mock fires below.
+        fake_python = root / "fake-python"
+        fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_python.chmod(0o755)
+
+        db = database()
+        job_id = db.create_job(
+            source_path=str(root / "source.mov"),
+            workspace_dir=str(workspace),
+            settings={
+                "transcription_settings": {
+                    "venv_python_path": str(fake_python),
+                }
+            },
+        )
+        # Two SPEAKER_NN clusters with several long enough turns
+        # each, so the embedding picker accepts them.
+        db.add_segments(
+            job_id,
+            [
+                {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00", "text": "Bonjour."},
+                {"start": 5.0, "end": 10.0, "speaker": "SPEAKER_01", "text": "Salut."},
+                {"start": 10.0, "end": 15.0, "speaker": "SPEAKER_00", "text": "Hello."},
+            ],
+        )
+        return job_id, workspace
+
+    def test_rename_triggers_enrollment_and_persists_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root)
+
+                def fake_run(cmd, *args, **kwargs):
+                    # Embedding script returns one fake 4-dim vector
+                    # per requested cluster. The pure-Python pipeline
+                    # downstream averages + matches these.
+                    payload = json.dumps(
+                        {
+                            "clusters": {
+                                "SPEAKER_00": [[1.0, 0.0, 0.0, 0.0]],
+                                "SPEAKER_01": [[0.0, 1.0, 0.0, 0.0]],
+                            }
+                        }
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    summary = library_rename_speakers(
+                        job_id,
+                        {"SPEAKER_00": "Robin", "SPEAKER_01": "David"},
+                    )
+
+                profiles = library_list_speaker_profiles()
+                names = sorted(p["name"] for p in profiles)
+
+            self.assertEqual(names, ["David", "Robin"])
+            self.assertEqual(summary["speakers_enrolled"], 2)
+
+    def test_recognition_pre_fills_known_voices_on_new_job(self):
+        # Enrol one profile, then run a fresh job whose SPEAKER_00
+        # has the same fake embedding. Recognition should match it
+        # back to the profile's name without the user typing
+        # anything.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                first_job_id, _ = self._seed_job(root)
+
+                def first_run(cmd, *args, **kwargs):
+                    payload = json.dumps(
+                        {"clusters": {"SPEAKER_00": [[1.0, 0.0, 0.0, 0.0]]}}
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=first_run,
+                ):
+                    library_rename_speakers(first_job_id, {"SPEAKER_00": "Robin"})
+
+                # Second meeting — same audio fingerprint.
+                second_job_id, _ = self._seed_job(root)
+
+                def second_run(cmd, *args, **kwargs):
+                    payload = json.dumps(
+                        {
+                            "clusters": {
+                                "SPEAKER_00": [[1.0, 0.0, 0.0, 0.0]],
+                                "SPEAKER_01": [[0.0, 0.0, 1.0, 0.0]],
+                            }
+                        }
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=second_run,
+                ):
+                    recognised = library_recognize_speakers(second_job_id)
+
+            # SPEAKER_00 matches Robin (same embedding); SPEAKER_01
+            # is a new voice with no matching profile, so stays a
+            # SPEAKER_NN placeholder for the user to confirm.
+            self.assertEqual(recognised, {"SPEAKER_00": "Robin"})
+
+    def test_recognition_skipped_when_no_profiles_exist(self):
+        # First-run path: the user hasn't enrolled anyone yet, so
+        # we don't even try to call pyannote — the cost is wasted
+        # on a guaranteed empty result.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root)
+                with patch(
+                    "ekovideo_engine.library.subprocess.run"
+                ) as mock_run:
+                    out = library_recognize_speakers(job_id)
+                    mock_run.assert_not_called()
+            self.assertEqual(out, {})
+
+    def test_enrollment_merges_into_existing_profile_centroid(self):
+        # Enrol Robin twice. The stored centroid should be the
+        # average of both samples and ``sample_count`` should bump
+        # to 2 — not 1 + 1 separately, that would mean "two Robins"
+        # in the store.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                first_job_id, _ = self._seed_job(root)
+
+                def first_run(cmd, *args, **kwargs):
+                    payload = json.dumps(
+                        {"clusters": {"SPEAKER_00": [[1.0, 0.0, 0.0, 0.0]]}}
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=first_run,
+                ):
+                    library_rename_speakers(first_job_id, {"SPEAKER_00": "Robin"})
+
+                second_job_id, _ = self._seed_job(root)
+
+                def second_run(cmd, *args, **kwargs):
+                    payload = json.dumps(
+                        {"clusters": {"SPEAKER_00": [[0.0, 1.0, 0.0, 0.0]]}}
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=second_run,
+                ):
+                    library_rename_speakers(second_job_id, {"SPEAKER_00": "Robin"})
+
+                profiles = library_list_speaker_profiles()
+                self.assertEqual(len(profiles), 1)
+                self.assertEqual(profiles[0]["sample_count"], 2)
+
+                db = database()
+                stored = db.get_speaker_profile_by_name("Robin")
+                centroid = decode_embedding(stored["embedding_json"])
+            # Average of (1,0,0,0) and (0,1,0,0) → (0.5, 0.5, 0, 0)
+            # → normalised (0.707, 0.707, 0, 0).
+            self.assertAlmostEqual(centroid[0], math.sqrt(0.5), places=4)
+            self.assertAlmostEqual(centroid[1], math.sqrt(0.5), places=4)
+
+    def test_delete_speaker_profile_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                db.upsert_speaker_profile(
+                    name="Marie",
+                    embedding_json=encode_embedding([1.0, 0.0]),
+                    sample_count=1,
+                )
+                self.assertEqual(library_delete_speaker_profile(name="Marie"), 1)
+                self.assertEqual(library_list_speaker_profiles(), [])
+                # Idempotent — second delete returns 0 instead of
+                # raising.
+                self.assertEqual(library_delete_speaker_profile(name="Marie"), 0)
+
+    def test_rename_with_enroll_disabled_skips_pyannote(self):
+        # The CLI / Swift caller can opt out of enrollment when
+        # they're just doing a string-only rename (e.g. fixing a
+        # typo on an already-named speaker).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root)
+                with patch(
+                    "ekovideo_engine.library.subprocess.run"
+                ) as mock_run:
+                    summary = library_rename_speakers(
+                        job_id,
+                        {"SPEAKER_00": "Robin"},
+                        enroll=False,
+                    )
+                    mock_run.assert_not_called()
+            self.assertEqual(summary["speakers_enrolled"], 0)
 
 
 if __name__ == "__main__":
