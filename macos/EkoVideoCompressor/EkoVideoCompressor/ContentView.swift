@@ -396,21 +396,15 @@ struct RunSettingsForm: View {
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
                 if settings.diarizationEnabled {
+                    // Plain string label only — wrapping the label in
+                    // an HStack(Spacer) collapses the entire form's
+                    // column layout on macOS (every TextEditor and
+                    // Picker shrinks to one character wide).
                     Stepper(
+                        speakerCountStepperLabel(settings.expectedSpeakerCount),
                         value: $settings.expectedSpeakerCount,
                         in: 0...12
-                    ) {
-                        HStack {
-                            Text("Nombre d'intervenants attendu")
-                            Spacer()
-                            Text(
-                                settings.expectedSpeakerCount == 0
-                                    ? "Auto"
-                                    : "\(settings.expectedSpeakerCount)"
-                            )
-                            .foregroundStyle(.secondary)
-                        }
-                    }
+                    )
                     Text("0 = laisse pyannote estimer. Renseigner cette valeur quand vous la connaissez réduit fortement les attributions erronées.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -523,9 +517,33 @@ struct LibraryView: View {
     @State private var rowToDelete: LibraryRow?
     @State private var expandedJobIDs: Set<Int> = []
     @State private var queueNotice: String?
+    /// Sort order driving the table — defaults to most-recently
+    /// updated first, mirroring what the engine returns from
+    /// ``library_list``. Columns toggle between ascending and
+    /// descending when the user clicks their header.
+    @State private var sortOrder: [KeyPathComparator<LibraryDisplayRow>] = [
+        .init(\.sortableUpdatedAt, order: .reverse),
+    ]
+    /// Per-column visibility + ordering state. ``@AppStorage`` so
+    /// the user's chosen layout survives a relaunch. Speakers and
+    /// total size start hidden because they're situational; the
+    /// user opts in via the header context menu (right-click on any
+    /// header).
+    @AppStorage("libraryColumnCustomization")
+    private var columnCustomization = TableColumnCustomization<LibraryDisplayRow>()
+
+    private var sortedRows: [LibraryRow] {
+        // Pull the parent jobs and sort by whichever key the user
+        // picked on the header. Children (artefact rows) follow
+        // their parent in the flatMap below regardless of the
+        // sort key, which preserves the visual hierarchy.
+        let displayJobs = library.rows.map { LibraryDisplayRow(job: $0) }
+        let sortedDisplay = displayJobs.sorted(using: sortOrder)
+        return sortedDisplay.map(\.job)
+    }
 
     private var displayRows: [LibraryDisplayRow] {
-        library.rows.flatMap { row in
+        sortedRows.flatMap { row in
             var rows = [LibraryDisplayRow(job: row)]
             if expandedJobIDs.contains(row.id) {
                 rows.append(contentsOf: row.artifacts.map { LibraryDisplayRow(job: row, artifact: $0) })
@@ -556,8 +574,12 @@ struct LibraryView: View {
                 )
             } else {
                 VStack(spacing: 0) {
-                    Table(displayRows) {
-                        TableColumn("Fichier") { displayRow in
+                    Table(
+                        displayRows,
+                        sortOrder: $sortOrder,
+                        columnCustomization: $columnCustomization
+                    ) {
+                        TableColumn("Fichier", value: \.sortableTitle) { displayRow in
                             if let artifact = displayRow.artifact {
                                 ArtifactTreeNameCell(artifact: artifact)
                             } else {
@@ -582,17 +604,26 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 360, ideal: 520)
+                        .customizationID("filename")
+                        // The user's primary anchor — keep it
+                        // visible no matter what they toggle.
+                        .disabledCustomizationBehavior(.visibility)
 
-                        TableColumn("Statut") { displayRow in
+                        TableColumn("Statut", value: \.sortableStatus) { displayRow in
                             if displayRow.artifact == nil {
+                                // Centered horizontally so the icon
+                                // sits under its column title, not
+                                // pinned to the leading edge.
                                 Image(systemName: statusIconName(displayRow.job.status))
                                     .foregroundStyle(statusColor(displayRow.job.status))
                                     .help(localizedStatus(displayRow.job.status))
+                                    .frame(maxWidth: .infinity, alignment: .center)
                             }
                         }
                         .width(min: 54, ideal: 64, max: 80)
+                        .customizationID("status")
 
-                        TableColumn("Mis à jour") { displayRow in
+                        TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
                             if displayRow.artifact == nil {
                                 Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
                                     .foregroundStyle(.secondary)
@@ -600,6 +631,7 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 140, ideal: 170)
+                        .customizationID("updatedAt")
 
                         TableColumn("Artefacts") { displayRow in
                             if let artifact = displayRow.artifact {
@@ -612,6 +644,36 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 190, ideal: 240)
+                        .customizationID("artefacts")
+
+                        // Hidden by default — the user opts in via
+                        // the header context menu. Renders the
+                        // friendly speaker names with a "+N" suffix
+                        // when there are too many to fit.
+                        TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
+                            if displayRow.artifact == nil {
+                                SpeakerListingCell(names: displayRow.job.displayedSpeakerNames)
+                            }
+                        }
+                        .width(min: 160, ideal: 220)
+                        .customizationID("speakers")
+                        .defaultVisibility(.hidden)
+
+                        // Workspace size, also hidden by default —
+                        // useful when the user hunts for what's
+                        // eating their disk but noisy in everyday
+                        // use.
+                        TableColumn("Poids", value: \.sortableTotalBytes) { displayRow in
+                            if displayRow.artifact == nil {
+                                Text(displayRow.displayedTotalBytes)
+                                    .font(.callout.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .trailing)
+                            }
+                        }
+                        .width(min: 80, ideal: 100, max: 140)
+                        .customizationID("totalBytes")
+                        .defaultVisibility(.hidden)
 
                         TableColumn("Actions") { displayRow in
                             if let artifact = displayRow.artifact {
@@ -629,6 +691,8 @@ struct LibraryView: View {
                             }
                         }
                         .width(min: 120, ideal: 150)
+                        .customizationID("actions")
+                        .disabledCustomizationBehavior(.visibility)
                     }
                 }
                 .overlay(alignment: .bottomLeading) {
@@ -1165,6 +1229,89 @@ extension LibraryRow {
             LibraryArtifact(kind: "review", title: "Rapport", path: review_path),
         ]
     }
+
+    /// Friendly speaker names for the optional Interlocuteurs
+    /// column. Empty strings (placeholders the LLM didn't manage to
+    /// name) are filtered out so the column stays readable. ID
+    /// strings are sorted alphabetically so the listing is stable
+    /// across refreshes.
+    var displayedSpeakerNames: [String] {
+        let map = speakerMap
+        let names = map
+            .compactMap { (key, value) -> String? in
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                return trimmed
+            }
+        // De-dupe — when the rename pass mapped the friendly name
+        // to itself we'd otherwise see "Robin · Robin".
+        var seen: Set<String> = []
+        var deduped: [String] = []
+        for name in names {
+            if seen.insert(name).inserted {
+                deduped.append(name)
+            }
+        }
+        // Stable order across refreshes; otherwise the Table
+        // recomputes diffs every time the dict iteration order
+        // shifts.
+        deduped.sort()
+        // If we only have placeholders, expose them too — the column
+        // becomes "SPEAKER_00 · SPEAKER_01" which is still useful
+        // to the user even if no friendly names landed.
+        if deduped.isEmpty {
+            return map.keys.sorted()
+        }
+        return deduped
+    }
+}
+
+private let _byteFormatter: ByteCountFormatter = {
+    let f = ByteCountFormatter()
+    f.countStyle = .file
+    f.allowedUnits = [.useAll]
+    f.includesUnit = true
+    return f
+}()
+
+extension LibraryDisplayRow {
+    /// Stable, comparable values used by the SwiftUI Table sort
+    /// machinery. The Table sorts ``LibraryDisplayRow`` items
+    /// directly, so each sortable column needs a key path on this
+    /// type. Artefact rows fall back to their parent job's value so
+    /// they always sort alongside their parent.
+    var sortableTitle: String { job.customTitleOrFilename.lowercased() }
+    var sortableStatus: String {
+        // Numeric prefix encodes the natural priority order
+        // (RUNNING > QUEUED > COMPLETED > FAILED), matching what
+        // the user reads off the icon.
+        switch (job.status ?? "").uppercased() {
+        case "RUNNING": return "0"
+        case "QUEUED", "PENDING": return "1"
+        case "COMPLETED": return "2"
+        case "FAILED": return "3"
+        default: return "4"
+        }
+    }
+    /// ISO-8601 timestamps compare lexically, so this is good
+    /// enough for sort purposes; we fall back to ``created_at``
+    /// when ``updated_at`` is blank.
+    var sortableUpdatedAt: String { job.updated_at ?? job.created_at ?? "" }
+    /// 0 for legacy rows so they group at the bottom on descending
+    /// sort, top on ascending. Either way they don't poison the
+    /// real values.
+    var sortableTotalBytes: Int64 { job.total_bytes ?? 0 }
+    /// Sort by interlocuteur count first, then alphabetical.
+    var sortableSpeakerListing: String {
+        let names = job.displayedSpeakerNames
+        return String(format: "%03d-%@", names.count, names.joined(separator: ","))
+    }
+    /// Human-readable rendering of ``total_bytes``. "—" for legacy
+    /// rows; the byte formatter for everything else.
+    var displayedTotalBytes: String {
+        guard let bytes = job.total_bytes else { return "—" }
+        return _byteFormatter.string(fromByteCount: bytes)
+    }
 }
 
 struct LibraryTableActionsView: View {
@@ -1277,6 +1424,57 @@ struct ArtifactDots: View {
             ArtifactDot(label: "A", isPresent: pathExists(row.enhanced_transcript_path))
             ArtifactDot(label: "R", isPresent: pathExists(row.review_path))
         }
+    }
+}
+
+/// Renders a list of speaker names as small capsules. Up to three
+/// fit fully; the remainder collapses into a single "+N" capsule
+/// with a tooltip listing the hidden names. Avoids the wall-of-text
+/// problem when a meeting has 6+ participants and the column would
+/// otherwise wrap or truncate ugly.
+struct SpeakerListingCell: View {
+    var names: [String]
+
+    private var visibleNames: [String] {
+        Array(names.prefix(3))
+    }
+    private var overflowCount: Int {
+        max(0, names.count - visibleNames.count)
+    }
+    private var overflowTooltip: String {
+        names.dropFirst(visibleNames.count).joined(separator: ", ")
+    }
+
+    var body: some View {
+        if names.isEmpty {
+            Text("—")
+                .foregroundStyle(.secondary)
+        } else {
+            HStack(spacing: 4) {
+                ForEach(visibleNames, id: \.self) { name in
+                    SpeakerChip(text: name)
+                }
+                if overflowCount > 0 {
+                    SpeakerChip(text: "+\(overflowCount)")
+                        .help(overflowTooltip)
+                }
+            }
+            .lineLimit(1)
+        }
+    }
+}
+
+struct SpeakerChip: View {
+    var text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .lineLimit(1)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(Color.teal.opacity(0.18), in: Capsule())
+            .foregroundStyle(.primary)
     }
 }
 
@@ -1710,6 +1908,15 @@ func revealInFinder(_ path: String) {
 func openHuggingFaceTokens() {
     guard let url = URL(string: "https://huggingface.co/settings/tokens") else { return }
     NSWorkspace.shared.open(url)
+}
+
+/// Builds the title shown next to the speaker-count Stepper.
+/// Embedded in the title (rather than a sibling label View) so the
+/// Form's column layout stays intact — wrapping a Spacer inside a
+/// Stepper label collapses every other field on macOS.
+func speakerCountStepperLabel(_ value: Int) -> String {
+    let suffix = value == 0 ? "Auto" : "\(value)"
+    return "Nombre d'intervenants attendu : \(suffix)"
 }
 
 func localizedStatus(_ raw: String?) -> String {

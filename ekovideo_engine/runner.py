@@ -84,6 +84,27 @@ def _persist_step_durations(db, job_id: int, results: list[StepResult]) -> None:
     db.update_job_durations(job_id, ffmpeg=ffmpeg, whisper=whisper, diarization=diarization)
 
 
+def _snapshot_workspace_size(db, job_id: int, workspace: Path) -> None:
+    """Walk the workspace and store the cumulative byte count.
+
+    The library's optional "Poids" column reads this. We compute it
+    once per successful job to avoid re-walking on every list
+    refresh — the user has cheaper ways to ask for an update
+    (delete + relaunch) and the alternative (lazy compute on
+    library-list) would re-scan dozens of folders every refresh.
+    """
+    if not workspace.exists() or not workspace.is_dir():
+        return
+    total = 0
+    for child in workspace.rglob("*"):
+        try:
+            if child.is_file() or child.is_symlink():
+                total += child.stat().st_size if child.is_file() else 0
+        except OSError:
+            continue
+    db.update_job_total_bytes(job_id, total)
+
+
 class EngineRunner:
     def __init__(self, sink: EventSink):
         self.sink = sink
@@ -180,6 +201,7 @@ class EngineRunner:
             )
 
         _persist_step_durations(db, job_id, results)
+        _snapshot_workspace_size(db, job_id, workspace)
         sink(ProgressEvent("done", 100, "Job complete", eta_seconds=0))
         db.update_job_status(job_id, "COMPLETED", "")
         sink(

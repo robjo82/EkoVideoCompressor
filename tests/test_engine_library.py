@@ -321,5 +321,47 @@ class DeleteWithFilesTest(unittest.TestCase):
             self.assertTrue(_looks_like_engine_workspace(ws))
 
 
+class JobTotalBytesPersistenceTest(unittest.TestCase):
+    def test_update_job_total_bytes_round_trips_via_list_jobs(self):
+        # The library's optional "Poids" column reads ``total_bytes``
+        # off each list_jobs row. Pin the round-trip so a future
+        # schema change doesn't silently drop the value.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(root / "work"),
+                    settings={},
+                )
+                db.update_job_total_bytes(job_id, 1_234_567)
+                rows = db.list_jobs(limit=10)
+                self.assertEqual(rows[0]["total_bytes"], 1_234_567)
+                # The runner's snapshot fires on every successful
+                # job, so updating the same id twice must overwrite
+                # rather than accumulate.
+                db.update_job_total_bytes(job_id, 999)
+                rows = db.list_jobs(limit=10)
+                self.assertEqual(rows[0]["total_bytes"], 999)
+
+    def test_legacy_rows_have_null_total_bytes(self):
+        # Migrations are silent — a row created without ever calling
+        # update_job_total_bytes must read back as None so the
+        # SwiftUI side can render "—" instead of fabricating a 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(root / "work"),
+                    settings={},
+                )
+                rows = db.list_jobs(limit=10)
+                self.assertEqual(rows[0]["id"], job_id)
+                self.assertIsNone(rows[0]["total_bytes"])
+
+
 if __name__ == "__main__":
     unittest.main()
