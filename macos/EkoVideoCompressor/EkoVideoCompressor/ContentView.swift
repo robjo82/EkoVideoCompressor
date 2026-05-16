@@ -7,12 +7,14 @@ enum AppSection: String, CaseIterable, Hashable {
     case queue
     case library
     case models
+    case speakers
 
     var title: String {
         switch self {
         case .queue: "Traitements"
         case .library: "Bibliothèque"
         case .models: "Modèles"
+        case .speakers: "Interlocuteurs"
         }
     }
 
@@ -21,6 +23,7 @@ enum AppSection: String, CaseIterable, Hashable {
         case .queue: "play.rectangle"
         case .library: "tray.full"
         case .models: "shippingbox"
+        case .speakers: "person.text.rectangle"
         }
     }
 }
@@ -48,6 +51,8 @@ struct ContentView: View {
                     LibraryView()
                 case .models:
                     ModelsView()
+                case .speakers:
+                    SpeakersView()
                 }
             }
             .navigationTitle(selectedSection.title)
@@ -945,6 +950,9 @@ struct SettingsView: View {
                 }
                 Section("Voix mémorisées") {
                     SpeakerProfilesSection()
+                }
+                Section("Connexion Odoo") {
+                    OdooConnectionSection()
                 }
                 Section("Hugging Face") {
                     SecureField("Token Read", text: $settings.hfToken)
@@ -1982,6 +1990,414 @@ func openPath(_ path: String) {
 
 func revealInFinder(_ path: String) {
     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+}
+
+// ---------------------------------------------------------------------------
+// Odoo connection panel (Réglages → Connexion Odoo)
+// ---------------------------------------------------------------------------
+
+/// Form section that lets the user paste their Odoo URL + database
+/// + login + API key, then test the connection. Kept ultra-light:
+/// four fields, one button, one status line. The user shouldn't
+/// have to think about XML-RPC, JSON-RPC, sessions, etc — just
+/// "where's your Odoo, what's your key".
+struct OdooConnectionSection: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var odoo: OdooStore
+
+    var body: some View {
+        TextField("URL Odoo", text: $settings.odooUrl, prompt: Text("https://erp.exemple.fr"))
+        TextField("Base de données", text: $settings.odooDatabase, prompt: Text("acme_prod"))
+        TextField("Email du compte", text: $settings.odooLogin, prompt: Text("vous@exemple.fr"))
+        SecureField("Clé API", text: $settings.odooApiKey)
+        HStack {
+            Button {
+                Task { await odoo.testConnection() }
+            } label: {
+                Label("Tester la connexion", systemImage: "checkmark.shield")
+            }
+            .disabled(!settings.odooConfigured)
+            Spacer()
+            statusLabel
+        }
+        Text("La clé API se génère depuis Odoo : Préférences utilisateur → Sécurité du compte → Nouvelle clé API. Aucune donnée Odoo n'est envoyée à un tiers.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private var statusLabel: some View {
+        switch odoo.status {
+        case .unknown:
+            EmptyView()
+        case .checking:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Vérification…").font(.caption).foregroundStyle(.secondary)
+            }
+        case .ok(let account, let count):
+            Label(
+                "Connecté · \(account) · \(count) contacts",
+                systemImage: "checkmark.circle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.green)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .lineLimit(2)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speakers view (4th sidebar item)
+// ---------------------------------------------------------------------------
+
+/// Top-level view of the local voice profiles, optionally grouped
+/// by their linked Odoo company. The grouping kicks in only when
+/// the user has linked at least one profile — otherwise we render
+/// a flat list so first-time users don't see empty "Sans société"
+/// brackets they don't understand.
+struct SpeakersView: View {
+    @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var odoo: OdooStore
+    @State private var profiles: [SpeakerProfile] = []
+    @State private var loading = false
+    @State private var profileToLink: SpeakerProfile?
+    @State private var profileToDelete: SpeakerProfile?
+
+    private var groupedProfiles: [(label: String, profiles: [SpeakerProfile])] {
+        // Plain list when nothing's linked yet — avoids fake bucket
+        // headers on a brand-new install.
+        let anyLinked = profiles.contains(where: \.isLinkedToOdoo)
+        if !anyLinked {
+            return [("", profiles)]
+        }
+        let buckets = Dictionary(grouping: profiles, by: \.groupingLabel)
+        return buckets
+            .map { ($0.key, $0.value.sorted { $0.name.lowercased() < $1.name.lowercased() }) }
+            .sorted { lhs, rhs in
+                // "Sans société Odoo" goes last so the named
+                // companies anchor the top of the list.
+                if lhs.0 == "Sans société Odoo" { return false }
+                if rhs.0 == "Sans société Odoo" { return true }
+                return lhs.0.lowercased() < rhs.0.lowercased()
+            }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ListHeaderView(
+                title: "Interlocuteurs",
+                subtitle: settings.odooConfigured
+                    ? "Voix mémorisées, regroupées par société Odoo."
+                    : "Voix mémorisées localement. Connectez Odoo dans Réglages pour les regrouper par entreprise.",
+                actionTitle: "Actualiser",
+                actionSystemImage: "arrow.clockwise"
+            ) {
+                Task { await reload() }
+            }
+            Divider()
+            if loading && profiles.isEmpty {
+                ProgressView("Chargement des voix…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if profiles.isEmpty {
+                EmptyStateView(
+                    title: "Aucune voix mémorisée",
+                    systemImage: "person.text.rectangle",
+                    message: "Renommez les locuteurs après une transcription pour qu'ils apparaissent ici."
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(groupedProfiles, id: \.label) { group in
+                            VStack(alignment: .leading, spacing: 6) {
+                                if !group.label.isEmpty {
+                                    Text(group.label)
+                                        .font(.headline)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 4)
+                                }
+                                VStack(spacing: 4) {
+                                    ForEach(group.profiles) { profile in
+                                        SpeakerProfileRow(
+                                            profile: profile,
+                                            onLink: { profileToLink = profile },
+                                            onUnlink: {
+                                                Task {
+                                                    if let updated = await library.unlinkSpeakerFromOdoo(profile) {
+                                                        replace(profile, with: updated)
+                                                    }
+                                                }
+                                            },
+                                            onDelete: { profileToDelete = profile }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(20)
+                }
+            }
+        }
+        .task { await reload() }
+        .sheet(item: $profileToLink) { profile in
+            OdooLinkSheet(profile: profile) { updated in
+                replace(profile, with: updated)
+            }
+            .environmentObject(odoo)
+            .environmentObject(library)
+        }
+        .confirmationDialog(
+            "Oublier cette voix ?",
+            isPresented: Binding(
+                get: { profileToDelete != nil },
+                set: { if !$0 { profileToDelete = nil } }
+            ),
+            presenting: profileToDelete
+        ) { profile in
+            Button("Supprimer", role: .destructive) {
+                Task {
+                    await library.deleteSpeakerProfile(profile)
+                    await reload()
+                }
+            }
+            Button("Annuler", role: .cancel) {}
+        } message: { profile in
+            Text("La prochaine fois que \(profile.name) parlera dans une réunion, l'app demandera à nouveau confirmation.")
+        }
+    }
+
+    private func reload() async {
+        loading = true
+        profiles = await library.listSpeakerProfiles()
+        loading = false
+    }
+
+    private func replace(_ old: SpeakerProfile, with new: SpeakerProfile) {
+        if let idx = profiles.firstIndex(where: { $0.id == old.id }) {
+            profiles[idx] = new
+        }
+    }
+}
+
+struct SpeakerProfileRow: View {
+    var profile: SpeakerProfile
+    var onLink: () -> Void
+    var onUnlink: () -> Void
+    var onDelete: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: profile.isLinkedToOdoo
+                  ? "person.crop.circle.badge.checkmark"
+                  : "person.crop.circle")
+                .foregroundStyle(profile.isLinkedToOdoo ? .teal : .secondary)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(profile.odoo_partner_name ?? profile.name)
+                    .font(.callout.weight(.medium))
+                if let odooName = profile.odoo_partner_name,
+                   odooName.lowercased() != profile.name.lowercased() {
+                    Text("voix mémorisée : \(profile.name)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("\(profile.sample_count) extrait(s)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if profile.isLinkedToOdoo {
+                Button {
+                    onUnlink()
+                } label: {
+                    Label("Délier", systemImage: "link.badge.minus")
+                }
+                .help("Délier ce contact Odoo")
+            } else {
+                Button {
+                    onLink()
+                } label: {
+                    Label("Lier à Odoo", systemImage: "link")
+                }
+                .help("Associer un contact Odoo à cette voix")
+            }
+            Button(role: .destructive) {
+                onDelete()
+            } label: {
+                Label("Supprimer", systemImage: "trash")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+/// Spotlight-style live search for an Odoo res.partner. The whole
+/// linker UX collapses into a TextField + a results list — no
+/// filters, no advanced options. The user types, we debounce
+/// 250 ms, the engine returns matches, click = link.
+struct OdooLinkSheet: View {
+    @EnvironmentObject private var odoo: OdooStore
+    @EnvironmentObject private var library: LibraryStore
+    @Environment(\.dismiss) private var dismiss
+    let profile: SpeakerProfile
+    var onLinked: (SpeakerProfile) -> Void
+
+    @State private var query: String = ""
+    @State private var results: [OdooPartner] = []
+    @State private var searching = false
+    @State private var debounceTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Lier « \(profile.name) » à un contact Odoo")
+                        .font(.title2.bold())
+                    Text("Tapez le nom ou l'email d'un contact pour l'associer à cette voix.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(20)
+            Divider()
+
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Rechercher dans les contacts Odoo…", text: $query)
+                    .textFieldStyle(.plain)
+                    .onChange(of: query) { newValue in
+                        scheduleSearch(newValue)
+                    }
+                if searching {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .padding(12)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            Divider()
+
+            if results.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "person.crop.circle.badge.questionmark")
+                        .font(.system(size: 36, weight: .light))
+                        .foregroundStyle(.secondary)
+                    Text(query.trimmingCharacters(in: .whitespaces).isEmpty
+                         ? "Commencez à taper pour rechercher"
+                         : "Aucun contact ne correspond")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(results) { partner in
+                    Button {
+                        link(partner)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: partner.is_company
+                                  ? "building.2"
+                                  : "person")
+                                .foregroundStyle(partner.is_company ? .teal : .primary)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(partner.display_name)
+                                    .font(.callout.weight(.medium))
+                                HStack(spacing: 6) {
+                                    if !partner.parent_name.isEmpty {
+                                        Text(partner.parent_name)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    if !partner.function.isEmpty {
+                                        Text("·")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Text(partner.function)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                if !partner.email.isEmpty {
+                                    Text(partner.email)
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            Spacer()
+                            Image(systemName: "link")
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .listStyle(.inset)
+            }
+
+            Divider()
+            HStack {
+                Button("Annuler") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+            }
+            .padding(14)
+        }
+        .frame(minWidth: 620, minHeight: 460)
+    }
+
+    private func scheduleSearch(_ value: String) {
+        debounceTask?.cancel()
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            results = []
+            return
+        }
+        debounceTask = Task {
+            // Debounce so we don't spam Odoo for every keystroke.
+            // 250 ms is short enough to feel instant, long enough
+            // to skip mid-word noise.
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
+            await MainActor.run { searching = true }
+            let found = await odoo.searchPartners(trimmed)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                results = found
+                searching = false
+            }
+        }
+    }
+
+    private func link(_ partner: OdooPartner) {
+        // Top-level companies have no parent; we surface the
+        // partner itself as the "company" so the grouping shelf
+        // shows the company name rather than dumping it under
+        // "Sans société".
+        let companyId = partner.is_company ? partner.id : (partner.parent_id > 0 ? partner.parent_id : nil)
+        let companyName = partner.is_company ? partner.name : partner.parent_name
+        Task {
+            if let updated = await library.linkSpeakerToOdoo(
+                profile,
+                partnerId: partner.id,
+                partnerName: partner.display_name,
+                companyId: companyId,
+                companyName: companyName
+            ) {
+                onLinked(updated)
+                await MainActor.run { dismiss() }
+            }
+        }
+    }
 }
 
 func openHuggingFaceTokens() {

@@ -8,6 +8,7 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var library = LibraryStore()
     @StateObject private var models = ModelStore()
     @StateObject private var updater = UpdateStore()
+    @StateObject private var odoo = OdooStore()
 
     init() {
         let args = CommandLine.arguments
@@ -26,9 +27,11 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(library)
                 .environmentObject(models)
                 .environmentObject(updater)
+                .environmentObject(odoo)
                 .frame(minWidth: 1180, minHeight: 760)
                 .onAppear {
                     updater.setSettings(settings)
+                    odoo.bind(settings)
                     Task {
                         await updater.checkUpdates(proactive: true)
                     }

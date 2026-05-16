@@ -170,6 +170,48 @@ struct SpeakerProfile: Codable, Identifiable, Equatable {
     var sample_count: Int
     var created_at: String?
     var updated_at: String?
+    // Optional Odoo linkage — present when the user paired the
+    // voice profile with a ``res.partner`` record. Absent on any
+    // profile that's still purely local.
+    var odoo_partner_id: Int?
+    var odoo_partner_name: String?
+    var odoo_company_id: Int?
+    var odoo_company_name: String?
+    var linked_at: String?
+
+    var isLinkedToOdoo: Bool {
+        guard let pid = odoo_partner_id, pid > 0 else { return false }
+        return true
+    }
+
+    /// Bucket key for the SwiftUI Interlocuteurs grouping.
+    /// "Sans société" when no Odoo company is set; the company
+    /// name otherwise (linked partner inherits its parent company).
+    var groupingLabel: String {
+        if let company = odoo_company_name, !company.isEmpty {
+            return company
+        }
+        if isLinkedToOdoo {
+            // Linked but the partner is itself a top-level company.
+            return odoo_partner_name ?? name
+        }
+        return "Sans société Odoo"
+    }
+}
+
+/// Minimal Odoo res.partner shape used by the search picker. The
+/// engine flattens parent_id from XML-RPC's [id, name] pair into
+/// two scalar fields so the UI doesn't have to branch.
+struct OdooPartner: Codable, Identifiable, Equatable {
+    var id: Int
+    var name: String
+    var display_name: String
+    var parent_id: Int
+    var parent_name: String
+    var is_company: Bool
+    var email: String
+    var phone: String
+    var function: String
 }
 
 /// Disk-usage preview shown in the deletion sheet so the user can
