@@ -12,6 +12,7 @@ from .library import (
     library_delete,
     library_delete_speaker_profile,
     library_discover_speakers,
+    library_flag_speaker_sample_review,
     library_link_speaker_profile_to_odoo,
     library_list,
     library_list_speaker_profiles,
@@ -81,7 +82,15 @@ def build_parser() -> argparse.ArgumentParser:
     samples = sub.add_parser("library-speaker-samples")
     samples.add_argument("job_id", type=int)
     samples.add_argument("--seconds", type=float, default=8.0)
+    samples.add_argument("--per-speaker", type=int, default=3)
     samples.add_argument("--jsonl", action="store_true")
+
+    sample_review = sub.add_parser("library-speaker-sample-review")
+    sample_review.add_argument("job_id", type=int)
+    sample_review.add_argument("--speaker", required=True)
+    sample_review.add_argument("--start", type=float, required=True)
+    sample_review.add_argument("--duration", type=float, required=True)
+    sample_review.add_argument("--note", default="")
 
     # Backfill the speaker list for old jobs whose pipeline didn't
     # persist segments or speaker_map_json. The SwiftUI rename sheet
@@ -201,12 +210,28 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "library-speaker-samples":
-            rows = library_speaker_samples(args.job_id, seconds=args.seconds)
+            rows = library_speaker_samples(
+                args.job_id,
+                seconds=args.seconds,
+                per_speaker=args.per_speaker,
+            )
             if args.jsonl:
                 for row in rows:
                     print(json.dumps(row, ensure_ascii=False, sort_keys=True))
             else:
                 _print_json(rows)
+            return 0
+
+        if args.command == "library-speaker-sample-review":
+            _print_json(
+                library_flag_speaker_sample_review(
+                    args.job_id,
+                    speaker=args.speaker,
+                    start=args.start,
+                    duration=args.duration,
+                    note=args.note,
+                )
+            )
             return 0
 
         if args.command == "library-update-context":

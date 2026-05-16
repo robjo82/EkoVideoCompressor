@@ -156,8 +156,12 @@ struct SpeakerSample: Codable, Identifiable, Equatable {
     var path: String
     var start: Double
     var duration: Double
+    var index: Int?
+    var utterance_count: Int?
+    var total_duration: Double?
+    var text: String?
 
-    var id: String { speaker }
+    var id: String { "\(speaker)-\(index ?? 1)-\(start)" }
 }
 
 /// One enrolled voice profile. The engine stores a 512-dim

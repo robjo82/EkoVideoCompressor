@@ -17,6 +17,7 @@ from ekovideo_engine.library import (
     library_delete_speaker_profile,
     library_discover_speakers,
     library_enroll_speakers_for_job,
+    library_flag_speaker_sample_review,
     library_link_speaker_profile_to_odoo,
     library_list_speaker_profiles,
     library_recognize_speakers,
@@ -111,6 +112,76 @@ class EngineLibraryActionsTest(unittest.TestCase):
 
             self.assertEqual([sample["speaker"] for sample in samples], ["SPEAKER_00", "SPEAKER_01"])
             self.assertTrue(all(Path(sample["path"]).exists() for sample in samples))
+            self.assertEqual(samples[0]["utterance_count"], 1)
+            self.assertAlmostEqual(samples[0]["total_duration"], 3.0)
+            self.assertEqual(samples[0]["index"], 1)
+
+    def test_speaker_samples_can_return_multiple_clips_per_speaker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            workspace.mkdir()
+            (workspace / "audio.wav").write_bytes(b"fake wav")
+
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                db.add_segments(
+                    job_id,
+                    [
+                        {"start": 1.0, "end": 4.0, "speaker": "SPEAKER_00", "text": "Premier."},
+                        {"start": 8.0, "end": 12.0, "speaker": "SPEAKER_00", "text": "Deuxième."},
+                        {"start": 15.0, "end": 21.0, "speaker": "SPEAKER_00", "text": "Troisième."},
+                    ],
+                )
+
+                def fake_run(cmd, *args, **kwargs):
+                    Path(cmd[-1]).write_bytes(b"sample")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with patch("ekovideo_engine.library.subprocess.run", side_effect=fake_run):
+                    samples = library_speaker_samples(job_id, seconds=3, per_speaker=2)
+
+            self.assertEqual(len(samples), 2)
+            self.assertEqual([sample["speaker"] for sample in samples], ["SPEAKER_00", "SPEAKER_00"])
+            self.assertEqual([sample["index"] for sample in samples], [1, 2])
+            self.assertTrue(all(sample["duration"] <= 3.0 for sample in samples))
+            self.assertEqual(samples[0]["utterance_count"], 3)
+            self.assertAlmostEqual(samples[0]["total_duration"], 13.0)
+
+    def test_flag_speaker_sample_review_writes_workspace_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            workspace.mkdir()
+            source = root / "source.mov"
+            source.write_bytes(b"source")
+
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(source),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                result = library_flag_speaker_sample_review(
+                    job_id,
+                    speaker="SPEAKER_00",
+                    start=12.3,
+                    duration=4.5,
+                    note="Deux voix entendues.",
+                )
+
+            marker = workspace / "speaker_review_requests.jsonl"
+            self.assertTrue(marker.exists())
+            payload = json.loads(marker.read_text(encoding="utf-8").strip())
+            self.assertEqual(payload["speaker"], "SPEAKER_00")
+            self.assertEqual(payload["note"], "Deux voix entendues.")
+            self.assertEqual(result["review_path"], str(marker))
 
 
 class DiscoverSpeakersTest(unittest.TestCase):

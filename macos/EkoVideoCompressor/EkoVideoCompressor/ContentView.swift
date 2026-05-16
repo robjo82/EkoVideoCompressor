@@ -99,6 +99,13 @@ struct ContentView: View {
             async let modelsLoad: Void = models.models.isEmpty ? models.refresh() : ()
             _ = await (libraryLoad, modelsLoad)
         }
+        .onChange(of: queue.autoRunRequestID) { _, requestID in
+            guard requestID != nil else { return }
+            queue.autoRunRequestID = nil
+            guard !queue.isBatchRunning, !queue.items.isEmpty else { return }
+            selectedSection = .queue
+            Task { await runQueue() }
+        }
     }
 
     private func chooseFiles() {
@@ -159,7 +166,7 @@ struct ContentView: View {
             ),
             glossary_terms: settings.glossaryTerms,
             speaker_overrides: [:],
-            technical_terms: [],
+            technical_terms: item.focusNote.map { [$0] } ?? [],
             rerun_steps: [],
             delete_source_after_copy: settings.deleteSourceAfterCopy
         )
@@ -721,6 +728,7 @@ struct LibraryView: View {
         .sheet(item: $editingRow) { row in
             LibraryContextEditor(row: row)
                 .environmentObject(library)
+                .environmentObject(queue)
         }
         .sheet(item: $rowToDelete) { row in
             LibraryDeletionSheet(row: row)
@@ -1485,12 +1493,15 @@ struct SpeakerChip: View {
 
 struct LibraryContextEditor: View {
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var queue: QueueStore
     @Environment(\.dismiss) private var dismiss
     var row: LibraryRow
     @State private var speakers: [SpeakerEditRow]
     @State private var samples: [SpeakerSample] = []
+    @State private var sampleIndexBySpeaker: [String: Int] = [:]
     @State private var loadingSamples = false
     @State private var currentSound: NSSound?
+    @State private var reviewNotice: String?
     @State private var termsText: String
 
     init(row: LibraryRow) {
@@ -1525,28 +1536,30 @@ struct LibraryContextEditor: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach($speakers) { $speaker in
-                            HStack {
-                                if speaker.id != speaker.name {
-                                    Text(speaker.id)
-                                        .font(.body.monospaced())
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 120, alignment: .leading)
-                                }
-                                TextField(speaker.name.isEmpty ? speaker.id : speaker.name, text: $speaker.name)
-                                if let sample = sample(for: speaker) {
-                                    Button {
-                                        play(sample)
-                                    } label: {
-                                        Label("Écouter", systemImage: "play.circle")
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack {
+                                    if speaker.id != speaker.name {
+                                        Text(speaker.id)
+                                            .font(.body.monospaced())
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 120, alignment: .leading)
                                     }
-                                    .labelStyle(.iconOnly)
-                                    .help("Écouter un extrait de cet interlocuteur")
-                                } else if loadingSamples {
-                                    ProgressView()
-                                        .controlSize(.small)
+                                    TextField(speaker.name.isEmpty ? speaker.id : speaker.name, text: $speaker.name)
+                                    speakerSampleControls(for: speaker)
+                                }
+                                if let stats = speakerStatsText(for: speaker) {
+                                    Text(stats)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.leading, speaker.id != speaker.name ? 128 : 0)
                                 }
                             }
                         }
+                    }
+                    if let reviewNotice {
+                        Label(reviewNotice, systemImage: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.green)
                     }
                     Text("Saisissez uniquement le nom à afficher. Les fichiers texte existants sont réécrits quand un nom change.")
                         .font(.caption)
@@ -1578,6 +1591,43 @@ struct LibraryContextEditor: View {
         .frame(minWidth: 680, minHeight: 560)
         .task {
             await loadSamples()
+        }
+    }
+
+    @ViewBuilder
+    private func speakerSampleControls(for speaker: SpeakerEditRow) -> some View {
+        let availableSamples = samples(for: speaker)
+        if let sample = selectedSample(for: speaker, in: availableSamples) {
+            HStack(spacing: 6) {
+                Button {
+                    play(sample)
+                } label: {
+                    Label("Écouter", systemImage: "play.circle")
+                }
+                .labelStyle(.iconOnly)
+                .help("Écouter \(samplePositionText(for: speaker, in: availableSamples))")
+
+                if availableSamples.count > 1 {
+                    Button {
+                        nextSample(for: speaker, count: availableSamples.count)
+                    } label: {
+                        Label("Extrait suivant", systemImage: "forward.end")
+                    }
+                    .labelStyle(.iconOnly)
+                    .help("Passer à l'extrait suivant")
+                }
+
+                Button {
+                    flagForReview(sample)
+                } label: {
+                    Label("À revoir", systemImage: "exclamationmark.bubble")
+                }
+                .labelStyle(.iconOnly)
+                .help("Marquer cet extrait comme ambigu et relancer la source en priorité")
+            }
+        } else if loadingSamples {
+            ProgressView()
+                .controlSize(.small)
         }
     }
 
@@ -1643,8 +1693,56 @@ struct LibraryContextEditor: View {
         }
     }
 
-    private func sample(for speaker: SpeakerEditRow) -> SpeakerSample? {
-        samples.first { $0.speaker == speaker.id || $0.speaker == speaker.name }
+    private func samples(for speaker: SpeakerEditRow) -> [SpeakerSample] {
+        samples
+            .filter { $0.speaker == speaker.id || $0.speaker == speaker.name }
+            .sorted {
+                if ($0.index ?? 0) != ($1.index ?? 0) {
+                    return ($0.index ?? 0) < ($1.index ?? 0)
+                }
+                return $0.start < $1.start
+            }
+    }
+
+    private func selectedSample(for speaker: SpeakerEditRow, in availableSamples: [SpeakerSample]) -> SpeakerSample? {
+        guard !availableSamples.isEmpty else { return nil }
+        let rawIndex = sampleIndexBySpeaker[speaker.id] ?? 0
+        return availableSamples[rawIndex % availableSamples.count]
+    }
+
+    private func nextSample(for speaker: SpeakerEditRow, count: Int) {
+        guard count > 0 else { return }
+        let rawIndex = sampleIndexBySpeaker[speaker.id] ?? 0
+        sampleIndexBySpeaker[speaker.id] = (rawIndex + 1) % count
+    }
+
+    private func samplePositionText(for speaker: SpeakerEditRow, in availableSamples: [SpeakerSample]) -> String {
+        guard !availableSamples.isEmpty else { return "un extrait" }
+        let index = (sampleIndexBySpeaker[speaker.id] ?? 0) % availableSamples.count
+        if availableSamples.count == 1 {
+            return "l'extrait"
+        }
+        return "l'extrait \(index + 1)/\(availableSamples.count)"
+    }
+
+    private func speakerStatsText(for speaker: SpeakerEditRow) -> String? {
+        guard let sample = samples(for: speaker).first,
+              let utterances = sample.utterance_count,
+              let totalDuration = sample.total_duration else { return nil }
+        return "\(utterances) prise\(utterances > 1 ? "s" : "") de parole · \(durationLabel(totalDuration)) de parole"
+    }
+
+    private func durationLabel(_ seconds: Double) -> String {
+        let totalSeconds = max(Int(seconds.rounded()), 0)
+        let minutes = totalSeconds / 60
+        let remainingSeconds = totalSeconds % 60
+        if minutes <= 0 {
+            return "\(remainingSeconds) s"
+        }
+        if remainingSeconds == 0 {
+            return "\(minutes) min"
+        }
+        return "\(minutes) min \(remainingSeconds) s"
     }
 
     private func play(_ sample: SpeakerSample) {
@@ -1652,6 +1750,34 @@ struct LibraryContextEditor: View {
         let sound = NSSound(contentsOfFile: sample.path, byReference: true)
         currentSound = sound
         sound?.play()
+    }
+
+    private func flagForReview(_ sample: SpeakerSample) {
+        Task {
+            let marked = await library.flagSpeakerSampleForReview(row, sample: sample)
+            guard marked else { return }
+            await MainActor.run {
+                if let path = pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path {
+                    queue.add(
+                        urls: [URL(fileURLWithPath: path)],
+                        focusNote: focusNote(for: sample),
+                        prioritize: true
+                    )
+                    queue.requestAutoRun()
+                }
+                reviewNotice = "Extrait marqué à revoir et relance prioritaire demandée."
+            }
+        }
+    }
+
+    private func focusNote(for sample: SpeakerSample) -> String {
+        let end = sample.start + sample.duration
+        return String(
+            format: "Passage interlocuteur à revoir: %@ de %.1fs à %.1fs. Vérifier diarisation, attribution du locuteur et transcription; l'utilisateur a signalé que plusieurs voix peuvent être présentes.",
+            sample.speaker,
+            sample.start,
+            end
+        )
     }
 }
 

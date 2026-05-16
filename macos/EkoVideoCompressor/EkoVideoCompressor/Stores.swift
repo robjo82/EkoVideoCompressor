@@ -4,6 +4,7 @@ import SwiftUI
 struct QueueItem: Identifiable, Equatable {
     let id = UUID()
     var sourceURL: URL
+    var focusNote: String?
     var status: String = "En attente"
     var progress: Double = 0
 }
@@ -12,12 +13,31 @@ struct QueueItem: Identifiable, Equatable {
 final class QueueStore: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var isBatchRunning = false
+    @Published var autoRunRequestID: UUID?
 
-    func add(urls: [URL]) {
-        let existing = Set(items.map(\.sourceURL))
-        for url in urls where !existing.contains(url) {
-            items.append(QueueItem(sourceURL: url))
+    func add(urls: [URL], focusNote: String? = nil, prioritize: Bool = false) {
+        for url in urls {
+            if let index = items.firstIndex(where: { $0.sourceURL == url }) {
+                if let focusNote {
+                    items[index].focusNote = focusNote
+                }
+                if prioritize && index > 0 {
+                    let item = items.remove(at: index)
+                    items.insert(item, at: 0)
+                }
+                continue
+            }
+            let item = QueueItem(sourceURL: url, focusNote: focusNote)
+            if prioritize {
+                items.insert(item, at: 0)
+            } else {
+                items.append(item)
+            }
         }
+    }
+
+    func requestAutoRun() {
+        autoRunRequestID = UUID()
     }
 
     func move(from source: IndexSet, to destination: Int) {
@@ -454,6 +474,8 @@ final class LibraryStore: ObservableObject {
             arguments: EngineProcess.defaultPythonArguments([
                 "library-speaker-samples",
                 "\(row.id)",
+                "--per-speaker",
+                "4",
                 "--jsonl",
             ])
         )
@@ -464,6 +486,29 @@ final class LibraryStore: ObservableObject {
         return result.lines.compactMap { line in
             try? JSONDecoder().decode(SpeakerSample.self, from: Data(line.utf8))
         }
+    }
+
+    @discardableResult
+    func flagSpeakerSampleForReview(_ row: LibraryRow, sample: SpeakerSample) async -> Bool {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-speaker-sample-review",
+                "\(row.id)",
+                "--speaker",
+                sample.speaker,
+                "--start",
+                String(format: "%.3f", sample.start),
+                "--duration",
+                String(format: "%.3f", sample.duration),
+                "--note",
+                "Extrait signalé depuis l'éditeur d'interlocuteurs : plusieurs voix possibles.",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return false
+        }
+        return true
     }
 
     /// Backfill the speaker map for jobs that completed before the

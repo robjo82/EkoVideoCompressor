@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -375,7 +376,85 @@ def _sample_audio_source(job: dict[str, Any]) -> Path | None:
     return None
 
 
-def library_speaker_samples(job_id: int, seconds: float = 8.0) -> list[dict[str, Any]]:
+def _segment_start(segment: dict[str, Any]) -> float:
+    return float(segment.get("start_time") or segment.get("start") or 0)
+
+
+def _segment_end(segment: dict[str, Any]) -> float:
+    return float(segment.get("end_time") or segment.get("end") or 0)
+
+
+def _segment_duration(segment: dict[str, Any]) -> float:
+    return max(0.0, _segment_end(segment) - _segment_start(segment))
+
+
+def _speaker_stats(segments: list[dict[str, Any]]) -> dict[str, dict[str, float | int]]:
+    stats: dict[str, dict[str, float | int]] = {}
+    for segment in segments:
+        speaker = str(segment.get("speaker") or "").strip()
+        if not speaker:
+            continue
+        bucket = stats.setdefault(speaker, {"utterance_count": 0, "total_duration": 0.0})
+        bucket["utterance_count"] = int(bucket["utterance_count"]) + 1
+        bucket["total_duration"] = float(bucket["total_duration"]) + _segment_duration(segment)
+    return stats
+
+
+def _sample_isolation_score(
+    segment: dict[str, Any],
+    all_segments: list[dict[str, Any]],
+) -> float:
+    """Prefer long turns with silence or same-speaker context around them.
+
+    Diarisation can be noisy: padding a clip into a neighbour from
+    another speaker is exactly what makes the UX confusing. This score
+    pushes isolated turns to the top and demotes segments that butt up
+    against another speaker.
+    """
+
+    start = _segment_start(segment)
+    end = _segment_end(segment)
+    speaker = str(segment.get("speaker") or "")
+    duration = max(0.0, end - start)
+    nearest_other_gap = 30.0
+    overlap_penalty = 0.0
+    for other in all_segments:
+        if other is segment:
+            continue
+        other_speaker = str(other.get("speaker") or "")
+        if other_speaker == speaker:
+            continue
+        other_start = _segment_start(other)
+        other_end = _segment_end(other)
+        if other_start < end and other_end > start:
+            overlap_penalty += 10.0
+            nearest_other_gap = 0.0
+        elif other_end <= start:
+            nearest_other_gap = min(nearest_other_gap, start - other_end)
+        elif other_start >= end:
+            nearest_other_gap = min(nearest_other_gap, other_start - end)
+    text_bonus = min(len(str(segment.get("text") or "")) / 120.0, 1.0)
+    gap_bonus = min(nearest_other_gap, 3.0)
+    return duration + gap_bonus + text_bonus - overlap_penalty
+
+
+def _clip_window(segment: dict[str, Any], seconds: float) -> tuple[float, float]:
+    start = _segment_start(segment)
+    end = _segment_end(segment)
+    duration = max(0.0, end - start)
+    if duration <= 0:
+        return start, 0.0
+    trim = 0.05 if duration > 1.2 else 0.0
+    clip_start = max(start + trim, 0)
+    clip_duration = max(min(seconds, duration - (trim * 2)), min(duration, 1.0))
+    return clip_start, clip_duration
+
+
+def library_speaker_samples(
+    job_id: int,
+    seconds: float = 8.0,
+    per_speaker: int = 3,
+) -> list[dict[str, Any]]:
     db = database()
     job = db.get_job(job_id)
     if not job:
@@ -384,8 +463,10 @@ def library_speaker_samples(job_id: int, seconds: float = 8.0) -> list[dict[str,
     if source is None:
         return []
 
+    all_segments = db.get_segments(job_id)
+    stats = _speaker_stats(all_segments)
     segments_by_speaker: dict[str, list[dict[str, Any]]] = {}
-    for segment in db.get_segments(job_id):
+    for segment in all_segments:
         speaker = str(segment.get("speaker") or "").strip()
         if not speaker:
             continue
@@ -396,45 +477,102 @@ def library_speaker_samples(job_id: int, seconds: float = 8.0) -> list[dict[str,
     ffmpeg = _bundled_ffmpeg_path()
     samples: list[dict[str, Any]] = []
     for speaker, segments in sorted(segments_by_speaker.items()):
-        segment = max(
-            segments,
-            key=lambda item: float(item.get("end_time") or 0) - float(item.get("start_time") or 0),
+        candidates = sorted(
+            (segment for segment in segments if _segment_duration(segment) >= 1.0),
+            key=lambda item: _sample_isolation_score(item, all_segments),
+            reverse=True,
         )
-        start = max(float(segment.get("start_time") or 0) - 0.2, 0)
-        end = float(segment.get("end_time") or start + seconds)
-        duration = max(min(seconds, end - start + 0.4), 1.0)
-        out_path = sample_dir / f"{_safe_filename(speaker)}.wav"
-        if not out_path.exists():
-            cmd = [
-                ffmpeg,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-ss",
-                f"{start:.3f}",
-                "-i",
-                str(source),
-                "-t",
-                f"{duration:.3f}",
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                str(out_path),
-            ]
-            subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if out_path.exists():
-            samples.append(
-                {
-                    "speaker": speaker,
-                    "path": str(out_path),
-                    "start": start,
-                    "duration": duration,
-                }
-            )
+        if not candidates and segments:
+            candidates = sorted(segments, key=_segment_duration, reverse=True)
+        for index, segment in enumerate(candidates[: max(1, per_speaker)], start=1):
+            start, duration = _clip_window(segment, seconds)
+            if duration <= 0:
+                continue
+            out_path = sample_dir / f"{_safe_filename(speaker)}_{index}_{start:.2f}.wav"
+            if not out_path.exists():
+                cmd = [
+                    ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{start:.3f}",
+                    "-i",
+                    str(source),
+                    "-t",
+                    f"{duration:.3f}",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    str(out_path),
+                ]
+                subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if out_path.exists():
+                speaker_stats = stats.get(speaker, {"utterance_count": 0, "total_duration": 0.0})
+                samples.append(
+                    {
+                        "speaker": speaker,
+                        "path": str(out_path),
+                        "start": start,
+                        "duration": duration,
+                        "index": index,
+                        "utterance_count": int(speaker_stats["utterance_count"]),
+                        "total_duration": float(speaker_stats["total_duration"]),
+                        "text": str(segment.get("text") or ""),
+                    }
+                )
     return samples
+
+
+def library_flag_speaker_sample_review(
+    job_id: int,
+    *,
+    speaker: str,
+    start: float,
+    duration: float,
+    note: str = "",
+) -> dict[str, Any]:
+    """Persist a user signal that one speaker sample needs attention.
+
+    The current pipeline cannot yet re-diarise only a 7-second span from
+    the UI. Persisting a structured marker gives the next rerun a clear
+    target and keeps the UX honest: the user can queue the meeting
+    again while we retain exactly which passage sounded mixed.
+    """
+
+    db = database()
+    job = db.get_job(job_id)
+    if not job:
+        raise ValueError(f"job not found: {job_id}")
+    workspace_raw = (job.get("workspace_dir") or "").strip()
+    if not workspace_raw:
+        raise ValueError(f"job has no workspace: {job_id}")
+    workspace = Path(workspace_raw)
+    workspace.mkdir(parents=True, exist_ok=True)
+    marker_path = workspace / "speaker_review_requests.jsonl"
+    payload = {
+        "job_id": job_id,
+        "speaker": speaker,
+        "start": float(start),
+        "duration": float(duration),
+        "note": note.strip() or "Extrait d'interlocuteur à revoir",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_path": job.get("source_path") or "",
+    }
+    with marker_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    return {
+        "job_id": job_id,
+        "review_path": str(marker_path),
+        "source_path": job.get("source_path") or "",
+        "copied_source_path": str(workspace / Path(job.get("source_path") or "").name)
+        if job.get("source_path")
+        else "",
+        "marked": True,
+    }
 
 
 def _job_artifact_paths(job: dict[str, Any]) -> list[Path]:
