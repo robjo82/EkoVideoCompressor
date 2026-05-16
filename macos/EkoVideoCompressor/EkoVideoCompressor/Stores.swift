@@ -69,6 +69,23 @@ final class SettingsStore: ObservableObject {
     /// derives the real flags from the preset string at job time.
     @AppStorage("qualityPreset") var qualityPreset = TranscriptionQualityPreset.balanced.rawValue
 
+    // Odoo connection. Stored alongside the other tokens via
+    // @AppStorage for cohesion — moving everything to the macOS
+    // Keychain is a separate, broader hardening pass. The API key
+    // here is the long-lived one a user creates under Account
+    // Security → New API Key in Odoo 17+.
+    @AppStorage("odooUrl") var odooUrl = ""
+    @AppStorage("odooDatabase") var odooDatabase = ""
+    @AppStorage("odooLogin") var odooLogin = ""
+    @AppStorage("odooApiKey") var odooApiKey = ""
+
+    var odooConfigured: Bool {
+        !odooUrl.trimmingCharacters(in: .whitespaces).isEmpty
+        && !odooDatabase.trimmingCharacters(in: .whitespaces).isEmpty
+        && !odooLogin.trimmingCharacters(in: .whitespaces).isEmpty
+        && !odooApiKey.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     var glossaryTerms: [String] {
         glossary
             .split(whereSeparator: \.isNewline)
@@ -515,6 +532,147 @@ final class LibraryStore: ObservableObject {
             return false
         }
         return true
+    }
+
+    /// Pair a local voice profile with an Odoo res.partner. The
+    /// engine returns the updated profile so the caller can swap
+    /// it into its in-memory list without a list-all round-trip.
+    func linkSpeakerToOdoo(
+        _ profile: SpeakerProfile,
+        partnerId: Int,
+        partnerName: String,
+        companyId: Int?,
+        companyName: String
+    ) async -> SpeakerProfile? {
+        var args: [String] = [
+            "library-link-speaker-profile",
+            "\(profile.id)",
+            "--partner-id", "\(partnerId)",
+            "--partner-name", partnerName,
+            "--company-name", companyName,
+        ]
+        if let companyId, companyId > 0 {
+            args.append(contentsOf: ["--company-id", "\(companyId)"])
+        }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(args)
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return nil
+        }
+        guard let data = result.rawOutput.data(using: .utf8),
+              let updated = try? JSONDecoder().decode(SpeakerProfile.self, from: data)
+        else { return nil }
+        return updated
+    }
+
+    func unlinkSpeakerFromOdoo(_ profile: SpeakerProfile) async -> SpeakerProfile? {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-unlink-speaker-profile",
+                "\(profile.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return nil
+        }
+        guard let data = result.rawOutput.data(using: .utf8),
+              let updated = try? JSONDecoder().decode(SpeakerProfile.self, from: data)
+        else { return nil }
+        return updated
+    }
+}
+
+/// Encapsulates everything Odoo-related the SwiftUI side calls. We
+/// avoid stuffing this into ``LibraryStore`` because the Odoo
+/// requests are network-bound and shouldn't share the library's
+/// loading state — a slow Odoo server would otherwise spin the
+/// library spinner forever.
+@MainActor
+final class OdooStore: ObservableObject {
+    @Published var status: ConnectionStatus = .unknown
+    @Published var lastError: String?
+
+    enum ConnectionStatus: Equatable {
+        case unknown
+        case checking
+        case ok(account: String, partnerCount: Int)
+        case failed(String)
+    }
+
+    private weak var settings: SettingsStore?
+
+    func bind(_ settings: SettingsStore) {
+        self.settings = settings
+    }
+
+    private func args(extra: [String]) -> [String] {
+        guard let s = settings else { return [] }
+        return [
+            "--url", s.odooUrl,
+            "--db", s.odooDatabase,
+            "--login", s.odooLogin,
+            "--api-key", s.odooApiKey,
+        ] + extra
+    }
+
+    func testConnection() async {
+        guard let settings, settings.odooConfigured else {
+            status = .failed("Configuration Odoo incomplète.")
+            return
+        }
+        status = .checking
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["odoo-test"] + args(extra: []))
+        )
+        guard let data = result.rawOutput.data(using: .utf8) else {
+            status = .failed("Réponse vide.")
+            return
+        }
+        struct Payload: Decodable {
+            var ok: Bool?
+            var error: String?
+            var login: String?
+            var partner_count: Int?
+        }
+        guard let payload = try? JSONDecoder().decode(Payload.self, from: data) else {
+            status = .failed("Réponse Odoo illisible.")
+            return
+        }
+        if payload.ok == true {
+            status = .ok(
+                account: payload.login ?? settings.odooLogin,
+                partnerCount: payload.partner_count ?? 0
+            )
+        } else {
+            status = .failed(payload.error ?? "Connexion impossible.")
+        }
+    }
+
+    /// Live-search res.partner records by name / email. Returns an
+    /// empty list when the query is blank or when Odoo is offline —
+    /// the linker UI shows that as "no results yet".
+    func searchPartners(_ query: String, limit: Int = 25) async -> [OdooPartner] {
+        guard let settings, settings.odooConfigured else { return [] }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(
+                ["odoo-search-partners", "--jsonl", "--query", trimmed, "--limit", "\(limit)"]
+                + args(extra: [])
+            )
+        )
+        if result.status != 0 {
+            // Don't poison ``status`` — the user may still be typing.
+            // The picker just stays empty.
+            lastError = result.events.last?.message ?? result.rawOutput
+            return []
+        }
+        return result.lines.compactMap { line in
+            try? JSONDecoder().decode(OdooPartner.self, from: Data(line.utf8))
+        }
     }
 }
 

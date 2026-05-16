@@ -843,6 +843,47 @@ def library_list_speaker_profiles() -> list[dict[str, Any]]:
     return out
 
 
+def library_link_speaker_profile_to_odoo(
+    profile_id: int,
+    *,
+    partner_id: int,
+    partner_name: str,
+    company_id: int | None = None,
+    company_name: str = "",
+) -> dict[str, Any]:
+    """Pair a local voice profile with an Odoo ``res.partner``.
+
+    Returns the updated profile (without the embedding blob) so the
+    SwiftUI side can refresh its in-memory list without a separate
+    list-all round-trip.
+    """
+    db = database()
+    db.link_speaker_profile_to_odoo(
+        int(profile_id),
+        partner_id=int(partner_id),
+        partner_name=partner_name,
+        company_id=company_id,
+        company_name=company_name,
+    )
+    for row in db.list_speaker_profiles():
+        if int(row.get("id") or 0) == int(profile_id):
+            clean = dict(row)
+            clean.pop("embedding_json", None)
+            return clean
+    return {}
+
+
+def library_unlink_speaker_profile_from_odoo(profile_id: int) -> dict[str, Any]:
+    db = database()
+    db.unlink_speaker_profile_from_odoo(int(profile_id))
+    for row in db.list_speaker_profiles():
+        if int(row.get("id") or 0) == int(profile_id):
+            clean = dict(row)
+            clean.pop("embedding_json", None)
+            return clean
+    return {}
+
+
 def library_delete_speaker_profile(profile_id: int | None = None, *, name: str | None = None) -> int:
     """Drop a stored profile by ``id`` or ``name``. Returns 1 when
     something was deleted, 0 otherwise."""

@@ -17,10 +17,12 @@ from ekovideo_engine.library import (
     library_delete_speaker_profile,
     library_discover_speakers,
     library_enroll_speakers_for_job,
+    library_link_speaker_profile_to_odoo,
     library_list_speaker_profiles,
     library_recognize_speakers,
     library_rename_speakers,
     library_speaker_samples,
+    library_unlink_speaker_profile_from_odoo,
     library_workspace_usage,
 )
 from speaker_recognition import decode_embedding, encode_embedding
@@ -602,6 +604,71 @@ class SpeakerEnrollmentTest(unittest.TestCase):
                     )
                     mock_run.assert_not_called()
             self.assertEqual(summary["speakers_enrolled"], 0)
+
+
+class OdooLinkageTest(unittest.TestCase):
+    """Pin the contract of the link / unlink wrappers and the
+    columns they hydrate on the speaker_profiles row."""
+
+    def test_link_then_unlink_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                db.upsert_speaker_profile(
+                    name="Robin",
+                    embedding_json=encode_embedding([1.0, 0.0, 0.0]),
+                    sample_count=1,
+                )
+                profile = library_list_speaker_profiles()[0]
+                # Robin → res.partner #42 sitting under company #100 "Acme".
+                updated = library_link_speaker_profile_to_odoo(
+                    profile["id"],
+                    partner_id=42,
+                    partner_name="Robin Dupuy",
+                    company_id=100,
+                    company_name="Acme",
+                )
+                self.assertEqual(updated["odoo_partner_id"], 42)
+                self.assertEqual(updated["odoo_partner_name"], "Robin Dupuy")
+                self.assertEqual(updated["odoo_company_id"], 100)
+                self.assertEqual(updated["odoo_company_name"], "Acme")
+                self.assertIsNotNone(updated.get("linked_at"))
+
+                # Unlink wipes everything Odoo-related but keeps
+                # the voice profile (and its embedding) alive.
+                cleared = library_unlink_speaker_profile_from_odoo(profile["id"])
+                self.assertIsNone(cleared.get("odoo_partner_id"))
+                self.assertIsNone(cleared.get("odoo_partner_name"))
+                self.assertIsNone(cleared.get("linked_at"))
+
+                self.assertEqual(len(library_list_speaker_profiles()), 1)
+
+    def test_relink_overwrites_previous_partner(self):
+        # The user picked the wrong contact, then re-runs the picker
+        # and chooses the right one. Second link must replace the
+        # first, not stack on top of it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                db.upsert_speaker_profile(
+                    name="David",
+                    embedding_json=encode_embedding([0.0, 1.0]),
+                    sample_count=1,
+                )
+                profile_id = library_list_speaker_profiles()[0]["id"]
+                library_link_speaker_profile_to_odoo(
+                    profile_id, partner_id=10, partner_name="WRONG",
+                )
+                library_link_speaker_profile_to_odoo(
+                    profile_id, partner_id=11, partner_name="RIGHT",
+                    company_id=5, company_name="Acme",
+                )
+                only = library_list_speaker_profiles()[0]
+                self.assertEqual(only["odoo_partner_id"], 11)
+                self.assertEqual(only["odoo_partner_name"], "RIGHT")
+                self.assertEqual(only["odoo_company_id"], 5)
 
 
 if __name__ == "__main__":

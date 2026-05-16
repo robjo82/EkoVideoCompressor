@@ -80,6 +80,7 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS idx_speaker_profiles_name_key "
                 "ON speaker_profiles(name_key)"
             )
+            self._ensure_speaker_profile_columns(conn)
 
     def _ensure_jobs_columns(self, conn):
         # The library now exposes each artefact as its own button in the
@@ -116,6 +117,27 @@ class DatabaseManager:
         for name, definition in columns.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+
+    def _ensure_speaker_profile_columns(self, conn):
+        # Optional Odoo linkage. NULL on the unlinked rows (typical
+        # first-use state) so the SwiftUI Interlocuteurs view can
+        # bucket them under "Sans société Odoo" without ambiguity.
+        existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(speaker_profiles)").fetchall()
+        }
+        columns = {
+            "odoo_partner_id": "INTEGER",
+            "odoo_partner_name": "TEXT",
+            "odoo_company_id": "INTEGER",
+            "odoo_company_name": "TEXT",
+            "linked_at": "DATETIME",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE speaker_profiles ADD COLUMN {name} {definition}"
+                )
 
     def create_job(self, source_path: str, workspace_dir: str, settings: dict) -> int:
         with self._get_connection() as conn:
@@ -331,7 +353,9 @@ class DatabaseManager:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 "SELECT id, name, name_key, embedding_json, sample_count, "
-                "created_at, updated_at FROM speaker_profiles ORDER BY name COLLATE NOCASE"
+                "created_at, updated_at, odoo_partner_id, odoo_partner_name, "
+                "odoo_company_id, odoo_company_name, linked_at "
+                "FROM speaker_profiles ORDER BY name COLLATE NOCASE"
             )
             return [dict(row) for row in cursor.fetchall()]
 
@@ -343,11 +367,67 @@ class DatabaseManager:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 "SELECT id, name, name_key, embedding_json, sample_count, "
-                "created_at, updated_at FROM speaker_profiles WHERE name_key = ?",
+                "created_at, updated_at, odoo_partner_id, odoo_partner_name, "
+                "odoo_company_id, odoo_company_name, linked_at "
+                "FROM speaker_profiles WHERE name_key = ?",
                 (key,),
             )
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    def link_speaker_profile_to_odoo(
+        self,
+        profile_id: int,
+        *,
+        partner_id: int,
+        partner_name: str,
+        company_id: Optional[int] = None,
+        company_name: str = "",
+    ) -> None:
+        """Pair a local voice profile with an Odoo ``res.partner``.
+
+        ``company_id`` defaults to NULL when the partner is itself
+        a company (top-level node) — the SwiftUI side then groups
+        these under their own name. Re-calling for the same profile
+        overwrites the previous link, which is what the UI expects
+        after the user re-runs the search picker.
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE speaker_profiles
+                SET odoo_partner_id = ?,
+                    odoo_partner_name = ?,
+                    odoo_company_id = ?,
+                    odoo_company_name = ?,
+                    linked_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    int(partner_id),
+                    partner_name,
+                    int(company_id) if company_id else None,
+                    company_name or "",
+                    int(profile_id),
+                ),
+            )
+
+    def unlink_speaker_profile_from_odoo(self, profile_id: int) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE speaker_profiles
+                SET odoo_partner_id = NULL,
+                    odoo_partner_name = NULL,
+                    odoo_company_id = NULL,
+                    odoo_company_name = NULL,
+                    linked_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(profile_id),),
+            )
 
     def upsert_speaker_profile(
         self,

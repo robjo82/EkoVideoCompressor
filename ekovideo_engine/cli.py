@@ -12,11 +12,13 @@ from .library import (
     library_delete,
     library_delete_speaker_profile,
     library_discover_speakers,
+    library_link_speaker_profile_to_odoo,
     library_list,
     library_list_speaker_profiles,
     library_recognize_speakers,
     library_rename_speakers,
     library_speaker_samples,
+    library_unlink_speaker_profile_from_odoo,
     library_update_context,
     library_workspace_usage,
 )
@@ -24,6 +26,13 @@ from .logging import export_logs_archive
 from .model_cache import delete_model, download_model, model_catalog
 from .models import DoneEvent, ErrorEvent, JobRequest, ProgressEvent
 from .runner import EngineRunner
+from odoo_client import (
+    OdooConfig,
+    OdooError,
+    fetch_partner,
+    search_partners,
+    test_connection as odoo_test_connection,
+)
 
 
 def _print_json(payload: object) -> None:
@@ -97,6 +106,36 @@ def build_parser() -> argparse.ArgumentParser:
     # added a new profile and wants to back-fill an older meeting).
     recognise = sub.add_parser("library-recognize-speakers")
     recognise.add_argument("job_id", type=int)
+
+    # ----- Odoo integration ---------------------------------------
+    # Three commands. ``odoo-test`` lives behind the SwiftUI
+    # "Tester la connexion" button; ``odoo-search-partners`` powers
+    # the link sheet's live search; ``library-link-speaker-profile``
+    # / ``library-unlink-speaker-profile`` persist the user's choice.
+    def _add_odoo_args(parser):
+        parser.add_argument("--url", required=True)
+        parser.add_argument("--db", required=True)
+        parser.add_argument("--login", required=True)
+        parser.add_argument("--api-key", required=True)
+
+    odoo_test = sub.add_parser("odoo-test")
+    _add_odoo_args(odoo_test)
+
+    odoo_search = sub.add_parser("odoo-search-partners")
+    _add_odoo_args(odoo_search)
+    odoo_search.add_argument("--query", required=True)
+    odoo_search.add_argument("--limit", type=int, default=25)
+    odoo_search.add_argument("--jsonl", action="store_true")
+
+    link_profile = sub.add_parser("library-link-speaker-profile")
+    link_profile.add_argument("profile_id", type=int)
+    link_profile.add_argument("--partner-id", type=int, required=True)
+    link_profile.add_argument("--partner-name", required=True)
+    link_profile.add_argument("--company-id", type=int, default=0)
+    link_profile.add_argument("--company-name", default="")
+
+    unlink_profile = sub.add_parser("library-unlink-speaker-profile")
+    unlink_profile.add_argument("profile_id", type=int)
 
     context = sub.add_parser("library-update-context")
     context.add_argument("job_id", type=int)
@@ -207,6 +246,51 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "library-recognize-speakers":
             speakers = library_recognize_speakers(args.job_id)
             _print_json({"job_id": args.job_id, "recognized": speakers})
+            return 0
+
+        if args.command in {
+            "odoo-test", "odoo-search-partners",
+        }:
+            config = OdooConfig(
+                url=args.url,
+                database=args.db,
+                login=args.login,
+                api_key=args.api_key,
+            )
+            try:
+                if args.command == "odoo-test":
+                    payload = odoo_test_connection(config)
+                    _print_json(payload)
+                    return 0
+                # odoo-search-partners
+                rows = search_partners(config, args.query, limit=args.limit)
+                if args.jsonl:
+                    for row in rows:
+                        print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+                else:
+                    _print_json(rows)
+                return 0
+            except OdooError as exc:
+                # Odoo errors carry a French human-readable message —
+                # surface them as a structured failure the SwiftUI
+                # status banner can render verbatim.
+                _print_json({"ok": False, "error": str(exc)})
+                return 1
+
+        if args.command == "library-link-speaker-profile":
+            updated = library_link_speaker_profile_to_odoo(
+                args.profile_id,
+                partner_id=args.partner_id,
+                partner_name=args.partner_name,
+                company_id=args.company_id or None,
+                company_name=args.company_name,
+            )
+            _print_json(updated)
+            return 0
+
+        if args.command == "library-unlink-speaker-profile":
+            updated = library_unlink_speaker_profile_from_odoo(args.profile_id)
+            _print_json(updated)
             return 0
 
         if args.command == "model-list":
