@@ -361,6 +361,53 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         review_text = Path(review.artifact_path).read_text(encoding="utf-8")
         self.assertIn("## Corrections LLM appliquées", review_text)
 
+    def test_audio_extract_produces_separate_wav_for_diarisation(self):
+        """Pyannote's clustering relies on timbre cues that the
+        speech-enhancement compressor smooths away. Pin that the
+        pipeline asks ffmpeg twice: once with filters (audio.wav for
+        Whisper) and once without (audio.diar.wav for pyannote).
+        """
+        request = _make_request(self.workspace, self.source)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        ffmpeg_calls: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                ffmpeg_calls.append(list(cmd))
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 2.0, "text": "Bonjour.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            pipeline.run(str(self.source))
+
+        # Two ffmpeg invocations: one for audio.wav (with filters),
+        # one for audio.diar.wav (without). The filtered call carries
+        # the ``-af`` flag; the diarisation call does not.
+        wav_calls = [c for c in ffmpeg_calls if c[-1].endswith("audio.wav")]
+        diar_calls = [c for c in ffmpeg_calls if c[-1].endswith("audio.diar.wav")]
+        self.assertEqual(len(wav_calls), 1)
+        self.assertEqual(len(diar_calls), 1)
+        self.assertIn("-af", wav_calls[0])
+        self.assertNotIn("-af", diar_calls[0])
+
     def test_pipeline_exposes_final_segments_and_speakers(self):
         """The runner needs the pipeline's final segment list +
         speaker map to populate the library DB. Pin those exposed
@@ -444,6 +491,98 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
         # "MOLLIE". Both spellings are acceptable evidence that the
         # glossary substitution made it into the report.
         self.assertTrue("Mollie" in body or "MOLLIE" in body, body)
+
+    def test_vad_falls_back_to_full_audio_when_too_aggressive(self):
+        """If VAD claims more than 60 % of the audio is non-speech we
+        almost certainly lost real content. Fall back to the full
+        audio so the transcript covers the whole meeting instead of
+        a sliced-out half.
+        """
+        fake_python = tempfile.NamedTemporaryFile(
+            suffix="-fake-python", delete=False
+        )
+        fake_python.write(b"#!/bin/sh\nexit 0\n")
+        fake_python.close()
+        Path(fake_python.name).chmod(0o755)
+
+        request = _make_request(
+            self.workspace,
+            self.source,
+            transcription_settings={
+                "vad_enabled": True,
+                "venv_python_path": fake_python.name,
+            },
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+
+        def fake_run(cmd, *args, **kwargs):
+            if cmd and cmd[0] == fake_python.name:
+                # The pipeline calls the same fake python for both
+                # VAD and the LLM. The VAD invocation has the
+                # trimmed-WAV path at argv[2] (after the script body
+                # at argv[1]); the LLM ones don't. Match on the
+                # script content to know which is which.
+                script = cmd[2] if len(cmd) > 2 else ""
+                if "silero" in script.lower() or "speech_timestamps" in script.lower():
+                    stdout = json.dumps(
+                        {
+                            "spans": [
+                                {
+                                    "trim_start": 0,
+                                    "trim_end": 30,
+                                    "src_start": 0,
+                                    "src_end": 100,
+                                }
+                            ],
+                            "trimmed_seconds": 30,
+                            "total_seconds": 100,
+                        }
+                    )
+                    # ``build_vad_cmd`` puts the output WAV at argv[4]
+                    # (cmd[4] when you count [python, -c, script,
+                    # in_path, out_path, ...]).
+                    trimmed = Path(cmd[4])
+                    trimmed.write_bytes(b"riff fake")
+                    return _StubResult(returncode=0, stdout=stdout)
+                # LLM (title or corrections) — return empty.
+                return _StubResult(
+                    returncode=0,
+                    stdout='{"title":"","speakers":{},"technical_terms":[]}',
+                )
+            if "ffmpeg" in (cmd[0] if cmd else ""):
+                Path(cmd[-1]).write_bytes(b"riff fake")
+                return _StubResult(returncode=0)
+            if "mlx_whisper" in (cmd[0] if cmd else ""):
+                target = (
+                    Path(cmd[cmd.index("--output-dir") + 1])
+                    / f"{cmd[cmd.index('--output-name') + 1]}.json"
+                )
+                _write_canned_whisper(
+                    target,
+                    [
+                        {
+                            "start": 0.0, "end": 2.0, "text": "OK.",
+                            "avg_logprob": -0.1, "no_speech_prob": 0.0,
+                            "compression_ratio": 1.5,
+                        }
+                    ],
+                )
+                return _StubResult(returncode=0)
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            results = pipeline.run(str(self.source))
+
+        # VAD step succeeded but flagged the fallback in metrics.
+        vad = next(r for r in results if r.name == "vad")
+        self.assertTrue(vad.ok)
+        self.assertTrue(vad.metrics.get("fallback"))
+        # The artifact path is the *original* WAV, not the trimmed
+        # one — the audio Whisper saw is the full meeting.
+        self.assertTrue(vad.artifact_path.endswith("audio.wav"))
+        # No manifest survives, so downstream remap is a no-op.
+        self.assertEqual(pipeline._vad_manifest, [])
 
     def test_vad_failure_does_not_kill_the_job(self):
         """VAD is an optimisation. If silero-vad isn't installed we
@@ -669,7 +808,12 @@ class QualityPresetTest(unittest.TestCase):
         self.assertTrue(settings.multipass_enabled)
         self.assertFalse(settings.per_speaker_enabled)
 
-    def test_max_preset_enables_everything(self):
+    def test_max_preset_enables_only_wired_phases(self):
+        # Pin the audit: ``per_speaker``, ``audio_recheck`` and
+        # ``web_enrichment`` are off until the orchestrator actually
+        # runs them. Promising features the engine doesn't deliver
+        # showed up in the field as "max prend des heures pour le
+        # même résultat que balanced".
         settings = JobRequest.from_dict(
             {
                 "source_path": "/tmp/x.mov",
@@ -680,9 +824,9 @@ class QualityPresetTest(unittest.TestCase):
         ).transcription_settings
         self.assertTrue(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
-        self.assertTrue(settings.per_speaker_enabled)
-        self.assertTrue(settings.audio_recheck_enabled)
-        self.assertTrue(settings.web_enrichment_enabled)
+        self.assertFalse(settings.per_speaker_enabled)
+        self.assertFalse(settings.audio_recheck_enabled)
+        self.assertFalse(settings.web_enrichment_enabled)
 
     def test_custom_preset_passes_individual_flags_through(self):
         settings = JobRequest.from_dict(

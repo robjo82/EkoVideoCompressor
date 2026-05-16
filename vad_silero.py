@@ -232,6 +232,12 @@ def remap_segments_to_source(
     ``end`` to the source timeline. Returns the new list. Segments
     without ``start`` / ``end`` (e.g. plain text passes) are returned
     unchanged.
+
+    When a segment carries a ``words`` list (Whisper word
+    timestamps), each word's ``start`` / ``end`` is remapped too —
+    otherwise downstream speaker assignment would compare word
+    midpoints in the VAD timeline against pyannote turns in the
+    source timeline, picking the wrong speaker on every word.
     """
     if not segments or not manifest:
         return [dict(s) for s in segments]
@@ -247,5 +253,21 @@ def remap_segments_to_source(
         new_seg = dict(seg)
         new_seg["start"] = new_s
         new_seg["end"] = new_e
+        words = seg.get("words") or []
+        if words:
+            remapped_words: list[dict] = []
+            for word in words:
+                try:
+                    ws = float(word.get("start"))
+                    we = float(word.get("end"))
+                except (TypeError, ValueError):
+                    remapped_words.append(dict(word))
+                    continue
+                w_new_s, w_new_e = remap_segment_to_source(ws, we, manifest)
+                remapped = dict(word)
+                remapped["start"] = w_new_s
+                remapped["end"] = w_new_e
+                remapped_words.append(remapped)
+            new_seg["words"] = remapped_words
         out.append(new_seg)
     return out

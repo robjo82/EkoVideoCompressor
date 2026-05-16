@@ -207,6 +207,29 @@ class TranscriptionCommandTest(unittest.TestCase):
         self.assertIn("--clip-timestamps", cmd)
         self.assertIn("600,900", cmd)
 
+    def test_build_mlx_whisper_command_word_timestamps_flag(self):
+        # When ``word_timestamps=True`` the CLI gets the explicit
+        # flag so the output JSON carries per-word start/end. Without
+        # it the flag is omitted (default behaviour preserved).
+        with_words = build_mlx_whisper_cmd(
+            mlx_whisper_path="/usr/local/bin/mlx_whisper",
+            audio_path="/tmp/a.wav",
+            output_path="/tmp/o.json",
+            model="mlx-community/whisper-large-v3-turbo",
+            word_timestamps=True,
+        )
+        self.assertIn("--word-timestamps", with_words)
+        idx = with_words.index("--word-timestamps")
+        self.assertEqual(with_words[idx + 1], "True")
+
+        without_words = build_mlx_whisper_cmd(
+            mlx_whisper_path="/usr/local/bin/mlx_whisper",
+            audio_path="/tmp/a.wav",
+            output_path="/tmp/o.json",
+            model="mlx-community/whisper-large-v3-turbo",
+        )
+        self.assertNotIn("--word-timestamps", without_words)
+
     def test_build_llm_command_passes_glossary(self):
         cmd = build_llm_cmd(
             "/tmp/venv/bin/python",
@@ -388,6 +411,52 @@ class FuseAndRenderTest(unittest.TestCase):
         self.assertEqual(out[0]["speaker"], "SPEAKER_00")  # 1.5s vs 0.5s
         self.assertEqual(out[1]["speaker"], "SPEAKER_01")  # full overlap
         self.assertIsNone(out[2]["speaker"])  # no diarisation turn
+
+    def test_assign_speakers_splits_segment_on_speaker_change_when_words_present(self):
+        # Whisper sometimes packs an interruption inside a single
+        # segment ("Bah ouais. — OK."). With word-level timestamps
+        # we must split it on the actual word boundary so each
+        # speaker gets the right line — not lump the whole sentence
+        # under whichever voice happened to dominate the segment.
+        whisper = [
+            {
+                "start": 0.0,
+                "end": 4.0,
+                "text": "Bah ouais. OK super on continue.",
+                "words": [
+                    {"start": 0.0, "end": 0.4, "word": "Bah "},
+                    {"start": 0.4, "end": 0.9, "word": "ouais."},
+                    {"start": 1.0, "end": 1.3, "word": " OK"},
+                    {"start": 1.3, "end": 1.7, "word": " super"},
+                    {"start": 1.7, "end": 2.4, "word": " on continue."},
+                ],
+            }
+        ]
+        diar = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00"},
+            {"start": 1.0, "end": 4.0, "speaker": "SPEAKER_01"},
+        ]
+        out = assign_speakers_to_segments(whisper, diar)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["speaker"], "SPEAKER_00")
+        self.assertIn("Bah", out[0]["text"])
+        self.assertIn("ouais", out[0]["text"])
+        self.assertEqual(out[1]["speaker"], "SPEAKER_01")
+        self.assertIn("OK", out[1]["text"])
+        self.assertIn("continue", out[1]["text"])
+        # Sub-segment timestamps should match the actual word
+        # boundaries rather than the parent segment edges.
+        self.assertAlmostEqual(out[0]["end"], 0.9, places=2)
+        self.assertAlmostEqual(out[1]["start"], 1.0, places=2)
+
+    def test_assign_speakers_falls_back_to_overlap_when_no_words(self):
+        # Word-less segments still go through the legacy max-overlap
+        # path so we don't regress callers that haven't migrated.
+        whisper = [{"start": 0.0, "end": 2.0, "text": "Bonjour"}]
+        diar = [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
+        out = assign_speakers_to_segments(whisper, diar)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["speaker"], "SPEAKER_00")
 
     def test_render_txt_groups_consecutive_same_speaker(self):
         segs = [

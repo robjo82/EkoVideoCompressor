@@ -325,9 +325,16 @@ class TranscriptionPipeline:
         workspace = job_workspace_dir(self.request)
         workspace.mkdir(parents=True, exist_ok=True)
         wav_path = workspace / "audio.wav"
+        # Pyannote runs on a separate WAV that skips the ASR
+        # filtering chain (compressor + loudnorm). Those filters help
+        # Whisper but degrade speaker embeddings — the compressor
+        # smooths out the timbre cues pyannote uses to tell two voices
+        # apart. Keep the ASR-targeted file for Whisper, give pyannote
+        # an unfiltered mono 16 kHz stream.
+        diar_wav_path = workspace / "audio.diar.wav"
 
         # --- step 1: audio extract -------------------------------------
-        results.append(self._extract_audio(source_path, wav_path))
+        results.append(self._extract_audio(source_path, wav_path, diar_wav_path))
         if not results[-1].ok:
             return results
 
@@ -365,7 +372,10 @@ class TranscriptionPipeline:
         # --- step 3: diarisation (optional) ----------------------------
         analysis_segments = segments
         if self._should_run_diarisation():
-            diar_result, turns = self._run_diarisation(wav_path)
+            # Pyannote sees the unfiltered audio (no compressor /
+            # loudnorm). Whisper still sees the enhanced WAV.
+            diar_source = diar_wav_path if diar_wav_path.exists() else wav_path
+            diar_result, turns = self._run_diarisation(diar_source)
             if diar_result is not None:
                 results.append(diar_result)
             if turns:
@@ -482,11 +492,33 @@ class TranscriptionPipeline:
     # Step 1 — audio extract
     # ------------------------------------------------------------------
 
-    def _extract_audio(self, source_path: str, wav_path: Path) -> StepResult:
+    def _extract_audio(
+        self,
+        source_path: str,
+        wav_path: Path,
+        diar_wav_path: Path | None = None,
+    ) -> StepResult:
+        """Extract the audio stream(s) needed for downstream stages.
+
+        Two files are produced:
+
+        * ``wav_path`` — mono 16 kHz, plus the speech-enhancement
+          chain (highpass / lowpass / compressor / loudnorm) when the
+          user enabled it. This is the file Whisper sees.
+        * ``diar_wav_path`` — same mono 16 kHz, **without** the
+          enhancement chain. Pyannote's clustering relies on timbre
+          cues that the compressor smooths away; feeding it the raw
+          stream measurably improves speaker-counting accuracy on
+          recordings with both close-mic and lavalier voices.
+
+        Failure to produce the diarisation WAV is non-fatal — the
+        diarisation step falls back to the ASR-targeted WAV.
+        """
         ts = time.monotonic()
         settings = self.request.transcription_settings
+        ffmpeg = self.request.compression_settings.ffmpeg_path or "ffmpeg"
         cmd = build_audio_extract_cmd(
-            self.request.compression_settings.ffmpeg_path or "ffmpeg",
+            ffmpeg,
             source_path,
             str(wav_path),
             speech_enhance=settings.enhance_audio,
@@ -501,6 +533,30 @@ class TranscriptionPipeline:
             message = _friendly_ffmpeg_error(raw, cmd[0])
             append_app_log(f"engine_audio_extract_failed rc={proc.returncode} error={raw!r}")
             return StepResult("audio_extract", False, duration_seconds=duration, error=message)
+
+        if diar_wav_path is not None:
+            diar_cmd = build_audio_extract_cmd(
+                ffmpeg,
+                source_path,
+                str(diar_wav_path),
+                speech_enhance=False,
+            )
+            diar_proc = subprocess.run(
+                diar_cmd,
+                capture_output=True,
+                text=True,
+                env=self._subprocess_env(),
+            )
+            if diar_proc.returncode != 0 or not diar_wav_path.exists():
+                # Don't fail the whole job — diarisation will reuse
+                # the ASR WAV when this one is missing.
+                append_app_log(
+                    f"engine_diar_audio_extract_failed rc={diar_proc.returncode} "
+                    f"stderr={tail_text(diar_proc.stderr)!r}"
+                )
+            else:
+                self.sink(ArtifactEvent("audio_diar_wav", str(diar_wav_path)))
+
         self.sink(ArtifactEvent("audio_wav", str(wav_path)))
         self.sink(ProgressEvent("audio_extract", 100, "Audio ready"))
         return StepResult("audio_extract", True, str(wav_path), duration_seconds=duration)
@@ -567,10 +623,38 @@ class TranscriptionPipeline:
             self.sink(ProgressEvent("vad", 100, "VAD found no speech, using original audio"))
             return StepResult("vad", True, str(wav_path), duration_seconds=duration)
 
-        self._vad_manifest = spans
         kept = payload.get("trimmed_seconds") or 0
         total = payload.get("total_seconds") or 0
         ratio = (kept / total) if total else 0
+
+        # Safety net: if VAD claims more than 60 % of the audio is
+        # non-speech we almost certainly lost real content (faint
+        # voices, overlapping speech, noisy mics). Fall back to the
+        # full audio so the user gets *something* over a transcript
+        # missing half the meeting.
+        if total >= 30 and ratio < 0.4:
+            self.sink(
+                WarningEvent(
+                    f"VAD trop agressif ({ratio*100:.0f}% du signal conservé) — "
+                    "passage en transcription complète pour préserver les voix faibles.",
+                    code="vad_fallback",
+                )
+            )
+            self._vad_manifest = []
+            return StepResult(
+                "vad",
+                True,
+                str(wav_path),
+                duration_seconds=duration,
+                metrics={
+                    "kept_seconds": kept,
+                    "total_seconds": total,
+                    "spans": len(spans),
+                    "fallback": True,
+                },
+            )
+
+        self._vad_manifest = spans
         self.sink(
             ProgressEvent(
                 "vad",
@@ -604,6 +688,11 @@ class TranscriptionPipeline:
         glossary = "\n".join(
             [*self.request.glossary_terms, *self.request.technical_terms]
         )
+        # Word timestamps drive per-word speaker attribution in the
+        # diarisation step (see ``assign_speakers_to_segments``).
+        # Skip them when diarisation is disabled — they cost roughly
+        # 5 % of the runtime for no downstream benefit.
+        request_word_timestamps = self._should_run_diarisation()
         cmd = build_mlx_whisper_cmd(
             mlx_whisper_path=settings.mlx_whisper_path or "mlx_whisper",
             audio_path=str(wav_path),
@@ -617,6 +706,7 @@ class TranscriptionPipeline:
                 meeting_context=self._meeting_context(),
             ),
             condition_on_previous_text=False,
+            word_timestamps=request_word_timestamps,
         )
         self.sink(ProgressEvent("whisper", 0, f"Running Whisper ({settings.model})"))
         # env= prepends the bundle's bin/ to PATH so mlx_whisper's
@@ -725,6 +815,11 @@ class TranscriptionPipeline:
                 ),
                 condition_on_previous_text=False,
                 clip_timestamps=f"{cs:.2f},{ce:.2f}",
+                # Repassed segments need to carry word timestamps too
+                # so the post-multipass diarisation step can split
+                # them on speaker boundaries — same reason as the
+                # primary pass.
+                word_timestamps=self._should_run_diarisation(),
             )
             proc = subprocess.run(
                 cmd,

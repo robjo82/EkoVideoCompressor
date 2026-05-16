@@ -559,6 +559,7 @@ def build_mlx_whisper_cmd(
     initial_prompt: str = "",
     condition_on_previous_text: bool = False,
     clip_timestamps: str = "",
+    word_timestamps: bool = False,
 ) -> list[str]:
     out = Path(output_path)
     fmt = (output_format or "txt").strip().lower()
@@ -587,6 +588,14 @@ def build_mlx_whisper_cmd(
     # sounds. If Whisper conditions each window on the previous one, a single
     # hallucinated "..." can poison the full recording.
     cmd += ["--condition-on-previous-text", "True" if condition_on_previous_text else "False"]
+
+    if word_timestamps:
+        # Word-level timestamps power per-word speaker attribution
+        # downstream — when pyannote says the speaker switches mid-
+        # segment we can split the segment on the actual word boundary
+        # instead of guessing. Costs ~5 % runtime on top of the regular
+        # Whisper pass.
+        cmd += ["--word-timestamps", "True"]
 
     clips = (clip_timestamps or "").strip()
     if clips:
@@ -1078,29 +1087,45 @@ except Exception as exc:
 try:
     def _clean_error(message):
         text = str(message)
-        if "speaker-diarization-community-1" in text or "Cannot access gated repo" in text:
+        if "Cannot access gated repo" in text:
             return (
-                "Accès Hugging Face refusé pour pyannote/speaker-diarization-community-1. "
-                "Ouvrez https://huggingface.co/pyannote/speaker-diarization-community-1, "
+                "Accès Hugging Face refusé pour le modèle de diarisation. "
+                "Ouvrez https://huggingface.co/pyannote/speaker-diarization-community-1 "
+                "(et son fallback https://huggingface.co/pyannote/speaker-diarization-3.1), "
                 "acceptez les conditions d'utilisation, vérifiez que votre token a le droit Read, "
                 "puis relancez la transcription."
             )
         return text
 
-    try:
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=hf_token,
-        )
-    except TypeError as exc:
-        if "token" not in str(exc):
-            raise
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token,
-        )
+    def _load(model_id):
+        try:
+            return Pipeline.from_pretrained(model_id, token=hf_token)
+        except TypeError as exc:
+            if "token" not in str(exc):
+                raise
+            return Pipeline.from_pretrained(model_id, use_auth_token=hf_token)
+
+    # community-1 (released after 3.1) ships better speaker counting,
+    # an exclusive-speaker output that's straightforward to align
+    # with Whisper timestamps, and broader language coverage. We
+    # try it first and fall back to 3.1 only when the user hasn't
+    # accepted the community-1 license — that way existing tokens
+    # keep working without a hard break.
+    pipeline = None
+    load_errors = []
+    for candidate in (
+        "pyannote/speaker-diarization-community-1",
+        "pyannote/speaker-diarization-3.1",
+    ):
+        try:
+            pipeline = _load(candidate)
+            if pipeline is not None:
+                break
+        except Exception as exc:
+            load_errors.append(f"{candidate}: {exc}")
     if pipeline is None:
-        raise RuntimeError("pipeline unavailable; check Hugging Face token and accepted pyannote licenses")
+        message = "; ".join(load_errors) or "no pyannote pipeline available"
+        raise RuntimeError(f"pipeline unavailable: {message}")
 except Exception as exc:
     print(json.dumps({"error": f"pipeline load failed: {_clean_error(exc)}"}))
     sys.exit(4)
@@ -1361,12 +1386,32 @@ def parse_whisper_json_segments(json_path: str) -> list[dict]:
     """
     MLX Whisper's --output-format json writes {"text": ..., "segments": [...],
     "language": ...}. We only care about the segments list.
+
+    When ``--word-timestamps True`` ran, each segment also carries a
+    ``words`` list of {start, end, word, probability}. We preserve
+    those so the speaker-assignment pass downstream can split a
+    segment on the actual word boundary when the diarisation turn
+    changes mid-sentence.
     """
     raw = Path(json_path).read_text(encoding="utf-8")
     payload = json.loads(raw)
     segments = payload.get("segments") or []
     out = []
     for seg in segments:
+        words_raw = seg.get("words") or []
+        words: list[dict] = []
+        for word in words_raw:
+            try:
+                words.append(
+                    {
+                        "start": float(word.get("start", 0.0)),
+                        "end": float(word.get("end", 0.0)),
+                        "word": str(word.get("word", "")),
+                        "probability": word.get("probability"),
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
         out.append({
             "start": float(seg.get("start", 0.0)),
             "end": float(seg.get("end", 0.0)),
@@ -1374,6 +1419,7 @@ def parse_whisper_json_segments(json_path: str) -> list[dict]:
             "avg_logprob": seg.get("avg_logprob"),
             "compression_ratio": seg.get("compression_ratio"),
             "no_speech_prob": seg.get("no_speech_prob"),
+            "words": words,
         })
     return clean_whisper_segments(out)
 
@@ -1424,18 +1470,38 @@ def assign_speakers_to_segments(
     whisper_segments: Iterable[dict],
     diarization_turns: Iterable[dict],
 ) -> list[dict]:
-    """
-    For each Whisper segment, assign the speaker whose turn(s) overlap
-    most with the segment. Segments with zero overlap stay unlabeled.
+    """Pair each Whisper segment with a speaker, splitting on
+    speaker boundaries when word-level timestamps are available.
 
-    Returns a new list of dicts with an added "speaker" key (or None).
+    Two regimes:
+
+    * **Word-level (preferred).** When the segment carries a non-
+      empty ``words`` list, we look up the active speaker at each
+      word's midpoint and group consecutive same-speaker words into
+      sub-segments. A short Whisper segment that spans an
+      interruption ("Bah ouais. — OK.") becomes two segments with
+      the right names instead of one wrongly attributed line.
+
+    * **Segment-level (fallback).** Without words we keep the
+      original "max overlap wins" rule. This still kicks in for
+      runs that didn't enable ``--word-timestamps`` and keeps the
+      old contract for callers that haven't migrated.
+
+    Returns a list of dicts. The same input segment may produce
+    multiple output segments — order is preserved.
     """
     turns = [
         (float(t["start"]), float(t["end"]), str(t["speaker"]))
         for t in diarization_turns
     ]
-    out = []
+    out: list[dict] = []
     for seg in whisper_segments:
+        words = seg.get("words") or []
+        if words and turns:
+            sub_segments = _split_segment_on_speaker_changes(seg, words, turns)
+            out.extend(sub_segments)
+            continue
+
         s_start = float(seg["start"])
         s_end = float(seg["end"])
         per_speaker: dict[str, float] = {}
@@ -1450,6 +1516,83 @@ def assign_speakers_to_segments(
         new_seg["speaker"] = best_speaker
         out.append(new_seg)
     return out
+
+
+def _speaker_at(time: float, turns: list[tuple[float, float, str]]) -> str | None:
+    """Return the speaker label active at ``time`` (or None when
+    no turn covers it). Falls back to the closest turn within 0.5 s
+    so a word that lands in the gap between two turns doesn't get
+    orphaned."""
+    for t_start, t_end, speaker in turns:
+        if t_start <= time <= t_end:
+            return speaker
+    closest: tuple[float, str] | None = None
+    for t_start, t_end, speaker in turns:
+        gap = min(abs(t_start - time), abs(t_end - time))
+        if gap <= 0.5 and (closest is None or gap < closest[0]):
+            closest = (gap, speaker)
+    return closest[1] if closest else None
+
+
+def _split_segment_on_speaker_changes(
+    segment: dict,
+    words: list[dict],
+    turns: list[tuple[float, float, str]],
+) -> list[dict]:
+    """Walk ``words``, group runs of same-speaker words, and emit
+    one sub-segment per group.
+
+    The sub-segments inherit Whisper's per-segment quality metrics
+    (``avg_logprob``, ``compression_ratio``, ``no_speech_prob``) so
+    downstream steps (multipass scoring, review markdown) still see
+    the same signal — the metrics describe the audio chunk that
+    *Whisper* processed, which we haven't re-decoded.
+    """
+    groups: list[tuple[str | None, list[dict]]] = []
+    for word in words:
+        try:
+            wstart = float(word.get("start", 0.0))
+            wend = float(word.get("end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        midpoint = (wstart + wend) / 2.0
+        speaker = _speaker_at(midpoint, turns)
+        if groups and groups[-1][0] == speaker:
+            groups[-1][1].append(word)
+        else:
+            groups.append((speaker, [word]))
+
+    if not groups:
+        # No usable word data — fall back to whole-segment max-overlap.
+        s_start = float(segment["start"])
+        s_end = float(segment["end"])
+        per_speaker: dict[str, float] = {}
+        for t_start, t_end, speaker in turns:
+            overlap = max(0.0, min(s_end, t_end) - max(s_start, t_start))
+            if overlap > 0:
+                per_speaker[speaker] = per_speaker.get(speaker, 0.0) + overlap
+        best_speaker = (
+            max(per_speaker.items(), key=lambda kv: kv[1])[0] if per_speaker else None
+        )
+        new_seg = dict(segment)
+        new_seg["speaker"] = best_speaker
+        return [new_seg]
+
+    sub_segments: list[dict] = []
+    for speaker, group_words in groups:
+        text = "".join(w.get("word", "") for w in group_words).strip()
+        if not text:
+            continue
+        # Use word-level start/end so the timeline stays accurate at
+        # the boundary we just split.
+        sub = dict(segment)
+        sub["start"] = float(group_words[0].get("start", segment["start"]))
+        sub["end"] = float(group_words[-1].get("end", segment["end"]))
+        sub["text"] = text
+        sub["speaker"] = speaker
+        sub["words"] = group_words
+        sub_segments.append(sub)
+    return sub_segments
 
 
 def _format_timestamp_srt(seconds: float) -> str:
