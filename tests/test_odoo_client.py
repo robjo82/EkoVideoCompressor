@@ -393,6 +393,47 @@ class SearchMeetingEventsTest(unittest.TestCase):
         # Only one network call (the search_read), no partner read.
         self.assertEqual(len(calls), 1)
 
+    def test_single_guest_calendar_entries_are_ignored(self):
+        calls = []
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(
+                [
+                    [
+                        {
+                            "id": 8, "name": "Rappel solo",
+                            "start": "2026-05-14 17:00:00",
+                            "stop": "2026-05-14 17:30:00",
+                            "duration": 0.5, "partner_ids": [10],
+                            "opportunity_id": False,
+                        },
+                        {
+                            "id": 9, "name": "Vraie réunion",
+                            "start": "2026-05-14 18:00:00",
+                            "stop": "2026-05-14 19:00:00",
+                            "duration": 1.0, "partner_ids": [10, 11],
+                            "opportunity_id": False,
+                        },
+                    ],
+                    [
+                        {"id": 10, "name": "Robin", "email": "r@acme.fr",
+                         "parent_id": False, "is_company": False},
+                        {"id": 11, "name": "David", "email": "d@acme.fr",
+                         "parent_id": False, "is_company": False},
+                    ],
+                ],
+                calls,
+            ),
+        ):
+            meetings = search_meeting_events(
+                self._config(),
+                near=datetime(2026, 5, 14, 19, 0, 0, tzinfo=timezone.utc),
+                window_hours=2.0,
+            )
+
+        self.assertEqual([meeting["id"] for meeting in meetings], [9])
+        self.assertEqual(sorted(calls[1]["body"]["ids"]), [10, 11])
+
 
 class ChatterHelpersTest(unittest.TestCase):
     def test_html_to_text_strips_tags_and_entities(self):

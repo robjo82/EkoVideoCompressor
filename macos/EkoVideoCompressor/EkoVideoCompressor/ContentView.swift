@@ -8,6 +8,7 @@ enum AppSection: String, CaseIterable, Hashable {
     case queue
     case library
     case models
+    case vocabulary
     case speakers
 
     var title: String {
@@ -15,6 +16,7 @@ enum AppSection: String, CaseIterable, Hashable {
         case .queue: "Traitements"
         case .library: "Bibliothèque"
         case .models: "Modèles"
+        case .vocabulary: "Vocabulaire"
         case .speakers: "Interlocuteurs"
         }
     }
@@ -24,6 +26,7 @@ enum AppSection: String, CaseIterable, Hashable {
         case .queue: "play.rectangle"
         case .library: "tray.full"
         case .models: "shippingbox"
+        case .vocabulary: "text.word.spacing"
         case .speakers: "person.text.rectangle"
         }
     }
@@ -40,6 +43,7 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingRunSetup = false
     @State private var didPreloadSecondaryData = false
+    @State private var lastLibraryRefreshAt = Date.distantPast
 
     var body: some View {
         NavigationSplitView {
@@ -53,6 +57,8 @@ struct ContentView: View {
                     LibraryView()
                 case .models:
                     ModelsView()
+                case .vocabulary:
+                    VocabularyView()
                 case .speakers:
                     SpeakersView()
                 }
@@ -96,6 +102,7 @@ struct ContentView: View {
             .environmentObject(engine)
             .environmentObject(queue)
             .environmentObject(odoo)
+            .environmentObject(library)
         }
         .task {
             guard !didPreloadSecondaryData else { return }
@@ -110,6 +117,16 @@ struct ContentView: View {
             guard !queue.isBatchRunning, !queue.items.isEmpty else { return }
             selectedSection = .queue
             Task { await runQueue() }
+        }
+        .onChange(of: engine.events.count) { _, _ in
+            guard let event = engine.events.last else { return }
+            guard event.event == .artifact || event.event == .done || event.event == .progress else { return }
+            let now = Date()
+            if event.event == .progress && now.timeIntervalSince(lastLibraryRefreshAt) < 2 {
+                return
+            }
+            lastLibraryRefreshAt = now
+            Task { await library.refresh() }
         }
     }
 
@@ -127,12 +144,14 @@ struct ContentView: View {
         guard !queue.items.isEmpty else { return }
         queue.isBatchRunning = true
         queue.resetPending()
-        let items = queue.items
+        let itemIDs = queue.items.map(\.id)
 
-        for item in items {
+        for itemID in itemIDs {
             if Task.isCancelled { break }
-            queue.update(item.id, status: "En cours", progress: 0)
-            var currentItem = item
+            guard var currentItem = queue.items.first(where: { $0.id == itemID }) else {
+                continue
+            }
+            queue.update(currentItem.id, status: "En cours", progress: 0)
             var exitCode = await runJob(currentItem)
             // Recovery loop: if the engine returned ``source_missing``,
             // give the user one shot to point us at the new location.
@@ -145,10 +164,7 @@ struct ContentView: View {
                     break
                 }
                 queue.replace(currentItem.id, with: relocated)
-                currentItem = QueueItem(
-                    sourceURL: relocated,
-                    focusNote: currentItem.focusNote
-                )
+                currentItem.sourceURL = relocated
                 queue.update(currentItem.id, status: "Reprise", progress: 0)
                 exitCode = await runJob(currentItem)
             }
@@ -215,13 +231,16 @@ struct ContentView: View {
                 api_key: settings.odooApiKey
             )
         }
+        let compressionSettings = compressionSettings(for: item)
+        let termsForRun = item.selectedGlossaryTerms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         let request = JobRequest(
             source_path: item.sourceURL.path,
-            workspace_dir: "",
+            workspace_dir: item.workspaceDir,
             output_dir: settings.outputDir,
             mode: settings.processingMode,
             profile: profile.isEmpty ? "Réunion équilibrée" : profile,
-            compression_settings: CompressionSettings(),
+            compression_settings: compressionSettings,
             transcription_settings: TranscriptionSettings(
                 model: settings.whisperModel,
                 output_format: settings.outputFormat,
@@ -234,14 +253,16 @@ struct ContentView: View {
                 expected_min_speakers: item.expectedSpeakerCount,
                 expected_max_speakers: item.expectedSpeakerCount
             ),
-            glossary_terms: settings.glossaryTerms,
+            glossary_terms: termsForRun,
             speaker_overrides: overrides,
             technical_terms: item.focusNote.map { [$0] } ?? [],
             rerun_steps: [],
-            delete_source_after_copy: settings.deleteSourceAfterCopy,
+            library_job_id: item.libraryJobId,
+            delete_source_after_copy: settings.deleteSourceAfterCopy && !item.isLibraryRerun,
             odoo_context_ref: contextRef,
             odoo_meeting_metadata: item.odooMeeting
         )
+        settings.recordVocabularyUsage(termsForRun)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ekovideo-job.json")
         do {
             let data = try JSONEncoder().encode(request)
@@ -251,6 +272,19 @@ struct ContentView: View {
             engine.lastError = error.localizedDescription
             return -1
         }
+    }
+
+    private func compressionSettings(for item: QueueItem) -> CompressionSettings {
+        var compression = CompressionSettings()
+        let start = max(0, item.trimStartSeconds)
+        let removedEnd = max(0, item.trimEndSeconds)
+        compression.trim_enabled = start > 0 || removedEnd > 0
+        compression.trim_start = formatHMS(start)
+        if removedEnd > 0, item.mediaDurationSeconds > removedEnd {
+            let absoluteEnd = max(start + 1, item.mediaDurationSeconds - removedEnd)
+            compression.trim_end = formatHMS(absoluteEnd)
+        }
+        return compression
     }
 }
 
@@ -380,6 +414,7 @@ struct QueueColumnView: View {
 }
 
 struct QueueRowView: View {
+    @EnvironmentObject private var queue: QueueStore
     var item: QueueItem
 
     var body: some View {
@@ -392,7 +427,8 @@ struct QueueRowView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.sourceURL.lastPathComponent)
                     .font(.headline)
-                    .lineLimit(2)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Text(item.sourceURL.deletingLastPathComponent().path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -410,6 +446,15 @@ struct QueueRowView: View {
                         .frame(width: 82)
                 }
             }
+            Button(role: .destructive) {
+                queue.remove(id: item.id)
+            } label: {
+                Label("Retirer", systemImage: "xmark.circle")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .help("Retirer ce fichier de la file d'attente")
+            .disabled(queue.isBatchRunning && item.status == "En cours")
         }
         .padding(.vertical, 6)
     }
@@ -424,6 +469,11 @@ struct QueueRowView: View {
 /// per-run knobs, and surfaced in Réglages where they belong.
 struct RunBatchSettingsForm: View {
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var queue: QueueStore
+
+    private var canDeleteOriginalSources: Bool {
+        queue.items.contains { !$0.isLibraryRerun }
+    }
 
     var body: some View {
         Form {
@@ -462,19 +512,18 @@ struct RunBatchSettingsForm: View {
             }
 
             Section("Vocabulaire") {
-                TextEditor(text: $settings.glossary)
-                    .font(.body.monospaced())
-                    .frame(minHeight: 110)
-                Text("\(settings.glossaryTerms.count) terme(s) transmis au moteur, partagés par toute la file.")
+                Text("Choisissez les termes utiles dans chaque fichier. Le catalogue global sert de suggestions, mais il n'est plus envoyé automatiquement à toutes les réunions.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Fichiers") {
+            if canDeleteOriginalSources {
+                Section("Fichiers") {
                 Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
                 Text("Le moteur copie d'abord l'original dans le dossier de travail. Si cette option est active, seul le fichier à son emplacement d'origine est supprimé.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
             }
         }
         .formStyle(.grouped)
@@ -522,6 +571,11 @@ struct PerFileSetupPanel: View {
                         .truncationMode(.middle)
                 }
                 Spacer()
+                if player.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .help("Préparation de l'aperçu audio")
+                }
                 Button {
                     player.toggle(url: item.sourceURL)
                 } label: {
@@ -533,26 +587,49 @@ struct PerFileSetupPanel: View {
                 .controlSize(.large)
                 .help("Aperçu audio — utile pour se rappeler des intervenants")
             }
-            if let elapsed = player.elapsedFormatted, let total = player.durationFormatted {
-                ProgressView(value: player.progress)
-                    .progressViewStyle(.linear)
-                Text("\(elapsed) / \(total)")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+            audioScrubber
+
+            DisclosureGroup("Rogner le début ou la fin") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Stepper(
+                            "Début ignoré : \(formatPreviewSeconds(item.trimStartSeconds))",
+                            value: $item.trimStartSeconds,
+                            in: 0...trimStartUpperBound,
+                            step: 5
+                        )
+                        Spacer()
+                        Stepper(
+                            "Fin ignorée : \(formatPreviewSeconds(item.trimEndSeconds))",
+                            value: $item.trimEndSeconds,
+                            in: 0...trimEndUpperBound,
+                            step: 5
+                        )
+                    }
+                    Text("Le rognage est appliqué avant la compression et la transcription.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 4)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Nombre d'intervenants attendu")
-                    .font(.callout.weight(.medium))
-                Stepper(
-                    speakerCountStepperLabel(item.expectedSpeakerCount),
-                    value: $item.expectedSpeakerCount,
-                    in: 0...12
-                )
-                Text("0 = laisse pyannote estimer. Renseigner cette valeur quand vous la connaissez réduit fortement les attributions erronées.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Picker("Nombre d'intervenants attendu", selection: $item.expectedSpeakerCount) {
+                Text("Auto").tag(0)
+                ForEach(1...12, id: \.self) { count in
+                    Text("\(count)").tag(count)
+                }
             }
+            .pickerStyle(.menu)
+
+            TokenListPicker(
+                title: "Interlocuteurs attendus",
+                placeholder: "Ajouter un nom",
+                selected: $item.expectedSpeakerNames,
+                suggestions: speakerSuggestions
+            )
+
+            VocabularyTokenPicker(selected: $item.selectedGlossaryTerms)
+                .environmentObject(settings)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Notes pour ce fichier (optionnel)")
@@ -582,15 +659,79 @@ struct PerFileSetupPanel: View {
         .background(Color(nsColor: .controlBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .task(id: item.sourceURL) {
+            player.load(url: item.sourceURL)
             await loadMeetingSuggestions()
         }
-        .onChange(of: index) { _, _ in
-            // User stepped to another file — kill the previous
-            // audio so it doesn't keep playing over the new
-            // selection.
-            player.stop()
+        .onChange(of: player.totalSeconds) { _, duration in
+            item.mediaDurationSeconds = duration
         }
         .onDisappear { player.stop() }
+    }
+
+    @ViewBuilder
+    private var audioScrubber: some View {
+        if player.totalSeconds > 0 {
+            HStack(spacing: 8) {
+                Button {
+                    player.skip(seconds: -15)
+                } label: {
+                    Label("Reculer 15 s", systemImage: "gobackward.15")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                Slider(
+                    value: Binding(
+                        get: { player.currentSeconds },
+                        set: { player.seek(to: $0) }
+                    ),
+                    in: 0...max(player.totalSeconds, 1)
+                )
+                Button {
+                    player.skip(seconds: 15)
+                } label: {
+                    Label("Avancer 15 s", systemImage: "goforward.15")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                Text("\(formatPreviewSeconds(player.currentSeconds)) / \(formatPreviewSeconds(player.totalSeconds))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 104, alignment: .trailing)
+            }
+        } else if player.isLoading {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Préparation de l'aperçu audio…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var knownDurationOrFallback: Double {
+        let known = max(player.totalSeconds, item.mediaDurationSeconds)
+        return known
+    }
+
+    private var trimStartUpperBound: Double {
+        if knownDurationOrFallback > 0 {
+            return max(0, knownDurationOrFallback - item.trimEndSeconds - 1)
+        }
+        return 24 * 3600
+    }
+
+    private var trimEndUpperBound: Double {
+        guard knownDurationOrFallback > 0 else { return 0 }
+        return max(0, knownDurationOrFallback - item.trimStartSeconds - 1)
+    }
+
+    private var speakerSuggestions: [String] {
+        let meetingNames = item.odooMeeting?.attendees.map(\.name) ?? []
+        return meetingNames.filter { name in
+            !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !item.expectedSpeakerNames.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame })
+        }
     }
 
     /// Bracket the file's modification time and ask Odoo for any
@@ -774,6 +915,186 @@ struct OdooMeetingSuggestionRow: View {
     }
 }
 
+struct TokenListPicker: View {
+    var title: String
+    var placeholder: String
+    @Binding var selected: [String]
+    var suggestions: [String] = []
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title)
+                .font(.callout.weight(.medium))
+            FlowLayout(spacing: 6) {
+                ForEach(selected, id: \.self) { value in
+                    RemovableToken(text: value) {
+                        selected.removeAll { $0 == value }
+                    }
+                }
+                TextField(placeholder, text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 180, maxWidth: 260)
+                    .onSubmit { add(draft) }
+            }
+            if !suggestions.isEmpty {
+                FlowLayout(spacing: 6) {
+                    ForEach(suggestions.prefix(8), id: \.self) { suggestion in
+                        Button {
+                            add(suggestion)
+                        } label: {
+                            Label(suggestion, systemImage: "plus.circle")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+            }
+        }
+    }
+
+    private func add(_ raw: String) {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        guard !selected.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) else {
+            draft = ""
+            return
+        }
+        selected.append(value)
+        draft = ""
+    }
+}
+
+struct VocabularyTokenPicker: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @Binding var selected: [String]
+    @State private var draft = ""
+
+    private var suggestions: [String] {
+        settings.suggestedVocabulary(matching: draft, excluding: selected)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Vocabulaire de cette réunion")
+                .font(.callout.weight(.medium))
+            FlowLayout(spacing: 6) {
+                ForEach(selected, id: \.self) { term in
+                    RemovableToken(text: term) {
+                        selected.removeAll { $0 == term }
+                    }
+                }
+                TextField("Ajouter un terme", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(minWidth: 190, maxWidth: 280)
+                    .onSubmit { add(draft) }
+            }
+            if !suggestions.isEmpty {
+                FlowLayout(spacing: 6) {
+                    ForEach(suggestions.prefix(10), id: \.self) { suggestion in
+                        Button {
+                            add(suggestion)
+                        } label: {
+                            Label(suggestion, systemImage: "plus.circle")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+            } else if !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("Entrée crée le terme.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func add(_ raw: String) {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        guard !selected.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) else {
+            draft = ""
+            return
+        }
+        selected.append(value)
+        settings.addVocabularyTerm(value)
+        draft = ""
+    }
+}
+
+struct RemovableToken: View {
+    var text: String
+    var onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(text)
+                .lineLimit(1)
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .imageScale(.small)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+        .font(.caption)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.teal.opacity(0.16), in: Capsule())
+    }
+}
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout Void
+    ) -> CGSize {
+        let maxWidth = proposal.width ?? 480
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: maxWidth, height: y + rowHeight)
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout Void
+    ) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(
+                at: CGPoint(x: x, y: y),
+                proposal: ProposedViewSize(size)
+            )
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
 /// Minimal AVFoundation wrapper used by the per-file setup panel.
 /// Exposes just the three knobs the UI binds against — toggle,
 /// progress, formatted timestamps — so the heavy AVPlayer
@@ -782,6 +1103,9 @@ struct OdooMeetingSuggestionRow: View {
 final class AudioPreviewPlayer: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var progress: Double = 0
+    @Published private(set) var isLoading = false
+    @Published private(set) var currentSeconds: Double = 0
+    @Published private(set) var totalSeconds: Double = 0
 
     private var player: AVPlayer?
     private var currentURL: URL?
@@ -796,22 +1120,37 @@ final class AudioPreviewPlayer: ObservableObject {
     // a stale token isn't a concern.
 
     var elapsedFormatted: String? {
-        guard let seconds = currentSeconds else { return nil }
-        return formatPreviewSeconds(seconds)
+        totalSeconds > 0 ? formatPreviewSeconds(currentSeconds) : nil
     }
 
     var durationFormatted: String? {
-        guard let seconds = totalSeconds else { return nil }
-        return formatPreviewSeconds(seconds)
+        totalSeconds > 0 ? formatPreviewSeconds(totalSeconds) : nil
+    }
+
+    func load(url: URL) {
+        if currentURL == url, player != nil { return }
+        stop()
+        isLoading = true
+        let asset = AVURLAsset(url: url)
+        let item = AVPlayerItem(asset: asset)
+        let player = AVPlayer(playerItem: item)
+        self.player = player
+        self.currentURL = url
+        installObserver()
+        Task { [weak self] in
+            let duration = (try? await asset.load(.duration)) ?? .invalid
+            let seconds = CMTimeGetSeconds(duration)
+            await MainActor.run {
+                guard let self, self.currentURL == url else { return }
+                self.totalSeconds = seconds.isFinite && seconds > 0 ? seconds : 0
+                self.isLoading = false
+            }
+        }
     }
 
     func toggle(url: URL) {
-        if currentURL != url {
-            stop()
-            let player = AVPlayer(url: url)
-            self.player = player
-            self.currentURL = url
-            installObserver()
+        if currentURL != url || player == nil {
+            load(url: url)
         }
         guard let player else { return }
         if isPlaying {
@@ -831,17 +1170,31 @@ final class AudioPreviewPlayer: ObservableObject {
         player = nil
         currentURL = nil
         isPlaying = false
+        isLoading = false
         progress = 0
+        currentSeconds = 0
+        totalSeconds = 0
         timeObserver = nil
     }
 
-    private var currentSeconds: Double? {
+    func seek(to seconds: Double) {
+        let clamped = min(max(seconds, 0), max(totalSeconds, 0))
+        currentSeconds = clamped
+        progress = totalSeconds > 0 ? min(max(clamped / totalSeconds, 0), 1) : 0
+        player?.seek(to: CMTime(seconds: clamped, preferredTimescale: 600))
+    }
+
+    func skip(seconds: Double) {
+        seek(to: currentSeconds + seconds)
+    }
+
+    private var playerCurrentSeconds: Double? {
         guard let player else { return nil }
         let time = CMTimeGetSeconds(player.currentTime())
         return time.isFinite ? time : nil
     }
 
-    private var totalSeconds: Double? {
+    private var playerTotalSeconds: Double? {
         guard let item = player?.currentItem else { return nil }
         let duration = CMTimeGetSeconds(item.duration)
         return duration.isFinite && duration > 0 ? duration : nil
@@ -867,8 +1220,14 @@ final class AudioPreviewPlayer: ObservableObject {
     }
 
     private func tick() {
-        guard let current = currentSeconds,
-              let total = totalSeconds, total > 0 else { return }
+        guard let current = playerCurrentSeconds else { return }
+        if let duration = playerTotalSeconds, duration > 0 {
+            totalSeconds = duration
+            isLoading = false
+        }
+        let total = totalSeconds
+        guard total > 0 else { return }
+        currentSeconds = current
         progress = min(max(current / total, 0), 1)
         // Auto-reset when playback finished — keeps the UI
         // honest about whether anything's currently playing.
@@ -890,6 +1249,14 @@ private func formatPreviewSeconds(_ seconds: Double) -> String {
         return String(format: "%d:%02d:%02d", h, m, s)
     }
     return String(format: "%d:%02d", m, s)
+}
+
+private func formatHMS(_ seconds: Double) -> String {
+    let total = max(Int(seconds.rounded()), 0)
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    return String(format: "%02d:%02d:%02d", h, m, s)
 }
 
 struct RunSetupView: View {
@@ -1204,14 +1571,18 @@ struct LibraryView: View {
 
                         TableColumn("Actions") { displayRow in
                             if let artifact = displayRow.artifact {
-                                ArtifactInlineActions(artifact: artifact) { path in
-                                    enqueue(path, label: "Artefact ajouté à la file d'attente")
+                                ArtifactInlineActions(row: displayRow.job, artifact: artifact) { path in
+                                    if artifact.canRerun {
+                                        enqueue(displayRow.job, sourcePath: path, label: "Relance ajoutée à la file d'attente")
+                                    } else {
+                                        enqueue(path, label: "Artefact ajouté à la file d'attente")
+                                    }
                                 }
                             } else {
                                 LibraryTableActionsView(
                                     row: displayRow.job,
                                     onInspect: { toggleExpanded(displayRow.job) },
-                                    onRerun: { path in enqueue(path, label: "Source ajoutée à la file d'attente") },
+                                    onRerun: { enqueue(displayRow.job, label: "Relance ajoutée à la file d'attente") },
                                     onEditContext: { editingRow = displayRow.job },
                                     onDelete: { rowToDelete = displayRow.job }
                                 )
@@ -1270,6 +1641,23 @@ struct LibraryView: View {
 
     private func enqueue(_ path: String, label: String) {
         queue.add(urls: [URL(fileURLWithPath: path)])
+        withAnimation(.easeInOut(duration: 0.16)) {
+            queueNotice = label
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 1_700_000_000)
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    if queueNotice == label {
+                        queueNotice = nil
+                    }
+                }
+            }
+        }
+    }
+
+    private func enqueue(_ row: LibraryRow, sourcePath: String? = nil, label: String) {
+        queue.addRerun(row: row, sourcePath: sourcePath)
         withAnimation(.easeInOut(duration: 0.16)) {
             queueNotice = label
         }
@@ -1354,6 +1742,89 @@ struct ModelsView: View {
             }
         }
     }
+}
+
+struct VocabularyView: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @State private var draft = ""
+
+    private var rows: [VocabularyDisplayRow] {
+        let usage = settings.vocabularyUsage
+        return settings.vocabularyCatalog.map {
+            VocabularyDisplayRow(term: $0, usage: usage[$0] ?? 0)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Vocabulaire")
+                        .font(.largeTitle.bold())
+                    Text("Conservez les noms propres et termes techniques, puis choisissez-les au lancement de chaque réunion.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(24)
+            Divider()
+            HStack(spacing: 10) {
+                TextField("Ajouter un mot ou une expression", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { addDraft() }
+                Button {
+                    addDraft()
+                } label: {
+                    Label("Ajouter", systemImage: "plus")
+                }
+                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 14)
+            Divider()
+            if rows.isEmpty {
+                EmptyStateView(
+                    title: "Aucun terme enregistré",
+                    systemImage: "text.word.spacing",
+                    message: "Ajoutez les noms de clients, outils, produits ou expressions métier que Whisper doit connaître."
+                )
+            } else {
+                Table(rows) {
+                    TableColumn("Terme") { row in
+                        Text(row.term)
+                            .font(.headline)
+                    }
+                    TableColumn("Utilisé") { row in
+                        Text(row.usage > 0 ? "\(row.usage)" : "—")
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .width(min: 70, ideal: 90, max: 110)
+                    TableColumn("Actions") { row in
+                        Button(role: .destructive) {
+                            settings.removeVocabularyTerm(row.term)
+                        } label: {
+                            Label("Supprimer", systemImage: "trash")
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                    }
+                    .width(min: 80, ideal: 90, max: 120)
+                }
+            }
+        }
+    }
+
+    private func addDraft() {
+        settings.addVocabularyTerm(draft)
+        draft = ""
+    }
+}
+
+struct VocabularyDisplayRow: Identifiable {
+    var term: String
+    var usage: Int
+    var id: String { term }
 }
 
 struct SettingsView: View {
@@ -1506,8 +1977,8 @@ struct SettingsView: View {
                     }
                 }
                 Section("Vocabulaire conservé") {
-                    TextEditor(text: $settings.glossary)
-                        .frame(minHeight: 130)
+                    Text("\(settings.vocabularyCatalog.count) terme(s) dans le catalogue. L'onglet Vocabulaire permet d'ajouter, supprimer et prioriser les termes selon l'usage.")
+                        .foregroundStyle(.secondary)
                 }
                 Section("Diagnostic") {
                     // Used to live in the Run Setup form. Moved
@@ -1860,7 +2331,7 @@ extension LibraryDisplayRow {
 struct LibraryTableActionsView: View {
     var row: LibraryRow
     var onInspect: () -> Void
-    var onRerun: (String) -> Void
+    var onRerun: () -> Void
     var onEditContext: () -> Void
     var onDelete: () -> Void
 
@@ -1873,9 +2344,7 @@ struct LibraryTableActionsView: View {
             .help("Afficher les artefacts")
 
             Button {
-                if let path = pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path {
-                    onRerun(path)
-                }
+                onRerun()
             } label: {
                 Label("Relancer", systemImage: "arrow.clockwise")
             }
@@ -1915,6 +2384,7 @@ struct ArtifactTreeNameCell: View {
 }
 
 struct ArtifactInlineActions: View {
+    var row: LibraryRow
     var artifact: LibraryArtifact
     var onRerun: (String) -> Void
 
@@ -2354,8 +2824,9 @@ struct LibraryContextEditor: View {
             guard marked else { return }
             await MainActor.run {
                 if let path = pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path {
-                    queue.add(
-                        urls: [URL(fileURLWithPath: path)],
+                    queue.addRerun(
+                        row: row,
+                        sourcePath: path,
                         focusNote: focusNote(for: sample),
                         prioritize: true
                     )

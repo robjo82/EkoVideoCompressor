@@ -98,6 +98,7 @@ struct JobRequest: Codable {
     var speaker_overrides: [String: String]
     var technical_terms: [String]
     var rerun_steps: [String]
+    var library_job_id: Int?
     var delete_source_after_copy: Bool
     /// Optional Odoo object whose chatter the engine fetches during
     /// the LLM step to enrich the correction prompt. ``nil`` when
@@ -335,6 +336,9 @@ struct CompressionSettings: Codable {
     var preset = "medium"
     var speech_enhance = true
     var mono_audio = false
+    var trim_enabled = false
+    var trim_start = "00:00:00"
+    var trim_end = "00:00:00"
 }
 
 /// Single "quality" knob the user sees in Settings. The engine

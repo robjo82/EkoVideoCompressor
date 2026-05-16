@@ -562,7 +562,11 @@ def search_meeting_events(
     if not isinstance(records, list):
         return []
 
-    stripped = [_strip_meeting_record(r) for r in records if isinstance(r, dict)]
+    stripped = [
+        meeting
+        for meeting in (_strip_meeting_record(r) for r in records if isinstance(r, dict))
+        if len(meeting.get("partner_ids") or []) > 1
+    ]
 
     # Expand attendees once for the whole batch.
     every_partner_id: list[int] = []

@@ -618,6 +618,13 @@ class TranscriptionPipeline:
             source_path,
             str(wav_path),
             speech_enhance=settings.enhance_audio,
+            ss=self.request.compression_settings.trim_start
+            if self.request.compression_settings.trim_enabled
+            else None,
+            to=self.request.compression_settings.trim_end
+            if self.request.compression_settings.trim_enabled
+            and self.request.compression_settings.trim_end != "00:00:00"
+            else None,
         )
         self.sink(ProgressEvent("audio_extract", 0, "Extracting audio"))
         proc = subprocess.run(
@@ -636,6 +643,13 @@ class TranscriptionPipeline:
                 source_path,
                 str(diar_wav_path),
                 speech_enhance=False,
+                ss=self.request.compression_settings.trim_start
+                if self.request.compression_settings.trim_enabled
+                else None,
+                to=self.request.compression_settings.trim_end
+                if self.request.compression_settings.trim_enabled
+                and self.request.compression_settings.trim_end != "00:00:00"
+                else None,
             )
             diar_proc = subprocess.run(
                 diar_cmd,
@@ -1679,7 +1693,9 @@ class CompressionPipeline:
             speech_enhance=settings.speech_enhance,
             mono_audio=settings.mono_audio,
             ss=settings.trim_start if settings.trim_enabled else None,
-            to=settings.trim_end if settings.trim_enabled else None,
+            to=settings.trim_end
+            if settings.trim_enabled and settings.trim_end != "00:00:00"
+            else None,
             audio_only=is_audio_only_path(self.request.source_path),
         )
         self.sink(ProgressEvent("compression", 0, "Running FFmpeg"))

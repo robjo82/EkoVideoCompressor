@@ -5,6 +5,23 @@ struct QueueItem: Identifiable, Equatable {
     let id = UUID()
     var sourceURL: URL
     var focusNote: String?
+    /// Existing library row this queue item is reprocessing. Nil for a
+    /// brand-new drop. When set, the engine updates that row instead of
+    /// creating a second execution entry.
+    var libraryJobId: Int?
+    /// Existing job workspace reused for reruns. Empty on fresh drops;
+    /// populated when the user relaunches from the library.
+    var workspaceDir: String = ""
+    /// Per-file vocabulary explicitly selected for this run. The global
+    /// vocabulary catalog suggests entries, but nothing is sent to
+    /// Whisper unless the user chose it here.
+    var selectedGlossaryTerms: [String] = []
+    /// User trim hints, in seconds. ``trimEndSeconds`` means "remove
+    /// this much from the tail"; the final absolute ffmpeg `-to` value
+    /// is computed from ``mediaDurationSeconds`` when launching.
+    var trimStartSeconds: Double = 0
+    var trimEndSeconds: Double = 0
+    var mediaDurationSeconds: Double = 0
     /// Number of speakers the user expects on this specific
     /// recording. 0 means "let pyannote estimate". Per-file rather
     /// than per-batch because a 5-person standup followed by a
@@ -33,6 +50,10 @@ struct QueueItem: Identifiable, Equatable {
     var odooContextRef: OdooContextRef?
     var status: String = "En attente"
     var progress: Double = 0
+
+    var isLibraryRerun: Bool {
+        libraryJobId != nil || !workspaceDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 @MainActor
@@ -41,11 +62,42 @@ final class QueueStore: ObservableObject {
     @Published var isBatchRunning = false
     @Published var autoRunRequestID: UUID?
 
-    func add(urls: [URL], focusNote: String? = nil, prioritize: Bool = false) {
+    func add(
+        urls: [URL],
+        focusNote: String? = nil,
+        prioritize: Bool = false,
+        libraryJobId: Int? = nil,
+        workspaceDir: String = "",
+        expectedSpeakerNames: [String] = [],
+        selectedGlossaryTerms: [String] = [],
+        odooMeetingTitle: String = "",
+        odooMeeting: OdooMeetingMetadata? = nil,
+        odooContextRef: OdooContextRef? = nil
+    ) {
         for url in urls {
-            if let index = items.firstIndex(where: { $0.sourceURL == url }) {
+            if let index = items.firstIndex(where: { $0.sourceURL == url && $0.libraryJobId == libraryJobId }) {
                 if let focusNote {
                     items[index].focusNote = focusNote
+                }
+                if libraryJobId != nil {
+                    items[index].libraryJobId = libraryJobId
+                    items[index].workspaceDir = workspaceDir
+                }
+                if !expectedSpeakerNames.isEmpty {
+                    items[index].expectedSpeakerNames = expectedSpeakerNames
+                    items[index].expectedSpeakerCount = expectedSpeakerNames.count
+                }
+                if !selectedGlossaryTerms.isEmpty {
+                    items[index].selectedGlossaryTerms = selectedGlossaryTerms
+                }
+                if !odooMeetingTitle.isEmpty {
+                    items[index].odooMeetingTitle = odooMeetingTitle
+                }
+                if let odooMeeting {
+                    items[index].odooMeeting = odooMeeting
+                }
+                if let odooContextRef {
+                    items[index].odooContextRef = odooContextRef
                 }
                 if prioritize && index > 0 {
                     let item = items.remove(at: index)
@@ -53,13 +105,49 @@ final class QueueStore: ObservableObject {
                 }
                 continue
             }
-            let item = QueueItem(sourceURL: url, focusNote: focusNote)
+            var item = QueueItem(sourceURL: url, focusNote: focusNote)
+            item.libraryJobId = libraryJobId
+            item.workspaceDir = workspaceDir
+            item.expectedSpeakerNames = expectedSpeakerNames
+            item.expectedSpeakerCount = expectedSpeakerNames.count
+            item.selectedGlossaryTerms = selectedGlossaryTerms
+            item.odooMeetingTitle = odooMeetingTitle
+            item.odooMeeting = odooMeeting
+            item.odooContextRef = odooContextRef
             if prioritize {
                 items.insert(item, at: 0)
             } else {
                 items.append(item)
             }
         }
+    }
+
+    func addRerun(
+        row: LibraryRow,
+        sourcePath: String? = nil,
+        focusNote: String? = nil,
+        prioritize: Bool = false
+    ) {
+        let path = sourcePath
+            ?? (pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path)
+        guard let path, !path.isEmpty else { return }
+        let meeting = row.odooMeeting
+        let attendeeNames = meeting?.attendees.map(\.name).filter { !$0.isEmpty } ?? []
+        let existingTerms = row.technicalTerms
+        add(
+            urls: [URL(fileURLWithPath: path)],
+            focusNote: focusNote,
+            prioritize: prioritize,
+            libraryJobId: row.id,
+            workspaceDir: row.workspace_dir ?? "",
+            expectedSpeakerNames: attendeeNames.isEmpty ? row.displayedSpeakerNames : attendeeNames,
+            selectedGlossaryTerms: existingTerms,
+            odooMeetingTitle: meeting?.event_name ?? "",
+            odooMeeting: meeting,
+            odooContextRef: meeting?.related.map {
+                OdooContextRef(model: $0.model, record_id: $0.id, url: "", database: "", login: "", api_key: "")
+            }
+        )
     }
 
     func requestAutoRun() {
@@ -72,6 +160,10 @@ final class QueueStore: ObservableObject {
 
     func remove(at offsets: IndexSet) {
         items.remove(atOffsets: offsets)
+    }
+
+    func remove(id: QueueItem.ID) {
+        items.removeAll { $0.id == id }
     }
 
     func update(_ id: QueueItem.ID, status: String, progress: Double? = nil) {
@@ -105,6 +197,7 @@ final class QueueStore: ObservableObject {
 final class SettingsStore: ObservableObject {
     @AppStorage("outputDir") var outputDir = "\(NSHomeDirectory())/EkoVideo Compressor"
     @AppStorage("glossary") var glossary = ""
+    @AppStorage("glossaryUsageJSON") private var glossaryUsageJSON = "{}"
     @AppStorage("hfToken") var hfToken = ""
     @AppStorage("githubToken") var githubToken = ""
     @AppStorage("whisperModel") var whisperModel = "mlx-community/whisper-large-v3-turbo"
@@ -140,6 +233,72 @@ final class SettingsStore: ObservableObject {
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    var vocabularyUsage: [String: Int] {
+        guard let data = glossaryUsageJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([String: Int].self, from: data) else {
+            return [:]
+        }
+        return decoded
+    }
+
+    var vocabularyCatalog: [String] {
+        let usage = vocabularyUsage
+        let terms = Set(glossaryTerms).union(usage.keys)
+        return terms.sorted { left, right in
+            let leftUsage = usage[left] ?? 0
+            let rightUsage = usage[right] ?? 0
+            if leftUsage != rightUsage {
+                return leftUsage > rightUsage
+            }
+            return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
+        }
+    }
+
+    func suggestedVocabulary(matching query: String, excluding selected: [String]) -> [String] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let excluded = Set(selected.map { $0.lowercased() })
+        return vocabularyCatalog.filter { term in
+            guard !excluded.contains(term.lowercased()) else { return false }
+            return needle.isEmpty || term.localizedCaseInsensitiveContains(needle)
+        }
+    }
+
+    func addVocabularyTerm(_ value: String) {
+        let term = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return }
+        var terms = glossaryTerms
+        guard !terms.contains(where: { $0.caseInsensitiveCompare(term) == .orderedSame }) else { return }
+        terms.append(term)
+        glossary = terms.joined(separator: "\n")
+    }
+
+    func removeVocabularyTerm(_ value: String) {
+        let term = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return }
+        let terms = glossaryTerms.filter { $0.caseInsensitiveCompare(term) != .orderedSame }
+        glossary = terms.joined(separator: "\n")
+        var usage = vocabularyUsage
+        usage.removeValue(forKey: term)
+        writeVocabularyUsage(usage)
+    }
+
+    func recordVocabularyUsage(_ terms: [String]) {
+        var usage = vocabularyUsage
+        for raw in terms {
+            let term = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !term.isEmpty else { continue }
+            usage[term, default: 0] += 1
+            addVocabularyTerm(term)
+        }
+        writeVocabularyUsage(usage)
+    }
+
+    private func writeVocabularyUsage(_ usage: [String: Int]) {
+        guard let data = try? JSONEncoder().encode(usage),
+              let text = String(data: data, encoding: .utf8) else { return }
+        glossaryUsageJSON = text
     }
 }
 
