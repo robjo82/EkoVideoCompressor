@@ -10,6 +10,17 @@ struct QueueItem: Identifiable, Equatable {
     /// than per-batch because a 5-person standup followed by a
     /// 1-on-1 in the same queue need different bounds.
     var expectedSpeakerCount: Int = 0
+    /// Names the user wants Whisper to be biased toward (typically
+    /// pulled from an Odoo calendar.event the user picked in Run
+    /// Setup). They land in ``JobRequest.speaker_overrides`` keyed
+    /// on themselves so the engine's initial-prompt builder sees
+    /// them as "expected participants" without forcing a SPEAKER_NN
+    /// assignment.
+    var expectedSpeakerNames: [String] = []
+    /// Title of the Odoo meeting the user paired with this file —
+    /// surfaced as the meeting_context line of the Whisper initial
+    /// prompt. Optional: empty when no meeting was attached.
+    var odooMeetingTitle: String = ""
     var status: String = "En attente"
     var progress: Double = 0
 }
@@ -725,6 +736,40 @@ final class OdooStore: ObservableObject {
         }
         return result.lines.compactMap { line in
             try? JSONDecoder().decode(OdooPartner.self, from: Data(line.utf8))
+        }
+    }
+
+    /// Detect ``calendar.event`` records around ``moment`` so the
+    /// Run Setup can offer "is this meeting one of those?" before
+    /// the user types anything. Returns an empty list when Odoo
+    /// isn't configured — the surface treats that as "no
+    /// suggestions" without surfacing an error.
+    func searchMeetings(
+        near moment: Date,
+        windowHours: Double = 2.0,
+        limit: Int = 10
+    ) async -> [OdooMeetingSuggestion] {
+        guard let settings, settings.odooConfigured else { return [] }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let nearString = formatter.string(from: moment)
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(
+                [
+                    "odoo-search-meetings",
+                    "--jsonl",
+                    "--near", nearString,
+                    "--window-hours", String(format: "%.2f", windowHours),
+                    "--limit", "\(limit)",
+                ] + args(extra: [])
+            )
+        )
+        if result.status != 0 {
+            lastError = result.events.last?.message ?? result.rawOutput
+            return []
+        }
+        return result.lines.compactMap { line in
+            try? JSONDecoder().decode(OdooMeetingSuggestion.self, from: Data(line.utf8))
         }
     }
 }

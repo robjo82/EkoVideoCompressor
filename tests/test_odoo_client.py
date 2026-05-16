@@ -14,17 +14,22 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
+from datetime import datetime, timezone
+
 from odoo_client import (
     OdooAuthError,
     OdooConfig,
     OdooConnectionError,
     _connection_error_message,
     _exception_chain,
+    _format_odoo_datetime,
     _is_certificate_error,
     _json2_call,
     _normalise_url,
+    _strip_meeting_record,
     _strip_partner_record,
     fetch_partner,
+    search_meeting_events,
     search_partners,
     test_connection,
 )
@@ -270,6 +275,120 @@ class FetchPartnerTest(unittest.TestCase):
             self.assertIsNone(fetch_partner(
                 OdooConfig("https://x", "y", "z@a.b", "k"), 99
             ))
+
+
+class FormatOdooDatetimeTest(unittest.TestCase):
+    def test_naive_datetime_passes_through(self):
+        out = _format_odoo_datetime(datetime(2026, 5, 14, 19, 4, 12))
+        self.assertEqual(out, "2026-05-14 19:04:12")
+
+    def test_aware_datetime_converted_to_utc_naive(self):
+        # Paris is UTC+2 in May, so 19:04 local becomes 17:04 UTC.
+        from datetime import timedelta as _td
+        paris = datetime(2026, 5, 14, 19, 4, 12, tzinfo=timezone(_td(hours=2)))
+        self.assertEqual(_format_odoo_datetime(paris), "2026-05-14 17:04:12")
+
+
+class StripMeetingRecordTest(unittest.TestCase):
+    def test_unpacks_opportunity_id_and_counts_partners(self):
+        record = _strip_meeting_record({
+            "id": 7,
+            "name": "Revue Acritec",
+            "start": "2026-05-14 17:00:00",
+            "stop": "2026-05-14 18:00:00",
+            "duration": 1.0,
+            "partner_ids": [1, 2, 3],
+            "opportunity_id": [42, "Migration Odoo"],
+            "location": "Visio",
+        })
+        self.assertEqual(record["id"], 7)
+        self.assertEqual(record["attendee_count"], 3)
+        self.assertEqual(record["duration_minutes"], 60.0)
+        self.assertEqual(record["related_object"], {
+            "model": "crm.lead", "id": 42, "name": "Migration Odoo",
+        })
+        self.assertEqual(record["location"], "Visio")
+
+    def test_missing_opportunity_returns_none(self):
+        record = _strip_meeting_record({
+            "id": 7, "name": "Standup", "partner_ids": [],
+            "opportunity_id": False, "duration": 0.5,
+        })
+        self.assertIsNone(record["related_object"])
+        self.assertEqual(record["duration_minutes"], 30.0)
+        self.assertEqual(record["attendee_count"], 0)
+
+
+class SearchMeetingEventsTest(unittest.TestCase):
+    def _config(self):
+        return OdooConfig(
+            url="https://erp.acme.com",
+            database="acme",
+            login="vous@acme.fr",
+            api_key="sk-xxx",
+        )
+
+    def test_returns_meetings_with_attendees_expanded(self):
+        # First call: calendar.event/search_read returns 1 meeting
+        # with partner_ids [10, 11]. Second call: res.partner/read
+        # returns the two attendees. The wrapper threads both
+        # responses transparently.
+        calls = []
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(
+                [
+                    [
+                        {
+                            "id": 7, "name": "Revue Acritec",
+                            "start": "2026-05-14 17:00:00",
+                            "stop": "2026-05-14 18:00:00",
+                            "duration": 1.0, "partner_ids": [10, 11],
+                            "opportunity_id": [42, "Migration Odoo"],
+                        }
+                    ],
+                    [
+                        {"id": 10, "name": "Robin", "email": "r@acme.fr",
+                         "parent_id": [99, "Acritec"], "is_company": False},
+                        {"id": 11, "name": "David", "email": "d@acme.fr",
+                         "parent_id": [99, "Acritec"], "is_company": False},
+                    ],
+                ],
+                calls,
+            ),
+        ):
+            meetings = search_meeting_events(
+                self._config(),
+                near=datetime(2026, 5, 14, 19, 0, 0, tzinfo=timezone.utc),
+                window_hours=2.0,
+            )
+
+        self.assertEqual(len(meetings), 1)
+        meeting = meetings[0]
+        self.assertEqual([a["name"] for a in meeting["attendees"]], ["Robin", "David"])
+        self.assertEqual(meeting["attendees"][0]["company"], "Acritec")
+        # The search domain includes the bracket bounds.
+        domain = calls[0]["body"]["domain"]
+        self.assertEqual(domain[0][0], "start")
+        self.assertEqual(domain[1][0], "stop")
+        # And the partner expansion uses a single batched read.
+        self.assertEqual(calls[1]["url"].split("/")[-2:], ["res.partner", "read"])
+        self.assertEqual(sorted(calls[1]["body"]["ids"]), [10, 11])
+
+    def test_empty_calendar_returns_empty_without_partner_lookup(self):
+        # No meetings → no partner expansion round-trip wasted.
+        calls = []
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([[]], calls),
+        ):
+            meetings = search_meeting_events(
+                self._config(),
+                near=datetime(2026, 5, 14, 19, 0, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual(meetings, [])
+        # Only one network call (the search_read), no partner read.
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

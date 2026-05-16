@@ -218,6 +218,37 @@ struct OdooPartner: Codable, Identifiable, Equatable {
     var function: String
 }
 
+/// One Odoo ``calendar.event`` suggestion surfaced in Run Setup so
+/// the user can click "this is the meeting" and pre-fill speaker
+/// names + expected count without typing them by hand.
+struct OdooMeetingSuggestion: Codable, Identifiable, Equatable {
+    var id: Int
+    var name: String
+    var start: String
+    var stop: String
+    var duration_minutes: Double
+    var allday: Bool
+    var location: String
+    var description: String
+    var partner_ids: [Int]
+    var attendee_count: Int
+    var related_object: OdooRelatedObject?
+    var attendees: [OdooMeetingAttendee]
+}
+
+struct OdooMeetingAttendee: Codable, Identifiable, Equatable {
+    var id: Int
+    var name: String
+    var email: String
+    var company: String
+}
+
+struct OdooRelatedObject: Codable, Equatable {
+    var model: String
+    var id: Int
+    var name: String
+}
+
 /// Disk-usage preview shown in the deletion sheet so the user can
 /// see exactly which files (and how many bytes) they're about to
 /// free before confirming a "supprimer + dossier de travail".

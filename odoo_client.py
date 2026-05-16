@@ -20,6 +20,7 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -32,6 +33,7 @@ __all__ = [
     "OdooConnectionError",
     "OdooAuthError",
     "test_connection",
+    "search_meeting_events",
     "search_partners",
     "fetch_partner",
 ]
@@ -49,6 +51,25 @@ _PARTNER_FIELDS = (
     "email",
     "phone",
     "function",
+)
+
+# Fields the meeting-event lookup pulls. ``opportunity_id`` and
+# ``task_id`` are the two canonical "related object" links Odoo
+# 17+ exposes on ``calendar.event``; we read them defensively so a
+# DB without those columns (e.g. base Community without CRM)
+# doesn't trip the request.
+_MEETING_FIELDS = (
+    "id",
+    "name",
+    "start",
+    "stop",
+    "duration",
+    "allday",
+    "partner_ids",
+    "attendee_ids",
+    "description",
+    "location",
+    "opportunity_id",
 )
 
 
@@ -387,3 +408,178 @@ def fetch_partner(config: OdooConfig, partner_id: int) -> dict | None:
     if not isinstance(record, dict):
         return None
     return _strip_partner_record(record)
+
+
+# ---------------------------------------------------------------------------
+# Calendar event discovery (Run Setup "Suggestions Odoo" section)
+# ---------------------------------------------------------------------------
+
+
+def _format_odoo_datetime(value: datetime) -> str:
+    """Odoo's JSON-2 expects naive UTC strings (``YYYY-MM-DD HH:MM:SS``).
+
+    SwiftUI passes the file's modification time as an ISO 8601 string
+    we parse on the way in; the formatter normalises back to that
+    shape so domain comparisons stay timezone-aligned.
+    """
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _strip_meeting_record(record: dict) -> dict:
+    """Flatten an Odoo ``calendar.event`` for SwiftUI consumption.
+
+    Many2one fields (``opportunity_id``) come back as ``[id, name]``
+    pairs or ``False`` — unpacked into a plain
+    ``related_object: {model, id, name}`` dict so the Swift side
+    doesn't have to branch.
+    """
+    related: dict | None = None
+    opportunity = record.get("opportunity_id")
+    if isinstance(opportunity, (list, tuple)) and len(opportunity) >= 2:
+        try:
+            related = {
+                "model": "crm.lead",
+                "id": int(opportunity[0]),
+                "name": str(opportunity[1]),
+            }
+        except (TypeError, ValueError):
+            related = None
+
+    # Attendee identities live in ``partner_ids`` as a list of ids.
+    # We don't expand them here — the caller can do a second
+    # batched ``read`` if they want richer info. Surface raw ids so
+    # the SwiftUI side knows how many people were invited.
+    raw_partners = record.get("partner_ids") or []
+    partner_ids: list[int] = []
+    if isinstance(raw_partners, list):
+        for value in raw_partners:
+            try:
+                partner_ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+
+    duration = record.get("duration")
+    try:
+        duration_minutes = float(duration) * 60.0 if duration else 0.0
+    except (TypeError, ValueError):
+        duration_minutes = 0.0
+
+    return {
+        "id": int(record.get("id") or 0),
+        "name": str(record.get("name") or ""),
+        "start": str(record.get("start") or ""),
+        "stop": str(record.get("stop") or ""),
+        "duration_minutes": duration_minutes,
+        "allday": bool(record.get("allday") or False),
+        "location": str(record.get("location") or "") if record.get("location") else "",
+        "description": str(record.get("description") or "") if record.get("description") else "",
+        "partner_ids": partner_ids,
+        "attendee_count": len(partner_ids),
+        "related_object": related,
+    }
+
+
+def _attendees_for_meetings(
+    config: OdooConfig,
+    partner_ids: list[int],
+) -> dict[int, dict]:
+    """Batched ``res.partner.read`` for every partner referenced by
+    the meetings we just fetched. Returns ``{id: stripped_record}``.
+
+    Done in one round-trip rather than N to keep the suggestion
+    list snappy even when several meetings invite the same crowd.
+    """
+    if not partner_ids:
+        return {}
+    unique = sorted({int(p) for p in partner_ids if p})
+    if not unique:
+        return {}
+    records = _json2_call(
+        config,
+        "res.partner",
+        "read",
+        {
+            "ids": unique,
+            "fields": list(_PARTNER_FIELDS),
+        },
+    )
+    if not isinstance(records, list):
+        return {}
+    out: dict[int, dict] = {}
+    for raw in records:
+        if not isinstance(raw, dict):
+            continue
+        clean = _strip_partner_record(raw)
+        out[int(clean.get("id") or 0)] = clean
+    return out
+
+
+def search_meeting_events(
+    config: OdooConfig,
+    *,
+    near: datetime | None = None,
+    window_hours: float = 2.0,
+    limit: int = 10,
+) -> list[dict]:
+    """Return the ``calendar.event`` records that bracket ``near``.
+
+    The domain looks for events whose [start, stop] window overlaps
+    [near - window_hours, near + window_hours]. ``near`` defaults to
+    "right now", which is what an `Enregistrer dans le moment`
+    workflow expects.
+
+    Each returned dict is augmented with an ``attendees`` list of
+    flat ``{id, name, email}`` records (resolved via a single batched
+    ``res.partner.read``). Returned in ascending start order.
+    """
+    moment = near or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    window = timedelta(hours=max(0.25, window_hours))
+    earliest = _format_odoo_datetime(moment - window)
+    latest = _format_odoo_datetime(moment + window)
+
+    # Overlap test: start <= latest AND stop >= earliest.
+    domain: list = [
+        ("start", "<=", latest),
+        ("stop", ">=", earliest),
+    ]
+    records = _json2_call(
+        config,
+        "calendar.event",
+        "search_read",
+        {
+            "domain": domain,
+            "fields": list(_MEETING_FIELDS),
+            "limit": int(limit),
+            "order": "start asc",
+        },
+    )
+    if not isinstance(records, list):
+        return []
+
+    stripped = [_strip_meeting_record(r) for r in records if isinstance(r, dict)]
+
+    # Expand attendees once for the whole batch.
+    every_partner_id: list[int] = []
+    for meeting in stripped:
+        every_partner_id.extend(meeting.get("partner_ids") or [])
+    attendee_map = _attendees_for_meetings(config, every_partner_id)
+    for meeting in stripped:
+        attendees: list[dict] = []
+        for pid in meeting.get("partner_ids") or []:
+            partner = attendee_map.get(int(pid))
+            if not partner:
+                continue
+            attendees.append(
+                {
+                    "id": int(partner.get("id") or 0),
+                    "name": str(partner.get("name") or partner.get("display_name") or ""),
+                    "email": str(partner.get("email") or ""),
+                    "company": str(partner.get("parent_name") or ""),
+                }
+            )
+        meeting["attendees"] = attendees
+    return stripped
