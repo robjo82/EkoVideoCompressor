@@ -133,6 +133,46 @@ def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSet
 
 
 @dataclass(slots=True)
+class OdooContextRef:
+    """Pointer to an Odoo object whose chatter the pipeline fetches
+    during the LLM step to enrich the correction prompt.
+
+    Lives outside ``TranscriptionSettings`` because the credentials
+    needed to act on it live next to it on the same JSON envelope
+    — keeps the LLM step from having to reach back into preferences
+    every time.
+    """
+
+    model: str = ""
+    record_id: int = 0
+    url: str = ""
+    database: str = ""
+    login: str = ""
+    api_key: str = ""
+
+    def is_actionable(self) -> bool:
+        return bool(
+            self.model
+            and self.record_id
+            and self.url
+            and self.database
+            and self.api_key
+        )
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "OdooContextRef":
+        data = dict(raw or {})
+        return cls(
+            model=str(data.get("model") or ""),
+            record_id=int(data.get("record_id") or data.get("id") or 0),
+            url=str(data.get("url") or ""),
+            database=str(data.get("database") or ""),
+            login=str(data.get("login") or ""),
+            api_key=str(data.get("api_key") or ""),
+        )
+
+
+@dataclass(slots=True)
 class JobRequest:
     source_path: str
     output_dir: str
@@ -147,6 +187,18 @@ class JobRequest:
     rerun_steps: list[str] = field(default_factory=list)
     library_job_id: int | None = None
     delete_source_after_copy: bool = False
+    # Optional Odoo object whose chatter we'll fetch during the LLM
+    # enhancement step. Empty when the user didn't link a meeting in
+    # Run Setup; populated when they clicked "Utiliser" on a
+    # ``calendar.event`` whose ``opportunity_id`` (or similar)
+    # pointed at a useful CRM / project record.
+    odoo_context_ref: OdooContextRef = field(default_factory=OdooContextRef)
+    # Snapshot of the Odoo calendar event the user paired with this
+    # job in Run Setup. Persisted on the ``jobs`` row so the rename
+    # sheet later shows one-click attribution chips for each
+    # invitee even after the engine has exited. Empty on jobs that
+    # weren't paired with any meeting.
+    odoo_meeting_metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "JobRequest":
@@ -180,6 +232,8 @@ class JobRequest:
             rerun_steps=[str(x) for x in data.get("rerun_steps") or []],
             library_job_id=data.get("library_job_id"),
             delete_source_after_copy=bool(data.get("delete_source_after_copy") or False),
+            odoo_context_ref=OdooContextRef.from_dict(data.get("odoo_context_ref")),
+            odoo_meeting_metadata=dict(data.get("odoo_meeting_metadata") or {}),
         )
 
     def to_dict(self) -> dict[str, Any]:

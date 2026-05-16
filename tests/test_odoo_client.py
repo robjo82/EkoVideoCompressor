@@ -20,14 +20,17 @@ from odoo_client import (
     OdooAuthError,
     OdooConfig,
     OdooConnectionError,
+    _build_chatter_summary,
     _connection_error_message,
     _exception_chain,
     _format_odoo_datetime,
+    _html_to_text,
     _is_certificate_error,
     _json2_call,
     _normalise_url,
     _strip_meeting_record,
     _strip_partner_record,
+    fetch_object_chatter,
     fetch_partner,
     search_meeting_events,
     search_partners,
@@ -389,6 +392,114 @@ class SearchMeetingEventsTest(unittest.TestCase):
         self.assertEqual(meetings, [])
         # Only one network call (the search_read), no partner read.
         self.assertEqual(len(calls), 1)
+
+
+class ChatterHelpersTest(unittest.TestCase):
+    def test_html_to_text_strips_tags_and_entities(self):
+        out = _html_to_text(
+            "<p>Bonjour <a href='x'>Robin</a>,&nbsp;la migration est validée.</p>"
+        )
+        self.assertEqual(out, "Bonjour Robin, la migration est validée.")
+
+    def test_html_to_text_handles_none_and_blank(self):
+        self.assertEqual(_html_to_text(""), "")
+        self.assertEqual(_html_to_text(None), "")  # type: ignore[arg-type]
+
+    def test_chatter_summary_concatenates_recent_messages(self):
+        summary = _build_chatter_summary(
+            "Migration Odoo",
+            [
+                {"date": "2026-05-13", "author": "Florence",
+                 "body": "On lance le go le 14."},
+                {"date": "2026-05-12", "author": "Antoine",
+                 "body": "Validé côté technique."},
+            ],
+        )
+        self.assertIn("Migration Odoo", summary)
+        self.assertIn("Florence", summary)
+        self.assertIn("Validé", summary)
+
+    def test_chatter_summary_caps_at_prompt_budget(self):
+        # 50 long bodies should not blow through the 1800-char cap
+        # — the formatter walks until budget is exhausted then
+        # stops without truncating mid-message.
+        messages = [
+            {"date": f"2026-05-{i:02d}", "author": "Spam",
+             "body": "x" * 400}
+            for i in range(1, 50)
+        ]
+        summary = _build_chatter_summary("Sujet", messages)
+        self.assertLessEqual(len(summary), 1900)
+
+
+class FetchObjectChatterTest(unittest.TestCase):
+    def _config(self):
+        return OdooConfig(
+            url="https://erp.acme.com",
+            database="acme",
+            login="vous@acme.fr",
+            api_key="sk-xxx",
+        )
+
+    def test_returns_summary_and_messages(self):
+        calls = []
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(
+                [
+                    # 1st: read(crm.lead, 42) → display_name + message_ids
+                    [
+                        {"id": 42, "display_name": "Migration Odoo Acritec",
+                         "message_ids": [101, 102, 103]}
+                    ],
+                    # 2nd: read(mail.message, [101,102,103]) → bodies
+                    [
+                        {"id": 101, "date": "2026-05-13 14:30:00",
+                         "author_id": [7, "Florence"],
+                         "body": "<p>On lance le go le 14.</p>",
+                         "message_type": "comment"},
+                        {"id": 102, "date": "2026-05-12 09:10:00",
+                         "author_id": [8, "Antoine"],
+                         "body": "Validé côté technique.",
+                         "message_type": "comment"},
+                        {"id": 103, "date": "2026-05-11 17:00:00",
+                         "author_id": [9, "Robin"],
+                         "body": "Plan revu.",
+                         "message_type": "comment"},
+                    ],
+                ],
+                calls,
+            ),
+        ):
+            payload = fetch_object_chatter(
+                self._config(), "crm.lead", 42, limit=3,
+            )
+        self.assertEqual(payload["display_name"], "Migration Odoo Acritec")
+        self.assertEqual(len(payload["messages"]), 3)
+        # Messages sorted newest-first.
+        self.assertEqual(payload["messages"][0]["author"], "Florence")
+        # Summary carries the display name + the most recent body.
+        self.assertIn("Migration Odoo Acritec", payload["summary"])
+        self.assertIn("Florence", payload["summary"])
+
+    def test_missing_record_returns_empty_payload(self):
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([[]], []),
+        ):
+            payload = fetch_object_chatter(
+                self._config(), "crm.lead", 99,
+            )
+        self.assertEqual(payload["messages"], [])
+        self.assertEqual(payload["summary"], "")
+
+    def test_blank_model_returns_empty_without_network(self):
+        with patch("odoo_client.urllib.request.urlopen") as mock:
+            payload = fetch_object_chatter(
+                self._config(), "", 0,
+            )
+            mock.assert_not_called()
+        self.assertEqual(payload["messages"], [])
 
 
 if __name__ == "__main__":

@@ -792,6 +792,10 @@ except ImportError:
 model_path = sys.argv[1]
 transcript_path = sys.argv[2]
 glossary = sys.argv[3] if len(sys.argv) > 3 else ""
+# Optional Odoo context blob (chatter summary of the linked CRM /
+# project record). Surfaced to the LLM as a secondary priority
+# below the explicit glossary, but above pure pattern guessing.
+odoo_context = sys.argv[4] if len(sys.argv) > 4 else ""
 
 try:
     with open(transcript_path, "r", encoding="utf-8") as f:
@@ -799,6 +803,17 @@ try:
     text = text[:30000]
 
     model, tokenizer = load(model_path)
+
+    context_section = ""
+    if odoo_context.strip():
+        # Cap the blob so a noisy chatter can't blow the prompt
+        # budget. 1 500 chars leaves room for the glossary + the
+        # transcript chunk.
+        context_section = (
+            "Contexte de la réunion (Odoo, à utiliser pour disambiguer les noms propres et les termes métier) :\\n"
+            + odoo_context.strip()[:1500]
+            + "\\n\\n"
+        )
 
     prompt = f"""[INST] Tu es un relecteur expert de transcriptions de réunions professionnelles françaises.
 
@@ -811,6 +826,7 @@ Règles strictes :
 - Ne reformule jamais une phrase correcte : corrige seulement une erreur phonétique locale.
 - Une correction doit être courte, remplacer un extrait exact, et rester très proche phonétiquement.
 - Le vocabulaire métier ci-dessous est prioritaire : si un passage ressemble phonétiquement à un terme listé, propose ce terme.
+- Le contexte Odoo (s'il est fourni) est une aide secondaire pour disambiguer les noms propres et acronymes — ne corrige pas un terme uniquement parce qu'il est absent du contexte.
 - Tu peux corriger un mot absurde vers un mot français évident si le contexte l'impose.
 - Format de sortie : markdown, exactement le format ci-dessous, rien d'autre.
 - Si rien à corriger : écris "Aucune correction." puis "Aucun doute." et stop.
@@ -838,7 +854,7 @@ Format exact (chaque entrée sur 2 lignes) :
 Vocabulaire métier (priorité absolue) :
 {glossary or "(aucun)"}
 
-Transcription :
+{context_section}Transcription :
 {text}
 [/INST]"""
 
@@ -872,7 +888,15 @@ def build_llm_corrections_cmd(
     model_path: str,
     transcript_path: str,
     glossary: str = "",
+    context: str = "",
 ) -> list[str]:
+    """Build the corrections-LLM invocation.
+
+    ``context`` carries the Odoo chatter summary (or any other
+    meeting-level context blob the pipeline wants the model to see).
+    Empty string is the default — the script's prompt simply omits
+    the "Contexte de la réunion" section in that case.
+    """
     return [
         venv_python_path,
         "-c",
@@ -880,6 +904,7 @@ def build_llm_corrections_cmd(
         model_path,
         transcript_path,
         glossary,
+        context,
     ]
 
 

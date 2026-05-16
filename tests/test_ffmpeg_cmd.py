@@ -774,7 +774,7 @@ class LlmPostProcessParsingTest(unittest.TestCase):
         self.assertIn("speakers", cmd[2])
         self.assertIn("technical_terms", cmd[2])
 
-    def test_build_corrections_cmd_carries_glossary(self):
+    def test_build_corrections_cmd_carries_glossary_and_context(self):
         cmd = build_llm_corrections_cmd(
             "/v/bin/python",
             "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
@@ -782,11 +782,28 @@ class LlmPostProcessParsingTest(unittest.TestCase):
             "Adèle, Odoo",
         )
         self.assertEqual(cmd[0], "/v/bin/python")
-        self.assertEqual(cmd[-1], "Adèle, Odoo")
+        # Layout: [python, -c, script, model, transcript, glossary, context]
+        self.assertEqual(cmd[-2], "Adèle, Odoo")
+        # Default context is empty — script branches on this.
+        self.assertEqual(cmd[-1], "")
         self.assertIn("Corrections", cmd[2])
         self.assertIn("Doutes", cmd[2])
         self.assertIn("erreur phonétique", cmd[2])
         self.assertIn("Chat GPT", cmd[2])
+
+    def test_build_corrections_cmd_forwards_odoo_context_blob(self):
+        cmd = build_llm_corrections_cmd(
+            "/v/bin/python",
+            "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+            "/tmp/t.txt",
+            "Adèle, Odoo",
+            context="Florence : on lance le go le 14.",
+        )
+        self.assertEqual(cmd[-1], "Florence : on lance le go le 14.")
+        # The script template carries the conditional section header
+        # so empty contexts skip it; the rendered prompt only
+        # injects it when the blob is non-empty.
+        self.assertIn("Contexte de la réunion (Odoo", cmd[2])
 
 
 if __name__ == "__main__":

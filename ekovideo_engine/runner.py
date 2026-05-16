@@ -207,6 +207,17 @@ class EngineRunner:
             progress_pct=0,
             eta_seconds=estimated_total_seconds,
         )
+        # Persist the Odoo meeting metadata so the rename sheet can
+        # surface attendee hint chips long after the engine exited.
+        # Empty dict means "no meeting linked"; the helper takes care
+        # of clearing the column on re-runs that detached the link.
+        if request.odoo_meeting_metadata:
+            db.update_job_odoo_meeting(job_id, request.odoo_meeting_metadata)
+        elif request.library_job_id is None:
+            # Fresh job, no meeting — explicitly null the column to
+            # cover the unlikely case of stale data lingering on a
+            # row reused via primary-key collision.
+            db.update_job_odoo_meeting(job_id, None)
 
         results: list[StepResult] = []
         active_source = str(working_source)

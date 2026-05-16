@@ -99,6 +99,33 @@ struct JobRequest: Codable {
     var technical_terms: [String]
     var rerun_steps: [String]
     var delete_source_after_copy: Bool
+    /// Optional Odoo object whose chatter the engine fetches during
+    /// the LLM step to enrich the correction prompt. ``nil`` when
+    /// the user didn't pair the file with a meeting.
+    var odoo_context_ref: OdooContextRef?
+    /// Snapshot of the meeting the user paired in Run Setup. The
+    /// runner persists this on the job row so the rename sheet can
+    /// surface attendee hint chips after the engine exits.
+    var odoo_meeting_metadata: OdooMeetingMetadata?
+}
+
+struct OdooContextRef: Codable, Equatable {
+    var model: String
+    var record_id: Int
+    var url: String
+    var database: String
+    var login: String
+    var api_key: String
+}
+
+/// JSON-shape the engine persists on ``jobs.odoo_meeting_json``.
+/// Used both as a transport payload (Run Setup → runner) and as a
+/// readback shape (library row → rename sheet).
+struct OdooMeetingMetadata: Codable, Equatable {
+    var event_id: Int
+    var event_name: String
+    var attendees: [OdooMeetingAttendee]
+    var related: OdooRelatedObject?
 }
 
 struct LibraryRow: Codable, Identifiable, Equatable {
@@ -124,9 +151,22 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     /// finished before the column existed — the library renders "—"
     /// for those instead of "0 octets".
     var total_bytes: Int64?
+    /// Raw JSON of the Odoo meeting metadata the user paired with
+    /// this job in Run Setup. Decoded on demand by the rename
+    /// sheet so it can show one-click attribution chips for each
+    /// invitee.
+    var odoo_meeting_json: String?
 
     var filename: String {
         URL(fileURLWithPath: source_path ?? "").lastPathComponent
+    }
+
+    /// Decoded ``OdooMeetingMetadata`` if the job was paired with
+    /// a calendar event in Run Setup. ``nil`` otherwise.
+    var odooMeeting: OdooMeetingMetadata? {
+        guard let raw = odoo_meeting_json, !raw.isEmpty,
+              let data = raw.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(OdooMeetingMetadata.self, from: data)
     }
 
     var customTitleOrFilename: String {

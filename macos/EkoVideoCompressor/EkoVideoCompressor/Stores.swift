@@ -21,6 +21,16 @@ struct QueueItem: Identifiable, Equatable {
     /// surfaced as the meeting_context line of the Whisper initial
     /// prompt. Optional: empty when no meeting was attached.
     var odooMeetingTitle: String = ""
+    /// Full picked meeting, including its attendees + related CRM
+    /// object. The runner persists this on the job row so the
+    /// rename sheet can later show one-click attribution chips for
+    /// each invitee. ``nil`` when no meeting was attached.
+    var odooMeeting: OdooMeetingMetadata?
+    /// Pointer to the related object whose chatter the pipeline
+    /// fetches during the LLM step. ``nil`` when there's no
+    /// related object (the meeting wasn't linked to a CRM lead or
+    /// project task).
+    var odooContextRef: OdooContextRef?
     var status: String = "En attente"
     var progress: Double = 0
 }
