@@ -54,6 +54,33 @@ class DatabaseManager:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_speaker ON transcription_segments(speaker)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_segments_text ON transcription_segments(text)")
 
+            # Speaker enrollment store. Each row is a single named
+            # voice profile: a friendly display name + the averaged
+            # pyannote embedding vector serialised as JSON. The store
+            # is keyed on lowercase name so renaming the same person
+            # twice merges into one profile instead of duplicating.
+            #
+            # ``sample_count`` tracks how many enrolled audio
+            # extracts contributed to the running average. Higher
+            # counts mean a more stable embedding; we use the count
+            # to update the centroid incrementally instead of
+            # re-averaging from scratch.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS speaker_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    name_key TEXT UNIQUE NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 1,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_speaker_profiles_name_key "
+                "ON speaker_profiles(name_key)"
+            )
+
     def _ensure_jobs_columns(self, conn):
         # The library now exposes each artefact as its own button in the
         # table view, so we track them as distinct columns instead of
@@ -281,3 +308,95 @@ class DatabaseManager:
     def delete_job(self, job_id: int):
         with self._get_connection() as conn:
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+
+    # ------------------------------------------------------------------
+    # Speaker enrollment store
+    # ------------------------------------------------------------------
+    #
+    # The library remembers a voice once the user has confirmed a
+    # name on it ("SPEAKER_00 → Robin"). Subsequent meetings extract
+    # the embedding for each new cluster and look it up against this
+    # table — when there's a match above the cosine-similarity
+    # threshold the rename sheet shows up pre-filled with the right
+    # name, so the user doesn't have to teach the model who's who
+    # every single week.
+    #
+    # ``name_key`` is just ``name.lower().strip()`` — the unique
+    # constraint then merges renames of the same person ("Robin"
+    # vs "ROBIN" vs "  robin ") into a single profile instead of
+    # accumulating duplicates.
+
+    def list_speaker_profiles(self) -> List[dict]:
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT id, name, name_key, embedding_json, sample_count, "
+                "created_at, updated_at FROM speaker_profiles ORDER BY name COLLATE NOCASE"
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_speaker_profile_by_name(self, name: str) -> Optional[dict]:
+        key = (name or "").strip().lower()
+        if not key:
+            return None
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT id, name, name_key, embedding_json, sample_count, "
+                "created_at, updated_at FROM speaker_profiles WHERE name_key = ?",
+                (key,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def upsert_speaker_profile(
+        self,
+        name: str,
+        embedding_json: str,
+        sample_count: int = 1,
+    ) -> int:
+        """Insert or merge a speaker profile by ``name_key``.
+
+        On first insert ``embedding_json`` lands as-is and
+        ``sample_count`` becomes 1 (or whatever the caller passes —
+        useful when re-importing a profile snapshot).
+
+        On a second call with the same name the caller is expected
+        to have already merged the new embedding into the existing
+        centroid (incremental average), so we just overwrite both
+        fields. Doing the merge in Python rather than SQL keeps the
+        DB schema oblivious to the embedding's vector shape.
+        """
+        key = (name or "").strip().lower()
+        if not key:
+            raise ValueError("speaker profile name cannot be blank")
+        clean_name = (name or "").strip()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO speaker_profiles (name, name_key, embedding_json, sample_count)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(name_key) DO UPDATE SET
+                    name = excluded.name,
+                    embedding_json = excluded.embedding_json,
+                    sample_count = excluded.sample_count,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (clean_name, key, embedding_json, int(sample_count)),
+            )
+            cursor = conn.execute(
+                "SELECT id FROM speaker_profiles WHERE name_key = ?", (key,)
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    def delete_speaker_profile(self, profile_id: int) -> None:
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM speaker_profiles WHERE id = ?", (profile_id,))
+
+    def delete_speaker_profile_by_name(self, name: str) -> None:
+        key = (name or "").strip().lower()
+        if not key:
+            return
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM speaker_profiles WHERE name_key = ?", (key,))

@@ -479,6 +479,43 @@ final class LibraryStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(value) else { return nil }
         return String(data: data, encoding: .utf8)
     }
+
+    /// Pulled out of the rename hot-path because ``LibraryStore``
+    /// is the right home for read/write to the engine's library DB,
+    /// and the speaker profiles surface (Settings) needs both list
+    /// and delete without touching the rest of the library state.
+
+    func listSpeakerProfiles() async -> [SpeakerProfile] {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-list-speaker-profiles",
+                "--jsonl",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return []
+        }
+        return result.lines.compactMap { line in
+            try? JSONDecoder().decode(SpeakerProfile.self, from: Data(line.utf8))
+        }
+    }
+
+    @discardableResult
+    func deleteSpeakerProfile(_ profile: SpeakerProfile) async -> Bool {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-delete-speaker-profile",
+                "--id",
+                "\(profile.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return false
+        }
+        return true
+    }
 }
 
 @MainActor

@@ -9,6 +9,18 @@ from pathlib import Path
 from typing import Any
 
 from database_manager import DatabaseManager
+from speaker_recognition import (
+    DEFAULT_MATCH_THRESHOLD,
+    aggregate_embeddings,
+    decode_embedding,
+    encode_embedding,
+    match_cluster_against_profiles,
+    merge_into_existing_centroid,
+)
+from transcription_utils import (
+    build_embedding_extract_cmd,
+    parse_embedding_output,
+)
 
 from .paths import library_db_path
 
@@ -473,11 +485,46 @@ def _rewrite_speaker_artifacts(job: dict[str, Any], mapping: dict[str, str]) -> 
     return rewritten
 
 
-def library_rename_speakers(job_id: int, mapping: dict[str, str]) -> dict[str, int]:
+def library_rename_speakers(
+    job_id: int,
+    mapping: dict[str, str],
+    *,
+    enroll: bool = True,
+) -> dict[str, int]:
+    """Rename speakers in DB segments + artefacts and (optionally)
+    enroll the renamed clusters as voice profiles.
+
+    The enrollment loop fires when ``enroll=True`` (the default) and
+    the placeholder being renamed actually looks like a SPEAKER_NN
+    cluster from pyannote — the user telling us "SPEAKER_00 is
+    Robin" is a strong signal we should remember Robin's voice for
+    next time. We silently skip enrollment when the clustering audio
+    isn't on disk anymore (old job whose workspace was wiped) or
+    when the embedding venv isn't reachable.
+    """
     db = database()
     job = db.get_job(job_id)
     if not job:
         raise ValueError(f"job not found: {job_id}")
+
+    # Enrollment runs *before* the DB segments get renamed —
+    # otherwise the SPEAKER_NN labels we want to look up are
+    # already gone from the segments table. Only SPEAKER_NN →
+    # real-name pairs are candidates; re-renaming "Robin" → "Robin
+    # Dupuy" is an edit, not a new voice to learn.
+    enrolled = 0
+    if enroll:
+        enrolment_targets: dict[str, str] = {
+            placeholder: name
+            for placeholder, name in mapping.items()
+            if name.strip()
+            and placeholder.upper().startswith("SPEAKER_")
+        }
+        if enrolment_targets:
+            enrolled = library_enroll_speakers_for_job(
+                job_id, enrolment_targets, db=db, job=job
+            )
+
     segments = db.get_segments(job_id)
     segments_changed = 0
     updated = []
@@ -504,7 +551,309 @@ def library_rename_speakers(job_id: int, mapping: dict[str, str]) -> dict[str, i
     db.update_job_context(job_id, speakers=current_speakers)
 
     artifacts_rewritten = _rewrite_speaker_artifacts(job, mapping)
+
     return {
         "segments_changed": segments_changed,
         "artifacts_rewritten": artifacts_rewritten,
+        "speakers_enrolled": enrolled,
     }
+
+
+# ---------------------------------------------------------------------------
+# Speaker enrollment / recognition
+# ---------------------------------------------------------------------------
+
+
+# Up to this many of the longest turns per cluster get fed to the
+# embedding model. More turns means a more stable centroid; past 3
+# the marginal value drops off and the inference cost adds up.
+_EMBEDDING_TURNS_PER_CLUSTER = 3
+# Minimum turn duration we'll bother sending to the embedding model.
+# Pyannote produces clean vectors from ~2 s of speech; anything
+# shorter is mostly noise floor and pollutes the centroid.
+_EMBEDDING_MIN_TURN_SECONDS = 2.0
+
+
+def _venv_python(job: dict[str, Any] | None = None) -> str | None:
+    """Resolve the venv python that runs pyannote.
+
+    Reads ``settings_json.transcription_settings.venv_python_path``
+    off the job row. Returns ``None`` when the path is missing or
+    doesn't exist on disk — the caller then quietly skips the
+    enrollment / recognition step.
+    """
+    if not job:
+        return None
+    settings_raw = job.get("settings_json") or "{}"
+    try:
+        settings = json.loads(settings_raw)
+    except json.JSONDecodeError:
+        return None
+    transcription = settings.get("transcription_settings") or {}
+    candidate = (transcription.get("venv_python_path") or "").strip()
+    if candidate and Path(candidate).exists():
+        return candidate
+    return None
+
+
+def _diarisation_audio_path(job: dict[str, Any]) -> Path | None:
+    """Pick the on-disk audio that gives the cleanest embeddings.
+
+    Preference order:
+      1. ``audio.diar.wav`` — extracted without the ASR enhancement
+         chain, which is exactly what pyannote was designed against.
+      2. ``audio.wav`` — fall back when the diarisation-targeted
+         file wasn't produced (job ran on an older engine version).
+      3. The original source file — last resort, but pyannote will
+         still happily accept it.
+    """
+    workspace = (job.get("workspace_dir") or "").strip()
+    if workspace:
+        for name in ("audio.diar.wav", "audio.wav"):
+            candidate = Path(workspace) / name
+            if candidate.exists():
+                return candidate
+    source = (job.get("source_path") or "").strip()
+    if source:
+        candidate = Path(source)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _segments_per_cluster(
+    segments: list[dict],
+    labels: list[str],
+) -> dict[str, list[dict]]:
+    """Pick the longest turns per cluster for embedding extraction.
+
+    Sorted longest-first; capped at ``_EMBEDDING_TURNS_PER_CLUSTER``.
+    Turns shorter than ``_EMBEDDING_MIN_TURN_SECONDS`` are dropped
+    so the centroid isn't poisoned by 200 ms back-channels.
+    """
+    by_label: dict[str, list[dict]] = {label: [] for label in labels}
+    for segment in segments:
+        label = (segment.get("speaker") or "").strip()
+        if label not in by_label:
+            continue
+        try:
+            start = float(segment.get("start_time") or segment.get("start") or 0)
+            end = float(segment.get("end_time") or segment.get("end") or 0)
+        except (TypeError, ValueError):
+            continue
+        duration = end - start
+        if duration < _EMBEDDING_MIN_TURN_SECONDS:
+            continue
+        by_label[label].append({"start": start, "end": end, "duration": duration})
+
+    out: dict[str, list[dict]] = {}
+    for label, turns in by_label.items():
+        if not turns:
+            continue
+        turns.sort(key=lambda t: t["duration"], reverse=True)
+        out[label] = [
+            {"start": t["start"], "end": t["end"]}
+            for t in turns[:_EMBEDDING_TURNS_PER_CLUSTER]
+        ]
+    return out
+
+
+def _extract_cluster_embeddings(
+    venv_python: str,
+    audio_path: Path,
+    cluster_segments: dict[str, list[dict]],
+) -> dict[str, list[list[float]]]:
+    """Shell out to pyannote-embedding for the requested clusters.
+
+    Returns a mapping ``{label: [vector, ...]}``. Empty mapping on
+    any failure — the caller treats that as "skip recognition for
+    this job" and surfaces a warning rather than crashing.
+    """
+    if not cluster_segments:
+        return {}
+    payload = [
+        {"label": label, "segments": segments}
+        for label, segments in cluster_segments.items()
+    ]
+    cmd = build_embedding_extract_cmd(venv_python, str(audio_path), payload)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    if proc.returncode != 0:
+        return {}
+    try:
+        return parse_embedding_output(proc.stdout)
+    except RuntimeError:
+        return {}
+
+
+def library_enroll_speakers_for_job(
+    job_id: int,
+    enrolment_mapping: dict[str, str],
+    *,
+    db: DatabaseManager | None = None,
+    job: dict[str, Any] | None = None,
+) -> int:
+    """Extract embeddings for the SPEAKER_NN clusters in ``enrolment_mapping``
+    and persist them under the friendly names.
+
+    ``enrolment_mapping`` is ``{SPEAKER_00: "Robin", SPEAKER_01: "Marie"}``.
+    Returns the number of profiles successfully written.
+
+    The function is intentionally lenient: it skips silently when
+    the venv isn't reachable, the audio file is missing, or pyannote
+    fails. Speaker rename remains valuable even when enrollment
+    couldn't run.
+    """
+    db = db or database()
+    job = job or db.get_job(job_id)
+    if not job:
+        return 0
+    venv_python = _venv_python(job)
+    if not venv_python:
+        return 0
+    audio_path = _diarisation_audio_path(job)
+    if audio_path is None:
+        return 0
+
+    segments = db.get_segments(job_id)
+    cluster_segments = _segments_per_cluster(
+        segments, list(enrolment_mapping.keys())
+    )
+    if not cluster_segments:
+        return 0
+
+    embeddings = _extract_cluster_embeddings(venv_python, audio_path, cluster_segments)
+    if not embeddings:
+        return 0
+
+    written = 0
+    for placeholder, name in enrolment_mapping.items():
+        vectors = embeddings.get(placeholder) or []
+        if not vectors:
+            continue
+        existing = db.get_speaker_profile_by_name(name)
+        if existing:
+            existing_centroid = decode_embedding(existing.get("embedding_json") or "")
+            existing_count = int(existing.get("sample_count") or 0)
+            centroid, sample_count = merge_into_existing_centroid(
+                existing_centroid=existing_centroid,
+                existing_count=existing_count,
+                new_embeddings=vectors,
+            )
+        else:
+            centroid = aggregate_embeddings(vectors)
+            sample_count = len(vectors)
+        if not centroid:
+            continue
+        db.upsert_speaker_profile(
+            name=name,
+            embedding_json=encode_embedding(centroid),
+            sample_count=sample_count,
+        )
+        written += 1
+    return written
+
+
+def library_recognize_speakers(
+    job_id: int,
+    *,
+    threshold: float = DEFAULT_MATCH_THRESHOLD,
+) -> dict[str, str]:
+    """Match each SPEAKER_NN cluster against the profile store.
+
+    Returns a mapping ``{SPEAKER_00: "Robin", ...}`` containing only
+    the labels that crossed the cosine threshold. Used at pipeline
+    completion to pre-fill the speaker map so the user opens the
+    rename sheet to a recording where their team is already named
+    correctly.
+    """
+    db = database()
+    job = db.get_job(job_id)
+    if not job:
+        return {}
+    profiles = db.list_speaker_profiles()
+    if not profiles:
+        return {}
+    venv_python = _venv_python(job)
+    if not venv_python:
+        return {}
+    audio_path = _diarisation_audio_path(job)
+    if audio_path is None:
+        return {}
+
+    segments = db.get_segments(job_id)
+    cluster_labels = sorted(
+        {
+            (segment.get("speaker") or "").strip()
+            for segment in segments
+            if (segment.get("speaker") or "").strip().upper().startswith("SPEAKER_")
+        }
+    )
+    if not cluster_labels:
+        return {}
+
+    cluster_segments = _segments_per_cluster(segments, cluster_labels)
+    if not cluster_segments:
+        return {}
+
+    embeddings = _extract_cluster_embeddings(venv_python, audio_path, cluster_segments)
+    if not embeddings:
+        return {}
+
+    out: dict[str, str] = {}
+    used_names: set[str] = set()
+    for label in cluster_labels:
+        vectors = embeddings.get(label) or []
+        if not vectors:
+            continue
+        centroid = aggregate_embeddings(vectors)
+        match = match_cluster_against_profiles(
+            centroid, profiles, threshold=threshold
+        )
+        if not match or not match.profile_name:
+            continue
+        # Don't assign the same profile to two clusters in the same
+        # meeting — pick the highest-confidence cluster for each
+        # name. A simple "first wins" works because we processed
+        # cluster_labels in sorted order; for a stricter rule we'd
+        # need a Hungarian assignment, overkill for now.
+        if match.profile_name in used_names:
+            continue
+        used_names.add(match.profile_name)
+        out[label] = match.profile_name
+    return out
+
+
+def library_list_speaker_profiles() -> list[dict[str, Any]]:
+    """Surface the stored profiles for the SwiftUI settings panel.
+
+    The embedding blob is intentionally trimmed off the response —
+    it's a 5 KB JSON array per row, useless to the UI, and noisy in
+    the JSONL transport.
+    """
+    out: list[dict[str, Any]] = []
+    for row in database().list_speaker_profiles():
+        clean = dict(row)
+        clean.pop("embedding_json", None)
+        out.append(clean)
+    return out
+
+
+def library_delete_speaker_profile(profile_id: int | None = None, *, name: str | None = None) -> int:
+    """Drop a stored profile by ``id`` or ``name``. Returns 1 when
+    something was deleted, 0 otherwise."""
+    db = database()
+    if profile_id is not None:
+        db.delete_speaker_profile(int(profile_id))
+        return 1
+    if name:
+        existing = db.get_speaker_profile_by_name(name)
+        if not existing:
+            return 0
+        db.delete_speaker_profile(int(existing["id"]))
+        return 1
+    return 0

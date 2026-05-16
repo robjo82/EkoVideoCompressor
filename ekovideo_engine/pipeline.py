@@ -23,6 +23,11 @@ from llm_corrections import (
     RejectedCorrection,
     apply_llm_corrections_to_text,
 )
+from speaker_recognition import (
+    DEFAULT_MATCH_THRESHOLD,
+    aggregate_embeddings,
+    match_cluster_against_profiles,
+)
 from multipass import (
     group_into_clip_ranges,
     identify_weak_segments,
@@ -32,12 +37,14 @@ from transcription_utils import (
     assign_speakers_to_segments,
     build_audio_extract_cmd,
     build_diarization_cmd,
+    build_embedding_extract_cmd,
     build_llm_corrections_cmd,
     build_llm_title_cmd,
     build_mlx_whisper_cmd,
     default_transcript_path,
     fuse_micro_turns,
     parse_diarization_output,
+    parse_embedding_output,
     parse_llm_corrections_markdown,
     parse_llm_title_speakers,
     parse_whisper_json_segments,
@@ -371,6 +378,7 @@ class TranscriptionPipeline:
 
         # --- step 3: diarisation (optional) ----------------------------
         analysis_segments = segments
+        recognized_speakers: dict[str, str] = {}
         if self._should_run_diarisation():
             # Pyannote sees the unfiltered audio (no compressor /
             # loudnorm). Whisper still sees the enhanced WAV.
@@ -381,6 +389,20 @@ class TranscriptionPipeline:
             if turns:
                 segments = assign_speakers_to_segments(segments, turns)
                 analysis_segments = segments
+                # --- step 3bis: speaker recognition --------------------
+                # Match each SPEAKER_NN cluster against the stored
+                # voice profiles so the rename sheet opens with the
+                # right names already filled in. No-op when no profiles
+                # exist yet — the user trains the system implicitly by
+                # confirming names on each meeting.
+                recognized_speakers = self._run_speaker_recognition(
+                    diar_source, segments
+                )
+                if recognized_speakers:
+                    segments = self._apply_speaker_renames(
+                        segments, recognized_speakers
+                    )
+                    analysis_segments = segments
 
         # --- step 4: write the base transcript -----------------------
         transcript_path = self._write_transcript(segments, workspace)
@@ -429,8 +451,16 @@ class TranscriptionPipeline:
         # guarantees the placeholders survive every code path: pure
         # diarisation, LLM-renamed, LLM-skipped, LLM-failed.
         self.final_segments = segments
+        # Recognised names take precedence over LLM-inferred ones —
+        # they came from a real voice match against a confirmed
+        # profile, not a probabilistic guess off the transcript.
+        merged_speakers = dict(speakers or {})
+        for placeholder, name in recognized_speakers.items():
+            if not name:
+                continue
+            merged_speakers[placeholder] = name
         self.final_speaker_map = self._build_speaker_map(
-            segments, llm_speakers=speakers
+            segments, llm_speakers=merged_speakers
         )
         self.final_technical_terms = list(
             self._llm_payload.get("technical_terms") or []
@@ -991,6 +1021,168 @@ class TranscriptionPipeline:
             ),
             turns,
         )
+
+    # ------------------------------------------------------------------
+    # Step 3bis — speaker recognition (voice profile match)
+    # ------------------------------------------------------------------
+
+    def _run_speaker_recognition(
+        self,
+        diar_audio_path: Path,
+        segments: list[dict],
+    ) -> dict[str, str]:
+        """Match each SPEAKER_NN cluster against the stored voice
+        profiles. Returns a mapping ``{cluster_label: friendly_name}``
+        the orchestrator then applies as a rename so the rename
+        sheet opens with the right names already filled in.
+
+        Bails out cleanly when:
+          * no profiles are enrolled yet (most common path on first
+            run for a new user),
+          * the embedding venv isn't reachable,
+          * pyannote fails / segments don't yield enough audio.
+
+        We surface a WarningEvent when something explicit went
+        wrong; silent skips on "no profiles yet" so we don't spam
+        the SwiftUI status bar with non-actionable noise.
+        """
+        # Lazy import — touching the DB here would force every test
+        # of TranscriptionPipeline to provide a stub library DB.
+        from .library import database
+
+        try:
+            db = database()
+            profiles = db.list_speaker_profiles()
+        except Exception as exc:
+            append_app_log(f"engine_speaker_recog_no_db error={exc!r}")
+            return {}
+        if not profiles:
+            return {}
+
+        settings = self.request.transcription_settings
+        venv_python = settings.venv_python_path
+        if not venv_python or not Path(venv_python).exists():
+            self.sink(
+                WarningEvent(
+                    "Reconnaissance des locuteurs ignorée : environnement Python introuvable.",
+                    code="speaker_recog_no_venv",
+                )
+            )
+            return {}
+
+        cluster_segments = self._build_recognition_clusters(segments)
+        if not cluster_segments:
+            return {}
+
+        clusters_payload = [
+            {"label": label, "segments": segs}
+            for label, segs in cluster_segments.items()
+        ]
+        ts = time.monotonic()
+        self.sink(ProgressEvent("speaker_recog", 0, "Matching voices against known profiles"))
+        cmd = build_embedding_extract_cmd(
+            venv_python, str(diar_audio_path), clusters_payload
+        )
+        env = self._subprocess_env()
+        env["HF_TOKEN"] = settings.hf_token
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=1800,
+            env=env,
+        )
+        if proc.returncode != 0:
+            self.sink(
+                WarningEvent(
+                    "Reconnaissance des locuteurs indisponible : "
+                    + tail_text(proc.stderr or proc.stdout),
+                    code="speaker_recog_failed",
+                )
+            )
+            append_app_log(
+                f"engine_speaker_recog_failed rc={proc.returncode} "
+                f"stderr={tail_text(proc.stderr)!r}"
+            )
+            return {}
+        try:
+            embeddings = parse_embedding_output(proc.stdout)
+        except RuntimeError as exc:
+            self.sink(
+                WarningEvent(
+                    f"Reconnaissance des locuteurs : sortie illisible : {exc}",
+                    code="speaker_recog_parse",
+                )
+            )
+            return {}
+
+        recognized: dict[str, str] = {}
+        used_names: set[str] = set()
+        # Iterate in deterministic order so the "first match wins"
+        # tie-break against duplicate-profile assignments stays
+        # stable across runs.
+        for label in sorted(cluster_segments.keys()):
+            vectors = embeddings.get(label) or []
+            if not vectors:
+                continue
+            centroid = aggregate_embeddings(vectors)
+            match = match_cluster_against_profiles(
+                centroid, profiles, threshold=DEFAULT_MATCH_THRESHOLD
+            )
+            if not match or not match.profile_name:
+                continue
+            if match.profile_name in used_names:
+                continue
+            used_names.add(match.profile_name)
+            recognized[label] = match.profile_name
+        duration = time.monotonic() - ts
+        self.sink(
+            ProgressEvent(
+                "speaker_recog",
+                100,
+                f"{len(recognized)} locuteur(s) reconnu(s) "
+                f"({duration:.1f}s)",
+            )
+        )
+        return recognized
+
+    # Embedding-extraction tuning constants kept identical to the
+    # ones the library uses for explicit re-recognition, so a job
+    # run-time match and a post-hoc one converge on the same answer.
+    _RECOGNITION_TURNS_PER_CLUSTER = 3
+    _RECOGNITION_MIN_TURN_SECONDS = 2.0
+
+    def _build_recognition_clusters(
+        self, segments: list[dict]
+    ) -> dict[str, list[dict]]:
+        """Pick the longest 1-3 turns per SPEAKER_NN cluster — the
+        embedding model wants ≥ 2 s of clean speech per sample, more
+        is better, past 3 the centroid stops improving.
+        """
+        candidates: dict[str, list[dict]] = {}
+        for segment in segments:
+            label = (segment.get("speaker") or "").strip()
+            if not label or not label.upper().startswith("SPEAKER_"):
+                continue
+            try:
+                start = float(segment.get("start") or 0)
+                end = float(segment.get("end") or 0)
+            except (TypeError, ValueError):
+                continue
+            duration = end - start
+            if duration < self._RECOGNITION_MIN_TURN_SECONDS:
+                continue
+            candidates.setdefault(label, []).append(
+                {"start": start, "end": end, "duration": duration}
+            )
+        out: dict[str, list[dict]] = {}
+        for label, turns in candidates.items():
+            turns.sort(key=lambda t: t["duration"], reverse=True)
+            out[label] = [
+                {"start": t["start"], "end": t["end"]}
+                for t in turns[: self._RECOGNITION_TURNS_PER_CLUSTER]
+            ]
+        return out
 
     # ------------------------------------------------------------------
     # Step 5 — LLM post-process

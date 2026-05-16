@@ -160,6 +160,18 @@ struct SpeakerSample: Codable, Identifiable, Equatable {
     var id: String { speaker }
 }
 
+/// One enrolled voice profile. The engine stores a 512-dim
+/// embedding alongside; we don't ship it to the UI (5 KB per row,
+/// useless for display), only the metadata.
+struct SpeakerProfile: Codable, Identifiable, Equatable {
+    var id: Int
+    var name: String
+    var name_key: String
+    var sample_count: Int
+    var created_at: String?
+    var updated_at: String?
+}
+
 /// Disk-usage preview shown in the deletion sheet so the user can
 /// see exactly which files (and how many bytes) they're about to
 /// free before confirming a "supprimer + dossier de travail".

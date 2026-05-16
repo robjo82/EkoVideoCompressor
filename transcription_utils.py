@@ -1237,6 +1237,170 @@ def build_diarization_cmd(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Speaker embedding extraction (recognition pass)
+# ---------------------------------------------------------------------------
+#
+# Diarisation tells us "this 8-second slice is speaker A". Embedding
+# extraction turns those slices into 512-dim vectors that we can
+# compare across meetings — the foundation of recognising "Robin"
+# next week without the user retyping the name.
+#
+# We use ``pyannote/embedding`` (same family as the diarisation
+# pipeline). The script reads a JSON list of {label, segments[]}
+# from argv[2], extracts one vector per segment via
+# ``Inference("pyannote/embedding", window="whole")``, and prints a
+# JSON map ``{label: [[...512 floats...], ...]}`` so the caller can
+# average them downstream.
+#
+# Loading the embedding model is a few seconds on Apple Silicon. The
+# pipeline only invokes this when at least one speaker profile is
+# stored — running it for users who haven't enrolled anyone wastes
+# time.
+
+_SPEAKER_EMBEDDING_SCRIPT = '''
+import json
+import os
+import sys
+
+audio_path = sys.argv[1]
+clusters_json = sys.argv[2]
+hf_token = os.environ.get("HF_TOKEN", "")
+if not hf_token:
+    print(json.dumps({"error": "HF_TOKEN not set"}))
+    sys.exit(2)
+
+try:
+    import torch
+    from pyannote.audio import Inference
+    from pyannote.core import Segment
+except Exception as exc:
+    print(json.dumps({"error": f"import failed: {exc}"}))
+    sys.exit(3)
+
+try:
+    clusters = json.loads(clusters_json)
+    if not isinstance(clusters, list):
+        raise ValueError("clusters payload must be a JSON list")
+except Exception as exc:
+    print(json.dumps({"error": f"clusters payload invalid: {exc}"}))
+    sys.exit(4)
+
+try:
+    inference = Inference(
+        "pyannote/embedding",
+        token=hf_token,
+        window="whole",
+    )
+except TypeError as exc:
+    if "token" not in str(exc):
+        print(json.dumps({"error": f"embedding load failed: {exc}"}))
+        sys.exit(5)
+    inference = Inference(
+        "pyannote/embedding",
+        use_auth_token=hf_token,
+        window="whole",
+    )
+except Exception as exc:
+    print(json.dumps({"error": f"embedding load failed: {exc}"}))
+    sys.exit(5)
+
+# Apple Silicon: prefer MPS when available, fall back to CPU.
+try:
+    if torch.backends.mps.is_available():
+        try:
+            inference.to(torch.device("mps"))
+        except Exception:
+            pass
+except Exception:
+    pass
+
+out = {}
+for cluster in clusters:
+    label = str(cluster.get("label") or "").strip()
+    segments = cluster.get("segments") or []
+    if not label or not segments:
+        continue
+    vectors = []
+    for entry in segments:
+        try:
+            start = float(entry["start"])
+            end = float(entry["end"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if end <= start:
+            continue
+        try:
+            embedding = inference.crop(audio_path, Segment(start, end))
+        except Exception as exc:
+            # Skip the bad segment; the others may still produce a
+            # usable centroid.
+            continue
+        # ``embedding`` is a numpy array of shape (D,) — turn it
+        # into a plain Python list for JSON serialisation.
+        vectors.append([float(v) for v in embedding.tolist()])
+    if vectors:
+        out[label] = vectors
+
+print(json.dumps({"clusters": out}))
+'''
+
+
+def build_embedding_extract_cmd(
+    venv_python_path: str,
+    wav_path: str,
+    clusters: list[dict],
+) -> list[str]:
+    """Build the command that extracts pyannote embeddings.
+
+    ``clusters`` is a list of ``{label, segments: [{start, end}]}``
+    — typically built by picking the longest 1-3 turns of each
+    diarisation cluster. The embedding script returns one vector per
+    segment, which the caller averages into a centroid.
+    """
+    return [
+        venv_python_path,
+        "-c",
+        _SPEAKER_EMBEDDING_SCRIPT,
+        wav_path,
+        json.dumps(clusters or [], ensure_ascii=False),
+    ]
+
+
+def parse_embedding_output(stdout: str) -> dict[str, list[list[float]]]:
+    """Counterpart to :func:`build_embedding_extract_cmd`.
+
+    Returns a mapping ``{cluster_label: [[float, ...], ...]}``.
+    Raises ``RuntimeError`` when the script reported an error so the
+    caller can surface it in the UI.
+    """
+    text = (stdout or "").strip()
+    if not text:
+        raise RuntimeError("Embeddings: sortie vide.")
+    last_line = text.splitlines()[-1].strip()
+    try:
+        payload = json.loads(last_line)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Embeddings: JSON invalide ({exc}).") from exc
+    if "error" in payload:
+        raise RuntimeError(f"Embeddings: {payload['error']}")
+    raw = payload.get("clusters") or {}
+    out: dict[str, list[list[float]]] = {}
+    for label, vectors in raw.items():
+        if not isinstance(vectors, list):
+            continue
+        cleaned: list[list[float]] = []
+        for vector in vectors:
+            if isinstance(vector, list):
+                try:
+                    cleaned.append([float(v) for v in vector])
+                except (TypeError, ValueError):
+                    continue
+        if cleaned:
+            out[str(label)] = cleaned
+    return out
+
+
 def fuse_micro_turns(
     turns: list[dict],
     *,
