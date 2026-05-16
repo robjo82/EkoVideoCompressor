@@ -4,7 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "EkoVideoCompressor",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     products: [
         .executable(name: "EkoVideoCompressor", targets: ["EkoVideoCompressor"])
     ],

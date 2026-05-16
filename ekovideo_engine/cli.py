@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     recognise.add_argument("job_id", type=int)
 
     # ----- Odoo integration ---------------------------------------
-    # Three commands. ``odoo-test`` lives behind the SwiftUI
+    # JSON-2 commands. ``odoo-test`` lives behind the SwiftUI
     # "Tester la connexion" button; ``odoo-search-partners`` powers
     # the link sheet's live search; ``library-link-speaker-profile``
     # / ``library-unlink-speaker-profile`` persist the user's choice.

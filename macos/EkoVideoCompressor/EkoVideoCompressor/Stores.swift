@@ -72,8 +72,8 @@ final class SettingsStore: ObservableObject {
     // Odoo connection. Stored alongside the other tokens via
     // @AppStorage for cohesion — moving everything to the macOS
     // Keychain is a separate, broader hardening pass. The API key
-    // here is the long-lived one a user creates under Account
-    // Security → New API Key in Odoo 17+.
+    // here is the API key a user creates under Account Security →
+    // New API Key in Odoo 19+.
     @AppStorage("odooUrl") var odooUrl = ""
     @AppStorage("odooDatabase") var odooDatabase = ""
     @AppStorage("odooLogin") var odooLogin = ""

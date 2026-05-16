@@ -536,7 +536,6 @@ struct LibraryView: View {
     /// header).
     @AppStorage("libraryColumnCustomization")
     private var columnCustomization = TableColumnCustomization<LibraryDisplayRow>()
-
     private var sortedRows: [LibraryRow] {
         // Pull the parent jobs and sort by whichever key the user
         // picked on the header. Children (artefact rows) follow
@@ -733,7 +732,7 @@ struct LibraryView: View {
                 await library.refresh()
             }
         }
-        .onChange(of: library.rows) { rows in
+        .onChange(of: library.rows) { _, rows in
             let validIDs = Set(rows.map(\.id))
             expandedJobIDs = expandedJobIDs.intersection(validIDs)
         }
@@ -2125,6 +2124,7 @@ struct SpeakersView: View {
                                     ForEach(group.profiles) { profile in
                                         SpeakerProfileRow(
                                             profile: profile,
+                                            canLinkToOdoo: settings.odooConfigured,
                                             onLink: { profileToLink = profile },
                                             onUnlink: {
                                                 Task {
@@ -2187,6 +2187,7 @@ struct SpeakersView: View {
 
 struct SpeakerProfileRow: View {
     var profile: SpeakerProfile
+    var canLinkToOdoo: Bool
     var onLink: () -> Void
     var onUnlink: () -> Void
     var onDelete: () -> Void
@@ -2225,7 +2226,10 @@ struct SpeakerProfileRow: View {
                 } label: {
                     Label("Lier à Odoo", systemImage: "link")
                 }
-                .help("Associer un contact Odoo à cette voix")
+                .disabled(!canLinkToOdoo)
+                .help(canLinkToOdoo
+                      ? "Associer un contact Odoo à cette voix"
+                      : "Configurez d'abord Odoo dans Réglages")
             }
             Button(role: .destructive) {
                 onDelete()
@@ -2276,7 +2280,7 @@ struct OdooLinkSheet: View {
                     .foregroundStyle(.secondary)
                 TextField("Rechercher dans les contacts Odoo…", text: $query)
                     .textFieldStyle(.plain)
-                    .onChange(of: query) { newValue in
+                    .onChange(of: query) { _, newValue in
                         scheduleSearch(newValue)
                     }
                 if searching {

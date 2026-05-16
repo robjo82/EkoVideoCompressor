@@ -1,23 +1,23 @@
-"""Tests for the Odoo XML-RPC client.
+"""Tests for the Odoo JSON-2 client.
 
-We never actually hit a real Odoo. Every call goes through a
-``ServerProxy`` we replace with a stub at module level — that
-isolates the parsing / error-mapping logic, which is the only
-thing worth pinning here. The XML-RPC transport is stdlib code
-we trust.
+We never hit a real Odoo. ``urllib.request.urlopen`` is replaced with
+a tiny stub so tests pin the endpoint, headers, payload shape and error
+mapping for the Odoo 19 external JSON-2 API.
 """
 
 from __future__ import annotations
 
+import io
+import json
 import unittest
-import xmlrpc.client
+import urllib.error
 from unittest.mock import patch
 
 from odoo_client import (
     OdooAuthError,
     OdooConfig,
     OdooConnectionError,
-    OdooError,
+    _json2_call,
     _normalise_url,
     _strip_partner_record,
     fetch_partner,
@@ -26,37 +26,38 @@ from odoo_client import (
 )
 
 
-class _StubCommonProxy:
-    def __init__(self, *, uid: int = 0, fault: Exception | None = None,
-                 version_info: dict | None = None):
-        self._uid = uid
-        self._fault = fault
-        self._version_info = version_info or {"server_version": "17.0"}
+class _FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
 
-    def authenticate(self, db, login, key, ctx):  # noqa: D401 — XML-RPC sig
-        if self._fault:
-            raise self._fault
-        return self._uid
+    def __enter__(self):
+        return self
 
-    def version(self):
-        return self._version_info
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
 
 
-class _StubObjectProxy:
-    """Records calls and replays canned responses keyed on
-    (model, method)."""
+def _urlopen_replayer(responses, calls):
+    queue = list(responses)
 
-    def __init__(self, responses: dict[tuple[str, str], object] | None = None,
-                 fault: Exception | None = None):
-        self.responses = responses or {}
-        self.fault = fault
-        self.calls: list[tuple] = []
+    def fake_urlopen(request, timeout=None):
+        calls.append(
+            {
+                "url": request.full_url,
+                "timeout": timeout,
+                "headers": dict(request.header_items()),
+                "body": json.loads((request.data or b"{}").decode("utf-8")),
+            }
+        )
+        response = queue.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return _FakeResponse(response)
 
-    def execute_kw(self, db, uid, key, model, method, args, kwargs=None):
-        self.calls.append((db, uid, model, method, args, kwargs or {}))
-        if self.fault:
-            raise self.fault
-        return self.responses.get((model, method), [])
+    return fake_urlopen
 
 
 class NormaliseUrlTest(unittest.TestCase):
@@ -98,6 +99,59 @@ class StripPartnerRecordTest(unittest.TestCase):
         self.assertEqual(row["display_name"], "Solo")
 
 
+class Json2CallTest(unittest.TestCase):
+    def _config(self):
+        return OdooConfig(
+            url="https://erp.acme.com",
+            database="acme",
+            login="vous@acme.fr",
+            api_key="sk-xxx",
+        )
+
+    def test_posts_to_json2_with_bearer_key_and_database_header(self):
+        calls = []
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([{"ok": True}], calls),
+        ):
+            out = _json2_call(
+                self._config(),
+                "res.partner",
+                "search_read",
+                {"domain": [["name", "ilike", "Robin"]]},
+            )
+
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(calls[0]["url"], "https://erp.acme.com/json/2/res.partner/search_read")
+        self.assertEqual(calls[0]["headers"]["Authorization"], "bearer sk-xxx")
+        self.assertEqual(calls[0]["headers"]["X-odoo-database"], "acme")
+        self.assertEqual(calls[0]["body"]["domain"], [["name", "ilike", "Robin"]])
+
+    def test_401_maps_to_auth_error(self):
+        body = json.dumps({"message": "Invalid apikey"}).encode("utf-8")
+        error = urllib.error.HTTPError(
+            "https://erp.acme.com/json/2/res.partner/search_count",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(body),
+        )
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([error], []),
+        ):
+            with self.assertRaises(OdooAuthError):
+                _json2_call(self._config(), "res.partner", "search_count", {"domain": []})
+
+    def test_url_error_maps_to_connection_error(self):
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([urllib.error.URLError("offline")], []),
+        ):
+            with self.assertRaises(OdooConnectionError):
+                _json2_call(self._config(), "res.partner", "search_count", {"domain": []})
+
+
 class TestConnectionTest(unittest.TestCase):
     def _config(self):
         return OdooConfig(
@@ -108,46 +162,26 @@ class TestConnectionTest(unittest.TestCase):
         )
 
     def test_returns_summary_on_success(self):
+        calls = []
         with patch(
-            "odoo_client._common_proxy",
-            return_value=_StubCommonProxy(uid=4, version_info={"server_version": "17.0"}),
-        ), patch(
-            "odoo_client._object_proxy",
-            return_value=_StubObjectProxy(responses={("res.partner", "search_count"): 1234}),
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(
+                [
+                    1234,
+                    [{"id": 4, "name": "Robin", "login": "vous@acme.fr"}],
+                ],
+                calls,
+            ),
         ):
             summary = test_connection(self._config())
+
         self.assertTrue(summary["ok"])
-        self.assertEqual(summary["uid"], 4)
+        self.assertEqual(summary["uid"], 0)
+        self.assertEqual(summary["login"], "Robin")
         self.assertEqual(summary["partner_count"], 1234)
-        self.assertEqual(summary["server_version"], "17.0")
-
-    def test_authentication_failure_raises_auth_error(self):
-        # Odoo returns ``False`` for bad credentials. Our wrapper
-        # promotes that to ``OdooAuthError`` so the SwiftUI status
-        # banner can show "vérifiez la clé API".
-        with patch(
-            "odoo_client._common_proxy", return_value=_StubCommonProxy(uid=False)
-        ):
-            with self.assertRaises(OdooAuthError):
-                test_connection(self._config())
-
-    def test_xmlrpc_protocol_error_maps_to_connection_error(self):
-        proto_err = xmlrpc.client.ProtocolError("url", 502, "Bad Gateway", {})
-        with patch(
-            "odoo_client._common_proxy",
-            return_value=_StubCommonProxy(fault=proto_err),
-        ):
-            with self.assertRaises(OdooConnectionError):
-                test_connection(self._config())
-
-    def test_xmlrpc_fault_maps_to_auth_error(self):
-        fault = xmlrpc.client.Fault(1, "AccessDenied: invalid api key")
-        with patch(
-            "odoo_client._common_proxy",
-            return_value=_StubCommonProxy(fault=fault),
-        ):
-            with self.assertRaises(OdooAuthError):
-                test_connection(self._config())
+        self.assertEqual(summary["server_version"], "Odoo 19+ JSON-2")
+        self.assertEqual(calls[0]["url"], "https://erp.acme.com/json/2/res.partner/search_count")
+        self.assertEqual(calls[1]["url"], "https://erp.acme.com/json/2/res.users/search_read")
 
 
 class SearchPartnersTest(unittest.TestCase):
@@ -160,13 +194,10 @@ class SearchPartnersTest(unittest.TestCase):
         )
 
     def test_blank_query_returns_empty_without_calling_odoo(self):
-        with patch("odoo_client._common_proxy") as common, patch(
-            "odoo_client._object_proxy"
-        ) as obj:
+        with patch("odoo_client.urllib.request.urlopen") as urlopen:
             self.assertEqual(search_partners(self._config(), ""), [])
             self.assertEqual(search_partners(self._config(), "   "), [])
-            common.assert_not_called()
-            obj.assert_not_called()
+            urlopen.assert_not_called()
 
     def test_returns_normalised_records(self):
         partners = [
@@ -181,28 +212,28 @@ class SearchPartnersTest(unittest.TestCase):
                 "email": False, "phone": False, "function": False,
             },
         ]
+        calls = []
         with patch(
-            "odoo_client._common_proxy", return_value=_StubCommonProxy(uid=4)
-        ), patch(
-            "odoo_client._object_proxy",
-            return_value=_StubObjectProxy(responses={("res.partner", "search_read"): partners}),
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([partners], calls),
         ):
             out = search_partners(self._config(), "robin")
         self.assertEqual(len(out), 2)
         self.assertEqual(out[0]["parent_name"], "Acme")
         self.assertEqual(out[0]["function"], "CTO")
-        # False email / phone become empty strings, not literal "False".
         self.assertEqual(out[1]["email"], "")
         self.assertEqual(out[1]["phone"], "")
+        self.assertEqual(
+            calls[0]["body"]["domain"],
+            ["|", ["name", "ilike", "robin"], ["email", "ilike", "robin"]],
+        )
 
 
 class FetchPartnerTest(unittest.TestCase):
     def test_returns_none_when_partner_does_not_exist(self):
         with patch(
-            "odoo_client._common_proxy", return_value=_StubCommonProxy(uid=4)
-        ), patch(
-            "odoo_client._object_proxy",
-            return_value=_StubObjectProxy(responses={("res.partner", "read"): []}),
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([[]], []),
         ):
             self.assertIsNone(fetch_partner(
                 OdooConfig("https://x", "y", "z@a.b", "k"), 99

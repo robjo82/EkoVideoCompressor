@@ -200,7 +200,7 @@ struct SpeakerProfile: Codable, Identifiable, Equatable {
 }
 
 /// Minimal Odoo res.partner shape used by the search picker. The
-/// engine flattens parent_id from XML-RPC's [id, name] pair into
+/// engine flattens parent_id from Odoo's many2one [id, name] pair into
 /// two scalar fields so the UI doesn't have to branch.
 struct OdooPartner: Codable, Identifiable, Equatable {
     var id: Int
