@@ -187,16 +187,29 @@ def prepare_job_workspace(request: JobRequest, sink: EventSink) -> tuple[Path, P
     workspace.mkdir(parents=True, exist_ok=True)
     source = Path(request.source_path).expanduser()
     copied_source = workspace / source.name
+    append_app_log(
+        "engine_prepare_workspace "
+        f"workspace={str(workspace)!r} source={str(source)!r} "
+        f"copied_source={str(copied_source)!r} delete_source={request.delete_source_after_copy!r}"
+    )
     if (
         source.exists()
         and source.resolve() != copied_source.resolve()
         and not copied_source.exists()
     ):
         shutil.copy2(source, copied_source)
+        append_app_log(
+            "engine_prepare_workspace copied "
+            f"source={str(source)!r} copied_source={str(copied_source)!r}"
+        )
         sink(ArtifactEvent("source", str(copied_source)))
         if request.delete_source_after_copy:
             try:
                 source.unlink()
+                append_app_log(
+                    "engine_prepare_workspace deleted_original "
+                    f"source={str(source)!r}"
+                )
                 sink(
                     ProgressEvent(
                         "source_cleanup",
@@ -205,6 +218,10 @@ def prepare_job_workspace(request: JobRequest, sink: EventSink) -> tuple[Path, P
                     )
                 )
             except OSError as exc:
+                append_app_log(
+                    "engine_prepare_workspace delete_original_failed "
+                    f"source={str(source)!r} error={exc!r}"
+                )
                 sink(
                     WarningEvent(
                         f"Le fichier source a été copié, mais n'a pas pu être supprimé : {exc}",
@@ -1681,6 +1698,12 @@ class CompressionPipeline:
             out_dir = job_workspace_dir(self.request)
         out_dir.mkdir(parents=True, exist_ok=True)
         output_path = default_out_path(self.request.source_path, str(out_dir), "_compressed")
+        append_app_log(
+            "engine_compress_start "
+            f"source={self.request.source_path!r} output={output_path!r} "
+            f"trim_enabled={settings.trim_enabled!r} "
+            f"trim_start={settings.trim_start!r} trim_end={settings.trim_end!r}"
+        )
         cmd = build_ffmpeg_cmd(
             settings.ffmpeg_path or "ffmpeg",
             self.request.source_path,
@@ -1711,6 +1734,10 @@ class CompressionPipeline:
             message = _friendly_ffmpeg_error(raw, cmd[0])
             append_app_log(f"engine_compress_failed rc={proc.returncode} error={raw!r}")
             return StepResult("compression", False, duration_seconds=duration, error=message)
+        append_app_log(
+            "engine_compress_done "
+            f"output={output_path!r} duration_seconds={duration:.2f}"
+        )
         self.sink(ArtifactEvent("compressed", output_path))
         self.sink(ProgressEvent("compression", 100, "Compression ready"))
         return StepResult("compression", True, output_path, duration_seconds=duration)

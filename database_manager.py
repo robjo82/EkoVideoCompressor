@@ -1,8 +1,34 @@
-import sqlite3
 import json
+import sqlite3
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
+
+
+_SENSITIVE_SETTINGS_KEYS = {
+    "api_key",
+    "access_token",
+    "client_secret",
+    "hf_token",
+    "password",
+    "refresh_token",
+    "token",
+}
+
+
+def _redact_settings(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, child in value.items():
+            if key in _SENSITIVE_SETTINGS_KEYS and child:
+                redacted[key] = "[redacted]"
+            else:
+                redacted[key] = _redact_settings(child)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_settings(child) for child in value]
+    return value
+
 
 class DatabaseManager:
     def __init__(self, db_path: Path):
@@ -149,10 +175,11 @@ class DatabaseManager:
                 )
 
     def create_job(self, source_path: str, workspace_dir: str, settings: dict) -> int:
+        storage_settings = _redact_settings(settings)
         with self._get_connection() as conn:
             cursor = conn.execute(
                 "INSERT INTO jobs (source_path, workspace_dir, settings_json) VALUES (?, ?, ?)",
-                (source_path, workspace_dir, json.dumps(settings))
+                (source_path, workspace_dir, json.dumps(storage_settings))
             )
             return cursor.lastrowid
 

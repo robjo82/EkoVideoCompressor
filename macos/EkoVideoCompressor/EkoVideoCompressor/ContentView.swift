@@ -511,18 +511,12 @@ struct RunBatchSettingsForm: View {
                 Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
             }
 
-            Section("Vocabulaire") {
-                Text("Choisissez les termes utiles dans chaque fichier. Le catalogue global sert de suggestions, mais il n'est plus envoyé automatiquement à toutes les réunions.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             if canDeleteOriginalSources {
                 Section("Fichiers") {
-                Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
-                Text("Le moteur copie d'abord l'original dans le dossier de travail. Si cette option est active, seul le fichier à son emplacement d'origine est supprimé.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
+                    Text("Le moteur copie d'abord l'original dans le dossier de travail. Si cette option est active, seul le fichier à son emplacement d'origine est supprimé.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -589,28 +583,12 @@ struct PerFileSetupPanel: View {
             }
             audioScrubber
 
-            DisclosureGroup("Rogner le début ou la fin") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Stepper(
-                            "Début ignoré : \(formatPreviewSeconds(item.trimStartSeconds))",
-                            value: $item.trimStartSeconds,
-                            in: 0...trimStartUpperBound,
-                            step: 5
-                        )
-                        Spacer()
-                        Stepper(
-                            "Fin ignorée : \(formatPreviewSeconds(item.trimEndSeconds))",
-                            value: $item.trimEndSeconds,
-                            in: 0...trimEndUpperBound,
-                            step: 5
-                        )
-                    }
-                    Text("Le rognage est appliqué avant la compression et la transcription.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 4)
+            if settings.odooConfigured {
+                OdooMeetingSuggestionsSection(
+                    item: $item,
+                    suggestions: suggestions,
+                    loading: suggestionsLoading
+                )
             }
 
             Picker("Nombre d'intervenants attendu", selection: $item.expectedSpeakerCount) {
@@ -645,14 +623,6 @@ struct PerFileSetupPanel: View {
                 .lineLimit(2...4)
                 .textFieldStyle(.roundedBorder)
             }
-
-            if settings.odooConfigured {
-                OdooMeetingSuggestionsSection(
-                    item: $item,
-                    suggestions: suggestions,
-                    loading: suggestionsLoading
-                )
-            }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
@@ -679,12 +649,12 @@ struct PerFileSetupPanel: View {
                 }
                 .labelStyle(.iconOnly)
                 .buttonStyle(.borderless)
-                Slider(
-                    value: Binding(
-                        get: { player.currentSeconds },
-                        set: { player.seek(to: $0) }
-                    ),
-                    in: 0...max(player.totalSeconds, 1)
+                TrimTimelineView(
+                    duration: player.totalSeconds,
+                    currentSeconds: player.currentSeconds,
+                    trimStartSeconds: $item.trimStartSeconds,
+                    trimEndSeconds: $item.trimEndSeconds,
+                    onSeek: { player.seek(to: $0) }
                 )
                 Button {
                     player.skip(seconds: 15)
@@ -707,23 +677,6 @@ struct PerFileSetupPanel: View {
                     .foregroundStyle(.secondary)
             }
         }
-    }
-
-    private var knownDurationOrFallback: Double {
-        let known = max(player.totalSeconds, item.mediaDurationSeconds)
-        return known
-    }
-
-    private var trimStartUpperBound: Double {
-        if knownDurationOrFallback > 0 {
-            return max(0, knownDurationOrFallback - item.trimEndSeconds - 1)
-        }
-        return 24 * 3600
-    }
-
-    private var trimEndUpperBound: Double {
-        guard knownDurationOrFallback > 0 else { return 0 }
-        return max(0, knownDurationOrFallback - item.trimStartSeconds - 1)
     }
 
     private var speakerSuggestions: [String] {
@@ -773,11 +726,11 @@ struct OdooMeetingSuggestionsSection: View {
     let loading: Bool
 
     private var attachedMeetingId: Int? {
-        // We don't persist the linkage on the QueueItem (the
-        // attendees + title already capture the intent), but we
-        // can still recognise "already applied" by checking
-        // whether the speaker names match the suggestion's
-        // attendees.
+        if let linkedId = item.odooMeeting?.event_id {
+            return linkedId
+        }
+        // Legacy fallback for queue items created before the meeting
+        // metadata was persisted on QueueItem.
         for meeting in suggestions {
             let attendeeNames = Set(meeting.attendees.map(\.name))
             let pickedNames = Set(item.expectedSpeakerNames)
@@ -1092,6 +1045,115 @@ struct FlowLayout: Layout {
             x += size.width + spacing
             rowHeight = max(rowHeight, size.height)
         }
+    }
+}
+
+struct TrimTimelineView: View {
+    let duration: Double
+    let currentSeconds: Double
+    @Binding var trimStartSeconds: Double
+    @Binding var trimEndSeconds: Double
+    var onSeek: (Double) -> Void
+
+    private var safeDuration: Double { max(duration, 1) }
+    private var minKeptDuration: Double { min(1, safeDuration) }
+
+    private var startSeconds: Double {
+        min(max(trimStartSeconds, 0), max(safeDuration - minKeptDuration, 0))
+    }
+
+    private var endSeconds: Double {
+        max(startSeconds + minKeptDuration, min(safeDuration, safeDuration - max(trimEndSeconds, 0)))
+    }
+
+    private var keptSeconds: Double {
+        max(endSeconds - startSeconds, 0)
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = max(proxy.size.width, 1)
+            let leftX = xPosition(for: startSeconds, width: width)
+            let rightX = xPosition(for: endSeconds, width: width)
+            let progressX = xPosition(for: min(max(currentSeconds, 0), safeDuration), width: width)
+
+            VStack(alignment: .leading, spacing: 4) {
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.secondary.opacity(0.18))
+                        .frame(height: 8)
+                        .position(x: width / 2, y: 16)
+                    Capsule()
+                        .fill(Color.teal.opacity(0.34))
+                        .frame(width: max(rightX - leftX, 0), height: 8)
+                        .position(x: leftX + max(rightX - leftX, 0) / 2, y: 16)
+                    Rectangle()
+                        .fill(Color.accentColor)
+                        .frame(width: 2, height: 20)
+                        .position(x: progressX, y: 16)
+                    trimHandle(accessibilityLabel: "Début du passage conservé")
+                        .position(x: leftX, y: 16)
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    let seconds = seconds(at: value.location.x, width: width)
+                                    let maxStart = max(0, endSeconds - minKeptDuration)
+                                    trimStartSeconds = min(max(seconds, 0), maxStart)
+                                }
+                        )
+                    trimHandle(accessibilityLabel: "Fin du passage conservé")
+                        .position(x: rightX, y: 16)
+                        .highPriorityGesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    let seconds = seconds(at: value.location.x, width: width)
+                                    let minEnd = min(safeDuration, startSeconds + minKeptDuration)
+                                    let clampedEnd = max(minEnd, min(seconds, safeDuration))
+                                    trimEndSeconds = max(0, safeDuration - clampedEnd)
+                                }
+                        )
+                }
+                .frame(height: 32)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onEnded { value in
+                            onSeek(seconds(at: value.location.x, width: width))
+                        }
+                )
+
+                HStack(spacing: 10) {
+                    Text("Début \(formatPreviewSeconds(startSeconds))")
+                    Text("Fin \(formatPreviewSeconds(endSeconds))")
+                    Spacer()
+                    Text("Conservé \(formatPreviewSeconds(keptSeconds))")
+                }
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+        }
+        .frame(minHeight: 50)
+        .help("Faites glisser les deux poignées pour rogner le début ou la fin. Cliquez la barre pour écouter un autre passage.")
+    }
+
+    private func xPosition(for seconds: Double, width: CGFloat) -> CGFloat {
+        CGFloat(min(max(seconds / safeDuration, 0), 1)) * width
+    }
+
+    private func seconds(at x: CGFloat, width: CGFloat) -> Double {
+        min(max(Double(x / max(width, 1)) * safeDuration, 0), safeDuration)
+    }
+
+    private func trimHandle(accessibilityLabel: String) -> some View {
+        RoundedRectangle(cornerRadius: 3)
+            .fill(Color.teal)
+            .frame(width: 7, height: 24)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(Color.white.opacity(0.9), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.12), radius: 2, y: 1)
+            .accessibilityLabel(accessibilityLabel)
     }
 }
 

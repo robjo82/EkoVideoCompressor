@@ -30,6 +30,39 @@ from speaker_recognition import decode_embedding, encode_embedding
 
 
 class EngineLibraryActionsTest(unittest.TestCase):
+    def test_create_job_redacts_sensitive_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(root / "work"),
+                    settings={
+                        "transcription_settings": {
+                            "hf_token": "hf-secret",
+                            "venv_python_path": "/usr/bin/python3",
+                        },
+                        "odoo_context_ref": {
+                            "api_key": "odoo-secret",
+                            "database": "prod",
+                        },
+                    },
+                )
+                row = db.get_job(job_id)
+
+            stored = json.loads(row["settings_json"])
+            self.assertEqual(
+                stored["transcription_settings"]["hf_token"],
+                "[redacted]",
+            )
+            self.assertEqual(
+                stored["transcription_settings"]["venv_python_path"],
+                "/usr/bin/python3",
+            )
+            self.assertEqual(stored["odoo_context_ref"]["api_key"], "[redacted]")
+            self.assertEqual(stored["odoo_context_ref"]["database"], "prod")
+
     def test_rename_speakers_updates_segments_and_text_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

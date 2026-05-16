@@ -108,13 +108,16 @@ def _resolve_source_path(request: JobRequest) -> Path | None:
     every job pays the cost on every launch.
     """
     if not request.source_path:
+        append_app_log("engine_resolve_source skipped reason='empty_source_path'")
         return None
     candidate = Path(request.source_path).expanduser()
     if candidate.exists():
+        append_app_log(f"engine_resolve_source hit='request_source' path={str(candidate)!r}")
         return candidate
 
     basename = candidate.name
     if not basename:
+        append_app_log(f"engine_resolve_source skipped reason='empty_basename' source={request.source_path!r}")
         return None
 
     workspace_dirs: list[str] = []
@@ -133,7 +136,15 @@ def _resolve_source_path(request: JobRequest) -> Path | None:
     for workspace_dir in workspace_dirs:
         workspace_copy = Path(workspace_dir).expanduser() / basename
         if workspace_copy.exists():
+            append_app_log(
+                "engine_resolve_source hit='workspace_copy' "
+                f"requested={str(candidate)!r} resolved={str(workspace_copy)!r}"
+            )
             return workspace_copy
+    append_app_log(
+        "engine_resolve_source miss "
+        f"requested={str(candidate)!r} workspaces={workspace_dirs!r}"
+    )
     return None
 
 
@@ -163,7 +174,11 @@ class EngineRunner:
         self.sink = sink
 
     def run_job(self, request: JobRequest) -> int:
-        append_app_log(f"engine_run_job mode={request.mode!r} source={request.source_path!r}")
+        append_app_log(
+            "engine_run_job "
+            f"mode={request.mode!r} source={request.source_path!r} "
+            f"workspace={request.workspace_dir!r} library_job_id={request.library_job_id!r}"
+        )
         resolved = _resolve_source_path(request)
         if resolved is None:
             # ``source_missing`` is the trigger the SwiftUI layer
