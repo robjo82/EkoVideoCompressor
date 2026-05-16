@@ -1276,13 +1276,9 @@ extension LibraryRow {
     }
 }
 
-private let _byteFormatter: ByteCountFormatter = {
-    let f = ByteCountFormatter()
-    f.countStyle = .file
-    f.allowedUnits = [.useAll]
-    f.includesUnit = true
-    return f
-}()
+private func formatFileBytes(_ bytes: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+}
 
 extension LibraryDisplayRow {
     /// Stable, comparable values used by the SwiftUI Table sort
@@ -1320,7 +1316,7 @@ extension LibraryDisplayRow {
     /// rows; the byte formatter for everything else.
     var displayedTotalBytes: String {
         guard let bytes = job.total_bytes else { return "—" }
-        return _byteFormatter.string(fromByteCount: bytes)
+        return formatFileBytes(bytes)
     }
 }
 

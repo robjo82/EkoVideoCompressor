@@ -20,6 +20,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
+
+from ekovideo_engine.logging import append_app_log, tail_text
 
 
 __all__ = [
@@ -91,6 +94,52 @@ def _json2_base_url(config: OdooConfig) -> str:
     return _normalise_url(config.url) + "/json/2"
 
 
+def _safe_host(value: str) -> str:
+    try:
+        parsed = urlparse(_normalise_url(value))
+    except OdooConnectionError:
+        return "<invalid-url>"
+    return parsed.netloc or parsed.path or "<unknown-host>"
+
+
+def _exception_chain(exc: BaseException) -> str:
+    parts: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{current.__class__.__name__}: {current}")
+        if isinstance(current, urllib.error.URLError) and isinstance(current.reason, BaseException):
+            current = current.reason
+        else:
+            current = current.__cause__ or current.__context__
+    return " <- ".join(parts)
+
+
+def _is_certificate_error(exc: BaseException) -> bool:
+    text = _exception_chain(exc).lower()
+    return any(
+        token in text
+        for token in (
+            "certificate verify failed",
+            "self-signed certificate",
+            "hostname",
+            "certificat",
+            "sslcertverificationerror",
+        )
+    )
+
+
+def _connection_error_message(exc: BaseException) -> str:
+    if _is_certificate_error(exc):
+        return (
+            "Certificat TLS Odoo invalide ou non approuvé par macOS. "
+            "Vérifiez le certificat HTTPS du serveur Odoo, sa chaîne "
+            "intermédiaire et le nom de domaine utilisé."
+        )
+    return f"Connexion à Odoo impossible : {exc}"
+
+
 def _error_message_from_payload(payload: Any) -> str:
     if isinstance(payload, dict):
         data = payload.get("data")
@@ -113,6 +162,12 @@ def _json2_call(
 ) -> Any:
     url = f"{_json2_base_url(config)}/{model}/{method}"
     body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+    host = _safe_host(config.url)
+    append_app_log(
+        "odoo_json2_request "
+        f"host={host!r} db={config.database.strip()!r} "
+        f"model={model!r} method={method!r}"
+    )
     request = urllib.request.Request(
         url,
         data=body,
@@ -127,6 +182,12 @@ def _json2_call(
     try:
         with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT) as response:
             raw = response.read().decode("utf-8")
+            status = getattr(response, "status", None) or getattr(response, "code", None)
+            append_app_log(
+                "odoo_json2_response "
+                f"host={host!r} model={model!r} method={method!r} "
+                f"status={status!r} bytes={len(raw.encode('utf-8'))}"
+            )
     except urllib.error.HTTPError as exc:
         raw_error = exc.read().decode("utf-8", errors="replace")
         try:
@@ -134,13 +195,24 @@ def _json2_call(
         except json.JSONDecodeError:
             payload_error = {}
         message = _error_message_from_payload(payload_error) or raw_error or str(exc)
+        append_app_log(
+            "odoo_json2_http_error "
+            f"host={host!r} model={model!r} method={method!r} "
+            f"status={exc.code} error={tail_text(message, 1200)!r}"
+        )
         if exc.code in {401, 403}:
             raise OdooAuthError(
                 f"Accès Odoo refusé par l'API JSON-2 : {message}"
             ) from exc
         raise OdooError(f"Erreur Odoo HTTP {exc.code} : {message}") from exc
     except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError, socket.timeout) as exc:
-        raise OdooConnectionError(f"Connexion à Odoo impossible : {exc}") from exc
+        append_app_log(
+            "odoo_json2_connection_error "
+            f"host={host!r} model={model!r} method={method!r} "
+            f"certificate_error={_is_certificate_error(exc)} "
+            f"error_chain={tail_text(_exception_chain(exc), 2000)!r}"
+        )
+        raise OdooConnectionError(_connection_error_message(exc)) from exc
 
     if not raw:
         return None

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import ssl
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -17,6 +18,9 @@ from odoo_client import (
     OdooAuthError,
     OdooConfig,
     OdooConnectionError,
+    _connection_error_message,
+    _exception_chain,
+    _is_certificate_error,
     _json2_call,
     _normalise_url,
     _strip_partner_record,
@@ -150,6 +154,31 @@ class Json2CallTest(unittest.TestCase):
         ):
             with self.assertRaises(OdooConnectionError):
                 _json2_call(self._config(), "res.partner", "search_count", {"domain": []})
+
+    def test_certificate_error_gets_actionable_message_and_log(self):
+        cert_error = ssl.SSLCertVerificationError(
+            "certificate verify failed: self-signed certificate"
+        )
+        wrapped = urllib.error.URLError(cert_error)
+
+        with patch("odoo_client.append_app_log") as log, patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer([wrapped], []),
+        ):
+            with self.assertRaises(OdooConnectionError) as ctx:
+                _json2_call(self._config(), "res.partner", "search_count", {"domain": []})
+
+        self.assertIn("Certificat TLS Odoo invalide", str(ctx.exception))
+        self.assertTrue(any("certificate_error=True" in call.args[0] for call in log.call_args_list))
+
+    def test_certificate_detection_walks_urlerror_reason(self):
+        cert_error = urllib.error.URLError(
+            ssl.SSLCertVerificationError("certificate verify failed")
+        )
+
+        self.assertTrue(_is_certificate_error(cert_error))
+        self.assertIn("SSLCertVerificationError", _exception_chain(cert_error))
+        self.assertIn("Certificat TLS Odoo invalide", _connection_error_message(cert_error))
 
 
 class TestConnectionTest(unittest.TestCase):
