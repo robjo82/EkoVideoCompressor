@@ -5,6 +5,11 @@ struct QueueItem: Identifiable, Equatable {
     let id = UUID()
     var sourceURL: URL
     var focusNote: String?
+    /// Number of speakers the user expects on this specific
+    /// recording. 0 means "let pyannote estimate". Per-file rather
+    /// than per-batch because a 5-person standup followed by a
+    /// 1-on-1 in the same queue need different bounds.
+    var expectedSpeakerCount: Int = 0
     var status: String = "En attente"
     var progress: Double = 0
 }
@@ -56,6 +61,17 @@ final class QueueStore: ObservableObject {
         }
     }
 
+    /// Used by the source-relocalisation recovery flow: the user
+    /// pointed us at a new file location, so the queue row updates
+    /// in place (status reset, new URL) without losing its slot
+    /// in the batch — the runner can retry immediately.
+    func replace(_ id: QueueItem.ID, with newURL: URL) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].sourceURL = newURL
+        items[index].status = "En attente"
+        items[index].progress = 0
+    }
+
     func resetPending() {
         for index in items.indices {
             items[index].status = "En attente"
@@ -75,14 +91,6 @@ final class SettingsStore: ObservableObject {
     @AppStorage("outputFormat") var outputFormat = "txt"
     @AppStorage("audioRecheckEnabled") var audioRecheckEnabled = false
     @AppStorage("diarizationEnabled") var diarizationEnabled = false
-    /// User-declared expected speaker count for the *next* run.
-    ///
-    /// This one is deliberately **not** ``@AppStorage`` — the value
-    /// is per-meeting, not a long-term preference. A 4-person
-    /// meeting today shouldn't carry "4" into next week's 6-person
-    /// meeting. The Run Setup sheet surfaces it; nothing else
-    /// touches it. 0 means "let pyannote estimate".
-    @Published var expectedSpeakerCount: Int = 0
     @AppStorage("deleteSourceAfterCopy") var deleteSourceAfterCopy = false
     /// Single user-facing quality knob. Replaces the previous handful
     /// of toggles (VAD / multipass / per-speaker / web). The engine
