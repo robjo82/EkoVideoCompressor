@@ -244,7 +244,11 @@ enum TranscriptionQualityPreset: String, Codable, CaseIterable, Identifiable {
         case .balanced:
             return "VAD + repasse haute qualité + relecture LLM. Recommandé pour la plupart des réunions."
         case .max:
-            return "Whisper par locuteur + réécoute IA + enrichissement web. Réservé aux contenus stratégiques."
+            // Honest description of what the orchestrator actually
+            // wires today. Kept tight on purpose — adding "réécoute
+            // IA" / "enrichissement web" promised features the
+            // engine didn't deliver, and users noticed.
+            return "Tout activer : VAD + repasse large-v3 sur les zones douteuses + diarisation + relecture LLM."
         case .custom:
             return "Conserve les bascules avancées telles que définies."
         }
