@@ -84,6 +84,59 @@ def _persist_step_durations(db, job_id: int, results: list[StepResult]) -> None:
     db.update_job_durations(job_id, ffmpeg=ffmpeg, whisper=whisper, diarization=diarization)
 
 
+def _resolve_source_path(request: JobRequest) -> Path | None:
+    """Return the path the runner should actually feed to the
+    pipeline, or ``None`` when nothing usable is on disk.
+
+    Three lookup tiers, ordered by trust:
+
+    1. ``request.source_path`` itself if it exists. Covers the
+       fresh-run case (user just dropped a file).
+
+    2. The workspace copy at ``request.workspace_dir / basename``.
+       Covers reruns where ``delete_source_after_copy`` cleaned up
+       the original. Without this the second run of any meeting
+       would dead-lock on "source missing" — the canonical copy is
+       in the workspace, not at the original drop path.
+
+    3. The library row's stored ``workspace_dir`` when the SwiftUI
+       caller didn't bother to forward one. Belt-and-braces for
+       legacy callers that re-submit a job_id without a workspace.
+
+    None of these touch the network, the DB, or anything stateful
+    beyond ``Path.exists()`` — kept deliberately cheap because
+    every job pays the cost on every launch.
+    """
+    if not request.source_path:
+        return None
+    candidate = Path(request.source_path).expanduser()
+    if candidate.exists():
+        return candidate
+
+    basename = candidate.name
+    if not basename:
+        return None
+
+    workspace_dirs: list[str] = []
+    if request.workspace_dir:
+        workspace_dirs.append(request.workspace_dir)
+    if request.library_job_id is not None:
+        try:
+            row = database().get_job(request.library_job_id)
+        except Exception:
+            row = None
+        if row:
+            stored_workspace = (row.get("workspace_dir") or "").strip()
+            if stored_workspace and stored_workspace not in workspace_dirs:
+                workspace_dirs.append(stored_workspace)
+
+    for workspace_dir in workspace_dirs:
+        workspace_copy = Path(workspace_dir).expanduser() / basename
+        if workspace_copy.exists():
+            return workspace_copy
+    return None
+
+
 def _snapshot_workspace_size(db, job_id: int, workspace: Path) -> None:
     """Walk the workspace and store the cumulative byte count.
 
@@ -111,10 +164,29 @@ class EngineRunner:
 
     def run_job(self, request: JobRequest) -> int:
         append_app_log(f"engine_run_job mode={request.mode!r} source={request.source_path!r}")
-        source = Path(request.source_path)
-        if not source.exists():
-            self.sink(ErrorEvent(f"Source file not found: {source}", code="source_missing"))
+        resolved = _resolve_source_path(request)
+        if resolved is None:
+            # ``source_missing`` is the trigger the SwiftUI layer
+            # listens for to pop the "Relocaliser la source" sheet.
+            # We surface the requested path AND the workspace we
+            # tried so the dialog can offer both as one-click
+            # actions.
+            attempted_workspace = (request.workspace_dir or "").strip()
+            append_app_log(
+                "engine_source_missing "
+                f"source={request.source_path!r} workspace={attempted_workspace!r}"
+            )
+            self.sink(
+                ErrorEvent(
+                    f"Source file not found: {request.source_path}",
+                    code="source_missing",
+                )
+            )
             return 2
+        # The resolver may have substituted a workspace copy or the
+        # source. Update the request so downstream code (workspace
+        # prep, DB row) sees the path that actually exists.
+        request.source_path = str(resolved)
         Path(request.output_dir).mkdir(parents=True, exist_ok=True)
         db = database()
         estimated_total_seconds = _historical_total_estimate_seconds(db, request)
@@ -144,6 +216,12 @@ class EngineRunner:
             results.append(result)
             if not result.ok:
                 _persist_step_durations(db, job_id, results)
+                # Failed jobs still left partial files (the source
+                # copy + maybe a half-written compressed clip). The
+                # library "Poids" column wants a real number on
+                # these, not "—", so the user can decide whether to
+                # cleanup or rerun.
+                _snapshot_workspace_size(db, job_id, workspace)
                 db.update_job_status(job_id, "FAILED", result.error or "Compression failed")
                 sink(ErrorEvent(result.error or "Compression failed", code="compression_failed"))
                 return 1
@@ -164,6 +242,10 @@ class EngineRunner:
             # prerequisites: audio extract and Whisper itself.
             if failed:
                 _persist_step_durations(db, job_id, results)
+                # Same rationale as the compression-failure branch:
+                # the user wants to see how much disk this run
+                # consumed before deciding whether to clean it up.
+                _snapshot_workspace_size(db, job_id, workspace)
                 db.update_job_status(job_id, "FAILED", failed[0].error or "Transcription failed")
                 sink(ErrorEvent(failed[0].error or "Transcription failed", code="transcription_failed"))
                 return 1

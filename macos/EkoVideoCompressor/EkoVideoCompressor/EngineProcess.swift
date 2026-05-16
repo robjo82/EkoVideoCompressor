@@ -16,6 +16,14 @@ final class EngineProcess: ObservableObject {
     @Published private(set) var runFinishedAt: Date?
     @Published var lastError: String?
 
+    /// The ``code`` field of the most recent error event, when any.
+    /// The queue runner uses this to detect ``source_missing`` and
+    /// pop the relocalisation sheet — much cleaner than fuzzy
+    /// substring matching on ``lastError``.
+    var lastErrorCode: String? {
+        events.last(where: { $0.event == .error })?.code
+    }
+
     private var process: Process?
     private let decoder = JSONDecoder()
 

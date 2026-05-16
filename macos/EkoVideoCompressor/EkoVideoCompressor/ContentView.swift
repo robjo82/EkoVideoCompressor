@@ -1,4 +1,5 @@
-@preconcurrency import Foundation
+@preconcurrency import AVFoundation
+import Foundation
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
@@ -83,6 +84,7 @@ struct ContentView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView()
                 .environmentObject(settings)
+                .environmentObject(engine)
         }
         .sheet(isPresented: $showingRunSetup) {
             RunSetupView {
@@ -91,6 +93,7 @@ struct ContentView: View {
             }
             .environmentObject(settings)
             .environmentObject(engine)
+            .environmentObject(queue)
         }
         .task {
             guard !didPreloadSecondaryData else { return }
@@ -127,14 +130,54 @@ struct ContentView: View {
         for item in items {
             if Task.isCancelled { break }
             queue.update(item.id, status: "En cours", progress: 0)
-            let exitCode = await runJob(item)
+            var currentItem = item
+            var exitCode = await runJob(currentItem)
+            // Recovery loop: if the engine returned ``source_missing``,
+            // give the user one shot to point us at the new location.
+            // We only retry on explicit relocalisation — Cancel falls
+            // through to the regular "Erreur" status so the batch
+            // keeps moving instead of blocking on an unresolved item.
+            while exitCode != 0 && engine.lastErrorCode == "source_missing" {
+                if Task.isCancelled { break }
+                guard let relocated = await promptRelocalize(missing: currentItem.sourceURL) else {
+                    break
+                }
+                queue.replace(currentItem.id, with: relocated)
+                currentItem = QueueItem(
+                    sourceURL: relocated,
+                    focusNote: currentItem.focusNote
+                )
+                queue.update(currentItem.id, status: "Reprise", progress: 0)
+                exitCode = await runJob(currentItem)
+            }
             if exitCode == 0 {
-                queue.update(item.id, status: "Terminé", progress: 100)
+                queue.update(currentItem.id, status: "Terminé", progress: 100)
             } else {
-                queue.update(item.id, status: "Erreur", progress: 0)
+                queue.update(currentItem.id, status: "Erreur", progress: 0)
             }
         }
         queue.isBatchRunning = false
+    }
+
+    /// Show an NSOpenPanel anchored on the queue window so the user
+    /// can point us at the new location of a missing source. Returns
+    /// the picked URL, or nil when the user cancels — the caller
+    /// then marks the item as failed and moves on.
+    @MainActor
+    private func promptRelocalize(missing: URL) async -> URL? {
+        let alert = NSAlert()
+        alert.messageText = "Source introuvable"
+        alert.informativeText = "\(missing.lastPathComponent) est introuvable à son emplacement d'origine. Voulez-vous sélectionner le nouveau fichier ?"
+        alert.addButton(withTitle: "Sélectionner…")
+        alert.addButton(withTitle: "Passer ce fichier")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.message = "Sélectionner le nouvel emplacement de \(missing.lastPathComponent)"
+        panel.directoryURL = missing.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let chosen = panel.url else { return nil }
+        return chosen
     }
 
     private func runJob(_ item: QueueItem) async -> Int32 {
@@ -161,8 +204,11 @@ struct ContentView: View {
                 // count, forward it as both bounds so pyannote pins
                 // the cluster count instead of guessing low. ``0``
                 // (the default) leaves pyannote on autopilot.
-                expected_min_speakers: settings.expectedSpeakerCount,
-                expected_max_speakers: settings.expectedSpeakerCount
+                // Per-file knob now lives on the QueueItem; the
+                // SettingsStore equivalent is gone. 0 still means
+                // "let pyannote estimate".
+                expected_min_speakers: item.expectedSpeakerCount,
+                expected_max_speakers: item.expectedSpeakerCount
             ),
             glossary_terms: settings.glossaryTerms,
             speaker_overrides: [:],
@@ -343,41 +389,20 @@ struct QueueRowView: View {
     }
 }
 
-struct ContextInspectorView: View {
+/// Batch-wide settings: action, format, model, quality preset,
+/// diarisation toggle, audio recheck, glossary. Anything that
+/// applies to every file in the queue lives here.
+///
+/// Hugging Face token + Exporter les logs deliberately stay out
+/// of this form — they're application-wide preferences, not
+/// per-run knobs, and surfaced in Réglages where they belong.
+struct RunBatchSettingsForm: View {
     @EnvironmentObject private var settings: SettingsStore
-    @EnvironmentObject private var engine: EngineProcess
-
-    var body: some View {
-        RunSettingsForm()
-            .formStyle(.grouped)
-            .padding(.vertical, 14)
-            .padding(.trailing, 16)
-    }
-}
-
-struct RunSettingsForm: View {
-    @EnvironmentObject private var settings: SettingsStore
-    @EnvironmentObject private var engine: EngineProcess
 
     var body: some View {
         Form {
-            Section("Vocabulaire de la réunion") {
-                TextEditor(text: $settings.glossary)
-                    .font(.body.monospaced())
-                    .frame(minHeight: 150)
-                Text("\(settings.glossaryTerms.count) terme(s) transmis au moteur.")
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Fichiers") {
-                Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
-                Text("Le moteur copie d'abord l'original dans le dossier de travail. Si cette option est active, seul le fichier à son emplacement d'origine est supprimé.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Transcription") {
-                Picker("Action", selection: $settings.processingMode) {
+            Section("Action") {
+                Picker("Mode", selection: $settings.processingMode) {
                     Text("Compresser + transcrire").tag("compress_transcribe")
                     Text("Transcrire seulement").tag("transcribe")
                     Text("Compresser seulement").tag("compress")
@@ -388,14 +413,14 @@ struct RunSettingsForm: View {
                     Text("VTT").tag("vtt")
                     Text("JSON").tag("json")
                 }
-                Picker("Modèle", selection: $settings.whisperModel) {
+            }
+
+            Section("Moteur de transcription") {
+                Picker("Modèle Whisper", selection: $settings.whisperModel) {
                     Text("Whisper Large v3 Turbo").tag("mlx-community/whisper-large-v3-turbo")
                     Text("Whisper Large v3").tag("mlx-community/whisper-large-v3-mlx")
                     Text("Whisper Medium").tag("mlx-community/whisper-medium-mlx")
                 }
-                // Per-batch quality override. The picker mirrors the
-                // one in Settings, so the user can dial up "Maximale"
-                // for a strategic call without opening preferences.
                 Picker("Qualité", selection: $settings.qualityPreset) {
                     ForEach(TranscriptionQualityPreset.allCases) { preset in
                         Text(preset.displayName).tag(preset.rawValue)
@@ -407,50 +432,241 @@ struct RunSettingsForm: View {
                         .foregroundStyle(.secondary)
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
-                if settings.diarizationEnabled {
-                    // Plain string label only — wrapping the label in
-                    // an HStack(Spacer) collapses the entire form's
-                    // column layout on macOS (every TextEditor and
-                    // Picker shrinks to one character wide).
-                    Stepper(
-                        speakerCountStepperLabel(settings.expectedSpeakerCount),
-                        value: $settings.expectedSpeakerCount,
-                        in: 0...12
-                    )
-                    Text("0 = laisse pyannote estimer. Renseigner cette valeur quand vous la connaissez réduit fortement les attributions erronées.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
                 Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
             }
 
-            Section("Hugging Face") {
-                SecureField("Token Read", text: $settings.hfToken)
-                Button {
-                    openHuggingFaceTokens()
-                } label: {
-                    Label("Créer ou gérer le token", systemImage: "person.crop.circle.badge.key")
-                }
-                Text("Requis pour pyannote quand la détection des locuteurs est activée.")
+            Section("Vocabulaire") {
+                TextEditor(text: $settings.glossary)
+                    .font(.body.monospaced())
+                    .frame(minHeight: 110)
+                Text("\(settings.glossaryTerms.count) terme(s) transmis au moteur, partagés par toute la file.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            Section("Sortie") {
-                TextField("Dossier", text: $settings.outputDir)
-                Button {
-                    engine.run(arguments: EngineProcess.defaultPythonArguments(["export-logs"]))
-                } label: {
-                    Label("Exporter les logs", systemImage: "doc.zipper")
+            Section("Fichiers") {
+                Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
+                Text("Le moteur copie d'abord l'original dans le dossier de travail. Si cette option est active, seul le fichier à son emplacement d'origine est supprimé.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+/// One-file pre-flight panel: filename, audio preview, per-file
+/// speaker count, per-file note. The user walks through the queue
+/// with Précédent / Suivant so they can preview every recording
+/// before launching the batch — particularly handy on a queue of
+/// 5 meetings where remembering "wait who was in the second one
+/// again?" used to mean opening Finder, hitting space, repeating.
+struct PerFileSetupPanel: View {
+    @Binding var item: QueueItem
+    let index: Int
+    let total: Int
+
+    @StateObject private var player = AudioPreviewPlayer()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Fichier \(index + 1) / \(total)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            HStack(spacing: 12) {
+                Image(systemName: "waveform.and.rectangle")
+                    .font(.title)
+                    .foregroundStyle(.teal)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.sourceURL.lastPathComponent)
+                        .font(.headline)
+                        .lineLimit(2)
+                    Text(item.sourceURL.deletingLastPathComponent().path)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
+                Spacer()
+                Button {
+                    player.toggle(url: item.sourceURL)
+                } label: {
+                    Label(
+                        player.isPlaying ? "Pause" : "Écouter",
+                        systemImage: player.isPlaying ? "pause.circle.fill" : "play.circle.fill"
+                    )
+                }
+                .controlSize(.large)
+                .help("Aperçu audio — utile pour se rappeler des intervenants")
+            }
+            if let elapsed = player.elapsedFormatted, let total = player.durationFormatted {
+                ProgressView(value: player.progress)
+                    .progressViewStyle(.linear)
+                Text("\(elapsed) / \(total)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Nombre d'intervenants attendu")
+                    .font(.callout.weight(.medium))
+                Stepper(
+                    speakerCountStepperLabel(item.expectedSpeakerCount),
+                    value: $item.expectedSpeakerCount,
+                    in: 0...12
+                )
+                Text("0 = laisse pyannote estimer. Renseigner cette valeur quand vous la connaissez réduit fortement les attributions erronées.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Notes pour ce fichier (optionnel)")
+                    .font(.callout.weight(.medium))
+                TextField(
+                    "Termes à retenir, contexte particulier…",
+                    text: Binding(
+                        get: { item.focusNote ?? "" },
+                        set: { item.focusNote = $0.isEmpty ? nil : $0 }
+                    ),
+                    axis: .vertical
+                )
+                .lineLimit(2...4)
+                .textFieldStyle(.roundedBorder)
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onChange(of: index) { _ in
+            // User stepped to another file — kill the previous
+            // audio so it doesn't keep playing over the new
+            // selection.
+            player.stop()
+        }
+        .onDisappear { player.stop() }
+    }
+}
+
+/// Minimal AVFoundation wrapper used by the per-file setup panel.
+/// Exposes just the three knobs the UI binds against — toggle,
+/// progress, formatted timestamps — so the heavy AVPlayer
+/// surface stays contained.
+@MainActor
+final class AudioPreviewPlayer: ObservableObject {
+    @Published private(set) var isPlaying = false
+    @Published private(set) var progress: Double = 0
+
+    private var player: AVPlayer?
+    private var currentURL: URL?
+    private var timeObserver: Any?
+
+    deinit {
+        if let player = self.player, let token = self.timeObserver {
+            player.removeTimeObserver(token)
+        }
+    }
+
+    var elapsedFormatted: String? {
+        guard let seconds = currentSeconds else { return nil }
+        return formatPreviewSeconds(seconds)
+    }
+
+    var durationFormatted: String? {
+        guard let seconds = totalSeconds else { return nil }
+        return formatPreviewSeconds(seconds)
+    }
+
+    func toggle(url: URL) {
+        if currentURL != url {
+            stop()
+            let player = AVPlayer(url: url)
+            self.player = player
+            self.currentURL = url
+            installObserver()
+        }
+        guard let player else { return }
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+        } else {
+            player.play()
+            isPlaying = true
+        }
+    }
+
+    func stop() {
+        if let player, let token = timeObserver {
+            player.removeTimeObserver(token)
+        }
+        player?.pause()
+        player = nil
+        currentURL = nil
+        isPlaying = false
+        progress = 0
+        timeObserver = nil
+    }
+
+    private var currentSeconds: Double? {
+        guard let player else { return nil }
+        let time = CMTimeGetSeconds(player.currentTime())
+        return time.isFinite ? time : nil
+    }
+
+    private var totalSeconds: Double? {
+        guard let item = player?.currentItem else { return nil }
+        let duration = CMTimeGetSeconds(item.duration)
+        return duration.isFinite && duration > 0 ? duration : nil
+    }
+
+    private func installObserver() {
+        guard let player else { return }
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 4)
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: interval, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            guard let current = self.currentSeconds,
+                  let total = self.totalSeconds, total > 0 else { return }
+            self.progress = min(max(current / total, 0), 1)
+            // Auto-reset when playback finished — keeps the UI
+            // honest about whether anything's currently playing.
+            if current >= total - 0.05 {
+                self.player?.seek(to: .zero)
+                self.player?.pause()
+                self.isPlaying = false
+                self.progress = 0
             }
         }
     }
 }
 
+private func formatPreviewSeconds(_ seconds: Double) -> String {
+    let total = Int(seconds.rounded())
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    if h > 0 {
+        return String(format: "%d:%02d:%02d", h, m, s)
+    }
+    return String(format: "%d:%02d", m, s)
+}
+
 struct RunSetupView: View {
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var queue: QueueStore
     @Environment(\.dismiss) private var dismiss
+    @State private var currentIndex = 0
     var onStart: () -> Void
+
+    private var clampedIndex: Int {
+        guard !queue.items.isEmpty else { return 0 }
+        return min(max(currentIndex, 0), queue.items.count - 1)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -458,27 +674,71 @@ struct RunSetupView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Préparer le traitement")
                         .font(.title.bold())
-                    Text("Ces informations sont appliquées à la file au lancement.")
+                    Text(queue.items.count > 1
+                         ? "Vérifiez chaque fichier puis lancez la file."
+                         : "Vérifiez les paramètres puis lancez le traitement.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
             }
             .padding(22)
             Divider()
-            RunSettingsForm()
-                .environmentObject(settings)
-                .padding()
+
+            // ScrollView so the whole form (per-file panel + global
+            // settings) fits even on a 13" laptop — the previous
+            // layout grew without bounds and pushed the action bar
+            // off-screen.
+            ScrollView {
+                VStack(spacing: 14) {
+                    if !queue.items.isEmpty {
+                        PerFileSetupPanel(
+                            item: $queue.items[clampedIndex],
+                            index: clampedIndex,
+                            total: queue.items.count
+                        )
+                        .padding(.horizontal, 22)
+                        .padding(.top, 14)
+                    }
+                    RunBatchSettingsForm()
+                        .environmentObject(settings)
+                }
+                .padding(.bottom, 14)
+            }
+            .frame(minHeight: 360)
+
             Divider()
             HStack {
                 Button("Annuler") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Spacer()
-                Button("Lancer la file") { onStart() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
+                if queue.items.count > 1 {
+                    Button {
+                        currentIndex = max(0, clampedIndex - 1)
+                    } label: {
+                        Label("Précédent", systemImage: "chevron.left")
+                    }
+                    .disabled(clampedIndex == 0)
+                    Text("\(clampedIndex + 1) / \(queue.items.count)")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    if clampedIndex < queue.items.count - 1 {
+                        Button {
+                            currentIndex = min(queue.items.count - 1, clampedIndex + 1)
+                        } label: {
+                            Label("Suivant", systemImage: "chevron.right")
+                        }
+                    }
+                }
+                Button(queue.items.count > 1 ? "Lancer la file" : "Lancer") {
+                    onStart()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(queue.items.isEmpty)
             }
             .padding(18)
         }
-        .frame(minWidth: 680, minHeight: 620)
+        .frame(minWidth: 720, minHeight: 640)
     }
 }
 
@@ -529,10 +789,16 @@ struct LibraryView: View {
     @State private var rowToDelete: LibraryRow?
     @State private var expandedJobIDs: Set<Int> = []
     @State private var queueNotice: String?
-    @AppStorage("libraryShowsSpeakersColumn")
-    private var showsSpeakersColumn = false
-    @AppStorage("libraryShowsProjectSizeColumn")
-    private var showsProjectSizeColumn = false
+    // The "Fichier" + "Actions" columns are always on — they're
+    // the table's reason to exist. Every other column is opt-in.
+    // The first three (status / updated / artefacts) default ON
+    // because they cover the 90 % case; the last two default OFF
+    // so first-time users don't see two empty bonus columns.
+    @AppStorage("libraryShowsStatusColumn") private var showsStatusColumn = true
+    @AppStorage("libraryShowsUpdatedColumn") private var showsUpdatedColumn = true
+    @AppStorage("libraryShowsArtefactsColumn") private var showsArtefactsColumn = true
+    @AppStorage("libraryShowsSpeakersColumn") private var showsSpeakersColumn = false
+    @AppStorage("libraryShowsProjectSizeColumn") private var showsProjectSizeColumn = false
     /// Sort order driving the table — defaults to most-recently
     /// updated first, mirroring what the engine returns from
     /// ``library_list``. Columns toggle between ascending and
@@ -570,6 +836,10 @@ struct LibraryView: View {
             }
             Spacer()
             Menu {
+                Toggle("Statut", isOn: $showsStatusColumn)
+                Toggle("Mis à jour", isOn: $showsUpdatedColumn)
+                Toggle("Artefacts", isOn: $showsArtefactsColumn)
+                Divider()
                 Toggle("Interlocuteurs", isOn: $showsSpeakersColumn)
                 Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
             } label: {
@@ -634,37 +904,46 @@ struct LibraryView: View {
                         }
                         .width(min: 360, ideal: 520)
 
-                        TableColumn("Statut", value: \.sortableStatus) { displayRow in
-                            if displayRow.artifact == nil {
-                                Image(systemName: statusIconName(displayRow.job.status))
-                                    .foregroundStyle(statusColor(displayRow.job.status))
-                                    .help(localizedStatus(displayRow.job.status))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(.leading, 8)
+                        if showsStatusColumn {
+                            TableColumn("Statut", value: \.sortableStatus) { displayRow in
+                                if displayRow.artifact == nil {
+                                    Image(systemName: statusIconName(displayRow.job.status))
+                                        .foregroundStyle(statusColor(displayRow.job.status))
+                                        .help(localizedStatus(displayRow.job.status))
+                                        // Centre the glyph in the column;
+                                        // a left-aligned icon hugged the
+                                        // column edge and read like a list
+                                        // bullet rather than a status.
+                                        .frame(maxWidth: .infinity, alignment: .center)
+                                }
                             }
+                            .width(min: 54, ideal: 64, max: 80)
                         }
-                        .width(min: 54, ideal: 64, max: 80)
 
-                        TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
-                            if displayRow.artifact == nil {
-                                Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
+                        if showsUpdatedColumn {
+                            TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
+                                if displayRow.artifact == nil {
+                                    Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
                             }
+                            .width(min: 140, ideal: 170)
                         }
-                        .width(min: 140, ideal: 170)
 
-                        TableColumn("Artefacts") { displayRow in
-                            if let artifact = displayRow.artifact {
-                                Text(artifactSubtitle(artifact))
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            } else {
-                                ArtifactDots(row: displayRow.job)
+                        if showsArtefactsColumn {
+                            TableColumn("Artefacts") { displayRow in
+                                if let artifact = displayRow.artifact {
+                                    Text(artifactSubtitle(artifact))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                } else {
+                                    ArtifactDots(row: displayRow.job)
+                                }
                             }
+                            .width(min: 190, ideal: 240)
                         }
-                        .width(min: 190, ideal: 240)
 
                         if showsSpeakersColumn {
                             TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
@@ -844,6 +1123,7 @@ struct ModelsView: View {
 struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var updater: UpdateStore
+    @EnvironmentObject private var engine: EngineProcess
     @Environment(\.dismiss) private var dismiss
     @State private var hfStatus = ""
     @State private var isCheckingHF = false
@@ -992,6 +1272,20 @@ struct SettingsView: View {
                 Section("Vocabulaire conservé") {
                     TextEditor(text: $settings.glossary)
                         .frame(minHeight: 130)
+                }
+                Section("Diagnostic") {
+                    // Used to live in the Run Setup form. Moved
+                    // here because exporting logs is a one-off
+                    // troubleshooting action, not something the
+                    // user does on every batch.
+                    Button {
+                        engine.run(arguments: EngineProcess.defaultPythonArguments(["export-logs"]))
+                    } label: {
+                        Label("Exporter les logs", systemImage: "doc.zipper")
+                    }
+                    Text("Une archive ZIP est déposée sur le Bureau pour partage avec le support.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
