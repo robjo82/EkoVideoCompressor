@@ -554,7 +554,7 @@ struct LibraryView: View {
     }
 
     private var libraryHeader: some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Bibliothèque")
                     .font(.largeTitle.bold())
@@ -567,7 +567,12 @@ struct LibraryView: View {
                 Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
             } label: {
                 Label("Colonnes", systemImage: "tablecells")
+                    .labelStyle(.iconOnly)
+                    .frame(width: 24, height: 20)
             }
+            .menuStyle(.button)
+            .fixedSize()
+            .help("Colonnes")
             Button {
                 Task { await library.refresh() }
             } label: {

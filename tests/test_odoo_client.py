@@ -47,11 +47,12 @@ class _FakeResponse:
 def _urlopen_replayer(responses, calls):
     queue = list(responses)
 
-    def fake_urlopen(request, timeout=None):
+    def fake_urlopen(request, timeout=None, context=None):
         calls.append(
             {
                 "url": request.full_url,
                 "timeout": timeout,
+                "context": context,
                 "headers": dict(request.header_items()),
                 "body": json.loads((request.data or b"{}").decode("utf-8")),
             }
@@ -130,6 +131,7 @@ class Json2CallTest(unittest.TestCase):
         self.assertEqual(calls[0]["headers"]["Authorization"], "bearer sk-xxx")
         self.assertEqual(calls[0]["headers"]["X-odoo-database"], "acme")
         self.assertEqual(calls[0]["body"]["domain"], [["name", "ilike", "Robin"]])
+        self.assertIsNotNone(calls[0]["context"])
 
     def test_401_maps_to_auth_error(self):
         body = json.dumps({"message": "Invalid apikey"}).encode("utf-8")

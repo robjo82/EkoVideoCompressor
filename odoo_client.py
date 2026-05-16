@@ -14,6 +14,7 @@ for a friendlier connection status.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import ssl
 import urllib.error
@@ -140,10 +141,33 @@ def _connection_error_message(exc: BaseException) -> str:
     return f"Connexion à Odoo impossible : {exc}"
 
 
-def _tls_diagnostics() -> str:
+def _certifi_cafile() -> str | None:
+    try:
+        import certifi  # type: ignore
+    except Exception:
+        return None
+    try:
+        path = certifi.where()
+    except Exception:
+        return None
+    if path and os.path.exists(path):
+        return path
+    return None
+
+
+def _ssl_context() -> tuple[ssl.SSLContext, str]:
+    cafile = _certifi_cafile()
+    if cafile:
+        return ssl.create_default_context(cafile=cafile), f"certifi:{cafile}"
+    return ssl.create_default_context(), "system-default"
+
+
+def _tls_diagnostics(active_ca: str) -> str:
     paths = ssl.get_default_verify_paths()
     diagnostics = {
+        "active_ca": active_ca,
         "openssl": ssl.OPENSSL_VERSION,
+        "certifi_cafile": _certifi_cafile(),
         "cafile": paths.cafile,
         "capath": paths.capath,
         "openssl_cafile_env": paths.openssl_cafile_env,
@@ -177,10 +201,11 @@ def _json2_call(
     url = f"{_json2_base_url(config)}/{model}/{method}"
     body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
     host = _safe_host(config.url)
+    context, active_ca = _ssl_context()
     append_app_log(
         "odoo_json2_request "
         f"host={host!r} db={config.database.strip()!r} "
-        f"model={model!r} method={method!r}"
+        f"model={model!r} method={method!r} tls_ca={active_ca!r}"
     )
     request = urllib.request.Request(
         url,
@@ -194,7 +219,7 @@ def _json2_call(
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT, context=context) as response:
             raw = response.read().decode("utf-8")
             status = getattr(response, "status", None) or getattr(response, "code", None)
             append_app_log(
@@ -221,7 +246,7 @@ def _json2_call(
         raise OdooError(f"Erreur Odoo HTTP {exc.code} : {message}") from exc
     except (urllib.error.URLError, TimeoutError, OSError, ssl.SSLError, socket.timeout) as exc:
         is_certificate_error = _is_certificate_error(exc)
-        extra = f" tls={tail_text(_tls_diagnostics(), 1200)!r}" if is_certificate_error else ""
+        extra = f" tls={tail_text(_tls_diagnostics(active_ca), 1200)!r}" if is_certificate_error else ""
         append_app_log(
             "odoo_json2_connection_error "
             f"host={host!r} model={model!r} method={method!r} "
