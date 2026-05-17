@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -376,6 +377,7 @@ def search_partners(
     text = (query or "").strip()
     if not text:
         return []
+    started = time.monotonic()
     domain = ["|", ["name", "ilike", text], ["email", "ilike", text]]
     records = _json2_call(
         config,
@@ -388,8 +390,20 @@ def search_partners(
         },
     )
     if not isinstance(records, list):
+        append_app_log(
+            "odoo_partner_search_done "
+            f"host={_safe_host(config.url)!r} query={tail_text(text, 80)!r} "
+            f"limit={int(limit)} count=0 duration_ms={(time.monotonic() - started) * 1000:.0f} "
+            "unexpected_payload=True"
+        )
         return []
-    return [_strip_partner_record(rec) for rec in records if isinstance(rec, dict)]
+    rows = [_strip_partner_record(rec) for rec in records if isinstance(rec, dict)]
+    append_app_log(
+        "odoo_partner_search_done "
+        f"host={_safe_host(config.url)!r} query={tail_text(text, 80)!r} "
+        f"limit={int(limit)} count={len(rows)} duration_ms={(time.monotonic() - started) * 1000:.0f}"
+    )
+    return rows
 
 
 def fetch_partner(config: OdooConfig, partner_id: int) -> dict | None:

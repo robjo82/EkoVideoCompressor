@@ -109,7 +109,8 @@ struct ContentView: View {
             didPreloadSecondaryData = true
             async let libraryLoad: Void = library.rows.isEmpty ? library.refresh() : ()
             async let modelsLoad: Void = models.models.isEmpty ? models.refresh() : ()
-            _ = await (libraryLoad, modelsLoad)
+            async let speakersLoad: Void = library.speakerProfiles.isEmpty ? library.refreshSpeakerProfiles() : ()
+            _ = await (libraryLoad, modelsLoad, speakersLoad)
         }
         .onChange(of: queue.autoRunRequestID) { _, requestID in
             guard requestID != nil else { return }
@@ -127,6 +128,9 @@ struct ContentView: View {
             }
             lastLibraryRefreshAt = now
             Task { await library.refresh() }
+            if event.event == .done {
+                Task { await library.refreshSpeakerProfiles(force: true) }
+            }
         }
     }
 
@@ -3689,10 +3693,12 @@ struct SpeakersView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var odoo: OdooStore
-    @State private var profiles: [SpeakerProfile] = []
-    @State private var loading = false
     @State private var profileToLink: SpeakerProfile?
     @State private var profileToDelete: SpeakerProfile?
+
+    private var profiles: [SpeakerProfile] {
+        library.speakerProfiles
+    }
 
     private var groupedProfiles: [(label: String, profiles: [SpeakerProfile])] {
         // Plain list when nothing's linked yet — avoids fake bucket
@@ -3723,10 +3729,10 @@ struct SpeakersView: View {
                 actionTitle: "Actualiser",
                 actionSystemImage: "arrow.clockwise"
             ) {
-                Task { await reload() }
+                Task { await reload(force: true) }
             }
             Divider()
-            if loading && profiles.isEmpty {
+            if library.speakerProfilesLoading && profiles.isEmpty {
                 ProgressView("Chargement des voix…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if profiles.isEmpty {
@@ -3753,9 +3759,13 @@ struct SpeakersView: View {
                                             canLinkToOdoo: settings.odooConfigured,
                                             onLink: { profileToLink = profile },
                                             onUnlink: {
+                                                let snapshot = library.speakerProfiles
+                                                library.replaceSpeakerProfile(profile.unlinkedFromOdoo())
                                                 Task {
                                                     if let updated = await library.unlinkSpeakerFromOdoo(profile) {
-                                                        replace(profile, with: updated)
+                                                        library.replaceSpeakerProfile(updated)
+                                                    } else {
+                                                        library.restoreSpeakerProfiles(snapshot)
                                                     }
                                                 }
                                             },
@@ -3773,7 +3783,7 @@ struct SpeakersView: View {
         .task { await reload() }
         .sheet(item: $profileToLink) { profile in
             OdooLinkSheet(profile: profile) { updated in
-                replace(profile, with: updated)
+                library.replaceSpeakerProfile(updated)
             }
             .environmentObject(odoo)
             .environmentObject(library)
@@ -3787,9 +3797,13 @@ struct SpeakersView: View {
             presenting: profileToDelete
         ) { profile in
             Button("Supprimer", role: .destructive) {
+                let snapshot = library.speakerProfiles
+                library.removeSpeakerProfileLocally(profile)
                 Task {
-                    await library.deleteSpeakerProfile(profile)
-                    await reload()
+                    let removed = await library.deleteSpeakerProfile(profile)
+                    if !removed {
+                        library.restoreSpeakerProfiles(snapshot)
+                    }
                 }
             }
             Button("Annuler", role: .cancel) {}
@@ -3798,16 +3812,8 @@ struct SpeakersView: View {
         }
     }
 
-    private func reload() async {
-        loading = true
-        profiles = await library.listSpeakerProfiles()
-        loading = false
-    }
-
-    private func replace(_ old: SpeakerProfile, with new: SpeakerProfile) {
-        if let idx = profiles.firstIndex(where: { $0.id == old.id }) {
-            profiles[idx] = new
-        }
+    private func reload(force: Bool = false) async {
+        await library.refreshSpeakerProfiles(force: force)
     }
 }
 
@@ -3834,7 +3840,7 @@ struct SpeakerProfileRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text("\(profile.sample_count) extrait(s)")
+                Text(profile.sampleSummary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -3886,6 +3892,12 @@ struct OdooLinkSheet: View {
     @State private var results: [OdooPartner] = []
     @State private var searching = false
     @State private var debounceTask: Task<Void, Never>?
+
+    init(profile: SpeakerProfile, onLinked: @escaping (SpeakerProfile) -> Void) {
+        self.profile = profile
+        self.onLinked = onLinked
+        _query = State(initialValue: profile.name)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3983,6 +3995,9 @@ struct OdooLinkSheet: View {
             .padding(14)
         }
         .frame(minWidth: 620, minHeight: 460)
+        .task(id: profile.id) {
+            await runSearch(query)
+        }
     }
 
     private func scheduleSearch(_ value: String) {
@@ -3992,20 +4007,29 @@ struct OdooLinkSheet: View {
             results = []
             return
         }
-        debounceTask = Task {
+        debounceTask = Task { @MainActor in
             // Debounce so we don't spam Odoo for every keystroke.
             // 250 ms is short enough to feel instant, long enough
             // to skip mid-word noise.
             try? await Task.sleep(nanoseconds: 250_000_000)
             if Task.isCancelled { return }
-            await MainActor.run { searching = true }
-            let found = await odoo.searchPartners(trimmed)
-            if Task.isCancelled { return }
-            await MainActor.run {
-                results = found
-                searching = false
-            }
+            await runSearch(trimmed)
         }
+    }
+
+    private func runSearch(_ value: String) async {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            results = []
+            searching = false
+            return
+        }
+        searching = true
+        let found = await odoo.searchPartners(trimmed)
+        if query.trimmingCharacters(in: .whitespacesAndNewlines) == trimmed {
+            results = found
+        }
+        searching = false
     }
 
     private func link(_ partner: OdooPartner) {
@@ -4015,7 +4039,9 @@ struct OdooLinkSheet: View {
         // "Sans société".
         let companyId = partner.is_company ? partner.id : (partner.parent_id > 0 ? partner.parent_id : nil)
         let companyName = partner.is_company ? partner.name : partner.parent_name
-        Task {
+        onLinked(profile.linked(to: partner, companyId: companyId, companyName: companyName))
+        dismiss()
+        Task { @MainActor in
             if let updated = await library.linkSpeakerToOdoo(
                 profile,
                 partnerId: partner.id,
@@ -4024,7 +4050,8 @@ struct OdooLinkSheet: View {
                 companyName: companyName
             ) {
                 onLinked(updated)
-                await MainActor.run { dismiss() }
+            } else {
+                onLinked(profile)
             }
         }
     }

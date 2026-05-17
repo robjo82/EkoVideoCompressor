@@ -259,6 +259,34 @@ struct OdooPartner: Codable, Identifiable, Equatable {
     var function: String
 }
 
+extension SpeakerProfile {
+    var sampleSummary: String {
+        if sample_count <= 0 {
+            return "Nom enregistré · voix à apprendre"
+        }
+        return "\(sample_count) extrait\(sample_count > 1 ? "s" : "")"
+    }
+
+    func linked(to partner: OdooPartner, companyId: Int?, companyName: String) -> SpeakerProfile {
+        var copy = self
+        copy.odoo_partner_id = partner.id
+        copy.odoo_partner_name = partner.display_name
+        copy.odoo_company_id = companyId
+        copy.odoo_company_name = companyName
+        return copy
+    }
+
+    func unlinkedFromOdoo() -> SpeakerProfile {
+        var copy = self
+        copy.odoo_partner_id = nil
+        copy.odoo_partner_name = nil
+        copy.odoo_company_id = nil
+        copy.odoo_company_name = nil
+        copy.linked_at = nil
+        return copy
+    }
+}
+
 /// One Odoo ``calendar.event`` suggestion surfaced in Run Setup so
 /// the user can click "this is the meeting" and pre-fill speaker
 /// names + expected count without typing them by hand.

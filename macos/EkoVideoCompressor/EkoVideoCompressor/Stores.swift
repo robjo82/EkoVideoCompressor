@@ -558,6 +558,9 @@ final class LibraryStore: ObservableObject {
     @Published var rows: [LibraryRow] = []
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published var speakerProfiles: [SpeakerProfile] = []
+    @Published var speakerProfilesLoading = false
+    private var speakerProfilesLoaded = false
 
     func refresh() async {
         isLoading = true
@@ -636,6 +639,7 @@ final class LibraryStore: ObservableObject {
             return
         }
         await refresh()
+        await refreshSpeakerProfiles(force: true)
     }
 
     func updateContext(_ row: LibraryRow, speakers: [String: String], technicalTerms: [String]) async {
@@ -742,7 +746,7 @@ final class LibraryStore: ObservableObject {
     /// and the speaker profiles surface (Settings) needs both list
     /// and delete without touching the rest of the library state.
 
-    func listSpeakerProfiles() async -> [SpeakerProfile] {
+    private func fetchSpeakerProfiles() async -> [SpeakerProfile]? {
         let result = await EngineProcess.runCommand(
             arguments: EngineProcess.defaultPythonArguments([
                 "library-list-speaker-profiles",
@@ -751,11 +755,54 @@ final class LibraryStore: ObservableObject {
         )
         if result.status != 0 {
             errorMessage = result.events.last?.message ?? result.rawOutput
-            return []
+            return nil
         }
         return result.lines.compactMap { line in
             try? JSONDecoder().decode(SpeakerProfile.self, from: Data(line.utf8))
         }
+    }
+
+    func refreshSpeakerProfiles(force: Bool = false) async {
+        if speakerProfilesLoaded && !force {
+            return
+        }
+        speakerProfilesLoading = true
+        defer { speakerProfilesLoading = false }
+        guard let profiles = await fetchSpeakerProfiles() else { return }
+        speakerProfiles = profiles
+        speakerProfilesLoaded = true
+    }
+
+    func listSpeakerProfiles(force: Bool = false) async -> [SpeakerProfile] {
+        if speakerProfilesLoaded && !force {
+            return speakerProfiles
+        }
+        await refreshSpeakerProfiles(force: true)
+        return speakerProfiles
+    }
+
+    func replaceSpeakerProfile(_ profile: SpeakerProfile) {
+        if let index = speakerProfiles.firstIndex(where: { $0.id == profile.id }) {
+            speakerProfiles[index] = profile
+        } else {
+            speakerProfiles.append(profile)
+        }
+        sortSpeakerProfiles()
+        speakerProfilesLoaded = true
+    }
+
+    func removeSpeakerProfileLocally(_ profile: SpeakerProfile) {
+        speakerProfiles.removeAll { $0.id == profile.id }
+        speakerProfilesLoaded = true
+    }
+
+    func restoreSpeakerProfiles(_ snapshot: [SpeakerProfile]) {
+        speakerProfiles = snapshot
+        speakerProfilesLoaded = true
+    }
+
+    private func sortSpeakerProfiles() {
+        speakerProfiles.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     @discardableResult
@@ -771,6 +818,7 @@ final class LibraryStore: ObservableObject {
             errorMessage = result.events.last?.message ?? result.rawOutput
             return false
         }
+        removeSpeakerProfileLocally(profile)
         return true
     }
 
@@ -804,6 +852,7 @@ final class LibraryStore: ObservableObject {
         guard let data = result.rawOutput.data(using: .utf8),
               let updated = try? JSONDecoder().decode(SpeakerProfile.self, from: data)
         else { return nil }
+        replaceSpeakerProfile(updated)
         return updated
     }
 
@@ -821,6 +870,7 @@ final class LibraryStore: ObservableObject {
         guard let data = result.rawOutput.data(using: .utf8),
               let updated = try? JSONDecoder().decode(SpeakerProfile.self, from: data)
         else { return nil }
+        replaceSpeakerProfile(updated)
         return updated
     }
 }
@@ -834,6 +884,7 @@ final class LibraryStore: ObservableObject {
 final class OdooStore: ObservableObject {
     @Published var status: ConnectionStatus = .unknown
     @Published var lastError: String?
+    private var partnerSearchCache: [String: [OdooPartner]] = [:]
 
     enum ConnectionStatus: Equatable {
         case unknown
@@ -898,6 +949,10 @@ final class OdooStore: ObservableObject {
         guard let settings, settings.odooConfigured else { return [] }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
+        let cacheKey = "\(settings.odooUrl)|\(settings.odooDatabase)|\(trimmed.lowercased())|\(limit)"
+        if let cached = partnerSearchCache[cacheKey] {
+            return cached
+        }
         let result = await EngineProcess.runCommand(
             arguments: EngineProcess.defaultPythonArguments(
                 ["odoo-search-partners", "--jsonl", "--query", trimmed, "--limit", "\(limit)"]
@@ -910,9 +965,11 @@ final class OdooStore: ObservableObject {
             lastError = result.events.last?.message ?? result.rawOutput
             return []
         }
-        return result.lines.compactMap { line in
+        let partners = result.lines.compactMap { line in
             try? JSONDecoder().decode(OdooPartner.self, from: Data(line.utf8))
         }
+        partnerSearchCache[cacheKey] = partners
+        return partners
     }
 
     /// Detect ``calendar.event`` records around ``moment`` so the

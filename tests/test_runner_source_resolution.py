@@ -19,6 +19,7 @@ from ekovideo_engine.library import database
 from ekovideo_engine.models import JobRequest
 from ekovideo_engine.runner import (
     _auto_rename_job_from_transcript,
+    _merge_declared_speaker_context,
     _resolve_source_path,
 )
 
@@ -274,6 +275,33 @@ class AutoRenameFromTranscriptTest(unittest.TestCase):
 
             self.assertIsNone(title)
             self.assertFalse((row["custom_title"] or "").strip())
+
+
+class SpeakerContextMergeTest(unittest.TestCase):
+    def test_declared_speakers_survive_partial_detection(self):
+        merged = _merge_declared_speaker_context(
+            {"Robin": "Robin"},
+            ["Robin", "Arnaud Maire"],
+        )
+
+        self.assertEqual(merged["Robin"], "Robin")
+        self.assertEqual(merged["Arnaud Maire"], "Arnaud Maire")
+
+    def test_declared_speaker_does_not_duplicate_existing_mapping(self):
+        merged = _merge_declared_speaker_context(
+            {"SPEAKER_00": "Robin"},
+            ["Robin"],
+        )
+
+        self.assertEqual(merged, {"SPEAKER_00": "Robin"})
+
+    def test_declared_name_fills_blank_self_key(self):
+        merged = _merge_declared_speaker_context(
+            {"Arnaud Maire": ""},
+            ["Arnaud Maire"],
+        )
+
+        self.assertEqual(merged, {"Arnaud Maire": "Arnaud Maire"})
 
 
 if __name__ == "__main__":

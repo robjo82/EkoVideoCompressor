@@ -214,6 +214,44 @@ def _auto_rename_job_from_transcript(
     return suggestion
 
 
+def _merge_declared_speaker_context(
+    detected: dict[str, str] | None,
+    declared_names: list[str] | tuple[str, ...] | set[str],
+) -> dict[str, str]:
+    """Keep user-declared participants in the job speaker context.
+
+    The final pipeline map is built from the labels that actually
+    appear in segments. That is the right source for diarisation rows,
+    but it can drop a participant the user declared at launch when the
+    LLM only identified one speaker by name. The library context should
+    preserve explicit user input: those names bias Whisper and should
+    stay available in the row/editor even before a segment has been
+    confidently assigned to them.
+    """
+    merged = dict(detected or {})
+    present: set[str] = set()
+    for key, value in merged.items():
+        key_norm = str(key or "").strip().lower()
+        value_norm = str(value or "").strip().lower()
+        if key_norm:
+            present.add(key_norm)
+        if value_norm:
+            present.add(value_norm)
+
+    for raw_name in declared_names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        norm = name.lower()
+        if norm in present:
+            if name in merged and not str(merged.get(name) or "").strip():
+                merged[name] = name
+            continue
+        merged[name] = name
+        present.add(norm)
+    return merged
+
+
 def _snapshot_workspace_size(db, job_id: int, workspace: Path) -> None:
     """Walk the workspace and store the cumulative byte count.
 
@@ -397,10 +435,13 @@ class EngineRunner:
             # interlocuteur détecté" on every run.
             if pipeline.final_segments:
                 db.add_segments(job_id, pipeline.final_segments)
-            if pipeline.final_speaker_map or pipeline.final_technical_terms:
+            speaker_context = _merge_declared_speaker_context(
+                pipeline.final_speaker_map, declared_speakers
+            )
+            if speaker_context or pipeline.final_technical_terms:
                 db.update_job_context(
                     job_id,
-                    speakers=pipeline.final_speaker_map or None,
+                    speakers=speaker_context or None,
                     technical_terms=pipeline.final_technical_terms or None,
                 )
             db.update_job_progress(job_id, step="Transcription terminée", progress_pct=100, eta_seconds=0)
