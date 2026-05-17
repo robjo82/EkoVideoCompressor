@@ -1001,6 +1001,114 @@ class LibrarySingleRowFetchTest(unittest.TestCase):
                 self.assertIsNone(library_get(424242))
 
 
+class LibraryRenameAutoLinkOdooTest(unittest.TestCase):
+    """When the rename target matches an Odoo meeting attendee, the
+    resulting speaker_profile should be auto-linked to the
+    corresponding ``res.partner``. Pins the link-lookup, the
+    case-insensitive match, and the "leave manual overrides alone"
+    guard."""
+
+    def _create_job_with_segments(self, db, root: Path) -> int:
+        job_id = db.create_job(
+            source_path=str(root / "source.mov"),
+            workspace_dir=str(root / "work"),
+            settings={},
+        )
+        db.add_segments(
+            job_id,
+            [
+                {
+                    "start": 1.0,
+                    "end": 2.0,
+                    "speaker": "SPEAKER_00",
+                    "text": "Bonjour.",
+                },
+            ],
+        )
+        return job_id
+
+    def test_links_new_profile_to_matching_attendee(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = self._create_job_with_segments(db, root)
+                attendee_map = {
+                    "sophie martin": {
+                        "partner_id": 42,
+                        "partner_name": "Sophie Martin",
+                        "company_name": "ACME",
+                    }
+                }
+                result = library_rename_speakers(
+                    job_id,
+                    {"SPEAKER_00": "Sophie Martin"},
+                    attendee_partner_map=attendee_map,
+                )
+                profile = db.get_speaker_profile_by_name("Sophie Martin")
+
+            self.assertEqual(result["speakers_linked_to_odoo"], 1)
+            assert profile is not None
+            self.assertEqual(profile["odoo_partner_id"], 42)
+            self.assertEqual(profile["odoo_partner_name"], "Sophie Martin")
+            self.assertEqual(profile["odoo_company_name"], "ACME")
+
+    def test_skips_when_name_not_in_attendee_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = self._create_job_with_segments(db, root)
+                result = library_rename_speakers(
+                    job_id,
+                    {"SPEAKER_00": "Inconnu"},
+                    attendee_partner_map={
+                        "sophie martin": {"partner_id": 42, "partner_name": "Sophie"}
+                    },
+                )
+                profile = db.get_speaker_profile_by_name("Inconnu")
+
+            self.assertEqual(result["speakers_linked_to_odoo"], 0)
+            assert profile is not None
+            self.assertFalse(profile.get("odoo_partner_id"))
+
+    def test_respects_manual_link_to_different_partner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = self._create_job_with_segments(db, root)
+                # Pre-existing profile already linked to partner 99.
+                db.upsert_speaker_profile(name="Sophie", embedding_json="[]", sample_count=0)
+                existing = db.get_speaker_profile_by_name("Sophie")
+                assert existing is not None
+                db.link_speaker_profile_to_odoo(
+                    int(existing["id"]),
+                    partner_id=99,
+                    partner_name="Manual",
+                    company_id=None,
+                    company_name="",
+                )
+
+                result = library_rename_speakers(
+                    job_id,
+                    {"SPEAKER_00": "Sophie"},
+                    attendee_partner_map={
+                        "sophie": {
+                            "partner_id": 42,
+                            "partner_name": "Sophie From Odoo",
+                            "company_name": "ACME",
+                        }
+                    },
+                )
+                profile = db.get_speaker_profile_by_name("Sophie")
+
+            self.assertEqual(result["speakers_linked_to_odoo"], 0)
+            assert profile is not None
+            self.assertEqual(profile["odoo_partner_id"], 99)
+            self.assertEqual(profile["odoo_partner_name"], "Manual")
+
+
 class LibraryDetachOdooMeetingTest(unittest.TestCase):
     """The hidden "Réunion Odoo" library column lets the user break
     a stale meeting link without a full rerun. The CLI helper writes

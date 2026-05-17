@@ -90,6 +90,15 @@ def build_parser() -> argparse.ArgumentParser:
     rename = sub.add_parser("library-rename-speakers")
     rename.add_argument("job_id", type=int)
     rename.add_argument("--mapping", required=True, help="JSON object or JSON file")
+    # Optional Odoo attendee partner map ``{lowercase_name: {partner_id,
+    # partner_name, company_id?, company_name?}}`` used to auto-link the
+    # speaker profile to a res.partner when the rename target matches an
+    # attendee from the linked calendar.event. Quietly ignored when empty.
+    rename.add_argument(
+        "--attendees",
+        default="",
+        help="JSON object or JSON file with the meeting's attendee partner map",
+    )
 
     samples = sub.add_parser("library-speaker-samples")
     samples.add_argument("job_id", type=int)
@@ -251,7 +260,17 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "library-rename-speakers":
             mapping = _load_json_arg(args.mapping)
-            result = library_rename_speakers(args.job_id, {str(k): str(v) for k, v in mapping.items()})
+            attendee_payload: dict | None = None
+            raw_attendees = (args.attendees or "").strip()
+            if raw_attendees:
+                attendee_payload = _load_json_arg(args.attendees)
+                if not isinstance(attendee_payload, dict):
+                    attendee_payload = None
+            result = library_rename_speakers(
+                args.job_id,
+                {str(k): str(v) for k, v in mapping.items()},
+                attendee_partner_map=attendee_payload,
+            )
             _print_json({"job_id": args.job_id, **result})
             return 0
 
