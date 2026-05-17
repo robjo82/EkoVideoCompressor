@@ -382,27 +382,44 @@ class TranscriptionPipeline:
         overrides = self.request.speaker_overrides or {}
         return [name for name in overrides.values() if (name or "").strip()]
 
-    def _fetch_odoo_context_blob(self) -> str:
-        """Pull the linked Odoo object's chatter, format it for the
-        LLM, return the resulting blob.
+    def _ensure_odoo_pack(self) -> dict:
+        """Lazily fetch (and cache) the recursive Odoo context pack.
 
-        Triggered only when ``request.odoo_context_ref`` is fully
-        populated (model + id + credentials). Failures are silent —
-        we surface a warning event so the SwiftUI status bar shows
-        "Contexte Odoo indisponible", but the LLM step then runs
-        without the bonus context rather than failing the whole job.
+        Behavioural difference vs the old single-record chatter
+        fetch this replaced:
+
+        * We recurse one level into the linked record's neighbours
+          (opportunity → quotations, task → project) so the LLM
+          sees the surrounding business context, not just the
+          calendar invite chatter.
+        * The pack is fetched **once per pipeline run** and the
+          extracted glossary terms are spliced into
+          ``request.glossary_terms`` in place. That mutation is
+          intentional — it lets every downstream consumer (Whisper
+          initial prompt, LLM corrections, per-speaker pass) read
+          the enriched list without each one having to merge
+          again.
+        * Failures stay silent: a broken Odoo just returns
+          ``{summary: "", terms: []}`` and the LLM falls back on
+          the user-typed glossary.
+
+        Returns the pack dict (possibly empty) so callers can read
+        ``summary`` for the LLM corrections prompt.
         """
+        if hasattr(self, "_odoo_pack_cache"):
+            return self._odoo_pack_cache  # type: ignore[has-type]
+
         ref = self.request.odoo_context_ref
         if not ref or not ref.is_actionable():
-            return ""
-        # Lazy imports: ``odoo_client`` already lives at the repo
-        # root so the import works in every test config, but keeping
-        # it lazy means a missing-credentials run pays zero import
-        # cost on the hot path.
+            self._odoo_pack_cache: dict = {}
+            return self._odoo_pack_cache
+
+        # Lazy imports: keeps a missing-credentials run from paying
+        # the import cost on the hot path.
         from odoo_client import (
             OdooConfig,
             OdooError,
-            fetch_object_chatter,
+            fetch_related_context_pack,
         )
 
         self.sink(
@@ -418,7 +435,9 @@ class TranscriptionPipeline:
             api_key=ref.api_key,
         )
         try:
-            payload = fetch_object_chatter(config, ref.model, ref.record_id)
+            pack = fetch_related_context_pack(
+                config, ref.model, ref.record_id
+            )
         except OdooError as exc:
             self.sink(
                 WarningEvent(
@@ -430,23 +449,58 @@ class TranscriptionPipeline:
                 f"engine_odoo_context_failed model={ref.model!r} "
                 f"id={ref.record_id} error={exc!r}"
             )
-            return ""
-        summary = str(payload.get("summary") or "")
-        if not summary:
+            self._odoo_pack_cache = {}
+            return self._odoo_pack_cache
+
+        related_count = len(pack.get("related") or [])
+        term_count = len(pack.get("terms") or [])
+        if not pack.get("summary"):
             self.sink(
                 ProgressEvent(
                     "odoo_context", 100,
                     "Contexte Odoo: aucun message à exploiter",
                 )
             )
-            return ""
-        self.sink(
-            ProgressEvent(
-                "odoo_context", 100,
-                f"Contexte Odoo récupéré ({len(payload.get('messages') or [])} message(s))",
+        else:
+            self.sink(
+                ProgressEvent(
+                    "odoo_context", 100,
+                    f"Contexte Odoo récupéré (+{related_count} record(s) lié(s), "
+                    f"{term_count} terme(s) glossaire)",
+                )
             )
-        )
-        return summary
+
+        # Splice the recovered entity names into the glossary the
+        # initial prompt feeds Whisper. Done case-insensitively to
+        # avoid stacking ``Sophie`` and ``sophie`` and surprising
+        # the user with double mentions in the rename sheet.
+        new_terms = [str(t) for t in (pack.get("terms") or []) if str(t).strip()]
+        if new_terms:
+            existing_keys = {
+                str(t).strip().lower()
+                for t in self.request.glossary_terms
+                if str(t).strip()
+            }
+            appended = [
+                t for t in new_terms if t.strip().lower() not in existing_keys
+            ]
+            if appended:
+                self.request.glossary_terms = [
+                    *self.request.glossary_terms, *appended
+                ]
+                append_app_log(
+                    "engine_odoo_glossary_boost "
+                    f"added={len(appended)} from_pack={term_count}"
+                )
+
+        self._odoo_pack_cache = pack
+        return pack
+
+    def _fetch_odoo_context_blob(self) -> str:
+        """Backwards-compatible wrapper. Returns the recursive pack's
+        ``summary`` so the LLM corrections path keeps its call shape
+        even after the recursion rewrite."""
+        return str(self._ensure_odoo_pack().get("summary") or "")
 
     def _meeting_context(self) -> str:
         """Short topic line surfaced to Whisper as semantic prior.
@@ -478,6 +532,16 @@ class TranscriptionPipeline:
         # apart. Keep the ASR-targeted file for Whisper, give pyannote
         # an unfiltered mono 16 kHz stream.
         diar_wav_path = workspace / "audio.diar.wav"
+
+        # --- step 0: warm the Odoo context pack before Whisper --------
+        # The pack mutates ``request.glossary_terms`` with the
+        # entity names mined from the linked record's neighbours
+        # (opportunity → quotations, task → project, etc.). Doing it
+        # here — before Whisper builds its initial prompt — is what
+        # lets the boost actually bias the transcription rather than
+        # only landing in the LLM correction pass. Cheap no-op when
+        # no Odoo ref is wired.
+        self._ensure_odoo_pack()
 
         # --- step 1: audio extract -------------------------------------
         results.append(self._extract_audio(source_path, wav_path, diar_wav_path))
