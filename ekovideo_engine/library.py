@@ -36,6 +36,32 @@ def library_list(limit: int = 1000, status: str | None = None) -> list[dict[str,
     return database().list_jobs(limit=limit, status=status)
 
 
+def library_get(job_id: int) -> dict[str, Any] | None:
+    """Return a single library row, or ``None`` if the job is gone.
+
+    Added for the SwiftUI ``refreshOne`` path: rather than refetching
+    the entire ``library_list`` (~1000 rows by default) every time the
+    user saves the rename sheet, the app calls this for the specific
+    row that changed and patches it into ``LibraryStore.rows`` in
+    place. Cuts the post-Enregistrer beat from "noticeably laggy" to
+    sub-100 ms on a warm DB.
+    """
+    return database().get_job(job_id)
+
+
+def library_detach_odoo_meeting(job_id: int) -> dict[str, Any]:
+    """Clear ``odoo_meeting_json`` on a job.
+
+    Used by the library's hidden "Réunion Odoo" column to let the
+    user break the link without going through a full re-run. Returns
+    a small audit dict the CLI echoes back so SwiftUI knows the
+    write succeeded.
+    """
+    db = database()
+    db.update_job_odoo_meeting(job_id, None)
+    return {"job_id": job_id, "detached": True}
+
+
 def library_delete(job_id: int, *, remove_files: bool = False) -> dict[str, Any]:
     """Remove a job from the library DB and optionally wipe its
     on-disk workspace.

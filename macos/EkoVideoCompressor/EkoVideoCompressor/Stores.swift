@@ -99,6 +99,11 @@ final class QueueStore: ObservableObject {
     @Published var items: [QueueItem] = []
     @Published var isBatchRunning = false
     @Published var autoRunRequestID: UUID?
+    /// Set when the queue was cancelled by an automated rule rather
+    /// than the user pressing Stop — currently the unplug-during-Max
+    /// guard. The ContentView surfaces this as a one-line banner so
+    /// the user understands why their job stopped on its own.
+    @Published var cancellationReason: String?
 
     func add(
         urls: [URL],
@@ -626,6 +631,47 @@ final class LibraryStore: ObservableObject {
         isLoading = false
     }
 
+    /// Fast path used by the rename sheet (and other edit flows): refetches
+    /// only the row that changed and patches it into ``rows`` in place,
+    /// instead of refetching the entire 1000-row job list. Cuts the
+    /// post-save latency from "noticeable beat" to invisible because
+    /// ``EngineProcess`` doesn't have to spin a new python subprocess
+    /// for the heavy library-list payload — just a single SELECT.
+    ///
+    /// On a missing row (engine returned ``{}``) we drop it from the
+    /// local cache so the table doesn't show ghost entries after a
+    /// concurrent delete from another window.
+    func refreshOne(_ jobId: Int) async {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-get", "\(jobId)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return
+        }
+        let trimmed = result.rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8) else { return }
+        // Empty object marker — engine signals "no such job".
+        if trimmed == "{}" {
+            rows.removeAll { $0.id == jobId }
+            return
+        }
+        guard let row = try? JSONDecoder().decode(LibraryRow.self, from: data) else {
+            // Fall back to a full refresh rather than leaving a stale row
+            // — the engine returned something we can't parse and we'd
+            // rather pay the latency than show out-of-date data.
+            await refresh()
+            return
+        }
+        if let index = rows.firstIndex(where: { $0.id == jobId }) {
+            rows[index] = row
+        } else {
+            rows.insert(row, at: 0)
+        }
+    }
+
     func delete(_ row: LibraryRow, removeFiles: Bool = false) async {
         let previousRows = rows
         rows.removeAll { $0.id == row.id }
@@ -687,8 +733,12 @@ final class LibraryStore: ObservableObject {
             isLoading = false
             return
         }
-        await refresh()
+        // Single-row patch instead of a full library-list reload —
+        // the rename sheet was the worst offender for the post-save
+        // beat (Python startup + 1000-row JSON decode for one edit).
+        await refreshOne(row.id)
         await refreshSpeakerProfiles(force: true)
+        isLoading = false
     }
 
     func updateContext(_ row: LibraryRow, speakers: [String: String], technicalTerms: [String]) async {
@@ -714,7 +764,31 @@ final class LibraryStore: ObservableObject {
             isLoading = false
             return
         }
-        await refresh()
+        await refreshOne(row.id)
+        isLoading = false
+    }
+
+    /// Clears the Odoo meeting/related metadata stored on a job.
+    /// Surfaced from the hidden library columns ("Réunion Odoo" /
+    /// "Opportunité / tâche") via their contextual menu. Detaching
+    /// is a single ``UPDATE`` in the engine, so we use the
+    /// single-row refresh path to avoid the full library reload.
+    func detachOdooMeeting(_ row: LibraryRow) async {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-detach-odoo-meeting",
+                "\(row.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            isLoading = false
+            return
+        }
+        await refreshOne(row.id)
+        isLoading = false
     }
 
     func speakerSamples(_ row: LibraryRow) async -> [SpeakerSample] {

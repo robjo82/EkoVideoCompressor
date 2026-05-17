@@ -15,9 +15,11 @@ from ekovideo_engine.library import (
     database,
     library_delete,
     library_delete_speaker_profile,
+    library_detach_odoo_meeting,
     library_discover_speakers,
     library_enroll_speakers_for_job,
     library_flag_speaker_sample_review,
+    library_get,
     library_link_speaker_profile_to_odoo,
     library_list_speaker_profiles,
     library_recognize_speakers,
@@ -967,6 +969,72 @@ class OdooLinkageTest(unittest.TestCase):
                 self.assertEqual(only["odoo_partner_id"], 11)
                 self.assertEqual(only["odoo_partner_name"], "RIGHT")
                 self.assertEqual(only["odoo_company_id"], 5)
+
+
+class LibrarySingleRowFetchTest(unittest.TestCase):
+    """The SwiftUI ``LibraryStore.refreshOne`` path swaps the
+    1000-row ``library-list`` payload for a single ``library-get``
+    SELECT after rename / context updates. Pin both the happy path
+    and the "row already deleted" branch so the SwiftUI cache
+    doesn't end up out of sync on either."""
+
+    def test_returns_row_when_job_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "x.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                row = library_get(job_id)
+
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row["id"], job_id)
+
+    def test_returns_none_when_job_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                self.assertIsNone(library_get(424242))
+
+
+class LibraryDetachOdooMeetingTest(unittest.TestCase):
+    """The hidden "Réunion Odoo" library column lets the user break
+    a stale meeting link without a full rerun. The CLI helper writes
+    ``odoo_meeting_json = NULL`` on the row — confirm both that the
+    write hits the DB and that re-reading the row sees the cleared
+    value."""
+
+    def test_detach_clears_odoo_meeting_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "x.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                db.update_job_odoo_meeting(
+                    job_id,
+                    {
+                        "event_id": 99,
+                        "event_name": "Atelier RH",
+                        "attendees": [],
+                    },
+                )
+
+                summary = library_detach_odoo_meeting(job_id)
+
+                self.assertEqual(summary["detached"], True)
+                self.assertEqual(summary["job_id"], job_id)
+                row = db.get_job(job_id)
+
+            assert row is not None
+            self.assertFalse((row.get("odoo_meeting_json") or "").strip())
 
 
 if __name__ == "__main__":
