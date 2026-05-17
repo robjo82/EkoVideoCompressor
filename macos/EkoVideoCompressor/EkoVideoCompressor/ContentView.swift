@@ -170,6 +170,14 @@ struct ContentView: View {
             }
             if exitCode == 0 {
                 queue.update(currentItem.id, status: "Terminé", progress: 100)
+                // Only credit vocabulary usage on success — bumping
+                // counts on a cancelled or failed run would skew the
+                // glossary "recently used" sort with terms that never
+                // actually shaped a transcript.
+                let usedTerms = currentItem.selectedGlossaryTerms
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                settings.recordVocabularyUsage(usedTerms)
             } else {
                 queue.update(currentItem.id, status: "Erreur", progress: 0)
             }
@@ -265,7 +273,6 @@ struct ContentView: View {
             odoo_context_ref: contextRef,
             odoo_meeting_metadata: item.odooMeeting
         )
-        settings.recordVocabularyUsage(termsForRun)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("ekovideo-job.json")
         do {
             let data = try JSONEncoder().encode(request)
@@ -3135,6 +3142,12 @@ struct LibraryContextEditor: View {
 
     private func nextSample(for speaker: SpeakerEditRow, count: Int) {
         guard count > 0 else { return }
+        // Stop whatever's currently playing — otherwise the previous
+        // clip keeps running over the new selection until its
+        // duration-bounded teardown task fires. Surprise-cuts the
+        // audio mid-listen, exactly what the user expected when
+        // they clicked Suivant.
+        stopPlayback()
         let rawIndex = sampleIndexBySpeaker[speaker.id] ?? 0
         sampleIndexBySpeaker[speaker.id] = (rawIndex + 1) % count
     }

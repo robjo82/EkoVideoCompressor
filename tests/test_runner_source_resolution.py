@@ -17,7 +17,10 @@ from unittest.mock import patch
 
 from ekovideo_engine.library import database
 from ekovideo_engine.models import JobRequest
-from ekovideo_engine.runner import _resolve_source_path
+from ekovideo_engine.runner import (
+    _auto_rename_job_from_transcript,
+    _resolve_source_path,
+)
 
 
 def _make_request(
@@ -117,6 +120,101 @@ class ResolveSourcePathTest(unittest.TestCase):
             transcription_settings=TranscriptionSettings(),
         )
         self.assertIsNone(_resolve_source_path(request))
+
+
+class AutoRenameFromTranscriptTest(unittest.TestCase):
+    """Pin the post-transcription job-title promotion.
+
+    The library used to display ``Enregistrement de l'écran 2026-...``
+    for every screen recording because the engine never set
+    ``custom_title``. Now we feed the transcript through
+    ``suggest_transcript_stem`` once the run completes — these tests
+    pin that we (a) actually call the suggester, (b) skip when the
+    user already typed a title, and (c) bail silently rather than
+    overwriting with the fallback when the transcript has nothing
+    topical to offer.
+    """
+
+    def _topical_transcript(self) -> str:
+        # Long enough + structured enough that suggest_transcript_stem
+        # passes its >=12 chars + score>=10 gates without us hand-tuning
+        # the topic-word dictionary.
+        return (
+            "[SPEAKER_00] Bonjour, ravi de vous voir.\n"
+            "[SPEAKER_01] Présentation du nouveau module RH "
+            "pour la formation des managers.\n"
+            "[SPEAKER_00] On va parler du planning et du budget "
+            "associé au projet.\n"
+        )
+
+    def test_promotes_topical_title_when_custom_title_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "transcript.txt"
+            transcript.write_text(self._topical_transcript(), encoding="utf-8")
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "Enregistrement de l'écran.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                title = _auto_rename_job_from_transcript(
+                    db,
+                    job_id,
+                    str(transcript),
+                    str(root / "Enregistrement de l'écran.mov"),
+                )
+                row = db.get_job(job_id)
+
+            self.assertIsNotNone(title)
+            self.assertEqual(row["custom_title"], title)
+            self.assertNotEqual(title, "Enregistrement de l'écran")
+
+    def test_respects_existing_custom_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "transcript.txt"
+            transcript.write_text(self._topical_transcript(), encoding="utf-8")
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "x.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                db.update_job_title(job_id, "Mon titre manuel")
+                title = _auto_rename_job_from_transcript(
+                    db, job_id, str(transcript), str(root / "x.mov")
+                )
+                row = db.get_job(job_id)
+
+            self.assertIsNone(title)
+            self.assertEqual(row["custom_title"], "Mon titre manuel")
+
+    def test_bails_when_transcript_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "x.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                title = _auto_rename_job_from_transcript(
+                    db, job_id, str(root / "missing.txt"), str(root / "x.mov")
+                )
+                row = db.get_job(job_id)
+
+            self.assertIsNone(title)
+            self.assertFalse((row["custom_title"] or "").strip())
 
 
 if __name__ == "__main__":
