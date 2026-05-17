@@ -36,11 +36,28 @@ class EngineCliTest(unittest.TestCase):
         self.assertEqual(lines[-1]["event"], "done")
         self.assertTrue(lines[-1]["summary"]["ok"])
 
-    def test_model_list_contains_audio_family(self):
+    def test_model_list_contains_every_role(self):
+        # Catalog now carries ``role`` per entry so the Models tab
+        # can group them into Transcription / Multipass / Text LLM
+        # / Audio LLM / Diarisation / Embedding buckets. Pin that
+        # all six show up.
         proc = self._run("model-list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = json.loads(proc.stdout)
-        self.assertTrue(any(row["family"] == "audio_llm" for row in rows))
+        roles = {row.get("role") for row in rows}
+        expected = {
+            "transcription", "multipass", "text_llm",
+            "audio_llm", "diarisation", "embedding",
+        }
+        self.assertEqual(roles & expected, expected)
+        # Each row must carry the metadata the SwiftUI tab consumes.
+        for row in rows:
+            self.assertIn("role", row)
+            self.assertIn("size_mb", row)
+            self.assertIn("tier", row)
+            self.assertIn("language", row)
+            self.assertIn("default", row)
+            self.assertIn("gated", row)
 
     def test_library_list_uses_configurable_support_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

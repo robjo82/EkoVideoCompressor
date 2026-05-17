@@ -41,6 +41,7 @@ from transcription_utils import (
     build_llm_corrections_cmd,
     build_llm_title_cmd,
     build_mlx_whisper_cmd,
+    canonical_multipass_model_id,
     default_transcript_path,
     fuse_micro_turns,
     parse_diarization_output,
@@ -916,7 +917,11 @@ class TranscriptionPipeline:
             )
             return None, segments
 
-        repass_model = "mlx-community/whisper-large-v3"
+        # User-selectable in Settings (Models tab) since the
+        # role-based refactor. ``canonical_multipass_model_id``
+        # falls back to ``whisper-large-v3-mlx`` when the user
+        # hasn't picked anything, preserving the previous default.
+        repass_model = canonical_multipass_model_id(settings.multipass_model)
         self.sink(
             ProgressEvent(
                 "multipass",

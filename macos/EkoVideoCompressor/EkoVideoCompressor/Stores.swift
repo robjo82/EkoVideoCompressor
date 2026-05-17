@@ -201,6 +201,13 @@ final class SettingsStore: ObservableObject {
     @AppStorage("hfToken") var hfToken = ""
     @AppStorage("githubToken") var githubToken = ""
     @AppStorage("whisperModel") var whisperModel = "mlx-community/whisper-large-v3-turbo"
+    // Active models for the other roles the Models tab now lists.
+    // Defaults match the catalog's ``"default": True`` entries so a
+    // first-run user still gets the recommended setup without
+    // having to click "Activer" once.
+    @AppStorage("multipassModel") var multipassModel = "mlx-community/whisper-large-v3-mlx"
+    @AppStorage("textLlmModel") var textLlmModel = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+    @AppStorage("audioLlmModel") var audioLlmModel = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
     @AppStorage("processingMode") var processingMode = "compress_transcribe"
     @AppStorage("outputFormat") var outputFormat = "txt"
     @AppStorage("audioRecheckEnabled") var audioRecheckEnabled = false
@@ -993,10 +1000,62 @@ final class ModelStore: ObservableObject {
     }
 }
 
+/// One catalogue entry as returned by the engine's
+/// ``model_catalog`` CLI. Each row carries the metadata the role-
+/// grouped Models tab needs: ``role`` decides which section the
+/// row lives in, ``size_mb`` powers the download-confirmation
+/// dialog, ``tier`` colours the recommendation badge.
 struct ModelRow: Codable, Identifiable {
     var id: String
     var family: String
     var label: String
+    var role: String
+    var size_mb: Int
+    var tier: String
+    var language: [String]
+    var `default`: Bool
+    var gated: Bool
     var cached: Bool
     var cache_dir: String
+
+    /// Composite identity: the same Whisper checkpoint can appear
+    /// in both the ``transcription`` and ``multipass`` roles. The
+    /// tab uses ``(id, role)`` everywhere so the "Activer" button
+    /// targets the right slot without ambiguity.
+    var compositeID: String { "\(role)|\(id)" }
+
+    enum CodingKeys: String, CodingKey {
+        case id, family, label, role, size_mb, tier, language, cached, cache_dir, gated
+        case isDefault = "default"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        family = try c.decode(String.self, forKey: .family)
+        label = try c.decode(String.self, forKey: .label)
+        role = try c.decodeIfPresent(String.self, forKey: .role) ?? "transcription"
+        size_mb = try c.decodeIfPresent(Int.self, forKey: .size_mb) ?? 0
+        tier = try c.decodeIfPresent(String.self, forKey: .tier) ?? "balanced"
+        language = try c.decodeIfPresent([String].self, forKey: .language) ?? ["multi"]
+        `default` = try c.decodeIfPresent(Bool.self, forKey: .isDefault) ?? false
+        gated = try c.decodeIfPresent(Bool.self, forKey: .gated) ?? false
+        cached = try c.decode(Bool.self, forKey: .cached)
+        cache_dir = try c.decode(String.self, forKey: .cache_dir)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(family, forKey: .family)
+        try c.encode(label, forKey: .label)
+        try c.encode(role, forKey: .role)
+        try c.encode(size_mb, forKey: .size_mb)
+        try c.encode(tier, forKey: .tier)
+        try c.encode(language, forKey: .language)
+        try c.encode(self.default, forKey: .isDefault)
+        try c.encode(gated, forKey: .gated)
+        try c.encode(cached, forKey: .cached)
+        try c.encode(cache_dir, forKey: .cache_dir)
+    }
 }

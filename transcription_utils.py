@@ -33,34 +33,83 @@ PYANNOTE_COMMUNITY_MODEL = "pyannote/speaker-diarization-community-1"
 # (3 B, 4-bit) and a stronger option for M4 Max (14 B, 4-bit).
 # ---------------------------------------------------------------------------
 
+#
+# Each catalogue entry now carries:
+#   - ``id``       canonical Hugging Face repo
+#   - ``label``    short human-readable name (without the role)
+#   - ``family``   model family (Whisper / Mistral / Qwen / …)
+#   - ``role``     where the engine uses it
+#                  (transcription / multipass / text_llm / audio_llm /
+#                  diarisation / embedding)
+#   - ``size_mb``  approximate on-disk weight in MB (post-quantisation)
+#   - ``tier``     coarse hardware target (``light`` / ``balanced`` /
+#                  ``heavy``) the SwiftUI tab uses to colour-code
+#                  recommendations
+#   - ``language`` optional ISO 639-1 list (defaults to ["multi"])
+#
+# Keep the lists short and curated — power users can override with
+# any HF repo by typing the id directly in Settings, the catalogue
+# is just what the Models tab surfaces.
+
+
+_TRANSCRIPTION_ROLE = "transcription"
+_MULTIPASS_ROLE = "multipass"
+_TEXT_LLM_ROLE = "text_llm"
+_AUDIO_LLM_ROLE = "audio_llm"
+_DIARISATION_ROLE = "diarisation"
+_EMBEDDING_ROLE = "embedding"
+
+
 TEXT_LLM_MODELS: list[dict] = [
     {
         "id": "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
-        "label": "Mistral 7B Instruct · 4-bit (~4 Go) — recommandé",
+        "label": "Mistral 7B Instruct · 4-bit",
         "family": "Mistral",
+        "role": _TEXT_LLM_ROLE,
+        "size_mb": 4100,
+        "tier": "balanced",
+        "language": ["fr", "en", "multi"],
+        "default": True,
     },
     {
         "id": "mlx-community/Llama-3.2-3B-Instruct-4bit",
-        "label": "Llama 3.2 3B Instruct · 4-bit (~2 Go) — léger (M1)",
+        "label": "Llama 3.2 3B Instruct · 4-bit",
         "family": "Llama",
+        "role": _TEXT_LLM_ROLE,
+        "size_mb": 2000,
+        "tier": "light",
+        "language": ["fr", "en", "multi"],
     },
     {
         "id": "mlx-community/Qwen2.5-7B-Instruct-4bit",
-        "label": "Qwen 2.5 7B Instruct · 4-bit (~4 Go)",
+        "label": "Qwen 2.5 7B Instruct · 4-bit",
         "family": "Qwen",
+        "role": _TEXT_LLM_ROLE,
+        "size_mb": 4400,
+        "tier": "balanced",
+        "language": ["fr", "en", "multi"],
     },
     {
         "id": "mlx-community/Qwen2.5-14B-Instruct-4bit",
-        "label": "Qwen 2.5 14B Instruct · 4-bit (~8 Go) — qualité supérieure (M4 Max)",
+        "label": "Qwen 2.5 14B Instruct · 4-bit",
         "family": "Qwen",
+        "role": _TEXT_LLM_ROLE,
+        "size_mb": 8200,
+        "tier": "heavy",
+        "language": ["fr", "en", "multi"],
     },
 ]
 
 AUDIO_LLM_MODELS: list[dict] = [
     {
         "id": "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
-        "label": "Qwen2-Audio 7B Instruct · 4-bit (~4 Go) — recommandé",
+        "label": "Qwen2-Audio 7B Instruct · 4-bit",
         "family": "Qwen-Audio",
+        "role": _AUDIO_LLM_ROLE,
+        "size_mb": 4500,
+        "tier": "balanced",
+        "language": ["multi"],
+        "default": True,
     },
 ]
 
@@ -81,19 +130,170 @@ LEGACY_WHISPER_MODEL_IDS: dict[str, str] = {
 WHISPER_MODELS: list[dict] = [
     {
         "id": "mlx-community/whisper-large-v3-turbo",
-        "label": "Whisper Large v3 Turbo · rapide — recommandé",
+        "label": "Whisper Large v3 Turbo",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 1600,
+        "tier": "balanced",
+        "language": ["multi"],
+        "default": True,
     },
     {
         "id": "mlx-community/whisper-large-v3-mlx",
-        "label": "Whisper Large v3 · qualité maximale",
+        "label": "Whisper Large v3",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 2900,
+        "tier": "heavy",
+        "language": ["multi"],
+    },
+    {
+        "id": "mlx-community/distil-whisper-large-v3",
+        "label": "Distil-Whisper Large v3 (rapide)",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 1500,
+        "tier": "balanced",
+        "language": ["en"],
     },
     {
         "id": "mlx-community/whisper-medium-mlx",
-        "label": "Whisper Medium · léger",
+        "label": "Whisper Medium",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 1500,
+        "tier": "light",
+        "language": ["multi"],
+    },
+    {
+        "id": "mlx-community/whisper-small-mlx",
+        "label": "Whisper Small",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 970,
+        "tier": "light",
+        "language": ["multi"],
+    },
+    {
+        "id": "mlx-community/whisper-base-mlx",
+        "label": "Whisper Base",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 290,
+        "tier": "light",
+        "language": ["multi"],
+    },
+    {
+        "id": "mlx-community/whisper-tiny-mlx",
+        "label": "Whisper Tiny (temps réel)",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 140,
+        "tier": "light",
+        "language": ["multi"],
+    },
+    # French-fine-tuned distilled checkpoint published by bofenghuang.
+    # Slightly stricter cadence on French than the multilingual large
+    # but much faster than the full large-v3 model. Tagged ``balanced``
+    # because it's a great default for French-only meetings.
+    {
+        "id": "bofenghuang/whisper-large-v3-french-distil-dec16",
+        "label": "Whisper Large v3 French (distil)",
+        "family": "Whisper",
+        "role": _TRANSCRIPTION_ROLE,
+        "size_mb": 2300,
+        "tier": "balanced",
+        "language": ["fr"],
+    },
+]
+
+
+# Models the engine runs in the *multipass* repass slot — the
+# higher-accuracy second pass triggered on low-confidence Whisper
+# segments. Today the pipeline hardcoded ``whisper-large-v3-mlx``;
+# the new Models tab exposes the alternatives so a user with the
+# headroom can pin a stronger checkpoint.
+MULTIPASS_MODELS: list[dict] = [
+    {
+        "id": "mlx-community/whisper-large-v3-mlx",
+        "label": "Whisper Large v3",
+        "family": "Whisper",
+        "role": _MULTIPASS_ROLE,
+        "size_mb": 2900,
+        "tier": "heavy",
+        "language": ["multi"],
+        "default": True,
+    },
+    {
+        "id": "bofenghuang/whisper-large-v3-french-distil-dec16",
+        "label": "Whisper Large v3 French (distil)",
+        "family": "Whisper",
+        "role": _MULTIPASS_ROLE,
+        "size_mb": 2300,
+        "tier": "balanced",
+        "language": ["fr"],
+    },
+    {
+        "id": "mlx-community/whisper-large-v3-turbo",
+        "label": "Whisper Large v3 Turbo (rapide)",
+        "family": "Whisper",
+        "role": _MULTIPASS_ROLE,
+        "size_mb": 1600,
+        "tier": "balanced",
+        "language": ["multi"],
+    },
+]
+
+
+# Pyannote pipelines the engine wires for diarisation + embedding.
+# Surfaced read-only in the Models tab: not user-selectable today —
+# the pipeline picks the first one the user's HF token can access.
+# The Models tab uses these entries to render a "Diarisation"
+# section with an explanation + a link to accept the gated repo
+# licences when the model isn't yet downloaded.
+DIARISATION_MODELS: list[dict] = [
+    {
+        "id": "pyannote/speaker-diarization-community-1",
+        "label": "pyannote · speaker-diarization-community-1",
+        "family": "Pyannote",
+        "role": _DIARISATION_ROLE,
+        "size_mb": 100,
+        "tier": "balanced",
+        "language": ["multi"],
+        "default": True,
+        "gated": True,
+    },
+    {
+        "id": "pyannote/speaker-diarization-3.1",
+        "label": "pyannote · speaker-diarization-3.1 (fallback)",
+        "family": "Pyannote",
+        "role": _DIARISATION_ROLE,
+        "size_mb": 100,
+        "tier": "balanced",
+        "language": ["multi"],
+        "gated": True,
+    },
+    {
+        "id": "pyannote/embedding",
+        "label": "pyannote · embedding (reconnaissance vocale)",
+        "family": "Pyannote",
+        "role": _EMBEDDING_ROLE,
+        "size_mb": 90,
+        "tier": "light",
+        "language": ["multi"],
+        "gated": True,
     },
 ]
 
 DEFAULT_WHISPER_MODEL = WHISPER_MODELS[0]["id"]
+DEFAULT_MULTIPASS_MODEL = MULTIPASS_MODELS[0]["id"]
+
+
+def canonical_multipass_model_id(model_id: str) -> str:
+    raw = (model_id or "").strip()
+    if not raw:
+        return DEFAULT_MULTIPASS_MODEL
+    return LEGACY_WHISPER_MODEL_IDS.get(raw, raw)
 
 
 def canonical_whisper_model_id(model_id: str) -> str:

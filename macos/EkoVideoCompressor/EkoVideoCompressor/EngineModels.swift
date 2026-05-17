@@ -399,6 +399,9 @@ struct TranscriptionSettings: Codable {
     var hf_token = ""
     var text_llm_model = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
     var audio_llm_model = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+    /// User-selected repass model. Empty string lets the engine fall
+    /// back to the catalog default (Whisper Large v3).
+    var multipass_model = ""
     var audio_recheck_enabled = false
     var vad_enabled = true
     var multipass_enabled = true

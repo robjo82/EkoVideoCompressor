@@ -246,6 +246,9 @@ struct ContentView: View {
                 output_format: settings.outputFormat,
                 diarization_enabled: settings.diarizationEnabled,
                 hf_token: settings.hfToken,
+                text_llm_model: settings.textLlmModel,
+                audio_llm_model: settings.audioLlmModel,
+                multipass_model: settings.multipassModel,
                 audio_recheck_enabled: settings.audioRecheckEnabled,
                 quality_preset: TranscriptionQualityPreset(
                     rawValue: settings.qualityPreset
@@ -1772,23 +1775,16 @@ struct ModelsView: View {
                     message: "Actualisez pour afficher les modèles Whisper, texte et audio."
                 )
             } else {
-                Table(models.models) {
-                    TableColumn("Modèle") { row in
-                        VStack(alignment: .leading) {
-                            Text(row.label)
-                                .font(.headline)
-                            Text(row.id)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 18) {
+                        ForEach(ModelRole.displayOrder, id: \.self) { role in
+                            let rows = models.models.filter { $0.role == role.rawValue }
+                            if !rows.isEmpty {
+                                ModelRoleSection(role: role, rows: rows)
+                            }
                         }
                     }
-                    TableColumn("Famille", value: \.family)
-                    TableColumn("État") { row in
-                        StatusText(row.cached ? "Téléchargé" : "À télécharger")
-                    }
-                    TableColumn("Actions") { row in
-                        ModelActionsView(row: row)
-                    }
+                    .padding(20)
                 }
                 .overlay(alignment: .bottomLeading) {
                     if let message = models.errorMessage, !message.isEmpty {
@@ -1804,6 +1800,330 @@ struct ModelsView: View {
             }
         }
     }
+}
+
+/// Discrete model-role buckets the Models tab renders. The raw
+/// value matches the engine catalogue's ``role`` field exactly so
+/// filtering stays a single string compare.
+enum ModelRole: String, Hashable, CaseIterable {
+    case transcription
+    case multipass
+    case textLLM = "text_llm"
+    case audioLLM = "audio_llm"
+    case diarisation
+    case embedding
+
+    static var displayOrder: [ModelRole] {
+        [.transcription, .multipass, .diarisation, .textLLM, .audioLLM, .embedding]
+    }
+
+    var title: String {
+        switch self {
+        case .transcription: "Transcription"
+        case .multipass: "Repasse qualité maximale"
+        case .diarisation: "Diarisation (détection des locuteurs)"
+        case .textLLM: "Correction textuelle (LLM)"
+        case .audioLLM: "Vérification multimodale (LLM audio)"
+        case .embedding: "Empreinte vocale"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .transcription:
+            return "Le moteur Whisper qui transforme l'audio en texte. Choix par défaut pour chaque réunion."
+        case .multipass:
+            return "Re-transcrit les zones où Whisper hésite, avec un modèle plus précis. Optionnel."
+        case .diarisation:
+            return "Identifie qui parle quand. Modèles pyannote — licence à accepter sur Hugging Face."
+        case .textLLM:
+            return "Corrige les noms propres et termes métier après transcription."
+        case .audioLLM:
+            return "Ré-écoute les passages douteux pour vérifier les mots peu clairs. Expérimental."
+        case .embedding:
+            return "Convertit les voix en empreintes pour reconnaître automatiquement vos interlocuteurs."
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .transcription: "waveform"
+        case .multipass: "arrow.triangle.2.circlepath"
+        case .diarisation: "person.2.wave.2"
+        case .textLLM: "text.badge.checkmark"
+        case .audioLLM: "ear.badge.waveform"
+        case .embedding: "person.crop.circle.badge.checkmark"
+        }
+    }
+
+    /// Whether the role's "Activer" button is hooked into a real
+    /// SwiftUI ``@AppStorage`` knob. Pyannote roles are read-only:
+    /// the engine picks them from a fixed list, no user choice.
+    var isUserSelectable: Bool {
+        switch self {
+        case .transcription, .multipass, .textLLM, .audioLLM:
+            return true
+        case .diarisation, .embedding:
+            return false
+        }
+    }
+}
+
+struct ModelRoleSection: View {
+    @EnvironmentObject private var settings: SettingsStore
+    let role: ModelRole
+    let rows: [ModelRow]
+
+    /// AppStorage key currently active for this role, or ``nil``
+    /// when the role is read-only (pyannote).
+    private var activeID: String? {
+        switch role {
+        case .transcription: return settings.whisperModel
+        case .multipass: return settings.multipassModel
+        case .textLLM: return settings.textLlmModel
+        case .audioLLM: return settings.audioLlmModel
+        case .diarisation, .embedding:
+            // Engine picks the first cached entry; the section
+            // displays it as "actif" so the user understands which
+            // gated repo is in use.
+            return rows.first(where: { $0.cached })?.id ?? rows.first?.id
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: role.icon)
+                    .font(.title2)
+                    .foregroundStyle(.teal)
+                    .frame(width: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(role.title)
+                        .font(.title3.weight(.semibold))
+                    Text(role.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let activeRow = rows.first(where: { $0.id == activeID }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.teal)
+                        Text(activeRow.label)
+                            .font(.callout.weight(.medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(.teal.opacity(0.12), in: Capsule())
+                }
+            }
+            VStack(spacing: 4) {
+                ForEach(rows, id: \.compositeID) { row in
+                    ModelRoleRow(
+                        row: row,
+                        role: role,
+                        isActive: row.id == activeID
+                    )
+                }
+            }
+        }
+    }
+}
+
+struct ModelRoleRow: View {
+    @EnvironmentObject private var models: ModelStore
+    @EnvironmentObject private var settings: SettingsStore
+    let row: ModelRow
+    let role: ModelRole
+    let isActive: Bool
+
+    @State private var pendingDownload: ModelRow?
+
+    private var tierBadge: (label: String, color: Color)? {
+        switch row.tier {
+        case "light": return ("Léger", .green)
+        case "balanced": return ("Équilibré", .blue)
+        case "heavy": return ("Lourd", .orange)
+        default: return nil
+        }
+    }
+
+    private var languageBadge: String? {
+        let langs = row.language.filter { $0 != "multi" }
+        if langs.isEmpty { return nil }
+        return langs.joined(separator: "/").uppercased()
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(row.label)
+                        .font(.callout.weight(isActive ? .semibold : .regular))
+                    if row.default {
+                        Text("Recommandé")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.secondary.opacity(0.15), in: Capsule())
+                    }
+                    if let badge = tierBadge {
+                        Text(badge.label)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(badge.color.opacity(0.15), in: Capsule())
+                            .foregroundStyle(badge.color)
+                    }
+                    if let lang = languageBadge {
+                        Text(lang)
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.purple.opacity(0.12), in: Capsule())
+                            .foregroundStyle(.purple)
+                    }
+                    if row.gated {
+                        Image(systemName: "lock.shield")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help("Modèle protégé Hugging Face — acceptez la licence avant le premier téléchargement.")
+                    }
+                }
+                HStack(spacing: 6) {
+                    Text(row.id)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if row.size_mb > 0 {
+                        Text("· \(formattedSize(row.size_mb))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Spacer()
+            // State badge — clearer than the previous "État" column.
+            if row.cached {
+                Label("Téléchargé", systemImage: "internaldrive.fill")
+                    .labelStyle(.iconOnly)
+                    .foregroundStyle(.green)
+                    .help("Modèle disponible localement")
+            } else {
+                Label("Non téléchargé", systemImage: "icloud.and.arrow.down")
+                    .labelStyle(.iconOnly)
+                    .foregroundStyle(.secondary)
+                    .help("Sera téléchargé au premier usage si activé")
+            }
+
+            // Activate button — only meaningful on user-selectable
+            // roles. Pyannote rows show "Verrouillé" instead.
+            if role.isUserSelectable {
+                if isActive {
+                    Label("Actif", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.teal)
+                        .font(.caption.weight(.medium))
+                } else {
+                    Button {
+                        activate()
+                    } label: {
+                        Label("Activer", systemImage: row.cached ? "checkmark" : "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help(
+                        row.cached
+                            ? "Utiliser ce modèle pour la suite"
+                            : "Télécharger (~\(formattedSize(row.size_mb))) puis activer"
+                    )
+                }
+            } else {
+                Text("Géré par le moteur")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if row.cached {
+                Button {
+                    Task { await models.delete(row) }
+                } label: {
+                    Label("Supprimer", systemImage: "trash")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .help("Libérer l'espace disque")
+            }
+            Button {
+                revealInFinder(row.cache_dir)
+            } label: {
+                Label("Cache", systemImage: "folder")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .help("Afficher le dossier de cache")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            (isActive ? Color.teal.opacity(0.06) : Color(nsColor: .controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(isActive ? Color.teal.opacity(0.5) : Color.clear, lineWidth: 1)
+        )
+        .disabled(models.isLoading)
+        .confirmationDialog(
+            "Télécharger ce modèle ?",
+            isPresented: Binding(
+                get: { pendingDownload != nil },
+                set: { if !$0 { pendingDownload = nil } }
+            ),
+            presenting: pendingDownload
+        ) { row in
+            Button("Télécharger (~\(formattedSize(row.size_mb)))") {
+                Task {
+                    await models.download(row)
+                    // After download, activate the model. If the
+                    // download failed, ``errorMessage`` carries the
+                    // reason — we still flip the AppStorage so the
+                    // user can retry next time.
+                    setActive(row.id)
+                }
+            }
+            Button("Annuler", role: .cancel) {}
+        } message: { row in
+            Text("\(row.label) sera téléchargé depuis Hugging Face (\(formattedSize(row.size_mb))) puis défini comme actif.")
+        }
+    }
+
+    private func activate() {
+        if row.cached {
+            setActive(row.id)
+        } else {
+            pendingDownload = row
+        }
+    }
+
+    private func setActive(_ modelID: String) {
+        switch role {
+        case .transcription: settings.whisperModel = modelID
+        case .multipass: settings.multipassModel = modelID
+        case .textLLM: settings.textLlmModel = modelID
+        case .audioLLM: settings.audioLlmModel = modelID
+        case .diarisation, .embedding: break  // read-only
+        }
+    }
+}
+
+private func formattedSize(_ mb: Int) -> String {
+    guard mb > 0 else { return "—" }
+    if mb >= 1024 {
+        let gb = Double(mb) / 1024.0
+        return String(format: "%.1f Go", gb)
+    }
+    return "\(mb) Mo"
 }
 
 struct VocabularyView: View {
@@ -3254,40 +3574,10 @@ struct LibraryDeletionSheet: View {
     }
 }
 
-struct ModelActionsView: View {
-    @EnvironmentObject private var models: ModelStore
-    var row: ModelRow
-
-    var body: some View {
-        HStack(spacing: 6) {
-            if row.cached {
-                Button {
-                    Task { await models.delete(row) }
-                } label: {
-                    Label("Supprimer", systemImage: "trash")
-                }
-                .labelStyle(.iconOnly)
-                .help("Supprimer le modèle local")
-            } else {
-                Button {
-                    Task { await models.download(row) }
-                } label: {
-                    Label("Télécharger", systemImage: "arrow.down.circle")
-                }
-                .labelStyle(.iconOnly)
-                .help("Pré-télécharger le modèle")
-            }
-            Button {
-                revealInFinder(row.cache_dir)
-            } label: {
-                Label("Cache", systemImage: "folder")
-            }
-            .labelStyle(.iconOnly)
-            .help("Afficher le dossier de cache")
-        }
-        .disabled(models.isLoading)
-    }
-}
+// ``ModelActionsView`` was deleted in the Models tab refactor.
+// Actions now live inside ``ModelRoleRow`` so the same row carries
+// download / activate / delete / reveal-in-Finder side by side
+// with the model's metadata and the "Actif" badge.
 
 struct ArtifactDot: View {
     var label: String
