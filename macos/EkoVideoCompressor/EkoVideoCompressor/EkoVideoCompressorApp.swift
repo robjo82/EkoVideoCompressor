@@ -54,6 +54,10 @@ struct RootView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var models: ModelStore
     @State private var isReady = false
+    /// Once-only flag for the post-PR #30 heal pass. Bump the suffix
+    /// when introducing a new migration that needs to run again.
+    /// ``@AppStorage`` persists this across launches automatically.
+    @AppStorage("librarySpeakerMapsRepaired_v1") private var speakerMapsRepaired = false
 
     var body: some View {
         ZStack {
@@ -88,6 +92,19 @@ struct RootView: View {
             // the background so any error surfaces in the Models tab
             // without the user seeing a half-loaded list mid-render.
             _ = await modelsLoad
+            // One-shot heal pass for ``speaker_map_json`` drift that
+            // PR #30 left on disk. Runs after the user has the UI
+            // (so it never blocks launch), once per app version,
+            // and refreshes the library when it touched anything so
+            // the displayed speaker names reflect the cleanup
+            // without a manual reload.
+            if !speakerMapsRepaired {
+                if let summary = await library.repairSpeakerMaps(),
+                   (summary["repaired"] ?? 0) > 0 {
+                    await library.refresh()
+                }
+                speakerMapsRepaired = true
+            }
         }
     }
 }

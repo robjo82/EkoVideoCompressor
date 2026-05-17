@@ -25,6 +25,7 @@ from ekovideo_engine.library import (
     library_recognize_speakers,
     library_remember_speaker_names,
     library_rename_speakers,
+    library_repair_all_speaker_maps,
     library_speaker_samples,
     library_unlink_speaker_profile_from_odoo,
     library_workspace_usage,
@@ -1107,6 +1108,107 @@ class LibraryRenameAutoLinkOdooTest(unittest.TestCase):
             assert profile is not None
             self.assertEqual(profile["odoo_partner_id"], 99)
             self.assertEqual(profile["odoo_partner_name"], "Manual")
+
+
+class LibraryRepairSpeakerMapsTest(unittest.TestCase):
+    """One-shot heal pass triggered at app launch (post PR #30).
+    Pins:
+
+    * A drifted map gets rebuilt from segments.
+    * A canonical map stays untouched (no needless writes).
+    * Jobs without any segments are skipped (don't replace whatever
+      the user might have entered with ``{}``).
+    """
+
+    def _seed_job(
+        self,
+        db,
+        root: Path,
+        *,
+        segments: list[dict],
+        stored_speaker_map: dict[str, str] | None,
+    ) -> int:
+        job_id = db.create_job(
+            source_path=str(root / "x.mov"),
+            workspace_dir=str(root / "ws"),
+            settings={},
+        )
+        if segments:
+            db.add_segments(job_id, segments)
+        if stored_speaker_map is not None:
+            db.update_job_context(job_id, speakers=stored_speaker_map)
+        return job_id
+
+    def test_rebuilds_drifted_map_from_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = self._seed_job(
+                    db,
+                    root,
+                    segments=[
+                        {"start": 0.0, "end": 1.0, "speaker": "Robin", "text": "Hi."},
+                        {"start": 1.0, "end": 2.0, "speaker": "Sophie", "text": "Hi."},
+                    ],
+                    # Drift: cluster IDs that no longer exist in segments.
+                    stored_speaker_map={"SPEAKER_01": "Robin", "SPEAKER_00": "Sophie"},
+                )
+
+                summary = library_repair_all_speaker_maps()
+                row = db.get_job(job_id)
+
+            self.assertEqual(summary["repaired"], 1)
+            self.assertEqual(summary["unchanged"], 0)
+            self.assertEqual(summary["skipped_no_segments"], 0)
+            assert row is not None
+            persisted = json.loads(row["speaker_map_json"])
+            self.assertEqual(persisted, {"Robin": "Robin", "Sophie": "Sophie"})
+
+    def test_canonical_map_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                self._seed_job(
+                    db,
+                    root,
+                    segments=[
+                        {"start": 0.0, "end": 1.0, "speaker": "Robin", "text": "Hi."},
+                    ],
+                    stored_speaker_map={"Robin": "Robin"},
+                )
+
+                summary = library_repair_all_speaker_maps()
+
+            self.assertEqual(summary["repaired"], 0)
+            self.assertEqual(summary["unchanged"], 1)
+
+    def test_empty_segments_jobs_are_skipped(self):
+        # Old jobs whose segments table was never populated — must
+        # NOT be flushed to ``{}``: the existing map may carry hints
+        # the user added by hand.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = self._seed_job(
+                    db,
+                    root,
+                    segments=[],
+                    stored_speaker_map={"SPEAKER_00": "Marie"},
+                )
+
+                summary = library_repair_all_speaker_maps()
+                row = db.get_job(job_id)
+
+            self.assertEqual(summary["skipped_no_segments"], 1)
+            self.assertEqual(summary["repaired"], 0)
+            assert row is not None
+            self.assertEqual(
+                json.loads(row["speaker_map_json"]),
+                {"SPEAKER_00": "Marie"},
+            )
 
 
 class LibraryDetachOdooMeetingTest(unittest.TestCase):

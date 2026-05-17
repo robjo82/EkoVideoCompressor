@@ -792,6 +792,62 @@ def library_rename_speakers(
     }
 
 
+def library_repair_all_speaker_maps() -> dict[str, int]:
+    """Heal every library job's ``speaker_map_json`` from segments.
+
+    PR #30 fixed the source of the drift (the rename sheet's
+    ``updateContext(speakers=…)`` clobber over the canonical rebuild),
+    but jobs that ran before the fix still carry the stale map in DB
+    — the rename sheet now masks the duplicates visually, but the
+    ``displayed_speaker_names`` accessor and the runner's history
+    pull from the persisted map. Without this one-shot pass the user
+    would have to re-Enregistrer every old job by hand to clean the
+    column.
+
+    Rules:
+
+    * Skip jobs whose ``transcription_segments`` table is empty —
+      they predate the persistence fix and have no source of truth
+      to rebuild from. Leaving the existing map alone is safer than
+      replacing it with ``{}``.
+    * Skip jobs whose canonical rebuild equals what's already in
+      DB (avoids needless writes / updated_at churn).
+    * Always returns an audit dict so the caller can surface "5
+      lignes nettoyées" if it wants to.
+    """
+    db = database()
+    checked = 0
+    repaired = 0
+    skipped_no_segments = 0
+    unchanged = 0
+    for row in db.list_jobs(limit=10_000):
+        checked += 1
+        job_id = int(row.get("id") or 0)
+        if job_id <= 0:
+            continue
+        segments = db.get_segments(job_id)
+        if not segments:
+            skipped_no_segments += 1
+            continue
+        canonical = _speaker_map_from_segments(segments)
+        raw_existing = row.get("speaker_map_json") or ""
+        try:
+            existing = json.loads(raw_existing) if raw_existing else {}
+        except (TypeError, ValueError):
+            existing = {}
+        if existing == canonical:
+            unchanged += 1
+            continue
+        db.update_job_context(job_id, speakers=canonical)
+        repaired += 1
+    return {
+        "checked": checked,
+        "repaired": repaired,
+        "skipped_no_segments": skipped_no_segments,
+        "unchanged": unchanged,
+    }
+
+
 def _speaker_map_from_segments(segments: list[dict]) -> dict[str, str]:
     """Project the current ``transcription_segments.speaker`` column
     into the ``speaker_map_json`` shape the rename sheet consumes.

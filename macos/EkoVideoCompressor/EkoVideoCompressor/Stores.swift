@@ -807,6 +807,34 @@ final class LibraryStore: ObservableObject {
         isLoading = false
     }
 
+    /// Heals every library row whose ``speaker_map_json`` drifted
+    /// from the segments table (the PR #30 regression source). Run
+    /// once per app version from ``RootView`` so old jobs land on
+    /// the canonical map shape without the user having to re-save
+    /// every one of them by hand.
+    ///
+    /// Best-effort: failures are swallowed (the engine returns a
+    /// non-zero status only on programming errors here) so a hiccup
+    /// on launch doesn't keep firing on every subsequent boot. The
+    /// caller persists the "ran once" flag regardless of outcome.
+    ///
+    /// Returns the engine's audit dict (``checked``, ``repaired``,
+    /// ``skipped_no_segments``, ``unchanged``) or ``nil`` when the
+    /// payload can't be parsed.
+    @discardableResult
+    func repairSpeakerMaps() async -> [String: Int]? {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-repair-speaker-maps",
+            ])
+        )
+        guard result.status == 0,
+              let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Int]
+        else { return nil }
+        return payload
+    }
+
     /// Re-runs ``library-recognize-speakers`` against an existing
     /// job's diarisation embeddings and compares them with every
     /// registered ``speaker_profile``. Anything that crosses the
