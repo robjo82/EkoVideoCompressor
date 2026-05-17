@@ -65,6 +65,40 @@ class EngineCliTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout), [])
 
+    def test_library_update_context_without_speakers_preserves_map(self):
+        """The rename sheet stopped passing ``--speakers`` to avoid
+        clobbering the canonical map. Pin that an empty value leaves
+        ``speaker_map_json`` untouched while still updating terms —
+        the previous behaviour wrote ``"{}"`` into the column."""
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            from ekovideo_engine.library import database
+            from unittest.mock import patch as patch_env
+            with patch_env.dict(os.environ, {"EKO_APP_SUPPORT_DIR": tmp}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(Path(tmp) / "x.mov"),
+                    workspace_dir=str(Path(tmp) / "ws"),
+                    settings={},
+                )
+                db.update_job_context(
+                    job_id,
+                    speakers={"SPEAKER_00": "Sophie", "SPEAKER_01": "Robin"},
+                )
+                proc = self._run(
+                    "library-update-context",
+                    f"{job_id}",
+                    "--technical-terms",
+                    '["Odoo","CRM"]',
+                    env={"EKO_APP_SUPPORT_DIR": tmp},
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                row = db.get_job(job_id)
+
+            assert row is not None
+            self.assertIn("Sophie", row["speaker_map_json"])
+            self.assertIn("Odoo", row["technical_terms_json"])
+
 
 class EngineProtocolTest(unittest.TestCase):
     def test_event_serialization_is_stable_json(self):
