@@ -6,7 +6,15 @@ from pathlib import Path
 
 from .events import EventSink
 from .logging import append_app_log
-from .models import DoneEvent, EngineEvent, ErrorEvent, JobRequest, ProgressEvent, WarningEvent
+from .models import (
+    ArtifactEvent,
+    DoneEvent,
+    EngineEvent,
+    ErrorEvent,
+    JobRequest,
+    ProgressEvent,
+    WarningEvent,
+)
 from .library import database
 from .pipeline import CompressionPipeline, StepResult, TranscriptionPipeline
 from .pipeline import prepare_job_workspace
@@ -148,6 +156,55 @@ def _resolve_source_path(request: JobRequest) -> Path | None:
     return None
 
 
+def _auto_rename_job_from_transcript(
+    db,
+    job_id: int,
+    transcript_path: str | None,
+    source_path: str,
+) -> str | None:
+    """Pick a topical title from the transcript and store it on the job.
+
+    Library rows fall back on the source filename when ``custom_title``
+    is empty, which leaves the user staring at a wall of
+    ``Enregistrement de l'écran 2026-05-16 à 14.42.30`` rows. Once the
+    transcription is in, we have enough signal to do better — feed the
+    text to :func:`suggest_transcript_stem` and persist the result.
+
+    We never overwrite a title the user already set by hand: if a
+    ``custom_title`` is present on the row before we run, we bail. The
+    suggester also returns the fallback stem when it can't find a
+    confident topic, in which case we still no-op to avoid promoting a
+    raw filename to a "title".
+    """
+    if not transcript_path:
+        return None
+    try:
+        row = db.get_job(job_id)
+    except Exception:
+        row = None
+    if row and (row.get("custom_title") or "").strip():
+        return None
+    try:
+        text = Path(transcript_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    # Lazy import to avoid pulling the full transcription_utils module
+    # into the engine's startup path (it imports MLX/whisper bits).
+    from transcription_utils import sanitize_filename_stem, suggest_transcript_stem
+
+    fallback_stem = sanitize_filename_stem(Path(source_path).stem or "Transcription")
+    suggestion = suggest_transcript_stem(text, fallback_stem)
+    if not suggestion or suggestion == fallback_stem:
+        return None
+    db.update_job_title(job_id, suggestion)
+    append_app_log(
+        f"engine_auto_rename job_id={job_id} title={suggestion!r}"
+    )
+    return suggestion
+
+
 def _snapshot_workspace_size(db, job_id: int, workspace: Path) -> None:
     """Walk the workspace and store the cumulative byte count.
 
@@ -215,6 +272,13 @@ class EngineRunner:
                 workspace_dir=str(workspace),
                 settings=request.to_dict(),
             )
+            # Nudge the SwiftUI library tab to refresh immediately. The
+            # source ArtifactEvent from prepare_job_workspace fired
+            # before the DB row existed, so its refresh saw nothing.
+            # This second artifact event arrives after the INSERT, so
+            # the list reflects the new job as soon as the user
+            # switches tabs.
+            sink(ArtifactEvent("library_row", str(workspace), model=str(job_id)))
         db.update_job_status(job_id, "RUNNING", "")
         db.update_job_progress(
             job_id,
@@ -275,15 +339,31 @@ class EngineRunner:
                 db.update_job_status(job_id, "FAILED", failed[0].error or "Transcription failed")
                 sink(ErrorEvent(failed[0].error or "Transcription failed", code="transcription_failed"))
                 return 1
+            transcript_for_title: str | None = None
             for r in tx_results:
                 if r.name == "transcript" and r.artifact_path:
                     db.update_job_artefact(job_id, "transcript", r.artifact_path)
                     db.update_job_output(job_id, r.artifact_path)
+                    transcript_for_title = r.artifact_path
                 elif r.name == "enhanced_transcript" and r.artifact_path:
                     db.update_job_artefact(job_id, "enhanced_transcript", r.artifact_path)
                     db.update_job_output(job_id, r.artifact_path)
+                    # The corrected transcript is a better title source
+                    # — Whisper output sometimes mangles proper nouns
+                    # that the LLM pass restores.
+                    transcript_for_title = r.artifact_path
                 elif r.name == "review" and r.artifact_path:
                     db.update_job_artefact(job_id, "review", r.artifact_path)
+            # Promote a topical title onto the library row so the user
+            # sees "Atelier RH 2026" rather than "Enregistrement de
+            # l'écran 2026-05-16 à 14.42.30" — but only when no custom
+            # title has been set yet (see the helper for the bail
+            # rules).
+            new_title = _auto_rename_job_from_transcript(
+                db, job_id, transcript_for_title, request.source_path
+            )
+            if new_title:
+                sink(ArtifactEvent("job_title", new_title, model=str(job_id)))
             # Persist segments + context so the library's rename
             # sheet has speakers to show and ``library_speaker_samples``
             # can cut audio extracts. Without these calls the
