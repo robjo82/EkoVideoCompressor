@@ -11,8 +11,10 @@ from .hf import hf_check
 from .library import (
     library_delete,
     library_delete_speaker_profile,
+    library_detach_odoo_meeting,
     library_discover_speakers,
     library_flag_speaker_sample_review,
+    library_get,
     library_link_speaker_profile_to_odoo,
     library_list,
     library_list_speaker_profiles,
@@ -59,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     library_list_parser = sub.add_parser("library-list")
     library_list_parser.add_argument("--jsonl", action="store_true")
+    # Single-row fetch used by the SwiftUI ``refreshOne`` path so
+    # the rename sheet doesn't trigger a full ``library-list`` after
+    # every save.
+    library_get_parser = sub.add_parser("library-get")
+    library_get_parser.add_argument("job_id", type=int)
+    # Clears ``odoo_meeting_json`` on a job — surfaced via the
+    # hidden "Réunion Odoo" column in the library.
+    library_detach_meeting_parser = sub.add_parser("library-detach-odoo-meeting")
+    library_detach_meeting_parser.add_argument("job_id", type=int)
     library_delete_parser = sub.add_parser("library-delete")
     library_delete_parser.add_argument("job_id", type=int)
     # Opt-in flag: also wipe the workspace dir on disk. Without this
@@ -212,6 +223,21 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps(row, ensure_ascii=False, sort_keys=True))
             else:
                 _print_json(rows)
+            return 0
+
+        if args.command == "library-get":
+            row = library_get(args.job_id)
+            if row is None:
+                # Empty object — SwiftUI treats the missing ``id`` as
+                # "row gone, drop from local cache". Non-zero exit
+                # codes are reserved for actual engine errors.
+                _print_json({})
+                return 0
+            _print_json(row)
+            return 0
+
+        if args.command == "library-detach-odoo-meeting":
+            _print_json(library_detach_odoo_meeting(args.job_id))
             return 0
 
         if args.command == "library-delete":

@@ -39,11 +39,17 @@ struct ContentView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var models: ModelStore
     @EnvironmentObject private var odoo: OdooStore
+    @EnvironmentObject private var energy: EnergyMonitor
     @State private var selectedSection: AppSection = .queue
     @State private var showingSettings = false
     @State private var showingRunSetup = false
     @State private var didPreloadSecondaryData = false
     @State private var lastLibraryRefreshAt = Date.distantPast
+    /// Tracks the running job's preset so the unplug listener can
+    /// decide whether the user is at risk (Max on battery = bad)
+    /// without rummaging through QueueStore on every event.
+    @State private var runningPreset: String = ""
+    @State private var unplugInterruptTask: Task<Void, Never>?
 
     var body: some View {
         NavigationSplitView {
@@ -77,7 +83,8 @@ struct ContentView: View {
                     } label: {
                         Label(queue.isBatchRunning ? "En cours" : "Lancer la file", systemImage: "play.fill")
                     }
-                    .disabled(queue.items.isEmpty || queue.isBatchRunning)
+                    .disabled(queue.items.isEmpty || queue.isBatchRunning || !energy.allowsTranscriptionStart)
+                    .help(energy.allowsTranscriptionStart ? "" : energy.blockingReason)
 
                     Button {
                         showingSettings = true
@@ -92,6 +99,7 @@ struct ContentView: View {
             SettingsView()
                 .environmentObject(settings)
                 .environmentObject(engine)
+                .environmentObject(energy)
         }
         .sheet(isPresented: $showingRunSetup) {
             RunSetupView {
@@ -103,6 +111,7 @@ struct ContentView: View {
             .environmentObject(queue)
             .environmentObject(odoo)
             .environmentObject(library)
+            .environmentObject(energy)
         }
         .task {
             guard !didPreloadSecondaryData else { return }
@@ -132,6 +141,26 @@ struct ContentView: View {
                 Task { await library.refreshSpeakerProfiles(force: true) }
             }
         }
+        .task {
+            // Listen for AC → battery transitions for the whole app
+            // lifetime. If a Max-preset run is in flight when the
+            // user unplugs, gracefully cancel the engine subprocess —
+            // the workspace is preserved and the user can resume on
+            // a lower preset once they're back on power.
+            for await _ in energy.unplugSignal {
+                guard queue.isBatchRunning else { continue }
+                let preset = runningPreset
+                guard preset == TranscriptionQualityPreset.max.rawValue else {
+                    // Non-Max runs are allowed to keep going on
+                    // battery as long as they stay above the safety
+                    // threshold. The Run button gating already
+                    // refuses to start a fresh one below 40 %.
+                    continue
+                }
+                engine.cancel()
+                queue.cancellationReason = "max_on_battery"
+            }
+        }
     }
 
     private func chooseFiles() {
@@ -147,11 +176,22 @@ struct ContentView: View {
     private func runQueue() async {
         guard !queue.items.isEmpty else { return }
         queue.isBatchRunning = true
+        queue.cancellationReason = nil
         queue.resetPending()
+        // Snapshot the preset chosen at queue-start so the unplug
+        // listener (which doesn't know which item is active) can tell
+        // whether an interrupt is warranted. Every item in a batch
+        // inherits the same preset today, so a single field suffices.
+        runningPreset = settings.qualityPreset
+        defer { runningPreset = "" }
         let itemIDs = queue.items.map(\.id)
 
         for itemID in itemIDs {
             if Task.isCancelled { break }
+            // If the energy guard cancelled the engine mid-batch,
+            // stop processing the rest of the queue too — the user
+            // needs to come back, plug in, and re-launch consciously.
+            if queue.cancellationReason != nil { break }
             guard var currentItem = queue.items.first(where: { $0.id == itemID }) else {
                 continue
             }
@@ -182,6 +222,12 @@ struct ContentView: View {
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { !$0.isEmpty }
                 settings.recordVocabularyUsage(usedTerms)
+            } else if queue.cancellationReason == "max_on_battery" {
+                queue.update(
+                    currentItem.id,
+                    status: "Interrompu (secteur)",
+                    progress: 0
+                )
             } else {
                 queue.update(currentItem.id, status: "Erreur", progress: 0)
             }
@@ -486,6 +532,7 @@ struct QueueRowView: View {
 struct RunBatchSettingsForm: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var queue: QueueStore
+    @EnvironmentObject private var energy: EnergyMonitor
 
     private var canDeleteOriginalSources: Bool {
         queue.items.contains { !$0.isLibraryRerun }
@@ -518,10 +565,35 @@ struct RunBatchSettingsForm: View {
                         Text(preset.displayName).tag(preset.rawValue)
                     }
                 }
+                // Auto-downgrade if the user unplugs while Max is
+                // selected. The picker itself doesn't try to disable
+                // the individual Max row — Picker option styling is
+                // brittle in SwiftUI — so we surface the constraint
+                // via the warning Label below + this guarded revert.
+                .onChange(of: energy.allowsMaxPreset) { _, allowed in
+                    if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                        settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
+                    }
+                }
+                .onAppear {
+                    if !energy.allowsMaxPreset && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                        settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
+                    }
+                }
                 if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
                     Text(preset.summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                }
+                if !energy.allowsMaxPreset {
+                    Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if let reason = Optional(energy.blockingReason), !reason.isEmpty {
+                    Label(reason, systemImage: "battery.25percent")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
                 Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
@@ -1540,6 +1612,13 @@ struct LibraryView: View {
     @AppStorage("libraryShowsSpeakersColumn") private var showsSpeakersColumn = false
     @AppStorage("libraryShowsProjectSizeColumn") private var showsProjectSizeColumn = false
     @AppStorage("libraryShowsMeetingDateColumn") private var showsMeetingDateColumn = false
+    /// Off by default — Odoo users hide it until they need to audit
+    /// which job is linked to which calendar event before a rerun.
+    /// Click the cell to detach via the contextual menu.
+    @AppStorage("libraryShowsOdooMeetingColumn") private var showsOdooMeetingColumn = false
+    /// Off by default — surfaces the opportunity / task related to
+    /// the event (whatever Odoo returned in ``related_object``).
+    @AppStorage("libraryShowsOdooRelatedColumn") private var showsOdooRelatedColumn = false
     /// Sort order driving the table — defaults to most-recently
     /// updated first, mirroring what the engine returns from
     /// ``library_list``. Columns toggle between ascending and
@@ -1584,6 +1663,9 @@ struct LibraryView: View {
                 Toggle("Date réunion", isOn: $showsMeetingDateColumn)
                 Toggle("Interlocuteurs", isOn: $showsSpeakersColumn)
                 Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
+                Divider()
+                Toggle("Réunion Odoo", isOn: $showsOdooMeetingColumn)
+                Toggle("Opportunité / tâche Odoo", isOn: $showsOdooRelatedColumn)
             } label: {
                 Label("Colonnes", systemImage: "tablecells")
                     .labelStyle(.iconOnly)
@@ -1717,6 +1799,30 @@ struct LibraryView: View {
                                 }
                             }
                             .width(min: 80, ideal: 100, max: 140)
+                        }
+
+                        if showsOdooMeetingColumn {
+                            TableColumn("Réunion Odoo", value: \.sortableOdooMeeting) { displayRow in
+                                if displayRow.artifact == nil {
+                                    OdooMeetingCell(
+                                        row: displayRow.job,
+                                        onEdit: { editingRow = displayRow.job }
+                                    )
+                                }
+                            }
+                            .width(min: 160, ideal: 200)
+                        }
+
+                        if showsOdooRelatedColumn {
+                            TableColumn("Opportunité / tâche", value: \.sortableOdooRelated) { displayRow in
+                                if displayRow.artifact == nil {
+                                    OdooRelatedCell(
+                                        row: displayRow.job,
+                                        onEdit: { editingRow = displayRow.job }
+                                    )
+                                }
+                            }
+                            .width(min: 160, ideal: 200)
                         }
 
                         TableColumn("Actions") { displayRow in
@@ -2298,6 +2404,7 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var updater: UpdateStore
     @EnvironmentObject private var engine: EngineProcess
+    @EnvironmentObject private var energy: EnergyMonitor
     @Environment(\.dismiss) private var dismiss
     @State private var hfStatus = ""
     @State private var isCheckingHF = false
@@ -2392,10 +2499,20 @@ struct SettingsView: View {
                             Text(preset.displayName).tag(preset.rawValue)
                         }
                     }
+                    .onChange(of: energy.allowsMaxPreset) { _, allowed in
+                        if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                            settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
+                        }
+                    }
                     if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
                         Text(preset.summary)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                    if !energy.allowsMaxPreset {
+                        Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
                     }
                     TextField("Modèle Whisper", text: $settings.whisperModel)
                 }
@@ -2794,6 +2911,43 @@ extension LibraryDisplayRow {
         guard let bytes = job.total_bytes else { return "—" }
         return formatFileBytes(bytes)
     }
+    /// Calendar event name when paired, else empty (renders as "—").
+    /// Sort key alphabetises detached jobs at the bottom by prefix.
+    var sortableOdooMeeting: String {
+        job.odooMeeting?.event_name ?? ""
+    }
+    /// "Opportunité : ACME" / "Tâche : Onboarding" / etc. Empty for
+    /// jobs without a related Odoo object.
+    var sortableOdooRelated: String {
+        guard let related = job.odooMeeting?.related, !related.name.isEmpty else { return "" }
+        return "\(related.model):\(related.name)"
+    }
+    /// Pretty label for the Opportunité/Tâche column: prefixes the
+    /// name with the technical model in French ("Opportunité",
+    /// "Tâche", "Devis", "Projet", "Lead") so the user knows what
+    /// type of record is linked at a glance.
+    var displayedOdooRelated: String {
+        guard let related = job.odooMeeting?.related, !related.name.isEmpty else { return "" }
+        return "\(frenchOdooModelLabel(related.model)) : \(related.name)"
+    }
+}
+
+/// Map an Odoo technical model name to a one-word French label
+/// used in the library's "Opportunité / tâche Odoo" column.
+/// Falls back to the raw model for anything we haven't catalogued —
+/// surfacing the technical name is more useful than an opaque "—"
+/// for power users who know Odoo's data model.
+func frenchOdooModelLabel(_ model: String) -> String {
+    switch model {
+    case "crm.lead": return "Opportunité"
+    case "project.task": return "Tâche"
+    case "project.project": return "Projet"
+    case "sale.order": return "Devis"
+    case "account.move": return "Facture"
+    case "helpdesk.ticket": return "Ticket"
+    case "res.partner": return "Contact"
+    default: return model
+    }
 }
 
 struct LibraryTableActionsView: View {
@@ -2959,6 +3113,91 @@ struct SpeakerChip: View {
     }
 }
 
+/// Library cell for the optional "Réunion Odoo" column. Shows the
+/// linked calendar.event name (truncated, with a calendar glyph) or
+/// "—" when nothing's paired. Right-click → "Détacher" / "Modifier"
+/// surfaces the edit affordances without crowding the cell with
+/// inline buttons — the column is opt-in and meant to stay narrow.
+struct OdooMeetingCell: View {
+    var row: LibraryRow
+    var onEdit: () -> Void
+
+    var body: some View {
+        let meeting = row.odooMeeting
+        HStack(spacing: 6) {
+            if let meeting, !meeting.event_name.isEmpty {
+                Image(systemName: "calendar")
+                    .foregroundStyle(.teal)
+                    .font(.caption)
+                Text(meeting.event_name)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(meeting.event_name)
+            } else {
+                Text("—")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .contextMenu {
+            Button(meeting == nil ? "Lier une réunion…" : "Modifier la réunion…") {
+                onEdit()
+            }
+        }
+        .onTapGesture(count: 2) {
+            onEdit()
+        }
+    }
+}
+
+/// Library cell for the optional "Opportunité / tâche" column.
+/// Shows the related Odoo object name prefixed by its French model
+/// label ("Opportunité : ACME", "Tâche : Onboarding"). The edit
+/// affordance routes through the same "Modifier le contexte" sheet
+/// as the meeting cell — they edit the same metadata under the hood.
+struct OdooRelatedCell: View {
+    var row: LibraryRow
+    var onEdit: () -> Void
+
+    var body: some View {
+        let related = row.odooMeeting?.related
+        HStack(spacing: 6) {
+            if let related, !related.name.isEmpty {
+                Image(systemName: iconName(for: related.model))
+                    .foregroundStyle(.indigo)
+                    .font(.caption)
+                Text("\(frenchOdooModelLabel(related.model)) : \(related.name)")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help("\(frenchOdooModelLabel(related.model)) : \(related.name)")
+            } else {
+                Text("—")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .contextMenu {
+            Button(related == nil ? "Lier un enregistrement Odoo…" : "Modifier le lien Odoo…") {
+                onEdit()
+            }
+        }
+        .onTapGesture(count: 2) {
+            onEdit()
+        }
+    }
+
+    private func iconName(for model: String) -> String {
+        switch model {
+        case "crm.lead": return "lightbulb"
+        case "project.task": return "checklist"
+        case "project.project": return "folder"
+        case "sale.order": return "doc.text"
+        case "account.move": return "receipt"
+        case "helpdesk.ticket": return "lifepreserver"
+        case "res.partner": return "person.crop.circle"
+        default: return "link"
+        }
+    }
+}
+
 struct LibraryContextEditor: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var queue: QueueStore
@@ -3074,6 +3313,7 @@ struct LibraryContextEditor: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                odooLinkSection
             }
             .formStyle(.grouped)
             .padding()
@@ -3092,6 +3332,46 @@ struct LibraryContextEditor: View {
         .frame(minWidth: 680, minHeight: 560)
         .task {
             await loadSamples()
+        }
+    }
+
+    /// Read-only summary of the Odoo meeting (and its related object)
+    /// paired with this job, plus a "Détacher" button. Replacing the
+    /// link from scratch is intentionally NOT here — the Odoo
+    /// meeting picker lives in Run Setup so users discover both
+    /// paths in the same place. To swap the linked event, detach
+    /// first, then relaunch via Run Setup.
+    @ViewBuilder
+    private var odooLinkSection: some View {
+        let meeting = row.odooMeeting
+        Section("Liaison Odoo") {
+            if let meeting {
+                HStack(spacing: 8) {
+                    Image(systemName: "calendar")
+                        .foregroundStyle(.teal)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(meeting.event_name.isEmpty ? "Réunion #\(meeting.event_id)" : meeting.event_name)
+                        if let related = meeting.related, !related.name.isEmpty {
+                            Text("\(frenchOdooModelLabel(related.model)) : \(related.name)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button("Détacher") {
+                        Task {
+                            await library.detachOdooMeeting(row)
+                            dismiss()
+                        }
+                    }
+                }
+                Text("Pour lier une autre réunion, détachez puis utilisez « Relancer » depuis la file d'attente.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Aucune réunion Odoo liée. La liaison se fait au moment du lancement, depuis l'écran « Lancer la file ».")
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

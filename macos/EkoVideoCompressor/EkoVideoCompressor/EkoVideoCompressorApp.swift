@@ -9,6 +9,7 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var models = ModelStore()
     @StateObject private var updater = UpdateStore()
     @StateObject private var odoo = OdooStore()
+    @StateObject private var energy = EnergyMonitor()
 
     init() {
         let args = CommandLine.arguments
@@ -28,6 +29,7 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(models)
                 .environmentObject(updater)
                 .environmentObject(odoo)
+                .environmentObject(energy)
                 .frame(minWidth: 1180, minHeight: 760)
                 .onAppear {
                     updater.setSettings(settings)
