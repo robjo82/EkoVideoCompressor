@@ -188,7 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     context = sub.add_parser("library-update-context")
     context.add_argument("job_id", type=int)
-    context.add_argument("--speakers", default="{}", help="JSON object or JSON file")
+    # ``--speakers`` is optional now. The library rename flow already
+    # rebuilds ``speaker_map_json`` canonically from segments; the
+    # SwiftUI sheet stopped clobbering that rebuild after a duplicate-
+    # row regression. Passing an empty string here means "leave the
+    # speaker map alone"; the engine only writes when speakers is
+    # explicitly provided.
+    context.add_argument("--speakers", default="", help="Optional JSON object or JSON file")
     context.add_argument("--technical-terms", default="[]", help="JSON array or JSON file")
 
     model_list = sub.add_parser("model-list")
@@ -300,7 +306,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "library-update-context":
-            speakers = _load_json_arg(args.speakers)
+            # Empty ``--speakers`` means "don't touch
+            # speaker_map_json" — the engine library code skips the
+            # column when this is ``None``. Passing an empty dict
+            # would clobber the canonical map written by the rename
+            # path, which is exactly the regression we're guarding
+            # against.
+            speakers_raw = (args.speakers or "").strip()
+            speakers = _load_json_arg(args.speakers) if speakers_raw else None
             technical_terms = _load_json_arg(args.technical_terms)
             library_update_context(args.job_id, speakers=speakers, technical_terms=technical_terms)
             _print_json({"job_id": args.job_id, "updated": True})

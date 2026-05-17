@@ -3639,7 +3639,14 @@ struct LibraryContextEditor: View {
             if !renameMapping.isEmpty {
                 await library.renameSpeakers(row, mapping: renameMapping)
             }
-            await library.updateContext(row, speakers: updatedSpeakers, technicalTerms: terms)
+            // Persist technical terms only. The rename path already
+            // rewrote ``speaker_map_json`` canonically from the
+            // post-rename segments — passing ``updatedSpeakers`` here
+            // would clobber that with the sheet's id-keyed shape,
+            // which caused the duplicate-row regression (a renamed
+            // cluster lingering as a ghost SPEAKER_NN entry while
+            // segments already used the friendly name).
+            await library.updateContext(row, technicalTerms: terms)
         }
     }
 
@@ -3667,8 +3674,17 @@ struct LibraryContextEditor: View {
         let loaded = await library.speakerSamples(row)
         await MainActor.run {
             samples = loaded
-            for sample in loaded where !speakers.contains(where: { $0.id == sample.speaker }) {
-                speakers.append(SpeakerEditRow(id: sample.speaker, name: row.speakerMap[sample.speaker] ?? ""))
+            // The ``transcription_segments`` table is the source of
+            // truth for who's in the recording. Earlier code paths
+            // could leave ``speaker_map_json`` carrying stale cluster
+            // IDs after a rename rewrote segments to friendly names
+            // (the duplicate-row symptom users saw: SPEAKER_01/Robin
+            // alongside an empty Robin/"" row with the same audio).
+            // Rebuild the row list from samples whenever the engine
+            // produced any — falls back to the speakerMap-seeded init
+            // only when samples are unavailable (workspace deleted).
+            if !loaded.isEmpty {
+                speakers = canonicalSpeakerRows(from: loaded)
             }
             loadingSamples = false
             // No need to surface the discovery to the user — the
@@ -3677,6 +3693,36 @@ struct LibraryContextEditor: View {
             // telemetry hook ("how often is the backfill needed?")
             // without bloating the UX right now.
             _ = seededFromDiscovery
+        }
+    }
+
+    /// Build a row per distinct ``segment.speaker`` label observed
+    /// in ``samples``, resolving friendly names from ``row.speakerMap``
+    /// when the label is a SPEAKER_NN cluster. Labels that are
+    /// already friendly (the user / LLM has named them) are used
+    /// as both ``id`` and ``name`` — there is no cluster left to
+    /// distinguish.
+    private func canonicalSpeakerRows(from samples: [SpeakerSample]) -> [SpeakerEditRow] {
+        let labels = Array(Set(samples.map(\.speaker)))
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .sorted()
+        return labels.map { label in
+            let isCluster = label.uppercased().hasPrefix("SPEAKER_")
+            let resolvedName: String
+            if isCluster {
+                // SPEAKER_NN cluster — look up the user-confirmed
+                // friendly name in the saved map. Empty when nothing
+                // is known yet, which gates the orange "new contact"
+                // status icon.
+                resolvedName = row.speakerMap[label] ?? ""
+            } else {
+                // Already-friendly segment label. The map can also
+                // carry a {label: ""} entry from a past clobber —
+                // ignore that and trust the segment label itself.
+                let fromMap = (row.speakerMap[label] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                resolvedName = fromMap.isEmpty ? label : fromMap
+            }
+            return SpeakerEditRow(id: label, name: resolvedName)
         }
     }
 

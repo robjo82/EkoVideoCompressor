@@ -765,23 +765,38 @@ final class LibraryStore: ObservableObject {
         isLoading = false
     }
 
-    func updateContext(_ row: LibraryRow, speakers: [String: String], technicalTerms: [String]) async {
-        guard let speakersPayload = jsonString(speakers),
-              let termsPayload = jsonString(technicalTerms) else {
+    /// Persist context edits made in the library sheet.
+    ///
+    /// ``speakers`` is intentionally optional: the rename flow's
+    /// engine side already rebuilds ``speaker_map_json`` canonically
+    /// from segments. Passing a sheet-shaped speakers dict here would
+    /// overwrite that rebuild with stale cluster IDs and re-introduce
+    /// the duplicate-row symptom (a SPEAKER_01/Robin row alongside a
+    /// ghost Robin/"" row carrying the same audio). Callers that
+    /// only want to update technical terms pass ``speakers: nil``.
+    func updateContext(
+        _ row: LibraryRow,
+        speakers: [String: String]? = nil,
+        technicalTerms: [String]
+    ) async {
+        guard let termsPayload = jsonString(technicalTerms) else {
             errorMessage = "Contexte invalide."
             return
         }
         isLoading = true
         errorMessage = nil
+        var args: [String] = [
+            "library-update-context",
+            "\(row.id)",
+            "--technical-terms",
+            termsPayload,
+        ]
+        if let speakers, let speakersPayload = jsonString(speakers) {
+            args.append("--speakers")
+            args.append(speakersPayload)
+        }
         let result = await EngineProcess.runCommand(
-            arguments: EngineProcess.defaultPythonArguments([
-                "library-update-context",
-                "\(row.id)",
-                "--speakers",
-                speakersPayload,
-                "--technical-terms",
-                termsPayload,
-            ])
+            arguments: EngineProcess.defaultPythonArguments(args)
         )
         if result.status != 0 {
             errorMessage = result.events.last?.message ?? result.rawOutput
