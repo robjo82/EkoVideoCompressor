@@ -56,6 +56,13 @@ class TranscriptionSettings:
     venv_python_path: str = ""
     text_llm_model: str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
     audio_llm_model: str = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+    # The repass model the pipeline reruns on Whisper's low-confidence
+    # segments. Used to be hardcoded inside ``_run_multipass``; now
+    # surfaced as a knob so users with the headroom can pin a
+    # French-tuned distil checkpoint instead of the multilingual
+    # large-v3. Empty string falls back to the catalog default
+    # (``whisper-large-v3-mlx``) inside the pipeline.
+    multipass_model: str = ""
     audio_recheck_enabled: bool = False
     vad_enabled: bool = True
     multipass_enabled: bool = True
