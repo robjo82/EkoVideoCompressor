@@ -20,6 +20,7 @@ from .library import (
     library_list_speaker_profiles,
     library_recognize_speakers,
     library_rename_speakers,
+    library_repair_all_speaker_maps,
     library_speaker_samples,
     library_unlink_speaker_profile_from_odoo,
     library_update_context,
@@ -70,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     # hidden "Réunion Odoo" column in the library.
     library_detach_meeting_parser = sub.add_parser("library-detach-odoo-meeting")
     library_detach_meeting_parser.add_argument("job_id", type=int)
+    # One-shot heal pass: rebuild every job's ``speaker_map_json``
+    # from the segments table. Fires once per app version from
+    # SwiftUI so old jobs whose map drifted before PR #30 land on
+    # the canonical shape without the user re-Enregistrer'ing each.
+    sub.add_parser("library-repair-speaker-maps")
     library_delete_parser = sub.add_parser("library-delete")
     library_delete_parser.add_argument("job_id", type=int)
     # Opt-in flag: also wipe the workspace dir on disk. Without this
@@ -253,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "library-detach-odoo-meeting":
             _print_json(library_detach_odoo_meeting(args.job_id))
+            return 0
+
+        if args.command == "library-repair-speaker-maps":
+            _print_json(library_repair_all_speaker_maps())
             return 0
 
         if args.command == "library-delete":
