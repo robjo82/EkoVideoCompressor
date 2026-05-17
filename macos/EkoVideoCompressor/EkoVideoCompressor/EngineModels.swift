@@ -100,6 +100,10 @@ struct JobRequest: Codable {
     var rerun_steps: [String]
     var library_job_id: Int?
     var delete_source_after_copy: Bool
+    /// Actual meeting date used for Odoo matching and generated
+    /// artefact metadata. ISO-8601 string; defaults to source file
+    /// metadata in the SwiftUI setup screen.
+    var meeting_date: String?
     /// Optional Odoo object whose chatter the engine fetches during
     /// the LLM step to enrich the correction prompt. ``nil`` when
     /// the user didn't pair the file with a meeting.
@@ -139,6 +143,9 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     var error_message: String?
     var updated_at: String?
     var created_at: String?
+    /// Actual meeting date captured at run setup, distinct from
+    /// created/updated timestamps. Hidden by default in the library.
+    var meeting_date: String?
     var compressed_path: String?
     var transcript_path: String?
     var enhanced_transcript_path: String?

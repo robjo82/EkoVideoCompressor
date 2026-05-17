@@ -1,6 +1,39 @@
 import Foundation
 import SwiftUI
 
+func sourceMeetingDate(for url: URL) -> Date {
+    (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+        ?? Date()
+}
+
+func engineMeetingDateString(_ date: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    return formatter.string(from: date)
+}
+
+func parseEngineMeetingDate(_ value: String?) -> Date? {
+    guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+    if let date = formatter.date(from: value) {
+        return date
+    }
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.date(from: value)
+}
+
+func displayMeetingDate(_ value: String?) -> String {
+    guard let date = parseEngineMeetingDate(value) else { return "—" }
+    let formatter = DateFormatter()
+    formatter.locale = Locale.autoupdatingCurrent
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .short
+    return formatter.string(from: date)
+}
+
 struct QueueItem: Identifiable, Equatable {
     let id = UUID()
     var sourceURL: URL
@@ -22,6 +55,11 @@ struct QueueItem: Identifiable, Equatable {
     var trimStartSeconds: Double = 0
     var trimEndSeconds: Double = 0
     var mediaDurationSeconds: Double = 0
+    /// Actual meeting date used for Odoo matching and artefact
+    /// metadata. Nil means "use source file metadata"; the manual
+    /// flag drives the Run Setup helper text.
+    var meetingDate: Date?
+    var meetingDateManuallyEdited: Bool = false
     /// Number of speakers the user expects on this specific
     /// recording. 0 means "let pyannote estimate". Per-file rather
     /// than per-batch because a 5-person standup followed by a
@@ -72,7 +110,9 @@ final class QueueStore: ObservableObject {
         selectedGlossaryTerms: [String] = [],
         odooMeetingTitle: String = "",
         odooMeeting: OdooMeetingMetadata? = nil,
-        odooContextRef: OdooContextRef? = nil
+        odooContextRef: OdooContextRef? = nil,
+        meetingDate: Date? = nil,
+        meetingDateManuallyEdited: Bool = false
     ) {
         for url in urls {
             if let index = items.firstIndex(where: { $0.sourceURL == url && $0.libraryJobId == libraryJobId }) {
@@ -99,6 +139,10 @@ final class QueueStore: ObservableObject {
                 if let odooContextRef {
                     items[index].odooContextRef = odooContextRef
                 }
+                if let meetingDate {
+                    items[index].meetingDate = meetingDate
+                    items[index].meetingDateManuallyEdited = meetingDateManuallyEdited
+                }
                 if prioritize && index > 0 {
                     let item = items.remove(at: index)
                     items.insert(item, at: 0)
@@ -114,6 +158,8 @@ final class QueueStore: ObservableObject {
             item.odooMeetingTitle = odooMeetingTitle
             item.odooMeeting = odooMeeting
             item.odooContextRef = odooContextRef
+            item.meetingDate = meetingDate
+            item.meetingDateManuallyEdited = meetingDateManuallyEdited
             if prioritize {
                 items.insert(item, at: 0)
             } else {
@@ -134,6 +180,7 @@ final class QueueStore: ObservableObject {
         let meeting = row.odooMeeting
         let attendeeNames = meeting?.attendees.map(\.name).filter { !$0.isEmpty } ?? []
         let existingTerms = row.technicalTerms
+        let existingMeetingDate = parseEngineMeetingDate(row.meeting_date)
         add(
             urls: [URL(fileURLWithPath: path)],
             focusNote: focusNote,
@@ -146,7 +193,9 @@ final class QueueStore: ObservableObject {
             odooMeeting: meeting,
             odooContextRef: meeting?.related.map {
                 OdooContextRef(model: $0.model, record_id: $0.id, url: "", database: "", login: "", api_key: "")
-            }
+            },
+            meetingDate: existingMeetingDate,
+            meetingDateManuallyEdited: existingMeetingDate != nil
         )
     }
 

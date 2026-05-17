@@ -64,6 +64,23 @@ class EngineLibraryActionsTest(unittest.TestCase):
             self.assertEqual(stored["odoo_context_ref"]["api_key"], "[redacted]")
             self.assertEqual(stored["odoo_context_ref"]["database"], "prod")
 
+    def test_job_meeting_date_is_persisted_for_library(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(root / "work"),
+                    settings={},
+                )
+                db.update_job_meeting_date(job_id, "2026-05-14T12:30:00Z")
+                row = db.get_job(job_id)
+                listed = db.list_jobs()
+
+            self.assertEqual(row["meeting_date"], "2026-05-14T12:30:00Z")
+            self.assertEqual(listed[0]["meeting_date"], "2026-05-14T12:30:00Z")
+
     def test_rename_speakers_updates_segments_and_text_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +162,60 @@ def subprocess_env_for_request(request: JobRequest) -> dict[str, str]:
             os.pathsep.join([*candidates, existing]) if existing else os.pathsep.join(candidates)
         )
     return env
+
+
+def meeting_datetime_from_request(request: JobRequest) -> datetime | None:
+    """Return the user-facing meeting date as an aware UTC datetime.
+
+    SwiftUI sends ISO-8601 strings with a timezone. Headless callers
+    may still pass a date without one; in that case we treat it as UTC
+    rather than guessing a local timezone inside the engine process.
+    """
+    raw = (request.meeting_date or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        append_app_log(f"engine_meeting_date_invalid value={raw!r}")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def ffmpeg_creation_time_from_request(request: JobRequest) -> str | None:
+    meeting_dt = meeting_datetime_from_request(request)
+    if meeting_dt is None:
+        return None
+    return meeting_dt.isoformat().replace("+00:00", "Z")
+
+
+def apply_meeting_date_to_artifact(request: JobRequest, path: str | Path | None) -> None:
+    """Apply the meeting date to lightweight filesystem metadata.
+
+    Text/Markdown files do not carry a portable internal creation
+    timestamp, so we at least align their access/modification times.
+    Media containers additionally receive FFmpeg's ``creation_time``
+    metadata through ``build_ffmpeg_cmd``.
+    """
+    if not path:
+        return
+    meeting_dt = meeting_datetime_from_request(request)
+    if meeting_dt is None:
+        return
+    artifact = Path(path)
+    if not artifact.exists():
+        return
+    timestamp = meeting_dt.timestamp()
+    try:
+        os.utime(artifact, (timestamp, timestamp))
+    except OSError as exc:
+        append_app_log(
+            "engine_meeting_date_utime_failed "
+            f"path={str(artifact)!r} error={exc!r}"
+        )
 
 
 def _safe_stem(value: str) -> str:
@@ -1476,6 +1530,7 @@ class TranscriptionPipeline:
         else:
             rendered = render_segments_plain(segments, settings.output_format)
         transcript_path.write_text(rendered, encoding="utf-8")
+        apply_meeting_date_to_artifact(self.request, transcript_path)
         self.sink(
             ArtifactEvent("transcript", str(transcript_path), model=settings.model)
         )
@@ -1532,6 +1587,7 @@ class TranscriptionPipeline:
             self._llm_corrections_rejected = outcome.rejected
 
         enhanced_path.write_text(rendered, encoding="utf-8")
+        apply_meeting_date_to_artifact(self.request, enhanced_path)
         self.sink(
             ArtifactEvent(
                 "enhanced_transcript",
@@ -1682,6 +1738,7 @@ class TranscriptionPipeline:
             lines.append("")
 
         review_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        apply_meeting_date_to_artifact(self.request, review_path)
         self.sink(ArtifactEvent("review", str(review_path)))
         return review_path
 
@@ -1727,6 +1784,7 @@ class CompressionPipeline:
             if settings.trim_enabled and settings.trim_end != "00:00:00"
             else None,
             audio_only=is_audio_only_path(self.request.source_path),
+            creation_time=ffmpeg_creation_time_from_request(self.request),
         )
         self.sink(ProgressEvent("compression", 0, "Running FFmpeg"))
         proc = subprocess.run(
@@ -1745,6 +1803,7 @@ class CompressionPipeline:
             "engine_compress_done "
             f"output={output_path!r} duration_seconds={duration:.2f}"
         )
+        apply_meeting_date_to_artifact(self.request, output_path)
         self.sink(ArtifactEvent("compressed", output_path))
         self.sink(ProgressEvent("compression", 100, "Compression ready"))
         return StepResult("compression", True, output_path, duration_seconds=duration)

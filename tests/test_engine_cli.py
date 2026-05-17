@@ -81,10 +81,12 @@ class EngineProtocolTest(unittest.TestCase):
                 "output_dir": "/tmp/out",
                 "mode": "compress_transcribe",
                 "glossary_terms": ["Mollie"],
+                "meeting_date": "2026-05-14T12:30:00Z",
             }
         )
         self.assertEqual(request.mode, "compress_transcribe")
         self.assertEqual(request.glossary_terms, ["Mollie"])
+        self.assertEqual(request.meeting_date, "2026-05-14T12:30:00Z")
 
         with self.assertRaises(ValueError):
             JobRequest.from_dict({"source_path": "/tmp/in.mov", "output_dir": "/tmp/out", "mode": "bad"})

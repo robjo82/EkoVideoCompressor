@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from ekovideo_engine.models import JobRequest
 from ekovideo_engine.pipeline import (
     StepResult,
     TranscriptionPipeline,
+    apply_meeting_date_to_artifact,
     _friendly_ffmpeg_error,
 )
 
@@ -91,6 +93,23 @@ class TranscriptionPipelinePortTest(unittest.TestCase):
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def test_meeting_date_is_applied_to_generated_artifact_mtime(self):
+        artifact = self.workspace / "transcription.txt"
+        artifact.write_text("Bonjour", encoding="utf-8")
+        request = JobRequest.from_dict(
+            {
+                "source_path": str(self.source),
+                "output_dir": str(self.workspace),
+                "mode": "transcribe",
+                "meeting_date": "2026-05-14T12:30:00Z",
+            }
+        )
+
+        apply_meeting_date_to_artifact(request, artifact)
+
+        expected = int(datetime(2026, 5, 14, 12, 30, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(int(artifact.stat().st_mtime), expected)
 
     def test_basic_flow_writes_transcript_and_emits_artifact(self):
         """Plumbing test: with every quality phase off and Whisper

@@ -244,6 +244,7 @@ struct ContentView: View {
             )
         }
         let compressionSettings = compressionSettings(for: item)
+        let meetingDate = item.meetingDate ?? sourceMeetingDate(for: item.sourceURL)
         let termsForRun = item.selectedGlossaryTerms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let request = JobRequest(
@@ -274,6 +275,7 @@ struct ContentView: View {
             rerun_steps: [],
             library_job_id: item.libraryJobId,
             delete_source_after_copy: settings.deleteSourceAfterCopy && !item.isLibraryRerun,
+            meeting_date: engineMeetingDateString(meetingDate),
             odoo_context_ref: contextRef,
             odoo_meeting_metadata: item.odooMeeting
         )
@@ -597,6 +599,8 @@ struct PerFileSetupPanel: View {
             }
             audioScrubber
 
+            meetingDatePicker
+
             if settings.odooConfigured {
                 OdooMeetingSuggestionsSection(
                     item: $item,
@@ -652,6 +656,46 @@ struct PerFileSetupPanel: View {
         .onDisappear { player.stop() }
     }
 
+    private var detectedMeetingDate: Date {
+        sourceMeetingDate(for: item.sourceURL)
+    }
+
+    private var meetingDateBinding: Binding<Date> {
+        Binding(
+            get: { item.meetingDate ?? detectedMeetingDate },
+            set: { newDate in
+                item.meetingDate = newDate
+                item.meetingDateManuallyEdited = true
+                markOdooMeetingDateChanged()
+            }
+        )
+    }
+
+    private var meetingDatePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                DatePicker(
+                    "Date de la réunion",
+                    selection: meetingDateBinding,
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                .datePickerStyle(.compact)
+                Spacer()
+                if item.meetingDateManuallyEdited {
+                    Button("Réinitialiser") {
+                        item.meetingDate = nil
+                        item.meetingDateManuallyEdited = false
+                        markOdooMeetingDateChanged()
+                    }
+                    .controlSize(.small)
+                }
+            }
+            Text(item.meetingDateManuallyEdited ? "Corrigée manuellement · utilisée pour Odoo et les fichiers générés." : "Détectée depuis les métadonnées du fichier source.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     @ViewBuilder
     private var audioScrubber: some View {
         if player.totalSeconds > 0 {
@@ -703,16 +747,35 @@ struct PerFileSetupPanel: View {
 
     /// Bracket the file's modification time and ask Odoo for any
     /// ``calendar.event`` records that touch that window. The
-    /// fetch is keyed on the URL so we only query once per file
-    /// per sheet — flipping back to the same file with Précédent /
-    /// Suivant doesn't re-hit the network.
-    private func loadMeetingSuggestions() async {
+    /// fetch is keyed on the URL + meeting date so we only query once
+    /// per file/date pair — manual date corrections intentionally
+    /// re-run the search.
+    private func markOdooMeetingDateChanged() {
+        let linkedAttendeeNames = item.odooMeeting?.attendees
+            .map(\.name)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? []
+        if !linkedAttendeeNames.isEmpty,
+           Set(linkedAttendeeNames) == Set(item.expectedSpeakerNames) {
+            item.expectedSpeakerNames = []
+            item.expectedSpeakerCount = 0
+        }
+        item.odooMeetingTitle = ""
+        item.odooMeeting = nil
+        item.odooContextRef = nil
+        lastSuggestionsKey = ""
+        if settings.odooConfigured {
+            Task { await loadMeetingSuggestions(force: true) }
+        }
+    }
+
+    private func loadMeetingSuggestions(force: Bool = false) async {
         guard settings.odooConfigured else {
             suggestions = []
             return
         }
-        let key = item.sourceURL.path
-        if key == lastSuggestionsKey { return }
+        let meetingDate = item.meetingDate ?? detectedMeetingDate
+        let key = "\(item.sourceURL.path)|\(engineMeetingDateString(meetingDate))"
+        if !force && key == lastSuggestionsKey { return }
         lastSuggestionsKey = key
         suggestions = []
         suggestionsLoading = true
@@ -721,9 +784,7 @@ struct PerFileSetupPanel: View {
         // We ask for a generous window (2 h before / 30 min after)
         // so a recording renamed slightly after the fact still
         // matches the event Odoo holds.
-        let fileDate = (try? item.sourceURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-            ?? Date()
-        let found = await odoo.searchMeetings(near: fileDate, windowHours: 2.5, limit: 8)
+        let found = await odoo.searchMeetings(near: meetingDate, windowHours: 2.5, limit: 8)
         await MainActor.run {
             suggestions = found
         }
@@ -1478,6 +1539,7 @@ struct LibraryView: View {
     @AppStorage("libraryShowsArtefactsColumn") private var showsArtefactsColumn = true
     @AppStorage("libraryShowsSpeakersColumn") private var showsSpeakersColumn = false
     @AppStorage("libraryShowsProjectSizeColumn") private var showsProjectSizeColumn = false
+    @AppStorage("libraryShowsMeetingDateColumn") private var showsMeetingDateColumn = false
     /// Sort order driving the table — defaults to most-recently
     /// updated first, mirroring what the engine returns from
     /// ``library_list``. Columns toggle between ascending and
@@ -1519,6 +1581,7 @@ struct LibraryView: View {
                 Toggle("Mis à jour", isOn: $showsUpdatedColumn)
                 Toggle("Artefacts", isOn: $showsArtefactsColumn)
                 Divider()
+                Toggle("Date réunion", isOn: $showsMeetingDateColumn)
                 Toggle("Interlocuteurs", isOn: $showsSpeakersColumn)
                 Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
             } label: {
@@ -1622,6 +1685,17 @@ struct LibraryView: View {
                                 }
                             }
                             .width(min: 190, ideal: 240)
+                        }
+
+                        if showsMeetingDateColumn {
+                            TableColumn("Date réunion", value: \.sortableMeetingDate) { displayRow in
+                                if displayRow.artifact == nil {
+                                    Text(displayMeetingDate(displayRow.job.meeting_date))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            .width(min: 130, ideal: 160)
                         }
 
                         if showsSpeakersColumn {
@@ -2704,6 +2778,7 @@ extension LibraryDisplayRow {
     /// enough for sort purposes; we fall back to ``created_at``
     /// when ``updated_at`` is blank.
     var sortableUpdatedAt: String { job.updated_at ?? job.created_at ?? "" }
+    var sortableMeetingDate: String { job.meeting_date ?? "" }
     /// 0 for legacy rows so they group at the bottom on descending
     /// sort, top on ascending. Either way they don't poison the
     /// real values.

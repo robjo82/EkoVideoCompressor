@@ -16,7 +16,12 @@ from .models import (
     WarningEvent,
 )
 from .library import database, library_remember_speaker_names
-from .pipeline import CompressionPipeline, StepResult, TranscriptionPipeline
+from .pipeline import (
+    CompressionPipeline,
+    StepResult,
+    TranscriptionPipeline,
+    apply_meeting_date_to_artifact,
+)
 from .pipeline import prepare_job_workspace
 
 
@@ -327,6 +332,7 @@ class EngineRunner:
             # switches tabs.
             sink(ArtifactEvent("library_row", str(workspace), model=str(job_id)))
         db.update_job_status(job_id, "RUNNING", "")
+        db.update_job_meeting_date(job_id, request.meeting_date or None)
         db.update_job_progress(
             job_id,
             step="Démarrage…",
@@ -374,6 +380,7 @@ class EngineRunner:
                 db.update_job_status(job_id, "FAILED", result.error or "Compression failed")
                 sink(ErrorEvent(result.error or "Compression failed", code="compression_failed"))
                 return 1
+            apply_meeting_date_to_artifact(request, result.artifact_path)
             db.update_job_artefact(job_id, "compressed", result.artifact_path)
             db.update_job_output(job_id, result.artifact_path)
             db.update_job_progress(job_id, step="Compression terminée", progress_pct=50, eta_seconds=None)
@@ -400,6 +407,8 @@ class EngineRunner:
                 return 1
             transcript_for_title: str | None = None
             for r in tx_results:
+                if r.artifact_path:
+                    apply_meeting_date_to_artifact(request, r.artifact_path)
                 if r.name == "transcript" and r.artifact_path:
                     db.update_job_artefact(job_id, "transcript", r.artifact_path)
                     db.update_job_output(job_id, r.artifact_path)

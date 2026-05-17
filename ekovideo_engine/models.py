@@ -194,6 +194,11 @@ class JobRequest:
     rerun_steps: list[str] = field(default_factory=list)
     library_job_id: int | None = None
     delete_source_after_copy: bool = False
+    # ISO-8601 timestamp of the actual meeting. Defaults to the
+    # source file's metadata on the SwiftUI side, but can be corrected
+    # manually when a recording was copied or exported later than the
+    # meeting itself.
+    meeting_date: str = ""
     # Optional Odoo object whose chatter we'll fetch during the LLM
     # enhancement step. Empty when the user didn't link a meeting in
     # Run Setup; populated when they clicked "Utiliser" on a
@@ -239,6 +244,7 @@ class JobRequest:
             rerun_steps=[str(x) for x in data.get("rerun_steps") or []],
             library_job_id=data.get("library_job_id"),
             delete_source_after_copy=bool(data.get("delete_source_after_copy") or False),
+            meeting_date=str(data.get("meeting_date") or ""),
             odoo_context_ref=OdooContextRef.from_dict(data.get("odoo_context_ref")),
             odoo_meeting_metadata=dict(data.get("odoo_meeting_metadata") or {}),
         )

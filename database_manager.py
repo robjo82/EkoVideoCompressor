@@ -139,6 +139,10 @@ class DatabaseManager:
             # before this column existed; the SwiftUI library shows
             # "—" for those instead of "0".
             "total_bytes": "INTEGER",
+            # Actual meeting timestamp (ISO-8601). Distinct from the
+            # job creation/update dates: users can correct it when the
+            # media file was duplicated/exported after the meeting.
+            "meeting_date": "TEXT",
             # Odoo meeting context the user paired with the job in
             # Run Setup. JSON shape:
             #   {"event_id": int, "event_name": str,
@@ -215,6 +219,16 @@ class DatabaseManager:
             conn.execute(
                 "UPDATE jobs SET odoo_meeting_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (blob, job_id),
+            )
+
+    def update_job_meeting_date(self, job_id: int, meeting_date: Optional[str]) -> None:
+        """Persist the actual meeting timestamp for library display
+        and artefact metadata. Empty values clear the field."""
+        value = meeting_date.strip() if isinstance(meeting_date, str) else None
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET meeting_date = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (value or None, job_id),
             )
 
     def update_job_total_bytes(self, job_id: int, total_bytes: int) -> None:

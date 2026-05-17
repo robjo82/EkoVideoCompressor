@@ -120,6 +120,27 @@ class BuildFfmpegCmdTest(unittest.TestCase):
         self.assertIn("-to", cmd)
         self.assertIn("00:02:00", cmd)
 
+    def test_creation_time_metadata_is_written_for_video_and_audio(self):
+        timestamp = "2026-05-14T12:30:00Z"
+        video_cmd = build_ffmpeg_cmd(
+            ffmpeg_path="/usr/local/bin/ffmpeg",
+            in_path="/tmp/in.mp4",
+            out_path="/tmp/out.mp4",
+            creation_time=timestamp,
+        )
+        audio_cmd = build_ffmpeg_cmd(
+            ffmpeg_path="/usr/local/bin/ffmpeg",
+            in_path="/tmp/in.m4a",
+            out_path="/tmp/out.m4a",
+            audio_only=True,
+            creation_time=timestamp,
+        )
+
+        for cmd in (video_cmd, audio_cmd):
+            self.assertIn("-metadata", cmd)
+            self.assertIn(f"creation_time={timestamp}", cmd)
+            self.assertLess(cmd.index(f"creation_time={timestamp}"), len(cmd) - 1)
+
 
 class BuildSpeakerConcatCmdTest(unittest.TestCase):
     def test_aselect_filter_carries_every_span(self):

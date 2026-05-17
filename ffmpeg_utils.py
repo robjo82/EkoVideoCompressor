@@ -114,6 +114,7 @@ def build_ffmpeg_cmd(
     ss: str | None = None,
     to: str | None = None,
     audio_only: bool = False,
+    creation_time: str | None = None,
 ) -> list[str]:
     cmd = [ffmpeg_path, "-y", "-hide_banner"]
 
@@ -145,6 +146,8 @@ def build_ffmpeg_cmd(
         cmd += ["-c:a", "aac", "-b:a", audio_bitrate]
         if mono_audio:
             cmd += ["-ac", "1"]
+        if creation_time:
+            cmd += ["-metadata", f"creation_time={creation_time}"]
         cmd += ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out_path]
         return cmd
 
@@ -179,6 +182,8 @@ def build_ffmpeg_cmd(
     ]
     if mono_audio:
         cmd += ["-ac", "1"]
+    if creation_time:
+        cmd += ["-metadata", f"creation_time={creation_time}"]
 
     cmd += ["-progress", "pipe:1", "-nostats", out_path]
     return cmd
