@@ -646,17 +646,31 @@ def library_rename_speakers(
         raise ValueError(f"job not found: {job_id}")
 
     # Enrollment runs *before* the DB segments get renamed —
-    # otherwise the SPEAKER_NN labels we want to look up are
-    # already gone from the segments table. Only SPEAKER_NN →
-    # real-name pairs are candidates; re-renaming "Robin" → "Robin
-    # Dupuy" is an edit, not a new voice to learn.
+    # otherwise the labels we want to look up are already gone
+    # from the segments table.
+    #
+    # We accept any "source label → real name" pair, not just
+    # ``SPEAKER_NN → name``. The previous filter rejected the
+    # common case where the LLM's title pass had already replaced
+    # the placeholder with a wrong guess ("SPEAKER_00" → "Marie"
+    # in the pipeline, then the user fixes "Marie" → "Sophie" in
+    # the rename sheet). That second rename never enrolled
+    # anything because "Marie" doesn't start with "SPEAKER_", so
+    # the speaker_profiles table stayed empty across the user's
+    # whole library.
+    #
+    # The only no-op case we still skip is ``X → X``: the user
+    # confirmed the existing label is the right name (typically
+    # via the auto-recognition pre-fill), which means the profile
+    # is already enrolled.
     enrolled = 0
     if enroll:
         enrolment_targets: dict[str, str] = {
-            placeholder: name
-            for placeholder, name in mapping.items()
+            source: name
+            for source, name in mapping.items()
             if name.strip()
-            and placeholder.upper().startswith("SPEAKER_")
+            and source.strip()
+            and source.strip().lower() != name.strip().lower()
         }
         if enrolment_targets:
             enrolled = library_enroll_speakers_for_job(
@@ -678,15 +692,17 @@ def library_rename_speakers(
     if segments_changed:
         db.add_segments(job_id, updated)
 
-    current_speakers: dict[str, str] = {}
-    raw_speakers = job.get("speaker_map_json")
-    if raw_speakers:
-        try:
-            current_speakers = json.loads(raw_speakers)
-        except json.JSONDecodeError:
-            current_speakers = {}
-    current_speakers.update({k: v for k, v in mapping.items() if v.strip()})
-    db.update_job_context(job_id, speakers=current_speakers)
+    # Rebuild the speaker map *canonically* from whatever ended up
+    # in the segments table — never merge historical rename pairs.
+    # The previous behaviour (``current_speakers.update(mapping)``)
+    # kept stale ``Marie → Sophie`` rows after Marie was already
+    # rewritten in segments, which caused the rename sheet to
+    # re-show "Sophie" twice on reopen (once from the historical
+    # pair, once from the actual segment label). Treating the
+    # segments table as the source of truth makes the map idempotent.
+    db.update_job_context(
+        job_id, speakers=_speaker_map_from_segments(db.get_segments(job_id))
+    )
 
     artifacts_rewritten = _rewrite_speaker_artifacts(job, mapping)
 
@@ -695,6 +711,39 @@ def library_rename_speakers(
         "artifacts_rewritten": artifacts_rewritten,
         "speakers_enrolled": enrolled,
     }
+
+
+def _speaker_map_from_segments(segments: list[dict]) -> dict[str, str]:
+    """Project the current ``transcription_segments.speaker`` column
+    into the ``speaker_map_json`` shape the rename sheet consumes.
+
+    Rules — kept identical to ``TranscriptionPipeline._build_speaker_map``
+    so the post-rename map and the post-pipeline map are
+    indistinguishable:
+
+    * SPEAKER_NN placeholders map to an empty string (the sheet
+      treats that as "user hasn't decided yet" and shows an
+      editable field).
+    * Friendly names map to themselves so the sheet can show the
+      current display name pre-filled.
+    * Empty / blank labels are skipped — they're a remnant of an
+      unattributed segment, not a speaker to surface.
+    """
+    labels: list[str] = []
+    seen: set[str] = set()
+    for seg in segments:
+        label = str(seg.get("speaker") or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    out: dict[str, str] = {}
+    for label in labels:
+        if label.upper().startswith("SPEAKER_"):
+            out[label] = ""
+        else:
+            out[label] = label
+    return out
 
 
 # ---------------------------------------------------------------------------
