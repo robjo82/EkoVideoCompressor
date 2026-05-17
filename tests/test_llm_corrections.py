@@ -160,5 +160,46 @@ class ApplyCorrectionsTest(unittest.TestCase):
         self.assertIn("Bravoo", out.text)
 
 
+class NoopAfterNormalisationTest(unittest.TestCase):
+    def test_rejects_cedilla_corruption(self):
+        # The LLM occasionally emits cedilla-corrupted French words
+        # ("clique" → "çlique") that pass both the literal-presence
+        # and the Levenshtein-distance checks. Their normalised forms
+        # are identical to the originals, so the "correction" is a
+        # pure no-op that just litters the transcript with mid-word
+        # diacritics. Pin the new guardrail.
+        text = "Quand je clique sur le bouton."
+        out = apply_llm_corrections_to_text(
+            text,
+            [{"original": "clique", "replacement": "çlique", "confidence": 0.85}],
+        )
+        self.assertEqual(out.text, text)
+        self.assertEqual(out.rejected[0].reason, "noop_after_normalization")
+
+    def test_rejects_accent_only_noise(self):
+        # "Et après" → "Et apres" (accent stripped) would also be a
+        # no-op once normalised. Both directions of the
+        # accent-corruption bug surface as the same rejection.
+        text = "Et après que ça se passe."
+        out = apply_llm_corrections_to_text(
+            text,
+            [{"original": "après", "replacement": "apres", "confidence": 0.85}],
+        )
+        self.assertEqual(out.text, text)
+        self.assertEqual(out.rejected[0].reason, "noop_after_normalization")
+
+    def test_keeps_real_correction_with_meaningful_change(self):
+        # Guard: the new check must not over-reject. "Sudokiz" vs
+        # "Sudokies" normalises differently (sudokiz vs sudokies),
+        # so the correction lands.
+        text = "Bonjour, ici Sudokiz."
+        out = apply_llm_corrections_to_text(
+            text,
+            [{"original": "Sudokiz", "replacement": "Sudokies", "confidence": 0.85}],
+        )
+        self.assertEqual(out.text, "Bonjour, ici Sudokies.")
+        self.assertEqual(out.rejected, [])
+
+
 if __name__ == "__main__":
     unittest.main()

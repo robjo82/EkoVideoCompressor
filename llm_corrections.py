@@ -316,6 +316,25 @@ def apply_llm_corrections_to_text(
             )
             continue
 
+        # Reject corrections whose normalised forms are identical.
+        # Catches the LLM emitting cedilla- or accent-corrupted
+        # words ("clique" → "çlique", "une" → "unee") that pass the
+        # Levenshtein and substring checks because the surface
+        # difference is tiny, but the normalised forms collide. The
+        # "fix" would actually corrupt the transcript with mid-word
+        # diacritics that weren't there in the original audio.
+        if _normalize_for_match(original) == _normalize_for_match(replacement):
+            rejected.append(
+                RejectedCorrection(
+                    timestamp=ts,
+                    original=original,
+                    replacement=replacement,
+                    confidence=confidence,
+                    reason="noop_after_normalization",
+                )
+            )
+            continue
+
         # Guardrail 1: the LLM quoted an `original` that actually
         # exists in the transcript. If not, the model is paraphrasing
         # what it *heard* about the audio rather than catching a real

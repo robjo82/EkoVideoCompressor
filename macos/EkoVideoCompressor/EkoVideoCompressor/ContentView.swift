@@ -2563,6 +2563,13 @@ struct LibraryContextEditor: View {
     @State private var sampleIndexBySpeaker: [String: Int] = [:]
     @State private var loadingSamples = false
     @State private var currentSound: NSSound?
+    // ID of the sample currently playing, used to flip the
+    // play/pause icon on the right button. Cleared on natural
+    // playback end via a duration-bounded Task — NSSound has no
+    // ergonomic delegate hook so we rely on the sample's stated
+    // duration to know when to reset.
+    @State private var playingSampleID: String?
+    @State private var playbackTimerTask: Task<Void, Never>?
     @State private var reviewNotice: String?
     @State private var termsText: String
 
@@ -2598,27 +2605,48 @@ struct LibraryContextEditor: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach($speakers) { $speaker in
+                            // ``showsClusterTag`` decides whether the
+                            // SPEAKER_NN-style label appears as a chip
+                            // to the left of the input. We only show it
+                            // for opaque cluster IDs — once the row
+                            // carries a friendly name (Marie, Robin…)
+                            // the chip is just noise.
+                            let showsClusterTag = speaker.id.uppercased().hasPrefix("SPEAKER_")
                             VStack(alignment: .leading, spacing: 5) {
-                                HStack {
-                                    if speaker.id != speaker.name {
+                                HStack(spacing: 10) {
+                                    if showsClusterTag {
                                         Text(speaker.id)
-                                            .font(.body.monospaced())
+                                            .font(.caption.monospaced())
                                             .foregroundStyle(.secondary)
-                                            .frame(width: 120, alignment: .leading)
+                                            .frame(width: 100, alignment: .leading)
                                     }
-                                    TextField(speaker.name.isEmpty ? speaker.id : speaker.name, text: $speaker.name)
+                                    // ``labelsHidden`` strips the
+                                    // implicit Form-style label that
+                                    // SwiftUI otherwise renders to the
+                                    // left of the input — which is what
+                                    // made the row look like "old name +
+                                    // new name (left, read-only) + new
+                                    // name (right, editable)". One label,
+                                    // one editable field, that's it.
+                                    TextField(
+                                        "Nom à afficher",
+                                        text: $speaker.name,
+                                        prompt: Text("Nom à afficher")
+                                    )
+                                    .textFieldStyle(.roundedBorder)
+                                    .labelsHidden()
                                     speakerSampleControls(for: speaker)
                                 }
                                 if let stats = speakerStatsText(for: speaker) {
                                     Text(stats)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
-                                        .padding(.leading, speaker.id != speaker.name ? 128 : 0)
+                                        .padding(.leading, showsClusterTag ? 110 : 0)
                                 }
                                 if let attendees = unusedAttendees(for: speaker),
                                    !attendees.isEmpty {
                                     odooAttendeeChips(for: $speaker, attendees: attendees)
-                                        .padding(.leading, speaker.id != speaker.name ? 128 : 0)
+                                        .padding(.leading, showsClusterTag ? 110 : 0)
                                 }
                             }
                         }
@@ -2665,14 +2693,22 @@ struct LibraryContextEditor: View {
     private func speakerSampleControls(for speaker: SpeakerEditRow) -> some View {
         let availableSamples = samples(for: speaker)
         if let sample = selectedSample(for: speaker, in: availableSamples) {
+            let isPlaying = playingSampleID == sample.id
             HStack(spacing: 6) {
                 Button {
-                    play(sample)
+                    togglePlay(sample)
                 } label: {
-                    Label("Écouter", systemImage: "play.circle")
+                    Label(
+                        isPlaying ? "Pause" : "Écouter",
+                        systemImage: isPlaying ? "pause.circle.fill" : "play.circle"
+                    )
                 }
                 .labelStyle(.iconOnly)
-                .help("Écouter \(samplePositionText(for: speaker, in: availableSamples))")
+                .help(
+                    isPlaying
+                        ? "Mettre en pause"
+                        : "Écouter \(samplePositionText(for: speaker, in: availableSamples))"
+                )
 
                 if availableSamples.count > 1 {
                     Button {
@@ -2873,11 +2909,44 @@ struct LibraryContextEditor: View {
         return "\(minutes) min \(remainingSeconds) s"
     }
 
-    private func play(_ sample: SpeakerSample) {
-        currentSound?.stop()
+    /// Toggle playback for ``sample``. If it's already playing,
+    /// pause + clear the active ID; otherwise stop any other
+    /// sample first, then start this one and arm a teardown task
+    /// that clears the ID once the clip's stated duration has
+    /// elapsed (NSSound doesn't surface a finish callback we can
+    /// hook into cleanly without an NSObject delegate).
+    private func togglePlay(_ sample: SpeakerSample) {
+        if playingSampleID == sample.id {
+            stopPlayback()
+            return
+        }
+        stopPlayback()
         let sound = NSSound(contentsOfFile: sample.path, byReference: true)
         currentSound = sound
-        sound?.play()
+        guard sound?.play() == true else { return }
+        playingSampleID = sample.id
+        let duration = max(sample.duration, 0.4)
+        let snapshotID = sample.id
+        playbackTimerTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+            await MainActor.run {
+                // Only reset if the same sample is still flagged
+                // as playing — the user may have toggled to a
+                // different sample while we were sleeping.
+                if playingSampleID == snapshotID {
+                    playingSampleID = nil
+                    currentSound = nil
+                }
+            }
+        }
+    }
+
+    private func stopPlayback() {
+        currentSound?.stop()
+        currentSound = nil
+        playingSampleID = nil
+        playbackTimerTask?.cancel()
+        playbackTimerTask = nil
     }
 
     private func flagForReview(_ sample: SpeakerSample) {

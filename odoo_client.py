@@ -524,6 +524,7 @@ def search_meeting_events(
     near: datetime | None = None,
     window_hours: float = 2.0,
     limit: int = 10,
+    min_attendees: int = 2,
 ) -> list[dict]:
     """Return the ``calendar.event`` records that bracket ``near``.
 
@@ -531,6 +532,10 @@ def search_meeting_events(
     [near - window_hours, near + window_hours]. ``near`` defaults to
     "right now", which is what an `Enregistrer dans le moment`
     workflow expects.
+
+    ``min_attendees`` filters out personal blockers / focus slots —
+    we default to 2 because a meeting recording always implies at
+    least two people. Pass 0 to disable the filter.
 
     Each returned dict is augmented with an ``attendees`` list of
     flat ``{id, name, email}`` records (resolved via a single batched
@@ -562,10 +567,11 @@ def search_meeting_events(
     if not isinstance(records, list):
         return []
 
+    min_required = max(0, int(min_attendees))
     stripped = [
         meeting
         for meeting in (_strip_meeting_record(r) for r in records if isinstance(r, dict))
-        if len(meeting.get("partner_ids") or []) > 1
+        if len(meeting.get("partner_ids") or []) >= min_required
     ]
 
     # Expand attendees once for the whole batch.

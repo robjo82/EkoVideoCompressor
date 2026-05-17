@@ -690,6 +690,110 @@ class SpeakerEnrollmentTest(unittest.TestCase):
                 # raising.
                 self.assertEqual(library_delete_speaker_profile(name="Marie"), 0)
 
+    def test_enrollment_fires_on_friendly_to_friendly_rename(self):
+        # The pipeline's LLM title pass often replaces SPEAKER_NN
+        # with a wrong guess ("Marie"). The user then corrects in
+        # the rename sheet ("Marie" → "Sophie"). The previous
+        # filter accepted only ``SPEAKER_NN → name`` pairs and
+        # silently dropped this case, which is why the
+        # speaker_profiles table stayed empty across the user's
+        # whole library. Pin the fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root)
+                # Pre-rename SPEAKER_00 → Marie so the segments
+                # already carry friendly names — mimics what the
+                # LLM title pass leaves behind.
+                db = database()
+                segments = db.get_segments(job_id)
+                renamed = [
+                    {**dict(s), "start": s.get("start_time"), "end": s.get("end_time"),
+                     "speaker": "Marie" if s.get("speaker") == "SPEAKER_00" else "Paul"}
+                    for s in segments
+                ]
+                db.add_segments(job_id, renamed)
+
+                def fake_run(cmd, *args, **kwargs):
+                    payload = json.dumps(
+                        {"clusters": {"Marie": [[1.0, 0.0, 0.0, 0.0]]}}
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    summary = library_rename_speakers(
+                        job_id, {"Marie": "Sophie"},
+                    )
+
+                profiles = library_list_speaker_profiles()
+            self.assertEqual([p["name"] for p in profiles], ["Sophie"])
+            self.assertEqual(summary["speakers_enrolled"], 1)
+
+    def test_no_op_rename_does_not_re_enroll(self):
+        # Pin the only "X → X" guard we kept: confirming the
+        # existing label is correct must not trigger another
+        # enrollment round-trip.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root)
+                with patch(
+                    "ekovideo_engine.library.subprocess.run"
+                ) as mock_run:
+                    summary = library_rename_speakers(
+                        job_id, {"SPEAKER_00": "SPEAKER_00"},
+                    )
+                    mock_run.assert_not_called()
+            self.assertEqual(summary["speakers_enrolled"], 0)
+
+    def test_rename_rebuilds_canonical_speaker_map_from_segments(self):
+        # The previous behaviour merged every historical rename
+        # pair into ``speaker_map_json``, which caused the sheet
+        # to show "Sophie" twice on reopen: once from the stale
+        # ``Marie → Sophie`` pair, once from the actual ``Sophie``
+        # cluster pulled off the samples list. Pin that the map
+        # now mirrors the segments table 1:1.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root)
+                db = database()
+                # Pre-state: segments labelled Marie + Paul (LLM
+                # guesses), map has them mapped to themselves.
+                segments = db.get_segments(job_id)
+                staged = [
+                    {**dict(s), "start": s.get("start_time"), "end": s.get("end_time"),
+                     "speaker": "Marie" if s.get("speaker") == "SPEAKER_00" else "Paul"}
+                    for s in segments
+                ]
+                db.add_segments(job_id, staged)
+                db.update_job_context(
+                    job_id, speakers={"Marie": "Marie", "Paul": "Paul"}
+                )
+
+                # Stub the enrollment call so the test stays
+                # focused on the map rebuild.
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps({"clusters": {}}), ""
+                    ),
+                ):
+                    library_rename_speakers(
+                        job_id, {"Marie": "Sophie", "Paul": "Robin"},
+                    )
+
+                row = db.get_job(job_id)
+                final_map = json.loads(row.get("speaker_map_json") or "{}")
+            # Map carries exactly the labels now in segments, each
+            # pointing to itself — no stale Marie → Sophie pair.
+            self.assertEqual(set(final_map.keys()), {"Sophie", "Robin"})
+            self.assertEqual(final_map["Sophie"], "Sophie")
+            self.assertEqual(final_map["Robin"], "Robin")
+
     def test_rename_with_enroll_disabled_skips_pyannote(self):
         # The CLI / Swift caller can opt out of enrollment when
         # they're just doing a string-only rename (e.g. fixing a
