@@ -296,6 +296,7 @@ class TranscriptionPipeline:
         self.final_segments: list[dict] = []
         self.final_speaker_map: dict[str, str] = {}
         self.final_technical_terms: list[str] = []
+        self.final_title: str = ""
 
     def _resolve_managed_python(self) -> None:
         settings = self.request.transcription_settings
@@ -549,6 +550,7 @@ class TranscriptionPipeline:
         self.final_technical_terms = list(
             self._llm_payload.get("technical_terms") or []
         )
+        self.final_title = str(self._llm_payload.get("title") or "").strip()
         # Always emit a ContextEvent — the SwiftUI app uses it to
         # surface live speaker hints in the queue view. Empty values
         # are fine: the sheet renders one row per placeholder either

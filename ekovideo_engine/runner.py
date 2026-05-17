@@ -15,7 +15,7 @@ from .models import (
     ProgressEvent,
     WarningEvent,
 )
-from .library import database
+from .library import database, library_remember_speaker_names
 from .pipeline import CompressionPipeline, StepResult, TranscriptionPipeline
 from .pipeline import prepare_job_workspace
 
@@ -161,6 +161,7 @@ def _auto_rename_job_from_transcript(
     job_id: int,
     transcript_path: str | None,
     source_path: str,
+    suggested_title: str | None = None,
 ) -> str | None:
     """Pick a topical title from the transcript and store it on the job.
 
@@ -192,10 +193,18 @@ def _auto_rename_job_from_transcript(
         return None
     # Lazy import to avoid pulling the full transcription_utils module
     # into the engine's startup path (it imports MLX/whisper bits).
-    from transcription_utils import sanitize_filename_stem, suggest_transcript_stem
+    from transcription_utils import (
+        is_useful_transcript_title,
+        sanitize_filename_stem,
+        suggest_transcript_stem,
+    )
 
     fallback_stem = sanitize_filename_stem(Path(source_path).stem or "Transcription")
-    suggestion = suggest_transcript_stem(text, fallback_stem)
+    llm_title = sanitize_filename_stem(suggested_title or "", "")
+    if is_useful_transcript_title(llm_title, fallback_stem):
+        suggestion = llm_title
+    else:
+        suggestion = suggest_transcript_stem(text, fallback_stem)
     if not suggestion or suggestion == fallback_stem:
         return None
     db.update_job_title(job_id, suggestion)
@@ -297,6 +306,18 @@ class EngineRunner:
             # cover the unlikely case of stale data lingering on a
             # row reused via primary-key collision.
             db.update_job_odoo_meeting(job_id, None)
+        declared_speakers = [
+            name
+            for name in (request.speaker_overrides or {}).values()
+            if (name or "").strip()
+        ]
+        if declared_speakers:
+            remembered = library_remember_speaker_names(declared_speakers, db=db)
+            if remembered:
+                append_app_log(
+                    "engine_speakers_remembered "
+                    f"job_id={job_id} count={remembered}"
+                )
 
         results: list[StepResult] = []
         active_source = str(working_source)
@@ -360,7 +381,11 @@ class EngineRunner:
             # title has been set yet (see the helper for the bail
             # rules).
             new_title = _auto_rename_job_from_transcript(
-                db, job_id, transcript_for_title, request.source_path
+                db,
+                job_id,
+                transcript_for_title,
+                request.source_path,
+                suggested_title=pipeline.final_title,
             )
             if new_title:
                 sink(ArtifactEvent("job_title", new_title, model=str(job_id)))

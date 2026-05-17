@@ -3356,7 +3356,11 @@ struct SpeakerProfilesSection: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(profile.name)
                                 .font(.callout.weight(.medium))
-                            Text("\(profile.sample_count) extrait(s)")
+                            Text(
+                                profile.sample_count > 0
+                                    ? "\(profile.sample_count) extrait(s)"
+                                    : "Nom enregistré · voix à apprendre"
+                            )
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }

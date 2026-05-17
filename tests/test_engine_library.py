@@ -21,6 +21,7 @@ from ekovideo_engine.library import (
     library_link_speaker_profile_to_odoo,
     library_list_speaker_profiles,
     library_recognize_speakers,
+    library_remember_speaker_names,
     library_rename_speakers,
     library_speaker_samples,
     library_unlink_speaker_profile_from_odoo,
@@ -486,7 +487,13 @@ class SpeakerEnrollmentTest(unittest.TestCase):
 
     _job_counter = 0
 
-    def _seed_job(self, root: Path, *, with_diar_audio: bool = True) -> tuple[int, Path]:
+    def _seed_job(
+        self,
+        root: Path,
+        *,
+        with_diar_audio: bool = True,
+        venv_in_settings: bool = True,
+    ) -> tuple[int, Path]:
         # Each call needs its own workspace dir, otherwise a second
         # _seed_job inside the same test trips ``mkdir(exist_ok=False)``.
         SpeakerEnrollmentTest._job_counter += 1
@@ -500,22 +507,23 @@ class SpeakerEnrollmentTest(unittest.TestCase):
         else:
             (workspace / "audio.wav").write_bytes(b"riff fake")
 
-        # The library's _venv_python helper reads the venv path off
+        # The library's _venv_python helper can read the venv path off
         # settings_json. Point it at a fake interpreter so the
         # subprocess.run mock fires below.
         fake_python = root / "fake-python"
         fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         fake_python.chmod(0o755)
+        settings = (
+            {"transcription_settings": {"venv_python_path": str(fake_python)}}
+            if venv_in_settings
+            else {"transcription_settings": {"venv_python_path": ""}}
+        )
 
         db = database()
         job_id = db.create_job(
             source_path=str(root / "source.mov"),
             workspace_dir=str(workspace),
-            settings={
-                "transcription_settings": {
-                    "venv_python_path": str(fake_python),
-                }
-            },
+            settings=settings,
         )
         # Two SPEAKER_NN clusters with several long enough turns
         # each, so the embedding picker accepts them.
@@ -563,6 +571,71 @@ class SpeakerEnrollmentTest(unittest.TestCase):
 
             self.assertEqual(names, ["David", "Robin"])
             self.assertEqual(summary["speakers_enrolled"], 2)
+
+    def test_rename_remembers_name_even_when_enrollment_cannot_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root, venv_in_settings=False)
+                with patch(
+                    "ekovideo_engine.library.managed_venv_python_path",
+                    return_value=root / "missing-python",
+                ), patch("ekovideo_engine.library.subprocess.run") as mock_run:
+                    summary = library_rename_speakers(job_id, {"SPEAKER_00": "Robin"})
+                    mock_run.assert_not_called()
+                profiles = library_list_speaker_profiles()
+
+            self.assertEqual(summary["speakers_enrolled"], 0)
+            self.assertEqual(summary["speakers_remembered"], 1)
+            self.assertEqual(profiles[0]["name"], "Robin")
+            self.assertEqual(profiles[0]["sample_count"], 0)
+
+    def test_enrollment_uses_managed_venv_when_settings_path_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed_python = root / "managed-python"
+            managed_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            managed_python.chmod(0o755)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                job_id, _ = self._seed_job(root, venv_in_settings=False)
+
+                def fake_run(cmd, *args, **kwargs):
+                    self.assertEqual(cmd[0], str(managed_python))
+                    payload = json.dumps(
+                        {"clusters": {"SPEAKER_00": [[1.0, 0.0, 0.0, 0.0]]}}
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+                with patch(
+                    "ekovideo_engine.library.managed_venv_python_path",
+                    return_value=managed_python,
+                ), patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    summary = library_rename_speakers(job_id, {"SPEAKER_00": "Robin"})
+
+                profiles = library_list_speaker_profiles()
+
+            self.assertEqual(summary["speakers_enrolled"], 1)
+            self.assertEqual(profiles[0]["name"], "Robin")
+            self.assertEqual(profiles[0]["sample_count"], 1)
+
+    def test_remember_speaker_names_does_not_overwrite_voiceprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                db.upsert_speaker_profile(
+                    name="Robin",
+                    embedding_json=encode_embedding([1.0, 0.0]),
+                    sample_count=3,
+                )
+                remembered = library_remember_speaker_names(["Robin", "Robin"], db=db)
+                profile = library_list_speaker_profiles()[0]
+
+            self.assertEqual(remembered, 0)
+            self.assertEqual(profile["sample_count"], 3)
 
     def test_recognition_pre_fills_known_voices_on_new_job(self):
         # Enrol one profile, then run a fresh job whose SPEAKER_00

@@ -23,7 +23,7 @@ from transcription_utils import (
     parse_embedding_output,
 )
 
-from .paths import library_db_path
+from .paths import library_db_path, managed_venv_python_path
 
 
 def database(path: str | Path | None = None) -> DatabaseManager:
@@ -676,6 +676,10 @@ def library_rename_speakers(
             enrolled = library_enroll_speakers_for_job(
                 job_id, enrolment_targets, db=db, job=job
             )
+    remembered = library_remember_speaker_names(
+        [name for name in mapping.values() if (name or "").strip()],
+        db=db,
+    )
 
     segments = db.get_segments(job_id)
     segments_changed = 0
@@ -710,6 +714,7 @@ def library_rename_speakers(
         "segments_changed": segments_changed,
         "artifacts_rewritten": artifacts_rewritten,
         "speakers_enrolled": enrolled,
+        "speakers_remembered": remembered,
     }
 
 
@@ -780,7 +785,41 @@ def _venv_python(job: dict[str, Any] | None = None) -> str | None:
     candidate = (transcription.get("venv_python_path") or "").strip()
     if candidate and Path(candidate).exists():
         return candidate
+    managed_candidate = managed_venv_python_path()
+    if managed_candidate.exists():
+        return str(managed_candidate)
     return None
+
+
+def library_remember_speaker_names(
+    names: list[str] | tuple[str, ...] | set[str],
+    *,
+    db: DatabaseManager | None = None,
+) -> int:
+    """Persist user-confirmed speaker names before a voiceprint exists.
+
+    The Interlocuteurs view is both an address book and the voice
+    recognition store. A rename previously appeared there only when
+    pyannote embedding extraction succeeded; any missing venv or old
+    workspace made the save look lost. We now keep a 0-sample row
+    immediately, then replace it with a real centroid on enrollment.
+    """
+    db = db or database()
+    written = 0
+    seen: set[str] = set()
+    for raw_name in names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if db.get_speaker_profile_by_name(name):
+            continue
+        db.upsert_speaker_profile(name=name, embedding_json="[]", sample_count=0)
+        written += 1
+    return written
 
 
 def _diarisation_audio_path(job: dict[str, Any]) -> Path | None:

@@ -35,6 +35,7 @@ from transcription_utils import (
     clean_whisper_segments,
     default_transcript_path,
     filter_speaker_names_by_context,
+    is_useful_transcript_title,
     is_phone_hold_boilerplate_text,
     parse_diarization_output,
     parse_llm_corrections_markdown,
@@ -344,6 +345,36 @@ class TranscriptTitleTest(unittest.TestCase):
 
     def test_suggest_transcript_stem_falls_back_for_generic_opening(self):
         self.assertEqual(suggest_transcript_stem("Bonjour. Merci.", "Réunion client"), "Réunion client")
+
+    def test_suggest_transcript_stem_skips_verbatim_first_person_detail(self):
+        text = (
+            "[Robin] J'ai pris une facture fournisseur basique, en l'occurrence c'est PayFit.\n"
+            "[Robin] Le sujet de la réunion c'est l'automatisation des factures fournisseurs avec PayFit dans Odoo.\n"
+            "[Client] On valide ensuite le workflow comptable et l'import des pièces."
+        )
+        title = suggest_transcript_stem(text, "Capture ecran")
+        self.assertNotEqual(
+            title,
+            "J'ai pris une facture fournisseur basique, en l'occurrence c'est PayFit",
+        )
+        self.assertEqual(
+            title,
+            "l'automatisation des factures fournisseurs avec PayFit dans Odoo",
+        )
+
+    def test_title_validator_rejects_local_utterances(self):
+        self.assertFalse(
+            is_useful_transcript_title(
+                "J'ai pris une facture fournisseur basique, c'est PayFit",
+                "Capture ecran",
+            )
+        )
+        self.assertTrue(
+            is_useful_transcript_title(
+                "Traitement des factures fournisseurs avec PayFit",
+                "Capture ecran",
+            )
+        )
 
 
 class DiarizationCommandTest(unittest.TestCase):

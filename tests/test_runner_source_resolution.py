@@ -173,6 +173,65 @@ class AutoRenameFromTranscriptTest(unittest.TestCase):
             self.assertEqual(row["custom_title"], title)
             self.assertNotEqual(title, "Enregistrement de l'écran")
 
+    def test_prefers_valid_llm_title_over_sentence_heuristic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "transcript.txt"
+            transcript.write_text(
+                "J'ai pris une facture fournisseur basique, en l'occurrence c'est PayFit.\n"
+                "Ensuite on regarde l'import dans Odoo.",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "capture.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                title = _auto_rename_job_from_transcript(
+                    db,
+                    job_id,
+                    str(transcript),
+                    str(root / "capture.mov"),
+                    suggested_title="Traitement des factures fournisseurs avec PayFit",
+                )
+                row = db.get_job(job_id)
+
+            self.assertEqual(title, "Traitement des factures fournisseurs avec PayFit")
+            self.assertEqual(row["custom_title"], title)
+
+    def test_rejects_verbatim_llm_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "transcript.txt"
+            transcript.write_text(
+                "Bonjour. Merci. Oui d'accord.",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "capture.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                title = _auto_rename_job_from_transcript(
+                    db,
+                    job_id,
+                    str(transcript),
+                    str(root / "capture.mov"),
+                    suggested_title="J'ai pris une facture fournisseur basique",
+                )
+                row = db.get_job(job_id)
+
+            self.assertIsNone(title)
+            self.assertFalse((row["custom_title"] or "").strip())
+
     def test_respects_existing_custom_title(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -481,7 +481,11 @@ _GENERIC_OPENING_RE = re.compile(
     re.IGNORECASE,
 )
 _TITLE_NOISE_RE = re.compile(
-    r"^(on va parler de|je vais|on va|nous allons|aujourd'hui|aujourd’hui|là on va|c'est parti pour|c’est parti pour)\s+",
+    r"^(on va parler de|je vais|on va|nous allons|aujourd'hui|aujourd’hui|là on va|c'est parti pour|c’est parti pour|le sujet de la réunion c'est|le sujet de la reunion c'est|cette réunion porte sur|cette reunion porte sur)\s+",
+    re.IGNORECASE,
+)
+_BAD_TITLE_START_RE = re.compile(
+    r"^(j['’ ]|je\b|tu\b|vous\b|nous\b|on\b|il faut\b|c'est\b|c’est\b|voilà\b|alors\b|du coup\b|là\b)",
     re.IGNORECASE,
 )
 _SPEAKER_PREFIX_RE = re.compile(r"^(\[[^\]]+\]|SPEAKER[_ -]?\d+|INTERVENANT[_ -]?\d+)\s*:?\s*", re.IGNORECASE)
@@ -494,6 +498,28 @@ def sanitize_filename_stem(stem: str, fallback: str = "Transcription") -> str:
     if len(cleaned) > 80:
         cleaned = cleaned[:80].rsplit(" ", 1)[0].strip(" .-_")
     return cleaned or fallback
+
+
+def is_useful_transcript_title(title: str, fallback_stem: str = "") -> bool:
+    candidate = sanitize_filename_stem(title or "", "")
+    if not candidate:
+        return False
+    fallback = sanitize_filename_stem(fallback_stem or "", "")
+    if fallback and candidate.casefold() == fallback.casefold():
+        return False
+    words = candidate.split()
+    if len(words) < 3 or len(words) > 12:
+        return False
+    if len(candidate) < 12 or len(candidate) > 80:
+        return False
+    lowered = candidate.casefold()
+    if _BAD_TITLE_START_RE.search(lowered):
+        return False
+    # A library title should name the meeting topic, not quote a full
+    # utterance from the transcript.
+    if re.search(r"\b(j['’]ai|je suis|je vais|j'aimerais|j’aimerais|on va|nous allons)\b", lowered):
+        return False
+    return True
 
 
 def _plain_transcript_lines(transcript_text: str) -> list[str]:
@@ -532,6 +558,8 @@ def suggest_transcript_stem(transcript_text: str, fallback_stem: str) -> str:
         "présentation", "presentation", "outil", "outils", "rh", "module",
         "projet", "client", "atelier", "formation", "demo", "démo",
         "planning", "budget", "process", "workflow", "intégration", "integration",
+        "facture", "factures", "fournisseur", "fournisseurs", "comptabilité",
+        "comptable", "paie", "payfit", "odoo", "automatisation", "import",
     }
 
     best = ""
@@ -549,6 +577,8 @@ def suggest_transcript_stem(transcript_text: str, fallback_stem: str) -> str:
         if len(words) > 14:
             candidate = " ".join(words[:14]).strip(" ,.")
             words = candidate.split()
+        if not is_useful_transcript_title(candidate):
+            continue
 
         lowered = {word.strip(" ,.;:!?()[]{}'\"").lower() for word in words}
         score = 0
@@ -955,6 +985,10 @@ Règles strictes :
 - Ne mets que les SPEAKER_XX présents dans la transcription.
 - "technical_terms" contient 0 à 20 termes, sans doublons, orthographiés proprement.
 - Priorise les termes du vocabulaire métier quand ils apparaissent même phonétiquement.
+- Le titre doit décrire le sujet global de toute la réunion, pas recopier une phrase locale.
+- Le titre doit être nominal, sans première personne : pas de titre commençant par "J'ai", "Je", "On va", "Nous allons".
+- Mauvais titre : "J'ai pris une facture fournisseur basique, c'est PayFit".
+- Bon titre : "Traitement des factures fournisseurs avec PayFit".
 
 Schéma exact attendu :
 {{"title": "...", "speakers": {{"SPEAKER_00": "..."}}, "technical_terms": ["Odoo"]}}
