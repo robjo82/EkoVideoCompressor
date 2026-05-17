@@ -39,6 +39,8 @@ __all__ = [
     "search_meeting_events",
     "search_partners",
     "fetch_partner",
+    "fetch_related_context_pack",
+    "extract_odoo_glossary_candidates",
 ]
 
 
@@ -768,6 +770,506 @@ def fetch_object_chatter(
         "messages": cleaned,
         "fetched_at": _format_odoo_datetime(datetime.now(timezone.utc)),
     }
+
+
+# ----------------------------------------------------------------------
+# Recursive context pack
+# ----------------------------------------------------------------------
+#
+# The single ``fetch_object_chatter`` call gives the LLM enough to
+# correct a meeting transcript only when the primary record (the lead,
+# the task) carries the whole story in its chatter. In practice the
+# interesting context spans multiple records:
+#
+# * A ``crm.lead`` opportunity sits next to the ``sale.order``
+#   quotation(s) sent for it — sometimes only the quote describes
+#   the actual offering.
+# * A ``project.task`` lives under a ``project.project`` whose
+#   description and recent chatter set the broader frame.
+# * Both can themselves point back to a ``res.partner`` whose name
+#   and parent_name are useful biases for Whisper.
+#
+# ``fetch_related_context_pack`` does that traversal in one round,
+# applies a token-budget-aware truncation so local LLMs (Mistral
+# 7B, Llama 3 8B) don't get overrun, and returns both:
+#   * a prompt-ready ``summary`` string for the LLM corrections pass
+#   * a deduplicated ``terms`` list of proper-noun candidates to
+#     splice into the glossary feeding Whisper's initial prompt.
+#
+# Failures along the way are silent — recursion just stops at the
+# broken edge — so the LLM step always gets a best-effort blob
+# instead of an exception.
+
+
+# Fields we read from a sale.order to extract a meaningful one-liner
+# in addition to the chatter. ``name`` is the quote ref, ``partner_id``
+# the customer.
+_SALE_ORDER_FIELDS = (
+    "id",
+    "name",
+    "display_name",
+    "state",
+    "amount_total",
+    "currency_id",
+    "partner_id",
+    "opportunity_id",
+)
+
+# Fields we pull off a project.task / project.project to enrich the
+# context blob with a topical sentence beyond just the message log.
+_TASK_FIELDS = (
+    "id",
+    "name",
+    "display_name",
+    "stage_id",
+    "user_ids",
+    "description",
+    "project_id",
+)
+
+_PROJECT_FIELDS = (
+    "id",
+    "name",
+    "display_name",
+    "description",
+    "partner_id",
+)
+
+# ``crm.lead`` is the model we recurse from. We pull the linked
+# project_id (Enterprise CRM ↔ Project bridge) AND the partner so
+# the resulting pack carries the customer name as a glossary boost.
+_LEAD_FIELDS = (
+    "id",
+    "name",
+    "display_name",
+    "description",
+    "partner_id",
+    "partner_name",
+    "user_id",
+    "team_id",
+    "stage_id",
+)
+
+
+def _safe_read(
+    config: OdooConfig,
+    model: str,
+    ids: list[int],
+    fields: tuple[str, ...],
+) -> list[dict]:
+    """Defensive ``read`` that returns ``[]`` on any error rather
+    than propagating. Used everywhere in the recursion path so a
+    permission glitch on one model never sinks the whole pack."""
+    if not ids:
+        return []
+    try:
+        out = _json2_call(
+            config, model, "read", {"ids": [int(i) for i in ids], "fields": list(fields)}
+        )
+    except OdooError:
+        return []
+    return [r for r in (out or []) if isinstance(r, dict)]
+
+
+def _safe_search_read(
+    config: OdooConfig,
+    model: str,
+    domain: list,
+    fields: tuple[str, ...],
+    *,
+    limit: int = 10,
+    order: str = "id desc",
+) -> list[dict]:
+    if not domain:
+        return []
+    try:
+        out = _json2_call(
+            config,
+            model,
+            "search_read",
+            {
+                "domain": domain,
+                "fields": list(fields),
+                "limit": int(limit),
+                "order": order,
+            },
+        )
+    except OdooError:
+        return []
+    return [r for r in (out or []) if isinstance(r, dict)]
+
+
+def _scalar_from_many2one(value: Any) -> tuple[int, str]:
+    """Odoo many2one fields come back as ``[id, display_name]`` —
+    flatten to ``(id, name)`` with ``(0, "")`` on garbage input."""
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            return int(value[0]), str(value[1] or "")
+        except (TypeError, ValueError):
+            return 0, ""
+    return 0, ""
+
+
+def fetch_related_context_pack(
+    config: OdooConfig,
+    model: str,
+    record_id: int,
+    *,
+    chatter_limit: int = 8,
+    max_total_chars: int = 4000,
+) -> dict:
+    """Build a recursive context pack rooted at ``(model, record_id)``.
+
+    Returns ``{primary, related, summary, terms, fetched_at}``.
+
+    * ``primary`` and ``related`` carry per-record dicts of the form
+      ``{model, id, display_name, body, chatter}`` (the most
+      informative single text snippet + an ordered chatter list).
+    * ``summary`` is a prompt-ready compact blob respecting
+      ``max_total_chars`` — local LLMs choke past 4-5 K extra chars
+      with 4-8 K windows.
+    * ``terms`` is the deduplicated list of proper-noun candidates
+      the pipeline can splice into ``glossary_terms`` for Whisper.
+
+    Traversal rules:
+
+    * ``crm.lead`` → linked ``sale.order`` (via ``opportunity_id``)
+      and any ``project.project`` referenced by ``project_ids``.
+    * ``project.task`` → its parent ``project.project``.
+    * ``calendar.event`` → ``opportunity_id`` (delegated to the
+      ``crm.lead`` branch).
+    * Anything else → no recursion; we still return the primary
+      record's chatter so old callers don't regress.
+    """
+    clean_model = (model or "").strip()
+    record_id = int(record_id or 0)
+    fetched_at = _format_odoo_datetime(datetime.now(timezone.utc))
+    if not clean_model or record_id <= 0:
+        return {
+            "primary": {},
+            "related": [],
+            "summary": "",
+            "terms": [],
+            "fetched_at": fetched_at,
+        }
+
+    primary = _fetch_one_record(config, clean_model, record_id, chatter_limit=chatter_limit)
+    related: list[dict] = []
+    if primary:
+        related = _expand_related_records(
+            config, primary, chatter_limit=chatter_limit
+        )
+
+    summary = _compose_pack_summary(
+        primary, related, budget=max(1000, int(max_total_chars))
+    )
+    terms = extract_odoo_glossary_candidates(primary, related)
+    return {
+        "primary": primary,
+        "related": related,
+        "summary": summary,
+        "terms": terms,
+        "fetched_at": fetched_at,
+    }
+
+
+def _fetch_one_record(
+    config: OdooConfig,
+    model: str,
+    record_id: int,
+    *,
+    chatter_limit: int,
+) -> dict:
+    """Fetch a single Odoo record + its chatter + a per-model body
+    excerpt. Returns ``{}`` on failure rather than raising."""
+    if model == "crm.lead":
+        fields = _LEAD_FIELDS
+    elif model == "project.task":
+        fields = _TASK_FIELDS
+    elif model == "project.project":
+        fields = _PROJECT_FIELDS
+    elif model == "sale.order":
+        fields = _SALE_ORDER_FIELDS
+    else:
+        fields = ("id", "display_name")
+
+    records = _safe_read(config, model, [record_id], fields)
+    if not records:
+        return {}
+    head = records[0]
+    display_name = str(head.get("display_name") or head.get("name") or "")
+
+    chatter_payload: dict = {}
+    try:
+        chatter_payload = fetch_object_chatter(
+            config, model, record_id, limit=chatter_limit
+        )
+    except OdooError:
+        chatter_payload = {}
+
+    return {
+        "model": model,
+        "id": record_id,
+        "display_name": display_name,
+        "raw": head,
+        "body": _per_model_excerpt(model, head),
+        "chatter": chatter_payload.get("messages") or [],
+        "chatter_summary": str(chatter_payload.get("summary") or ""),
+    }
+
+
+def _per_model_excerpt(model: str, record: dict) -> str:
+    """Pick the single most useful free-text snippet for each model.
+    A short body excerpt (≤ 400 chars) beats the chatter for the
+    primary topic since it's the static "what is this record".
+    """
+    if model in {"crm.lead", "project.task", "project.project"}:
+        body = _html_to_text(record.get("description") or "")
+        return body[:400].strip()
+    if model == "sale.order":
+        bits: list[str] = []
+        if record.get("name"):
+            bits.append(str(record["name"]))
+        _, partner_name = _scalar_from_many2one(record.get("partner_id"))
+        if partner_name:
+            bits.append(f"client: {partner_name}")
+        if record.get("amount_total"):
+            bits.append(f"montant: {record['amount_total']}")
+        return " — ".join(bits)
+    return ""
+
+
+def _expand_related_records(
+    config: OdooConfig,
+    primary: dict,
+    *,
+    chatter_limit: int,
+) -> list[dict]:
+    """Discover and fetch records the primary points to."""
+    related: list[dict] = []
+    model = primary.get("model")
+    head = primary.get("raw") or {}
+    primary_id = int(primary.get("id") or 0)
+
+    if model == "crm.lead":
+        # Quotations linked back via opportunity_id. Cap at 5 to
+        # avoid blowing the budget when a hot lead has 30 quotes.
+        quotes = _safe_search_read(
+            config,
+            "sale.order",
+            [("opportunity_id", "=", primary_id)],
+            _SALE_ORDER_FIELDS,
+            limit=5,
+            order="date_order desc",
+        )
+        for q in quotes:
+            qid = int(q.get("id") or 0)
+            if qid <= 0:
+                continue
+            related.append(_fetch_one_record(
+                config, "sale.order", qid, chatter_limit=chatter_limit
+            ))
+
+    elif model == "project.task":
+        project_id, _ = _scalar_from_many2one(head.get("project_id"))
+        if project_id:
+            project = _fetch_one_record(
+                config, "project.project", project_id, chatter_limit=chatter_limit
+            )
+            if project:
+                related.append(project)
+
+    elif model == "calendar.event":
+        opportunity_id, _ = _scalar_from_many2one(head.get("opportunity_id"))
+        if opportunity_id:
+            lead = _fetch_one_record(
+                config, "crm.lead", opportunity_id, chatter_limit=chatter_limit
+            )
+            if lead:
+                related.append(lead)
+                # And recurse one more level into the lead's quotes.
+                related.extend(_expand_related_records(
+                    config, lead, chatter_limit=chatter_limit
+                ))
+
+    return [r for r in related if r]
+
+
+_SECTION_LABELS = {
+    "crm.lead": "Opportunité",
+    "project.task": "Tâche",
+    "project.project": "Projet",
+    "sale.order": "Devis",
+    "calendar.event": "Réunion",
+    "res.partner": "Contact",
+}
+
+
+def _section_label(model: str) -> str:
+    return _SECTION_LABELS.get(model, model)
+
+
+def _compose_pack_summary(
+    primary: dict,
+    related: list[dict],
+    *,
+    budget: int,
+) -> str:
+    """Glue the records into a single prompt-ready blob.
+
+    Priority order — what we'd surface even on a tight budget:
+
+    1. Primary record header + body excerpt.
+    2. 1-2 most recent chatter messages on the primary.
+    3. Each related record's header + body excerpt.
+    4. 1 most recent chatter message per related record.
+
+    Anything still over budget gets dropped from the bottom up.
+    """
+    if not primary:
+        return ""
+    chunks: list[str] = []
+    used = 0
+
+    def append(text: str) -> bool:
+        nonlocal used
+        if not text:
+            return True
+        if used + len(text) + 2 > budget:
+            return False
+        chunks.append(text)
+        used += len(text) + 2
+        return True
+
+    # --- primary ---
+    label = _section_label(primary.get("model", ""))
+    name = (primary.get("display_name") or "").strip()
+    body = (primary.get("body") or "").strip()
+    if name:
+        append(f"[{label}] {name}")
+    if body:
+        append(body)
+    primary_messages = primary.get("chatter") or []
+    for msg in primary_messages[:2]:
+        snippet = _format_message(msg)
+        if snippet and not append(snippet):
+            break
+
+    # --- related ---
+    for rec in related:
+        rlabel = _section_label(rec.get("model", ""))
+        rname = (rec.get("display_name") or "").strip()
+        rbody = (rec.get("body") or "").strip()
+        if rname and not append(f"[{rlabel}] {rname}"):
+            break
+        if rbody and not append(rbody):
+            break
+        rmessages = rec.get("chatter") or []
+        if rmessages:
+            snippet = _format_message(rmessages[0])
+            if snippet and not append(snippet):
+                break
+
+    return "\n".join(chunks).strip()
+
+
+def _format_message(msg: dict) -> str:
+    body = (msg.get("body") or "").strip()
+    if not body:
+        return ""
+    body = body.replace("\n", " ").strip()
+    snippet = body[:220].rsplit(" ", 1)[0] if len(body) > 220 else body
+    author = (msg.get("author") or "Anonyme").strip()
+    date = (msg.get("date") or "").strip()
+    bits: list[str] = []
+    if date:
+        bits.append(date.split(" ")[0])  # drop the hour, keep the day
+    bits.append(author)
+    return f"  · {' — '.join(bits)} : {snippet}"
+
+
+# Tokens that look like proper nouns but are uninformative in
+# French and just bloat the glossary. Stripped before deduplication.
+_GLOSSARY_STOPWORDS = {
+    "Bonjour", "Merci", "Cordialement", "Salutations", "Madame",
+    "Monsieur", "Mme", "Mr", "Anonyme", "Odoo", "Réunion",
+}
+
+# Match capitalised tokens (incl. é à ç etc.) + multi-token proper
+# nouns ("Sophie Martin"). Restricted to 2-4 token sequences so
+# arbitrary capitalised sentence openers don't sneak in.
+_ENTITY_RE = re.compile(
+    r"\b([A-ZÉÈÊÀÂÎÔÛÇ][\wÉÈÊÀÂÎÔÛÇéèêàâîôûç'\-]+(?:\s+[A-ZÉÈÊÀÂÎÔÛÇ][\wÉÈÊÀÂÎÔÛÇéèêàâîôûç'\-]+){0,3})\b"
+)
+
+
+def extract_odoo_glossary_candidates(
+    primary: dict,
+    related: list[dict],
+    *,
+    max_terms: int = 30,
+) -> list[str]:
+    """Pull proper-noun candidates from the pack to splice into the
+    glossary that feeds Whisper's initial prompt + the LLM
+    correction pass.
+
+    Keeps things simple: regex over the combined free text, dedupe
+    case-insensitively, drop French stopwords. Returns at most
+    ``max_terms`` candidates so a chatty opportunity doesn't dilute
+    the glossary with 200 sentence openers.
+
+    Customer / partner / project / task display names are added
+    explicitly even when the regex would have missed them (e.g. a
+    single-token customer name like "PayFit") since we know they're
+    structural, not just headline tokens.
+    """
+    text_parts: list[str] = []
+    explicit_names: list[str] = []
+    for record in [primary, *related]:
+        if not record:
+            continue
+        name = (record.get("display_name") or "").strip()
+        if name:
+            explicit_names.append(name)
+        head = record.get("raw") or {}
+        partner_name = ""
+        if isinstance(head.get("partner_id"), (list, tuple)) and len(head["partner_id"]) >= 2:
+            partner_name = str(head["partner_id"][1] or "")
+        if partner_name:
+            explicit_names.append(partner_name)
+        if record.get("body"):
+            text_parts.append(str(record["body"]))
+        for msg in record.get("chatter") or []:
+            body = (msg.get("body") or "").strip()
+            if body:
+                text_parts.append(body)
+            subject = (msg.get("subject") or "").strip()
+            if subject:
+                text_parts.append(subject)
+
+    combined = " ".join(text_parts)
+    candidates: list[str] = list(explicit_names)
+    for match in _ENTITY_RE.finditer(combined):
+        candidate = match.group(1).strip(" ,;:.!?'\"")
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for raw in candidates:
+        cleaned = raw.strip(" ,;:.!?'\"")
+        if not cleaned or len(cleaned) < 2:
+            continue
+        if cleaned in _GLOSSARY_STOPWORDS:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cleaned)
+        if len(unique) >= max_terms:
+            break
+    return unique
 
 
 def _build_chatter_summary(display_name: str, messages: list[dict]) -> str:

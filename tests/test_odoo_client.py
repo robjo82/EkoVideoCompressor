@@ -30,8 +30,10 @@ from odoo_client import (
     _normalise_url,
     _strip_meeting_record,
     _strip_partner_record,
+    extract_odoo_glossary_candidates,
     fetch_object_chatter,
     fetch_partner,
+    fetch_related_context_pack,
     search_meeting_events,
     search_partners,
     test_connection,
@@ -541,6 +543,193 @@ class FetchObjectChatterTest(unittest.TestCase):
             )
             mock.assert_not_called()
         self.assertEqual(payload["messages"], [])
+
+
+class FetchRelatedContextPackTest(unittest.TestCase):
+    """The pack drives the LLM correction pass and the Whisper
+    glossary boost. Pin three concerns:
+
+    1. A ``crm.lead`` recurses into its linked ``sale.order``
+       quotations.
+    2. A ``project.task`` recurses into its parent
+       ``project.project``.
+    3. Compression respects ``max_total_chars`` even when every
+       record carries huge chatter.
+    """
+
+    def _config(self):
+        return OdooConfig(
+            url="https://erp.acme.com",
+            database="acme",
+            login="vous@acme.fr",
+            api_key="sk-xxx",
+        )
+
+    def test_crm_lead_recurses_into_sale_orders(self):
+        calls: list[dict] = []
+        responses = [
+            # read crm.lead 42
+            [{
+                "id": 42,
+                "display_name": "Migration Acritec",
+                "description": "<p>Refonte de l'ERP pour Acritec</p>",
+                "partner_id": [99, "Acritec SAS"],
+            }],
+            # fetch_object_chatter → read message_ids
+            [{"id": 42, "display_name": "Migration Acritec", "message_ids": [1]}],
+            # fetch_object_chatter → read messages
+            [{"id": 1, "date": "2026-05-10 09:00:00",
+              "author_id": [7, "Florence"], "subject": "",
+              "body": "<p>Kickoff prévu le 15.</p>",
+              "message_type": "comment"}],
+            # search_read sale.order where opportunity_id=42
+            [{"id": 7, "display_name": "SO/2026/001",
+              "name": "SO/2026/001", "state": "sent",
+              "partner_id": [99, "Acritec SAS"],
+              "amount_total": 12000}],
+            # read sale.order 7
+            [{"id": 7, "display_name": "SO/2026/001",
+              "name": "SO/2026/001", "state": "sent",
+              "partner_id": [99, "Acritec SAS"],
+              "amount_total": 12000, "opportunity_id": [42, "Migration"]}],
+            # fetch_object_chatter on the quote → message_ids
+            [{"id": 7, "display_name": "SO/2026/001", "message_ids": [11]}],
+            # fetch_object_chatter on the quote → messages
+            [{"id": 11, "date": "2026-05-12 11:00:00",
+              "author_id": [9, "Robin"], "subject": "",
+              "body": "Validé par le client.",
+              "message_type": "comment"}],
+        ]
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(responses, calls),
+        ):
+            pack = fetch_related_context_pack(
+                self._config(), "crm.lead", 42, max_total_chars=4000,
+            )
+        self.assertEqual(pack["primary"]["model"], "crm.lead")
+        self.assertEqual(pack["primary"]["display_name"], "Migration Acritec")
+        # The lead's quote was discovered.
+        self.assertEqual(len(pack["related"]), 1)
+        self.assertEqual(pack["related"][0]["model"], "sale.order")
+        # Summary carries both sections.
+        self.assertIn("[Opportunité] Migration Acritec", pack["summary"])
+        self.assertIn("[Devis] SO/2026/001", pack["summary"])
+        # Glossary candidates include the customer and the quote ref.
+        self.assertIn("Acritec SAS", pack["terms"])
+
+    def test_project_task_recurses_into_parent_project(self):
+        calls: list[dict] = []
+        responses = [
+            # read project.task 5
+            [{
+                "id": 5,
+                "display_name": "Onboarding RH",
+                "description": "<p>Configurer les badges</p>",
+                "project_id": [3, "Acritec — RH"],
+            }],
+            # task chatter (no messages)
+            [{"id": 5, "display_name": "Onboarding RH", "message_ids": []}],
+            # read project.project 3
+            [{
+                "id": 3,
+                "display_name": "Acritec — RH",
+                "description": "<p>Projet RH Acritec</p>",
+                "partner_id": [99, "Acritec SAS"],
+            }],
+            # project chatter (no messages)
+            [{"id": 3, "display_name": "Acritec — RH", "message_ids": []}],
+        ]
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(responses, calls),
+        ):
+            pack = fetch_related_context_pack(
+                self._config(), "project.task", 5,
+            )
+        self.assertEqual(pack["primary"]["model"], "project.task")
+        self.assertEqual(len(pack["related"]), 1)
+        self.assertEqual(pack["related"][0]["model"], "project.project")
+        self.assertIn("[Tâche] Onboarding RH", pack["summary"])
+        self.assertIn("[Projet] Acritec — RH", pack["summary"])
+
+    def test_blank_inputs_short_circuit_without_network(self):
+        with patch("odoo_client.urllib.request.urlopen") as mock:
+            pack = fetch_related_context_pack(self._config(), "", 0)
+            mock.assert_not_called()
+        self.assertEqual(pack["primary"], {})
+        self.assertEqual(pack["related"], [])
+        self.assertEqual(pack["summary"], "")
+        self.assertEqual(pack["terms"], [])
+
+    def test_compression_caps_summary_at_budget(self):
+        # Single primary record with a huge body — verify
+        # ``max_total_chars`` actually bites. The recursion call
+        # for sale.order returns an empty list (no quotes), so we
+        # supply a 3rd response for that search.
+        huge_body = "Lorem ipsum dolor sit amet, " * 200  # ~5600 chars
+        calls: list[dict] = []
+        responses = [
+            [{"id": 1, "display_name": "Big record",
+              "description": f"<p>{huge_body}</p>", "partner_id": False}],
+            [{"id": 1, "display_name": "Big record", "message_ids": []}],
+            [],  # _safe_search_read(sale.order, opportunity_id=1) — no quotes
+        ]
+        with patch(
+            "odoo_client.urllib.request.urlopen",
+            side_effect=_urlopen_replayer(responses, calls),
+        ):
+            pack = fetch_related_context_pack(
+                self._config(), "crm.lead", 1, max_total_chars=1000,
+            )
+        # The 400-char per-model excerpt + the header ~ 420 chars,
+        # comfortably under the 1000 budget. The point: nothing
+        # exploded and the summary stays bounded.
+        self.assertLessEqual(len(pack["summary"]), 1000)
+        self.assertTrue(pack["summary"].startswith("[Opportunité]"))
+
+
+class ExtractOdooGlossaryCandidatesTest(unittest.TestCase):
+    """The Whisper initial prompt gets a glossary boost from these
+    candidates. Pin the dedupe, the stopword filter, and the
+    explicit promotion of customer / project / task names so they
+    still surface when the regex would have missed them."""
+
+    def test_promotes_explicit_partner_and_record_names(self):
+        primary = {
+            "model": "crm.lead",
+            "id": 1,
+            "display_name": "Migration Acritec",
+            "raw": {"partner_id": [99, "Acritec SAS"]},
+            "body": "",
+            "chatter": [],
+        }
+        terms = extract_odoo_glossary_candidates(primary, [])
+        self.assertIn("Migration Acritec", terms)
+        self.assertIn("Acritec SAS", terms)
+
+    def test_drops_french_stopwords(self):
+        primary = {
+            "model": "crm.lead",
+            "id": 1,
+            "display_name": "",
+            "raw": {},
+            "body": "Bonjour, ravi de vous voir. Cordialement, Robin.",
+            "chatter": [],
+        }
+        terms = extract_odoo_glossary_candidates(primary, [])
+        for stopword in ("Bonjour", "Cordialement"):
+            self.assertNotIn(stopword, terms)
+        self.assertIn("Robin", terms)
+
+    def test_caps_at_max_terms(self):
+        body = " ".join(f"Personne{i}" for i in range(200))
+        primary = {
+            "model": "crm.lead", "id": 1, "display_name": "",
+            "raw": {}, "body": body, "chatter": [],
+        }
+        terms = extract_odoo_glossary_candidates(primary, [], max_terms=8)
+        self.assertEqual(len(terms), 8)
 
 
 if __name__ == "__main__":
