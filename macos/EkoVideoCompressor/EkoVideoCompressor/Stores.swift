@@ -720,13 +720,37 @@ final class LibraryStore: ObservableObject {
         }
         isLoading = true
         errorMessage = nil
+        // Build the attendee → res.partner lookup the engine uses to
+        // auto-link the resulting voice profile to its Odoo contact.
+        // Keyed lowercase so the engine can match case-insensitively
+        // against the renamed name; entries without a partner id are
+        // dropped because the link target wouldn't be meaningful.
+        var attendeeArgs: [String] = []
+        if let attendees = row.odooMeeting?.attendees, !attendees.isEmpty {
+            var map: [String: [String: Any]] = [:]
+            for attendee in attendees {
+                let nameKey = attendee.name.lowercased()
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !nameKey.isEmpty, attendee.id > 0 else { continue }
+                map[nameKey] = [
+                    "partner_id": attendee.id,
+                    "partner_name": attendee.name,
+                    "company_name": attendee.company,
+                ]
+            }
+            if !map.isEmpty,
+               let data = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]),
+               let raw = String(data: data, encoding: .utf8) {
+                attendeeArgs = ["--attendees", raw]
+            }
+        }
         let result = await EngineProcess.runCommand(
             arguments: EngineProcess.defaultPythonArguments([
                 "library-rename-speakers",
                 "\(row.id)",
                 "--mapping",
                 payload,
-            ])
+            ] + attendeeArgs)
         )
         if result.status != 0 {
             errorMessage = result.events.last?.message ?? result.rawOutput
@@ -766,6 +790,46 @@ final class LibraryStore: ObservableObject {
         }
         await refreshOne(row.id)
         isLoading = false
+    }
+
+    /// Re-runs ``library-recognize-speakers`` against an existing
+    /// job's diarisation embeddings and compares them with every
+    /// registered ``speaker_profile``. Anything that crosses the
+    /// match threshold gets named in the segments + speaker_map_json.
+    /// Surfaced from the library row's contextual menu so the user
+    /// can backfill a job that was transcribed before they had any
+    /// voice profile enrolled.
+    ///
+    /// Returns the recognized map ``{cluster: name}`` so the caller
+    /// can show a one-line toast ("3 interlocuteurs identifiés")
+    /// rather than silently mutating the row.
+    @discardableResult
+    func recognizeSpeakers(_ row: LibraryRow) async -> [String: String] {
+        isLoading = true
+        errorMessage = nil
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-recognize-speakers",
+                "\(row.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            isLoading = false
+            return [:]
+        }
+        // Pull the updated row in so the rename sheet / library
+        // picks up the freshly-assigned names without a full reload.
+        await refreshOne(row.id)
+        isLoading = false
+        // Engine emits ``{"job_id": ..., "recognized": {...}}`` on
+        // stdout. Best-effort parse — the row patch above is the
+        // user-visible side effect, so a parse failure isn't fatal.
+        guard let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let recognized = payload["recognized"] as? [String: String]
+        else { return [:] }
+        return recognized
     }
 
     /// Clears the Odoo meeting/related metadata stored on a job.

@@ -654,6 +654,7 @@ def library_rename_speakers(
     mapping: dict[str, str],
     *,
     enroll: bool = True,
+    attendee_partner_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     """Rename speakers in DB segments + artefacts and (optionally)
     enroll the renamed clusters as voice profiles.
@@ -665,6 +666,16 @@ def library_rename_speakers(
     next time. We silently skip enrollment when the clustering audio
     isn't on disk anymore (old job whose workspace was wiped) or
     when the embedding venv isn't reachable.
+
+    ``attendee_partner_map`` (optional) carries the Odoo attendee
+    metadata the SwiftUI rename sheet already has on hand for a
+    meeting-linked job. Shape: ``{name_lowercase: {partner_id,
+    partner_name, company_id?, company_name?}}``. When a renamed
+    speaker matches one of these names, the resulting voice profile
+    is auto-linked to the corresponding ``res.partner`` — the user
+    doesn't have to step into the Interlocuteurs tab and pair them
+    by hand. We only link profiles that aren't already linked to
+    *some* partner, to preserve a manual override.
     """
     db = database()
     job = db.get_job(job_id)
@@ -707,6 +718,42 @@ def library_rename_speakers(
         db=db,
     )
 
+    # Auto-link the profiles created above (or pre-existing) to the
+    # Odoo res.partner records carried by the meeting attendees.
+    # Runs after ``remember`` so the lookup-by-name path always finds
+    # a row, even when enrollment failed (no diarisation audio etc.).
+    linked_to_odoo = 0
+    if attendee_partner_map:
+        for raw_name in mapping.values():
+            name = str(raw_name or "").strip()
+            if not name:
+                continue
+            attendee = attendee_partner_map.get(name.lower())
+            if not attendee:
+                continue
+            partner_id = int(attendee.get("partner_id") or 0)
+            if partner_id <= 0:
+                continue
+            profile = db.get_speaker_profile_by_name(name)
+            if not profile:
+                continue
+            existing_partner = int(profile.get("odoo_partner_id") or 0)
+            if existing_partner == partner_id:
+                # Already linked to this exact partner — nothing to do.
+                continue
+            if existing_partner > 0:
+                # Already linked to a *different* partner. Respect the
+                # user's manual choice and don't silently overwrite.
+                continue
+            db.link_speaker_profile_to_odoo(
+                int(profile["id"]),
+                partner_id=partner_id,
+                partner_name=str(attendee.get("partner_name") or name),
+                company_id=int(attendee.get("company_id") or 0) or None,
+                company_name=str(attendee.get("company_name") or ""),
+            )
+            linked_to_odoo += 1
+
     segments = db.get_segments(job_id)
     segments_changed = 0
     updated = []
@@ -741,6 +788,7 @@ def library_rename_speakers(
         "artifacts_rewritten": artifacts_rewritten,
         "speakers_enrolled": enrolled,
         "speakers_remembered": remembered,
+        "speakers_linked_to_odoo": linked_to_odoo,
     }
 
 

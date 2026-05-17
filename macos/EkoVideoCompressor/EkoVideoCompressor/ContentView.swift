@@ -3217,6 +3217,8 @@ struct LibraryContextEditor: View {
     @State private var playbackTimerTask: Task<Void, Never>?
     @State private var reviewNotice: String?
     @State private var termsText: String
+    @State private var isRecognizing = false
+    @State private var recognitionSummary: String?
 
     init(row: LibraryRow) {
         self.row = row
@@ -3273,6 +3275,7 @@ struct LibraryContextEditor: View {
                                     // new name (left, read-only) + new
                                     // name (right, editable)". One label,
                                     // one editable field, that's it.
+                                    speakerStatusIcon(for: speaker)
                                     TextField(
                                         "Nom à afficher",
                                         text: $speaker.name,
@@ -3280,6 +3283,7 @@ struct LibraryContextEditor: View {
                                     )
                                     .textFieldStyle(.roundedBorder)
                                     .labelsHidden()
+                                    speakerProfileSuggestionMenu(for: $speaker)
                                     speakerSampleControls(for: speaker)
                                 }
                                 if let stats = speakerStatsText(for: speaker) {
@@ -3304,6 +3308,27 @@ struct LibraryContextEditor: View {
                     Text("Saisissez uniquement le nom à afficher. Les fichiers texte existants sont réécrits quand un nom change.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        Button {
+                            Task { await runRecognition() }
+                        } label: {
+                            if isRecognizing {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .controlSize(.small)
+                                Text("Reconnaissance en cours…")
+                            } else {
+                                Label("Re-reconnaître les interlocuteurs", systemImage: "waveform.badge.magnifyingglass")
+                            }
+                        }
+                        .disabled(isRecognizing || speakers.isEmpty)
+                        .help("Compare la voix de chaque cluster avec la bibliothèque d'interlocuteurs pour pré-remplir les noms reconnus.")
+                        if let summary = recognitionSummary {
+                            Text(summary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
                 Section("Termes techniques") {
                     TextEditor(text: $termsText)
@@ -3375,6 +3400,144 @@ struct LibraryContextEditor: View {
         }
     }
 
+    /// Renders a small SF symbol that telegraphs whether the typed
+    /// name is a fresh contact, a known voice profile, or already
+    /// linked to a res.partner in Odoo. The icon is more compact
+    /// than a text badge and lets the user audit a 6-speaker row
+    /// without scanning labels. Tooltip carries the verbose form
+    /// ("Connu en bibliothèque", "Lié à Odoo : ACME"…).
+    @ViewBuilder
+    private func speakerStatusIcon(for speaker: SpeakerEditRow) -> some View {
+        let status = speakerStatus(for: speaker)
+        Image(systemName: status.symbol)
+            .foregroundStyle(status.color)
+            .imageScale(.medium)
+            .frame(width: 18, alignment: .center)
+            .help(status.tooltip)
+    }
+
+    /// People-picker menu next to the field. Lists the 8 most-recent
+    /// voice profiles from the library so the user can pin a known
+    /// speaker without retyping. Hidden when nothing is enrolled yet
+    /// — pointless menu otherwise.
+    @ViewBuilder
+    private func speakerProfileSuggestionMenu(for speaker: Binding<SpeakerEditRow>) -> some View {
+        let suggestions = recentProfileSuggestions(excluding: speaker.wrappedValue.name)
+        if !suggestions.isEmpty {
+            Menu {
+                ForEach(suggestions) { profile in
+                    Button {
+                        speaker.wrappedValue.name = profile.name
+                    } label: {
+                        speakerSuggestionRow(profile)
+                    }
+                }
+            } label: {
+                Image(systemName: "person.crop.circle.badge.questionmark")
+                    .imageScale(.medium)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("Suggérer un interlocuteur déjà enregistré")
+        }
+    }
+
+    @ViewBuilder
+    private func speakerSuggestionRow(_ profile: SpeakerProfile) -> some View {
+        if profile.isLinkedToOdoo {
+            Label {
+                if let company = profile.odoo_company_name, !company.isEmpty {
+                    Text("\(profile.name) — \(company)")
+                } else {
+                    Text(profile.name)
+                }
+            } icon: {
+                Image(systemName: "building.2.fill")
+            }
+        } else {
+            Label(profile.name, systemImage: "person.fill.checkmark")
+        }
+    }
+
+    private func recentProfileSuggestions(excluding name: String) -> [SpeakerProfile] {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // We exclude (a) profiles already typed in this sheet —
+        // wouldn't add anything — and (b) the in-progress entry.
+        // The engine returns profiles alphabetically, so we sort
+        // client-side by ``updated_at`` desc to surface the names
+        // the user actually touched recently. Profiles missing the
+        // timestamp fall to the bottom rather than disappearing.
+        let alreadyAssigned = Set(
+            speakers
+                .map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        let candidates = library.speakerProfiles.filter { profile in
+            let key = profile.name.lowercased()
+            if key == trimmed { return false }
+            if alreadyAssigned.contains(key) { return false }
+            return true
+        }
+        return candidates
+            .sorted { lhs, rhs in
+                let lhsStamp = lhs.updated_at ?? ""
+                let rhsStamp = rhs.updated_at ?? ""
+                if lhsStamp == rhsStamp {
+                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                }
+                return lhsStamp > rhsStamp
+            }
+            .prefix(8)
+            .map { $0 }
+    }
+
+    /// Status descriptor — symbol, colour, French tooltip — for the
+    /// little icon to the left of the speaker field.
+    private struct SpeakerStatusDescriptor {
+        var symbol: String
+        var color: Color
+        var tooltip: String
+    }
+
+    private func speakerStatus(for speaker: SpeakerEditRow) -> SpeakerStatusDescriptor {
+        let trimmed = speaker.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return SpeakerStatusDescriptor(
+                symbol: "person.fill.questionmark",
+                color: .secondary,
+                tooltip: "Aucun nom saisi — l'extrait restera étiqueté \(speaker.id)."
+            )
+        }
+        let profile = library.speakerProfiles.first {
+            $0.name.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        }
+        guard let profile else {
+            return SpeakerStatusDescriptor(
+                symbol: "person.fill.badge.plus",
+                color: .orange,
+                tooltip: "Nouvel interlocuteur — sera ajouté à la bibliothèque à l'enregistrement."
+            )
+        }
+        if profile.isLinkedToOdoo {
+            let company = profile.odoo_company_name ?? ""
+            return SpeakerStatusDescriptor(
+                symbol: "building.2.fill",
+                color: .indigo,
+                tooltip: company.isEmpty
+                    ? "Lié au contact Odoo \(profile.odoo_partner_name ?? trimmed)."
+                    : "Lié à Odoo : \(profile.odoo_partner_name ?? trimmed) — \(company)."
+            )
+        }
+        return SpeakerStatusDescriptor(
+            symbol: "person.fill.checkmark",
+            color: .teal,
+            tooltip: profile.sample_count > 0
+                ? "Connu en bibliothèque (\(profile.sample_count) extrait\(profile.sample_count > 1 ? "s" : ""))"
+                : "Connu en bibliothèque — voix à apprendre."
+        )
+    }
+
     @ViewBuilder
     private func speakerSampleControls(for speaker: SpeakerEditRow) -> some View {
         let availableSamples = samples(for: speaker)
@@ -3418,6 +3581,41 @@ struct LibraryContextEditor: View {
             ProgressView()
                 .controlSize(.small)
         }
+    }
+
+    /// Asks the engine to re-run voice-print recognition against the
+    /// current ``speaker_profiles`` store and prefills the sheet with
+    /// whatever crosses the match threshold. The user still has to
+    /// hit Enregistrer to commit — recognition only proposes names,
+    /// it doesn't silently mutate the row. Useful for jobs that ran
+    /// before the user enrolled any voices.
+    @MainActor
+    private func runRecognition() async {
+        isRecognizing = true
+        recognitionSummary = nil
+        let recognized = await library.recognizeSpeakers(row)
+        if recognized.isEmpty {
+            recognitionSummary = "Aucun interlocuteur reconnu pour l'instant."
+            isRecognizing = false
+            return
+        }
+        // Patch the local list — only fills in *empty* slots so the
+        // user's in-progress edits aren't overwritten. If a renamed
+        // name already differs from what recognition would propose,
+        // we leave the user's value alone (they know better).
+        var filledCount = 0
+        for index in speakers.indices {
+            let speaker = speakers[index]
+            if !speaker.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                continue
+            }
+            if let suggestion = recognized[speaker.id], !suggestion.isEmpty {
+                speakers[index].name = suggestion
+                filledCount += 1
+            }
+        }
+        recognitionSummary = "\(recognized.count) interlocuteur\(recognized.count > 1 ? "s" : "") reconnu\(recognized.count > 1 ? "s" : "") · \(filledCount) champ\(filledCount > 1 ? "s" : "") pré-rempli\(filledCount > 1 ? "s" : "")."
+        isRecognizing = false
     }
 
     private func save() {
