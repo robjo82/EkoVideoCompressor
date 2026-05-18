@@ -237,6 +237,103 @@ def job_workspace_dir(request: JobRequest) -> Path:
     return root / f"{stamp} - {_safe_stem(Path(request.source_path).stem)}"
 
 
+def snapshot_existing_artifacts(
+    workspace: Path,
+    job: dict[str, Any],
+    sink: EventSink,
+) -> dict[str, Any]:
+    """Move the user-facing outputs of the previous run into a dated
+    ``versions/`` subfolder so the rerun about to start can't clobber
+    them.
+
+    Returns a metadata dict suitable for
+    ``DatabaseManager.prepend_job_version`` — empty when there was
+    nothing to snapshot (fresh job, or workspace already wiped).
+
+    What we snapshot:
+
+    * ``compressed_path``
+    * ``transcript_path``
+    * ``enhanced_transcript_path``
+    * ``review_path``
+
+    We deliberately skip intermediates (``audio.wav``, ``whisper.json``,
+    ``speaker_samples/``) because (a) they're regenerated anyway and
+    (b) keeping them inflates the workspace footprint for negligible
+    user value. The compressed file is included because the
+    compression preset might change between runs and the user could
+    reasonably want to A/B compare.
+
+    Files are MOVED rather than copied — disk is cheap but not free
+    for hour-long meetings, and the snapshot is meant as a safety
+    net, not a permanent archive.
+    """
+    candidates = {
+        "compressed_path": (job.get("compressed_path") or "").strip(),
+        "transcript_path": (job.get("transcript_path") or "").strip(),
+        "enhanced_transcript_path": (job.get("enhanced_transcript_path") or "").strip(),
+        "review_path": (job.get("review_path") or "").strip(),
+    }
+    existing = {
+        column: path
+        for column, path in candidates.items()
+        if path and Path(path).exists()
+    }
+    if not existing:
+        return {}
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    versions_dir = workspace / "versions" / timestamp
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    moved: dict[str, str] = {}
+    for column, source_path in existing.items():
+        src = Path(source_path)
+        dest = versions_dir / src.name
+        # Disambiguate when two artefacts share a filename — unlikely
+        # given the engine's naming, but cheaper than a debugging
+        # session if the unlikely happens.
+        if dest.exists():
+            counter = 1
+            while dest.exists():
+                dest = versions_dir / f"{src.stem}_{counter}{src.suffix}"
+                counter += 1
+        try:
+            shutil.move(str(src), str(dest))
+        except OSError as exc:
+            append_app_log(
+                f"engine_snapshot_move_failed src={source_path!r} "
+                f"dest={str(dest)!r} error={exc!r}"
+            )
+            # Best-effort: copy when move fails (e.g. cross-device).
+            try:
+                shutil.copy2(src, dest)
+                src.unlink()
+            except OSError:
+                continue
+        moved[column] = str(dest)
+        sink(
+            ArtifactEvent(
+                "previous_version",
+                str(dest),
+                model=column,
+            )
+        )
+
+    if not moved:
+        return {}
+
+    summary = {
+        "label": timestamp,
+        "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **moved,
+    }
+    append_app_log(
+        "engine_snapshot_previous_run "
+        f"workspace={str(workspace)!r} files={len(moved)} label={timestamp!r}"
+    )
+    return summary
+
+
 def prepare_job_workspace(request: JobRequest, sink: EventSink) -> tuple[Path, Path]:
     workspace = job_workspace_dir(request)
     workspace.mkdir(parents=True, exist_ok=True)

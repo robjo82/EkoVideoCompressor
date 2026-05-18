@@ -128,6 +128,13 @@ class DatabaseManager:
             "transcript_path": "TEXT",
             "enhanced_transcript_path": "TEXT",
             "review_path": "TEXT",
+            # Historical artefacts preserved across reruns. JSON
+            # array of {label, created_at, compressed_path,
+            # transcript_path, enhanced_transcript_path, review_path}
+            # entries. Newest version first. NULL on fresh jobs that
+            # have never been rerun. See ``snapshot_existing_artifacts``
+            # in pipeline.py for the move logic.
+            "previous_versions_json": "TEXT",
             "speaker_map_json": "TEXT",
             "technical_terms_json": "TEXT",
             # Live progress for the in-flight job(s).
@@ -294,6 +301,38 @@ class DatabaseManager:
             conn.execute(
                 f"UPDATE jobs SET {column} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (path, job_id),
+            )
+
+    def prepend_job_version(self, job_id: int, version: dict) -> None:
+        """Prepend a snapshot entry to ``previous_versions_json``.
+
+        The list grows on every rerun, newest first, so the SwiftUI
+        detail panel can show "il y a 2 jours" without a sort step.
+        Capped at 10 entries to keep the column from ballooning on
+        jobs that get re-run dozens of times — older versions remain
+        on disk inside the workspace, just unindexed in the DB.
+        """
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT previous_versions_json FROM jobs WHERE id = ?",
+                (job_id,),
+            )
+            row = cursor.fetchone()
+            existing: list = []
+            if row and row["previous_versions_json"]:
+                try:
+                    parsed = json.loads(row["previous_versions_json"])
+                    if isinstance(parsed, list):
+                        existing = parsed
+                except (TypeError, ValueError):
+                    existing = []
+            existing.insert(0, dict(version))
+            if len(existing) > 10:
+                existing = existing[:10]
+            conn.execute(
+                "UPDATE jobs SET previous_versions_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(existing, ensure_ascii=False), job_id),
             )
 
     def update_job_progress(

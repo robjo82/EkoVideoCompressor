@@ -1110,6 +1110,118 @@ class LibraryRenameAutoLinkOdooTest(unittest.TestCase):
             self.assertEqual(profile["odoo_partner_name"], "Manual")
 
 
+class SnapshotExistingArtifactsTest(unittest.TestCase):
+    """Pins the rerun safety net: previous outputs are moved into
+    ``versions/<timestamp>/`` before the new run overwrites them."""
+
+    def _seed_workspace(self, root: Path) -> tuple[Path, dict]:
+        workspace = root / "ws"
+        workspace.mkdir()
+        compressed = workspace / "source.compressed.mp4"
+        compressed.write_bytes(b"compressed-v1")
+        transcript = workspace / "source.txt"
+        transcript.write_text("transcript v1", encoding="utf-8")
+        enhanced = workspace / "source - améliorée.txt"
+        enhanced.write_text("enhanced v1", encoding="utf-8")
+        review = workspace / "source - à vérifier.md"
+        review.write_text("review v1", encoding="utf-8")
+        job = {
+            "id": 1,
+            "compressed_path": str(compressed),
+            "transcript_path": str(transcript),
+            "enhanced_transcript_path": str(enhanced),
+            "review_path": str(review),
+        }
+        return workspace, job
+
+    def test_moves_existing_outputs_into_versioned_folder(self):
+        from ekovideo_engine.pipeline import snapshot_existing_artifacts
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace, job = self._seed_workspace(root)
+            summary = snapshot_existing_artifacts(workspace, job, lambda _: None)
+
+            self.assertTrue(summary)
+            versions_dir = workspace / "versions"
+            snapshots = list(versions_dir.iterdir())
+            self.assertEqual(len(snapshots), 1)
+            snapshot = snapshots[0]
+            # The four files moved out of the workspace root and
+            # into the dated subfolder.
+            self.assertTrue((snapshot / "source.compressed.mp4").exists())
+            self.assertTrue((snapshot / "source.txt").exists())
+            self.assertFalse((workspace / "source.txt").exists())
+            # Summary carries the destination paths so the DB can
+            # render Reveal-in-Finder later.
+            self.assertEqual(summary["compressed_path"], str(snapshot / "source.compressed.mp4"))
+            self.assertIn("label", summary)
+            self.assertIn("created_at", summary)
+
+    def test_fresh_workspace_no_ops(self):
+        from ekovideo_engine.pipeline import snapshot_existing_artifacts
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            summary = snapshot_existing_artifacts(workspace, {}, lambda _: None)
+            self.assertEqual(summary, {})
+            self.assertFalse((workspace / "versions").exists())
+
+    def test_skips_missing_files_silently(self):
+        # A row whose paths point at deleted files (workspace was
+        # wiped manually) must not crash — just skip the missing
+        # entries and snapshot whatever survives.
+        from ekovideo_engine.pipeline import snapshot_existing_artifacts
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            kept = workspace / "source.txt"
+            kept.write_text("kept", encoding="utf-8")
+            job = {
+                "id": 1,
+                "transcript_path": str(kept),
+                "compressed_path": str(workspace / "missing.mp4"),
+            }
+            summary = snapshot_existing_artifacts(workspace, job, lambda _: None)
+            self.assertIn("transcript_path", summary)
+            self.assertNotIn("compressed_path", summary)
+
+
+class PrependJobVersionTest(unittest.TestCase):
+    """The new ``previous_versions_json`` column accumulates snapshot
+    metadata across reruns. Pins: list grows newest-first and is
+    capped at 10 entries so an aggressively rerun job doesn't bloat
+    the DB."""
+
+    def test_prepend_keeps_newest_first_and_caps_at_ten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "x.mov"),
+                    workspace_dir=str(root / "ws"),
+                    settings={},
+                )
+                for i in range(12):
+                    db.prepend_job_version(
+                        job_id,
+                        {
+                            "label": f"20260517-{i:06d}",
+                            "created_at": f"2026-05-17T14:00:{i:02d}Z",
+                            "transcript_path": f"/ws/v{i}/t.txt",
+                        },
+                    )
+                row = db.get_job(job_id)
+
+            assert row is not None
+            versions = json.loads(row["previous_versions_json"])
+            self.assertEqual(len(versions), 10)
+            # Newest first — the 11th prepend (i=11) lives at index 0;
+            # the original two (i=0, i=1) got dropped off the tail.
+            self.assertEqual(versions[0]["label"], "20260517-000011")
+            self.assertEqual(versions[-1]["label"], "20260517-000002")
+
+
 class LibraryRepairSpeakerMapsTest(unittest.TestCase):
     """One-shot heal pass triggered at app launch (post PR #30).
     Pins:

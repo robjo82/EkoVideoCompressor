@@ -164,6 +164,13 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     /// sheet so it can show one-click attribution chips for each
     /// invitee.
     var odoo_meeting_json: String?
+    /// Raw JSON array of previous-run snapshots created on rerun.
+    /// Newest first. Each entry mirrors the four artefact paths
+    /// (compressed / transcript / enhanced / review) that existed
+    /// when the rerun started, moved into ``versions/<timestamp>/``
+    /// so the current run is free to overwrite the originals
+    /// without losing work.
+    var previous_versions_json: String?
 
     var filename: String {
         URL(fileURLWithPath: source_path ?? "").lastPathComponent
@@ -196,6 +203,72 @@ struct LibraryRow: Codable, Identifiable, Equatable {
 
     var technicalTerms: [String] {
         decodeJSONArray(technical_terms_json)
+    }
+
+    /// Decoded list of previous-run snapshots. Newest first.
+    /// Empty when the job has never been rerun, or when the
+    /// stored JSON is malformed (we'd rather hide the section
+    /// than crash the library on bad data).
+    var previousVersions: [LibraryPreviousVersion] {
+        guard let raw = previous_versions_json, !raw.isEmpty,
+              let data = raw.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([LibraryPreviousVersion].self, from: data)) ?? []
+    }
+}
+
+/// One archived snapshot of a previous run's artefacts. Lives in
+/// ``workspace/versions/<label>/`` on disk; the four path fields
+/// point to whichever of the user-facing outputs existed when
+/// the rerun started (any can be empty when the prior run skipped
+/// that step).
+struct LibraryPreviousVersion: Codable, Identifiable, Equatable {
+    var label: String
+    var created_at: String
+    var compressed_path: String?
+    var transcript_path: String?
+    var enhanced_transcript_path: String?
+    var review_path: String?
+
+    /// Stable identifier — the timestamp label is unique within a
+    /// job's history (we generate one per rerun at second
+    /// granularity, and the engine never re-runs twice in the same
+    /// second on the same job).
+    var id: String { label }
+
+    /// Folder containing the snapshot files. Derived from any of
+    /// the artefact paths since they all share the same parent.
+    var folderPath: String? {
+        let first = [compressed_path, transcript_path, enhanced_transcript_path, review_path]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        guard let path = first else { return nil }
+        return URL(fileURLWithPath: path).deletingLastPathComponent().path
+    }
+
+    /// Pretty French rendering of ``created_at`` for the detail
+    /// section ("17 mai 2026 à 14:30"). Falls back to the raw
+    /// timestamp when parsing fails so we never show nothing.
+    var displayedTimestamp: String {
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: created_at) {
+            let out = DateFormatter()
+            out.locale = Locale(identifier: "fr_FR")
+            out.dateStyle = .medium
+            out.timeStyle = .short
+            return out.string(from: date)
+        }
+        return created_at
+    }
+
+    /// Names of the artefacts kept in this snapshot, ready for a
+    /// caption line ("compressé, transcription, améliorée").
+    var artefactSummary: String {
+        var parts: [String] = []
+        if let p = compressed_path, !p.isEmpty { parts.append("compressé") }
+        if let p = transcript_path, !p.isEmpty { parts.append("transcription") }
+        if let p = enhanced_transcript_path, !p.isEmpty { parts.append("améliorée") }
+        if let p = review_path, !p.isEmpty { parts.append("rapport") }
+        return parts.joined(separator: " · ")
     }
 }
 
