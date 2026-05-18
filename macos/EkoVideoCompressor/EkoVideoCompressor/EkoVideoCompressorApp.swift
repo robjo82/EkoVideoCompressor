@@ -10,6 +10,7 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var updater = UpdateStore()
     @StateObject private var odoo = OdooStore()
     @StateObject private var energy = EnergyMonitor()
+    @StateObject private var pyannote = PyannoteStatusStore()
 
     init() {
         let args = CommandLine.arguments
@@ -30,10 +31,12 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(updater)
                 .environmentObject(odoo)
                 .environmentObject(energy)
+                .environmentObject(pyannote)
                 .frame(minWidth: 1180, minHeight: 760)
                 .onAppear {
                     updater.setSettings(settings)
                     odoo.bind(settings)
+                    pyannote.bind(settings)
                     Task {
                         await updater.checkUpdates(proactive: true)
                     }

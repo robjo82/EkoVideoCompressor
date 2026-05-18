@@ -382,6 +382,137 @@ enum UpdateState: Equatable {
     case error(String)
 }
 
+/// Status of the Pyannote / Hugging Face setup. Drives both the
+/// Réglages panel (per-model rows with action buttons) and a
+/// pre-flight banner in Run Setup when the user has diarisation
+/// enabled but the gated models aren't accessible yet.
+enum PyannoteStatus: Equatable {
+    case unknown
+    case checking
+    /// Everything green — the user can run diarisation jobs.
+    case ready(account: String, models: [HuggingFaceModelCheck])
+    /// Token works but at least one model card hasn't had its
+    /// license accepted. Carries both the missing subset (for the
+    /// banner caption) and the full list (for the Réglages rows).
+    case partial(account: String, missing: [HuggingFaceModelCheck], all: [HuggingFaceModelCheck])
+    /// Token rejected by Hugging Face — wrong / expired / revoked.
+    case invalidToken(detail: String)
+    /// Network or engine-side error. The string is shown verbatim
+    /// to the user as a hint for what went wrong.
+    case error(String)
+
+    var isReady: Bool {
+        if case .ready = self { return true }
+        return false
+    }
+
+    var allModels: [HuggingFaceModelCheck] {
+        switch self {
+        case .ready(_, let models): return models
+        case .partial(_, _, let models): return models
+        default: return []
+        }
+    }
+
+    var missingModels: [HuggingFaceModelCheck] {
+        switch self {
+        case .partial(_, let missing, _): return missing
+        default: return []
+        }
+    }
+}
+
+/// Tracks Pyannote / Hugging Face setup state app-wide. The
+/// verification step happens on demand (Settings "Vérifier") and
+/// also lazily at app launch when a token is present, so the Run
+/// Setup pre-flight banner reflects the right state on cold start.
+@MainActor
+final class PyannoteStatusStore: ObservableObject {
+    @Published private(set) var status: PyannoteStatus = .unknown
+    @Published private(set) var lastCheckedAt: Date?
+
+    /// Hash of the last token that fully verified — persisted so
+    /// we can skip the network round-trip on cold start when the
+    /// user hasn't changed their token. Stored as the token text
+    /// itself (it lives in ``@AppStorage("hfToken")`` anyway, so
+    /// no extra exposure).
+    @AppStorage("pyannoteLastReadyToken") private var lastReadyToken = ""
+    @AppStorage("pyannoteLastReadyAccount") private var lastReadyAccount = ""
+
+    private weak var settings: SettingsStore?
+
+    func bind(_ store: SettingsStore) {
+        self.settings = store
+        rehydrateFromCache()
+    }
+
+    /// Restore a "ready" badge from the last successful verification
+    /// so the Run Setup banner doesn't flash a warning at launch
+    /// before the user manually re-verifies.
+    private func rehydrateFromCache() {
+        let token = currentToken()
+        guard !token.isEmpty, token == lastReadyToken else { return }
+        // Rehydrate with an empty models list — the Réglages panel
+        // shows "Cliquer pour rafraîchir" when models is empty, and
+        // the banner only cares about ``isReady``.
+        status = .ready(account: lastReadyAccount.isEmpty ? "compte connecté" : lastReadyAccount, models: [])
+    }
+
+    private func currentToken() -> String {
+        (settings?.hfToken ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Re-verify against Hugging Face. Updates ``status`` in place.
+    /// No-ops when the token field is empty (status becomes
+    /// ``.unknown`` so the banner can prompt the user to paste one).
+    func verify() async {
+        let token = currentToken()
+        guard !token.isEmpty else {
+            status = .unknown
+            lastReadyToken = ""
+            return
+        }
+        status = .checking
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["hf-check", "--token", token])
+        )
+        if result.status != 0 {
+            status = .error(result.events.last?.message ?? "Vérification Hugging Face échouée.")
+            return
+        }
+        guard let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(HuggingFaceCheckResponse.self, from: data)
+        else {
+            status = .error("Réponse Hugging Face illisible.")
+            return
+        }
+        let accountName = (payload.account.name ?? payload.account.fullname ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if accountName.isEmpty {
+            status = .invalidToken(detail: "Hugging Face n'a pas reconnu ce token.")
+            lastReadyToken = ""
+            return
+        }
+        let missing = payload.checks.filter { !$0.ok }
+        if missing.isEmpty {
+            status = .ready(account: accountName, models: payload.checks)
+            lastReadyToken = token
+            lastReadyAccount = accountName
+        } else {
+            status = .partial(account: accountName, missing: missing, all: payload.checks)
+            lastReadyToken = ""
+        }
+        lastCheckedAt = Date()
+    }
+
+    /// Called when the token field changes mid-session. Drops the
+    /// cached ready state so the banner doesn't lie about the
+    /// previous token's access.
+    func tokenDidChange() {
+        if status.isReady || status == .checking { return }
+        status = .unknown
+    }
+}
+
 @MainActor
 final class UpdateStore: ObservableObject {
     @Published var state: UpdateState = .idle

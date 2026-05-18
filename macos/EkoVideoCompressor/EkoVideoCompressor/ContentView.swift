@@ -40,6 +40,8 @@ struct ContentView: View {
     @EnvironmentObject private var models: ModelStore
     @EnvironmentObject private var odoo: OdooStore
     @EnvironmentObject private var energy: EnergyMonitor
+    @EnvironmentObject private var pyannote: PyannoteStatusStore
+    @EnvironmentObject private var updater: UpdateStore
     @State private var selectedSection: AppSection = .queue
     @State private var showingSettings = false
     @State private var showingRunSetup = false
@@ -100,6 +102,8 @@ struct ContentView: View {
                 .environmentObject(settings)
                 .environmentObject(engine)
                 .environmentObject(energy)
+                .environmentObject(pyannote)
+                .environmentObject(updater)
         }
         .sheet(isPresented: $showingRunSetup) {
             RunSetupView {
@@ -112,6 +116,8 @@ struct ContentView: View {
             .environmentObject(odoo)
             .environmentObject(library)
             .environmentObject(energy)
+            .environmentObject(pyannote)
+            .environmentObject(updater)
         }
         .task {
             guard !didPreloadSecondaryData else { return }
@@ -533,6 +539,13 @@ struct RunBatchSettingsForm: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var queue: QueueStore
     @EnvironmentObject private var energy: EnergyMonitor
+    @EnvironmentObject private var pyannote: PyannoteStatusStore
+    /// Surfaces a one-tap link to Réglages when the user has
+    /// diarisation on but pyannote isn't set up. The actual sheet
+    /// is opened by the parent (RunSetupView passes a closure in via
+    /// the environment), so this binding stays a no-op unless the
+    /// banner is rendered.
+    var onOpenSettings: () -> Void = {}
 
     private var canDeleteOriginalSources: Bool {
         queue.items.contains { !$0.isLibraryRerun }
@@ -596,6 +609,7 @@ struct RunBatchSettingsForm: View {
                         .foregroundStyle(.red)
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                pyannotePreflightBanner
                 Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
             }
 
@@ -609,6 +623,69 @@ struct RunBatchSettingsForm: View {
             }
         }
         .formStyle(.grouped)
+        .task {
+            // Lazy verification at sheet open. The user hasn't
+            // typed anything yet, but if a token's in @AppStorage
+            // and we don't have a cached "ready" state, take the
+            // ~300ms hit to seed the banner.
+            guard pyannote.status == .unknown,
+                  !settings.hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return }
+            await pyannote.verify()
+        }
+    }
+
+    /// Inline warning shown directly below the diarisation toggle.
+    /// Empty when (a) diarisation is off or (b) pyannote is already
+    /// known-ready. Shows the actionable variants — partial access
+    /// gets a "Configurer maintenant" CTA, invalid token / errors
+    /// surface what's wrong + the same CTA.
+    @ViewBuilder
+    private var pyannotePreflightBanner: some View {
+        if settings.diarizationEnabled {
+            switch pyannote.status {
+            case .ready:
+                EmptyView()
+            case .checking:
+                Label("Vérification de l'accès Hugging Face…", systemImage: "ellipsis.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .unknown:
+                HStack(spacing: 8) {
+                    Label("Pyannote n'est pas configuré — la détection des locuteurs échouera.", systemImage: "exclamationmark.shield")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Spacer()
+                    Button("Configurer maintenant", action: onOpenSettings)
+                        .controlSize(.small)
+                }
+            case .partial(_, let missing, _):
+                HStack(spacing: 8) {
+                    Label(
+                        "Licence(s) pyannote à accepter : \(missing.map(\.label).joined(separator: ", "))",
+                        systemImage: "exclamationmark.shield"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    Spacer()
+                    Button("Configurer maintenant", action: onOpenSettings)
+                        .controlSize(.small)
+                }
+            case .invalidToken(let detail):
+                HStack(spacing: 8) {
+                    Label(detail, systemImage: "xmark.shield.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Spacer()
+                    Button("Configurer maintenant", action: onOpenSettings)
+                        .controlSize(.small)
+                }
+            case .error(let message):
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
     }
 }
 
@@ -1471,8 +1548,17 @@ private func formatHMS(_ seconds: Double) -> String {
 struct RunSetupView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var queue: QueueStore
+    @EnvironmentObject private var engine: EngineProcess
+    @EnvironmentObject private var energy: EnergyMonitor
+    @EnvironmentObject private var pyannote: PyannoteStatusStore
+    @EnvironmentObject private var updater: UpdateStore
     @Environment(\.dismiss) private var dismiss
     @State private var currentIndex = 0
+    /// Local sheet for the "Configurer maintenant" deep link from
+    /// the pyannote pre-flight banner. We avoid asking the parent
+    /// (ContentView) to manage the toggle so the Run Setup sheet
+    /// stays self-contained.
+    @State private var showingSettings = false
     var onStart: () -> Void
 
     private var clampedIndex: Int {
@@ -1511,12 +1597,20 @@ struct RunSetupView: View {
                         .padding(.horizontal, 22)
                         .padding(.top, 14)
                     }
-                    RunBatchSettingsForm()
+                    RunBatchSettingsForm(onOpenSettings: { showingSettings = true })
                         .environmentObject(settings)
                 }
                 .padding(.bottom, 14)
             }
             .frame(minHeight: 360)
+            .sheet(isPresented: $showingSettings) {
+                SettingsView()
+                    .environmentObject(settings)
+                    .environmentObject(engine)
+                    .environmentObject(energy)
+                    .environmentObject(pyannote)
+                    .environmentObject(updater)
+            }
 
             Divider()
             HStack {
@@ -2424,9 +2518,8 @@ struct SettingsView: View {
     @EnvironmentObject private var updater: UpdateStore
     @EnvironmentObject private var engine: EngineProcess
     @EnvironmentObject private var energy: EnergyMonitor
+    @EnvironmentObject private var pyannote: PyannoteStatusStore
     @Environment(\.dismiss) private var dismiss
-    @State private var hfStatus = ""
-    @State private var isCheckingHF = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2550,34 +2643,8 @@ struct SettingsView: View {
                 Section("Connexion Odoo") {
                     OdooConnectionSection()
                 }
-                Section("Hugging Face") {
-                    SecureField("Token Read", text: $settings.hfToken)
-                    HStack {
-                        Button {
-                            openHuggingFaceTokens()
-                        } label: {
-                            Label("Créer ou gérer le token", systemImage: "person.crop.circle.badge.key")
-                        }
-                        Button {
-                            Task { await checkHuggingFaceAccess() }
-                        } label: {
-                            if isCheckingHF {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Label("Vérifier l'accès", systemImage: "checkmark.shield")
-                            }
-                        }
-                        .disabled(settings.hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCheckingHF)
-                    }
-                    if !hfStatus.isEmpty {
-                        Text(hfStatus)
-                            .font(.callout)
-                            .foregroundStyle(hfStatus.hasPrefix("OK") ? .green : .secondary)
-                    } else {
-                        Text("Requis pour la détection des locuteurs pyannote. L'app vérifie le token et l'acceptation des conditions des modèles.")
-                            .foregroundStyle(.secondary)
-                    }
+                Section("Hugging Face — pyannote") {
+                    HuggingFaceSetupSection()
                 }
                 Section("Vocabulaire conservé") {
                     Text("\(settings.vocabularyCatalog.count) terme(s) dans le catalogue. L'onglet Vocabulaire permet d'ajouter, supprimer et prioriser les termes selon l'usage.")
@@ -2604,45 +2671,147 @@ struct SettingsView: View {
         .frame(minWidth: 620, minHeight: 520)
     }
 
-    private func checkHuggingFaceAccess() async {
-        isCheckingHF = true
-        defer { isCheckingHF = false }
-        let result = await EngineProcess.runCommand(
-            arguments: EngineProcess.defaultPythonArguments(["hf-check", "--token", settings.hfToken])
-        )
-        if result.status != 0 {
-            hfStatus = result.events.last?.message ?? result.rawOutput
-            return
+}
+
+/// Guided setup for the Pyannote / Hugging Face access pipeline.
+/// Lives inside Réglages → "Hugging Face — pyannote" and is what
+/// the Run Setup banner deep-links to via the parent sheet.
+///
+/// Layout matches the user's mental sequence:
+/// 1. paste a HF token
+/// 2. click "Vérifier l'accès"
+/// 3. for each model that's still gated, click "Accepter la
+///    licence" → browser opens directly on the model card
+/// 4. click "Vérifier à nouveau"
+/// 5. all green
+struct HuggingFaceSetupSection: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var pyannote: PyannoteStatusStore
+
+    private var tokenIsEmpty: Bool {
+        settings.hfToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SecureField("Token Read", text: $settings.hfToken)
+                .onChange(of: settings.hfToken) { _, _ in
+                    pyannote.tokenDidChange()
+                }
+            HStack {
+                Button {
+                    openHuggingFaceTokens()
+                } label: {
+                    Label("Créer ou gérer le token", systemImage: "person.crop.circle.badge.key")
+                }
+                Button {
+                    Task { await pyannote.verify() }
+                } label: {
+                    if pyannote.status == .checking {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Label("Vérifier l'accès", systemImage: "checkmark.shield")
+                    }
+                }
+                .disabled(tokenIsEmpty || pyannote.status == .checking)
+            }
+            statusSummary
+            if !pyannote.status.allModels.isEmpty {
+                Divider()
+                ForEach(pyannote.status.allModels) { model in
+                    HuggingFaceModelRow(model: model)
+                }
+            }
         }
-        guard let data = result.rawOutput.data(using: .utf8),
-              let payload = try? JSONDecoder().decode(HuggingFaceCheckResponse.self, from: data) else {
-            hfStatus = "Réponse Hugging Face illisible."
-            return
-        }
-        let missing = payload.checks.filter { !$0.ok }
-        if missing.isEmpty {
-            let name = payload.account.name ?? payload.account.fullname ?? "compte connecté"
-            hfStatus = "OK · \(name) · accès pyannote vérifié."
-        } else {
-            let labels = missing.map(\.label).joined(separator: ", ")
-            hfStatus = "Accès incomplet : \(labels). Ouvrez Hugging Face et acceptez les conditions."
+    }
+
+    @ViewBuilder
+    private var statusSummary: some View {
+        switch pyannote.status {
+        case .unknown:
+            Text("Requis pour la détection des locuteurs pyannote. L'app vérifie le token et l'acceptation des conditions des modèles.")
+                .foregroundStyle(.secondary)
+        case .checking:
+            Text("Vérification en cours…")
+                .foregroundStyle(.secondary)
+        case .ready(let account, _):
+            Label("OK · \(account) · accès pyannote vérifié.", systemImage: "checkmark.seal.fill")
+                .foregroundStyle(.green)
+        case .partial(_, let missing, _):
+            Label(
+                "Licence(s) à accepter : \(missing.map(\.label).joined(separator: ", "))",
+                systemImage: "exclamationmark.shield"
+            )
+            .foregroundStyle(.orange)
+        case .invalidToken(let detail):
+            Label(detail, systemImage: "xmark.shield.fill")
+                .foregroundStyle(.red)
+        case .error(let message):
+            Label(message, systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.red)
         }
     }
 }
 
-private struct HuggingFaceCheckResponse: Decodable {
+/// One row per gated model with a status glyph + license button.
+/// Hidden when the verification hasn't run yet so the panel stays
+/// compact for the first-launch case.
+struct HuggingFaceModelRow: View {
+    var model: HuggingFaceModelCheck
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: model.ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .foregroundStyle(model.ok ? .green : .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.label)
+                    .font(.callout)
+                Text(model.repo_id)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                if !model.ok {
+                    Text(model.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if !model.ok, let url = URL(string: model.license_url) {
+                Button {
+                    NSWorkspace.shared.open(url)
+                } label: {
+                    Label("Accepter la licence", systemImage: "arrow.up.right.square")
+                }
+                .help("Ouvre la page du modèle sur Hugging Face. Cliquez « Agree and access repository » puis revenez ici et cliquez « Vérifier à nouveau ».")
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct HuggingFaceCheckResponse: Decodable {
     var account: HuggingFaceAccount
     var checks: [HuggingFaceModelCheck]
 }
 
-private struct HuggingFaceAccount: Decodable {
+struct HuggingFaceAccount: Decodable {
     var name: String?
     var fullname: String?
 }
 
-private struct HuggingFaceModelCheck: Decodable {
+struct HuggingFaceModelCheck: Decodable, Identifiable, Equatable {
+    var repo_id: String
     var label: String
     var ok: Bool
+    var detail: String
+    /// URL of the model card on Hugging Face. The license gate
+    /// ("Agree and access repository") lives at the top of this
+    /// page — surfaced as a one-click button so the user doesn't
+    /// have to copy/paste the repo id into a browser.
+    var license_url: String
+
+    var id: String { repo_id }
 }
 
 struct StatusBarView: View {
