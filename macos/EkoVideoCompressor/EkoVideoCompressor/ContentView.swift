@@ -1640,7 +1640,17 @@ struct LibraryView: View {
         sortedRows.flatMap { row in
             var rows = [LibraryDisplayRow(job: row)]
             if expandedJobIDs.contains(row.id) {
-                rows.append(contentsOf: row.artifacts.map { LibraryDisplayRow(job: row, artifact: $0) })
+                rows.append(contentsOf: row.artifacts.map {
+                    LibraryDisplayRow(job: row, artifact: $0)
+                })
+                // Previous-run snapshots — engine moves the old
+                // compressed/transcript/etc. into versions/<ts>/
+                // before each rerun. Rendered after the current
+                // artefacts so the chronology reads top-down: now,
+                // then progressively older.
+                rows.append(contentsOf: row.previousVersions.map {
+                    LibraryDisplayRow(job: row, previousVersion: $0)
+                })
             }
             return rows
         }
@@ -1705,6 +1715,8 @@ struct LibraryView: View {
                         TableColumn("Fichier", value: \.sortableTitle) { displayRow in
                             if let artifact = displayRow.artifact {
                                 ArtifactTreeNameCell(artifact: artifact)
+                            } else if let version = displayRow.previousVersion {
+                                PreviousVersionTreeNameCell(version: version)
                             } else {
                                 HStack(spacing: 8) {
                                     Button {
@@ -1730,7 +1742,7 @@ struct LibraryView: View {
 
                         if showsStatusColumn {
                             TableColumn("Statut", value: \.sortableStatus) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     Image(systemName: statusIconName(displayRow.job.status))
                                         .foregroundStyle(statusColor(displayRow.job.status))
                                         .help(localizedStatus(displayRow.job.status))
@@ -1746,7 +1758,7 @@ struct LibraryView: View {
 
                         if showsUpdatedColumn {
                             TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
                                         .foregroundStyle(.secondary)
                                         .lineLimit(2)
@@ -1762,6 +1774,11 @@ struct LibraryView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
+                                } else if let version = displayRow.previousVersion {
+                                    Text(version.artefactSummary)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
                                 } else {
                                     ArtifactDots(row: displayRow.job)
                                 }
@@ -1771,7 +1788,7 @@ struct LibraryView: View {
 
                         if showsMeetingDateColumn {
                             TableColumn("Date réunion", value: \.sortableMeetingDate) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     Text(displayMeetingDate(displayRow.job.meeting_date))
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
@@ -1782,7 +1799,7 @@ struct LibraryView: View {
 
                         if showsSpeakersColumn {
                             TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     SpeakerListingCell(names: displayRow.job.displayedSpeakerNames)
                                 }
                             }
@@ -1791,7 +1808,7 @@ struct LibraryView: View {
 
                         if showsProjectSizeColumn {
                             TableColumn("Poids", value: \.sortableTotalBytes) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     Text(displayRow.displayedTotalBytes)
                                         .font(.callout.monospacedDigit())
                                         .foregroundStyle(.secondary)
@@ -1803,7 +1820,7 @@ struct LibraryView: View {
 
                         if showsOdooMeetingColumn {
                             TableColumn("Réunion Odoo", value: \.sortableOdooMeeting) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     OdooMeetingCell(
                                         row: displayRow.job,
                                         onEdit: { editingRow = displayRow.job }
@@ -1815,7 +1832,7 @@ struct LibraryView: View {
 
                         if showsOdooRelatedColumn {
                             TableColumn("Opportunité / tâche", value: \.sortableOdooRelated) { displayRow in
-                                if displayRow.artifact == nil {
+                                if displayRow.isJobRow {
                                     OdooRelatedCell(
                                         row: displayRow.job,
                                         onEdit: { editingRow = displayRow.job }
@@ -1834,6 +1851,8 @@ struct LibraryView: View {
                                         enqueue(path, label: "Artefact ajouté à la file d'attente")
                                     }
                                 }
+                            } else if let version = displayRow.previousVersion {
+                                PreviousVersionInlineActions(version: version)
                             } else {
                                 LibraryTableActionsView(
                                     row: displayRow.job,
@@ -2812,12 +2831,26 @@ struct LibraryArtifact: Identifiable, Equatable {
 struct LibraryDisplayRow: Identifiable, Equatable {
     var job: LibraryRow
     var artifact: LibraryArtifact?
+    /// Set when the row represents an archived previous-run snapshot
+    /// rather than the current artefact set. Mutually exclusive with
+    /// ``artifact``.
+    var previousVersion: LibraryPreviousVersion?
 
     var id: String {
         if let artifact {
-            return "\(job.id)-\(artifact.kind)"
+            return "\(job.id)-art-\(artifact.kind)"
+        }
+        if let previousVersion {
+            return "\(job.id)-ver-\(previousVersion.label)"
         }
         return "\(job.id)"
+    }
+
+    /// True for parent (job) rows, the only ones that should render
+    /// the status / dates / actions columns. Child rows (artefacts
+    /// and version snapshots) leave those cells empty.
+    var isJobRow: Bool {
+        artifact == nil && previousVersion == nil
     }
 }
 
@@ -3001,6 +3034,87 @@ struct ArtifactTreeNameCell: View {
                 .foregroundStyle(pathExists(artifact.path) ? .primary : .secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
+        }
+    }
+}
+
+/// Tree row representing one archived previous-run snapshot of the
+/// parent job. Indented like an artefact row and tagged with a clock
+/// glyph so it reads as historical at a glance. Subtitle carries the
+/// formatted timestamp so the user can tell two snapshots apart.
+struct PreviousVersionTreeNameCell: View {
+    var version: LibraryPreviousVersion
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Spacer()
+                .frame(width: 26)
+            Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Version du \(version.displayedTimestamp)")
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                if !version.artefactSummary.isEmpty {
+                    Text(version.artefactSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+    }
+}
+
+/// Action row for an archived snapshot. Two affordances: open the
+/// snapshot folder in Finder (the simplest way to browse what was
+/// preserved), or open the transcript/compressed file directly when
+/// present. No "Relancer" — relaunching a previous *version* would
+/// be a weird flow; the user should relaunch the current job
+/// instead, which auto-snapshots again.
+struct PreviousVersionInlineActions: View {
+    var version: LibraryPreviousVersion
+
+    private var primaryPath: String? {
+        // Prefer the transcript — it's the artefact the user is
+        // most likely to want to re-read. Fall back to enhanced /
+        // compressed / review in turn.
+        let ordered: [String?] = [
+            version.transcript_path,
+            version.enhanced_transcript_path,
+            version.compressed_path,
+            version.review_path,
+        ]
+        for raw in ordered {
+            guard let path = raw, !path.isEmpty else { continue }
+            if FileManager.default.fileExists(atPath: path) { return path }
+        }
+        return nil
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if let path = primaryPath {
+                Button {
+                    openPath(path)
+                } label: {
+                    Label("Ouvrir", systemImage: "doc.text")
+                }
+                .labelStyle(.iconOnly)
+                .help("Ouvrir la transcription de cette version")
+            }
+            if let folder = version.folderPath,
+               FileManager.default.fileExists(atPath: folder) {
+                Button {
+                    revealInFinder(folder)
+                } label: {
+                    Label("Finder", systemImage: "folder")
+                }
+                .labelStyle(.iconOnly)
+                .help("Afficher le dossier de cette version dans le Finder")
+            }
         }
     }
 }

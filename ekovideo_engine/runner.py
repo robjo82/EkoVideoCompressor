@@ -22,7 +22,7 @@ from .pipeline import (
     TranscriptionPipeline,
     apply_meeting_date_to_artifact,
 )
-from .pipeline import prepare_job_workspace
+from .pipeline import prepare_job_workspace, snapshot_existing_artifacts
 
 
 class EtaSmoothingSink:
@@ -333,6 +333,36 @@ class EngineRunner:
             sink(ArtifactEvent("library_row", str(workspace), model=str(job_id)))
         db.update_job_status(job_id, "RUNNING", "")
         db.update_job_meeting_date(job_id, request.meeting_date or None)
+        # Rerun safety: before any pipeline step writes new artefacts,
+        # snapshot the previous outputs into ``versions/<timestamp>/``.
+        # Only fires when the job already has artefacts on disk —
+        # fresh jobs no-op silently. The snapshot helper logs and
+        # emits ``ArtifactEvent("previous_version", …)`` for each
+        # file moved so the SwiftUI library refresh picks them up.
+        if request.library_job_id is not None:
+            existing_job = db.get_job(job_id)
+            if existing_job:
+                snapshot = snapshot_existing_artifacts(workspace, existing_job, sink)
+                if snapshot:
+                    db.prepend_job_version(job_id, snapshot)
+                    # Clear the current artefact paths — the pipeline
+                    # will repopulate them as it runs. Without this
+                    # the library would briefly show the moved paths
+                    # as "current" until the new outputs land.
+                    for column in (
+                        "compressed_path",
+                        "transcript_path",
+                        "enhanced_transcript_path",
+                        "review_path",
+                    ):
+                        if column in snapshot:
+                            kind = {
+                                "compressed_path": "compressed",
+                                "transcript_path": "transcript",
+                                "enhanced_transcript_path": "enhanced_transcript",
+                                "review_path": "review",
+                            }[column]
+                            db.update_job_artefact(job_id, kind, "")
         db.update_job_progress(
             job_id,
             step="Démarrage…",
