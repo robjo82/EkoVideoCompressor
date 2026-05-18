@@ -73,6 +73,12 @@ def hf_check(token: str) -> dict:
                 "label": label,
                 "ok": ok,
                 "detail": detail,
+                # Direct URL to the model card — that's where the
+                # "Agree and access repository" gate lives. We
+                # surface this from SwiftUI as a one-click button
+                # so the user doesn't have to copy the repo_id
+                # into a browser by hand.
+                "license_url": f"{HF_API_BASE}/{repo_id}",
             }
         )
     return {"account": account, "checks": checks}
