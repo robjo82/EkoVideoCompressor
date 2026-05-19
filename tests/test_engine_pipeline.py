@@ -33,6 +33,7 @@ from ekovideo_engine.pipeline import (
     TranscriptionPipeline,
     apply_meeting_date_to_artifact,
     apply_spoken_punctuation_in_email_contexts,
+    normalize_spoken_clock_times,
     reconstruct_letter_spellings,
     reconstruct_spelled_text,
     _apply_glossary_capitalization,
@@ -869,6 +870,73 @@ class QualityPresetTest(unittest.TestCase):
         self.assertFalse(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
         self.assertTrue(settings.per_speaker_enabled)
+
+
+class SpokenClockTimeNormalizationTest(unittest.TestCase):
+    """PR O — turn ``neuf heures`` into ``9h``. The Caste job had
+    ``Neuveur à Mirandol`` (Whisper hallucination from "neuf heures")
+    — out of scope here, but the standard ``neuf heures`` pattern
+    is fixable and very common in French dictation."""
+
+    def test_simple_hour(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("On se voit à neuf heures."),
+            "On se voit à 9h.",
+        )
+
+    def test_hour_with_demie(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("Rendez-vous à dix heures et demie."),
+            "Rendez-vous à 10h30.",
+        )
+
+    def test_hour_with_quart(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("À huit heures et quart."),
+            "À 8h15.",
+        )
+
+    def test_hour_moins_le_quart(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("Démarrage à neuf heures moins le quart."),
+            "Démarrage à 8h45.",
+        )
+
+    def test_hour_with_digit_minutes(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("Le RDV est à treize heures 45."),
+            "Le RDV est à 13h45.",
+        )
+
+    def test_hour_pile(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("À quinze heures pile."),
+            "À 15h.",
+        )
+
+    def test_does_not_touch_durations_with_articles(self):
+        # ``deux heures de réunion`` IS a duration but ``2h de
+        # réunion`` reads fine either way — we don't try to
+        # disambiguate. Pin that ``deux heures`` becomes ``2h``
+        # consistently (acceptable behaviour for transcripts).
+        out = normalize_spoken_clock_times("On a deux heures de réunion.")
+        self.assertEqual(out, "On a 2h de réunion.")
+
+    def test_does_not_touch_other_number_uses(self):
+        # ``deux mille`` shouldn't become ``2000h`` or anything
+        # weird — the regex requires ``heure(s)`` to fire.
+        text = "On a vendu deux mille unités."
+        self.assertEqual(normalize_spoken_clock_times(text), text)
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            normalize_spoken_clock_times("À NEUF HEURES précises."),
+            "À 9h précises.",
+        )
+
+    def test_idempotent_on_already_normalized(self):
+        text = "RDV à 9h30."
+        self.assertEqual(normalize_spoken_clock_times(text), text)
 
 
 class LetterSpellingReconstructionTest(unittest.TestCase):
