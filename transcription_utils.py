@@ -110,6 +110,13 @@ AUDIO_LLM_MODELS: list[dict] = [
         "tier": "balanced",
         "language": ["multi"],
         "default": True,
+        # ``available=False`` because the new SwiftUI engine doesn't
+        # wire the multimodal recheck pass yet — the orchestrator
+        # in ``ekovideo_engine.pipeline`` has no audio-LLM step (it
+        # only lives in the legacy ``video_compactor.py`` PySide
+        # path). The Models tab surfaces this as "À venir" so the
+        # user doesn't expect the toggle to do anything in v0.
+        "available": False,
     },
 ]
 

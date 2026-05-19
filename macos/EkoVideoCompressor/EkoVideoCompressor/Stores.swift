@@ -1435,6 +1435,12 @@ struct ModelRow: Codable, Identifiable {
     var gated: Bool
     var cached: Bool
     var cache_dir: String
+    /// Whether the engine actually wires this role in the current
+    /// build. Defaults to ``true``; the catalog flips it to
+    /// ``false`` for roles that exist as a settings target but
+    /// aren't run by the pipeline yet (today: ``audio_llm``).
+    /// Drives the "À venir" badge in the Models tab.
+    var available: Bool
 
     /// Composite identity: the same Whisper checkpoint can appear
     /// in both the ``transcription`` and ``multipass`` roles. The
@@ -1443,7 +1449,7 @@ struct ModelRow: Codable, Identifiable {
     var compositeID: String { "\(role)|\(id)" }
 
     enum CodingKeys: String, CodingKey {
-        case id, family, label, role, size_mb, tier, language, cached, cache_dir, gated
+        case id, family, label, role, size_mb, tier, language, cached, cache_dir, gated, available
         case isDefault = "default"
     }
 
@@ -1460,6 +1466,10 @@ struct ModelRow: Codable, Identifiable {
         gated = try c.decodeIfPresent(Bool.self, forKey: .gated) ?? false
         cached = try c.decode(Bool.self, forKey: .cached)
         cache_dir = try c.decode(String.self, forKey: .cache_dir)
+        // ``available`` is a recent addition (post-Pyannote PR).
+        // Treat absence as "yes, available" so older catalog
+        // outputs don't get tagged "À venir" by accident.
+        available = try c.decodeIfPresent(Bool.self, forKey: .available) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1475,5 +1485,6 @@ struct ModelRow: Codable, Identifiable {
         try c.encode(gated, forKey: .gated)
         try c.encode(cached, forKey: .cached)
         try c.encode(cache_dir, forKey: .cache_dir)
+        try c.encode(available, forKey: .available)
     }
 }

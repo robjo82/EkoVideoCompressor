@@ -76,6 +76,32 @@ class CatalogRoleCoverageTest(unittest.TestCase):
         for row in model_catalog():
             self.assertIn(row["tier"], allowed, row["id"])
 
+    def test_available_flag_is_set_on_every_row(self):
+        # Drives the "À venir" badge in the SwiftUI Models tab.
+        # Every row carries the field — entries that haven't been
+        # wired in the new engine (audio_llm today) flip it to
+        # False so the UI doesn't promise a working toggle.
+        for row in model_catalog():
+            self.assertIn("available", row, row["id"])
+            self.assertIsInstance(row["available"], bool, row["id"])
+
+    def test_audio_llm_is_marked_unavailable(self):
+        # The multimodal recheck pass lives in video_compactor.py
+        # (legacy PySide path) but isn't ported to
+        # ekovideo_engine.pipeline. Pin the explicit "not yet"
+        # signal so SwiftUI keeps surfacing the warning until the
+        # engine wires it.
+        audio = [row for row in model_catalog() if row["role"] == "audio_llm"]
+        self.assertTrue(audio, "expected at least one audio_llm row")
+        for row in audio:
+            self.assertFalse(row["available"], row["id"])
+
+    def test_other_roles_stay_available_by_default(self):
+        for row in model_catalog():
+            if row["role"] == "audio_llm":
+                continue
+            self.assertTrue(row["available"], row["id"])
+
 
 class CanonicalMultipassTest(unittest.TestCase):
     def test_blank_falls_back_to_catalog_default(self):
