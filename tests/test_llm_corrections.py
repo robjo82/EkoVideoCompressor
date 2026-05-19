@@ -201,5 +201,84 @@ class NoopAfterNormalisationTest(unittest.TestCase):
         self.assertEqual(out.rejected, [])
 
 
+class BetraysGlossaryGuardrailTest(unittest.TestCase):
+    """PR N — the Caste regression. The LLM rewrote ``au doubs``
+    into ``au doute`` because "doute" is a real French word, but
+    the glossary had ``Odoo``. The new guardrail refuses any
+    correction whose phonetic distance to a glossary term grows."""
+
+    def test_au_doubs_to_au_doute_rejected_when_odoo_in_glossary(self):
+        text = "On parle de au doubs au quotidien."
+        out = apply_llm_corrections_to_text(
+            text,
+            [
+                {
+                    "original": "au doubs",
+                    "replacement": "au doute",
+                    "confidence": 0.85,
+                }
+            ],
+            glossary_terms=["Odoo"],
+        )
+        # The correction was refused — text untouched.
+        self.assertEqual(out.text, text)
+        self.assertEqual(out.rejected[0].reason, "betrays_glossary")
+
+    def test_glossary_term_in_replacement_is_accepted(self):
+        # ``au doubs`` → ``Odoo`` moves TOWARDS the glossary, so the
+        # guardrail must NOT reject it. (In practice the LLM rarely
+        # proposes this directly, but pin the contract anyway so a
+        # smarter prompt later doesn't get caught.)
+        text = "On parle de au doubs au quotidien."
+        out = apply_llm_corrections_to_text(
+            text,
+            [
+                {
+                    "original": "au doubs",
+                    "replacement": "Odoo",
+                    "confidence": 0.85,
+                }
+            ],
+            glossary_terms=["Odoo"],
+            max_edit_ratio=1.0,  # disable the distance guard for this test
+        )
+        self.assertIn("Odoo", out.text)
+        self.assertEqual(out.rejected, [])
+
+    def test_no_glossary_no_op(self):
+        # Without glossary context, the guardrail does nothing —
+        # legacy callers see no behavior change.
+        text = "On parle de au doubs au quotidien."
+        out = apply_llm_corrections_to_text(
+            text,
+            [
+                {
+                    "original": "au doubs",
+                    "replacement": "au doute",
+                    "confidence": 0.85,
+                }
+            ],
+        )
+        self.assertEqual(out.text, "On parle de au doute au quotidien.")
+
+    def test_unrelated_correction_with_glossary_still_passes(self):
+        # Pin that an unrelated correction (no phonetic adjacency
+        # to any glossary term) is unaffected by the new guardrail.
+        text = "Bonjour, Sudokiz est notre nom."
+        out = apply_llm_corrections_to_text(
+            text,
+            [
+                {
+                    "original": "Sudokiz",
+                    "replacement": "Sudokies",
+                    "confidence": 0.85,
+                }
+            ],
+            glossary_terms=["Odoo", "Caste"],
+        )
+        self.assertEqual(out.text, "Bonjour, Sudokies est notre nom.")
+        self.assertEqual(out.rejected, [])
+
+
 if __name__ == "__main__":
     unittest.main()
