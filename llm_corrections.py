@@ -74,7 +74,9 @@ class RejectedCorrection:
     original: str
     replacement: str
     confidence: float
-    reason: str  # one of: "low_confidence", "not_found", "too_distant", "empty"
+    # One of: "low_confidence", "not_found", "too_distant", "empty",
+    # "noop_after_normalization", "betrays_glossary".
+    reason: str
 
 
 @dataclass
@@ -216,6 +218,70 @@ def _find_all_normalised(haystack: str, needle: str) -> list[tuple[int, int]]:
 # ---------------------------------------------------------------------------
 
 
+def _betrays_glossary(
+    original: str,
+    replacement: str,
+    glossary_terms: list[str],
+    *,
+    phonetic_threshold: int = 1,
+) -> bool:
+    """Return True when the ORIGINAL is phonetically close to a
+    glossary term but the REPLACEMENT doesn't contain that term.
+
+    Motivating case from the Caste job: the LLM rewrote ``au doubs``
+    into ``au doute`` because "au doute" is a valid French phrase.
+    But the glossary contained ``Odoo`` (the user's domain term),
+    and ``au doubs`` sounds like Odoo. The correction reroutes the
+    text into a real-but-wrong French word, away from the glossary.
+
+    Algorithm:
+    1. For each glossary term, compute its French-aware phonetic key.
+    2. Compute the phonetic key of ``original``.
+    3. If a glossary term is "close enough" to the ORIGINAL
+       (Levenshtein on keys ≤ ``phonetic_threshold``) AND the
+       glossary term doesn't appear verbatim in the REPLACEMENT,
+       reject — the LLM is steering away from the user's term.
+
+    Note: distance ≤ 1 is intentionally strict to avoid false
+    positives on common French words that happen to share a
+    rough phonetic skeleton with a glossary term.
+    """
+    if not glossary_terms:
+        return False
+    try:
+        # Lazy import: glossary_postprocess depends on heavier
+        # rules of phonetic encoding, no need to load it when no
+        # glossary is in play.
+        from glossary_postprocess import french_phonetic_key
+        from glossary_postprocess import _levenshtein as _phonetic_levenshtein
+    except Exception:
+        return False
+    orig_key = french_phonetic_key(original)
+    if not orig_key:
+        return False
+    replacement_normalized = _normalize_for_match(replacement)
+    for term in glossary_terms:
+        cleaned = (term or "").strip()
+        if not cleaned:
+            continue
+        term_key = french_phonetic_key(cleaned)
+        if not term_key:
+            continue
+        dist = _phonetic_levenshtein(
+            orig_key, term_key, limit=phonetic_threshold + 2
+        )
+        if dist > phonetic_threshold:
+            continue
+        # The original phonetically resembles a glossary term — does
+        # the replacement preserve that term? If yes, the LLM has
+        # actually pulled the text closer to the glossary; allow.
+        term_normalized = _normalize_for_match(cleaned)
+        if term_normalized and term_normalized in replacement_normalized:
+            return False
+        return True
+    return False
+
+
 def apply_llm_corrections_to_text(
     text: str,
     corrections: Iterable[dict],
@@ -223,6 +289,7 @@ def apply_llm_corrections_to_text(
     min_confidence: float = 0.7,
     max_edit_ratio: float = 0.45,
     max_replacements_per_correction: int = 4,
+    glossary_terms: list[str] | None = None,
 ) -> CorrectionOutcome:
     """Rewrite ``text`` by applying every correction that clears both
     guardrails.
@@ -353,7 +420,25 @@ def apply_llm_corrections_to_text(
             )
             continue
 
-        # Guardrail 2: stay phonetically close. A wide edit ratio
+        # Guardrail 2: never move the text AWAY from a glossary
+        # term. The Caste regression had the LLM rewriting
+        # ``au doubs`` (phonetically Odoo) into ``au doute`` because
+        # "doute" is a real French word — but the user's glossary
+        # had ``Odoo``. The fix: refuse any correction whose
+        # phonetic distance to a glossary term grows.
+        if _betrays_glossary(original, replacement, list(glossary_terms or [])):
+            rejected.append(
+                RejectedCorrection(
+                    timestamp=ts,
+                    original=original,
+                    replacement=replacement,
+                    confidence=confidence,
+                    reason="betrays_glossary",
+                )
+            )
+            continue
+
+        # Guardrail 3: stay phonetically close. A wide edit ratio
         # signals a rewrite ("On parle de X" -> "On parle ce matin de
         # notre amie X"), not a transcription fix. Refuse so we never
         # rewrite the user's style under the guise of correcting

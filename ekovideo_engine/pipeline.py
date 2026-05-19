@@ -1927,7 +1927,18 @@ class TranscriptionPipeline:
         # the audit list clean ("no corrections were even attempted").
         corrections = self._llm_payload.get("corrections") or []
         if corrections:
-            outcome = apply_llm_corrections_to_text(rendered, corrections)
+            # Pass the glossary so the ``betrays_glossary`` guardrail
+            # can refuse corrections that move the text away from a
+            # term the user explicitly added (e.g. ``au doubs`` →
+            # ``au doute`` when the glossary has ``Odoo``).
+            glossary_for_correction = list(self.request.glossary_terms) + list(
+                self.request.technical_terms
+            )
+            outcome = apply_llm_corrections_to_text(
+                rendered,
+                corrections,
+                glossary_terms=glossary_for_correction,
+            )
             rendered = outcome.text
             self._llm_corrections_applied = outcome.applied
             self._llm_corrections_rejected = outcome.rejected
