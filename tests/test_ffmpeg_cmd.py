@@ -21,7 +21,9 @@ from transcription_utils import (
     DEFAULT_WHISPER_MODEL,
     TEXT_LLM_MODELS,
     WHISPER_MODELS,
+    absorb_orphan_speaker_fragments,
     assign_speakers_to_segments,
+    merge_adjacent_same_speaker_segments,
     audio_llm_label_for,
     build_audio_extract_cmd,
     build_diarization_cmd,
@@ -536,6 +538,116 @@ class FuseAndRenderTest(unittest.TestCase):
         segs = [{"start": 0.0, "end": 1.0, "text": "Hum", "speaker": None}]
         out = render_segments_with_speakers(segs, "srt")
         self.assertIn("[?] Hum", out)
+
+
+class TurnRealignmentTest(unittest.TestCase):
+    """PR A — pin the three post-passes added on top of the
+    legacy word-level diarisation projection.
+
+    The motivating case is the Caste transcript where Manon's first
+    sentence got split across ``[?]`` / ``[SPEAKER_00]`` / ``[Manon]``
+    on word boundaries — pyannote flickered at the turn start. The
+    smoothing + orphan-absorption + merge passes collapse that into
+    a single Manon turn (or two clean ones, when the truth really is
+    a speaker change)."""
+
+    def test_smoothing_absorbs_one_word_speaker_flicker(self):
+        # Manon speaks the full sentence "Bonjour ravi de vous voir".
+        # pyannote briefly puts the second word on SPEAKER_00 — a
+        # boundary flicker. The smoothing pass should collapse that
+        # into the dominant Manon run.
+        whisper = [
+            {
+                "start": 0.0,
+                "end": 3.0,
+                "text": "Bonjour ravi de vous voir",
+                "words": [
+                    {"start": 0.0, "end": 0.5, "word": "Bonjour"},
+                    {"start": 0.55, "end": 0.8, "word": " ravi"},
+                    {"start": 0.9, "end": 1.4, "word": " de"},
+                    {"start": 1.4, "end": 2.0, "word": " vous"},
+                    {"start": 2.0, "end": 2.8, "word": " voir"},
+                ],
+            }
+        ]
+        # Diarisation has Manon throughout except a brief flicker
+        # at the "ravi" mark — exactly the kind of noise we smooth.
+        diar = [
+            {"start": 0.0, "end": 0.55, "speaker": "Manon"},
+            {"start": 0.55, "end": 0.8, "speaker": "SPEAKER_00"},
+            {"start": 0.8, "end": 3.0, "speaker": "Manon"},
+        ]
+        out = assign_speakers_to_segments(whisper, diar)
+        # All sub-segments collapsed back into one Manon turn.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["speaker"], "Manon")
+        self.assertIn("Bonjour", out[0]["text"])
+        self.assertIn("voir", out[0]["text"])
+
+    def test_orphan_question_mark_segment_absorbs_into_same_speaker_neighbours(self):
+        # A 0.2 s segment with no diarisation coverage, sandwiched
+        # between two SPEAKER_00 turns. The renderer would otherwise
+        # show it as ``[?]`` — the orphan absorption fixes that.
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Carrément", "speaker": "SPEAKER_00"},
+            {"start": 1.05, "end": 1.25, "text": "des", "speaker": None},
+            {"start": 1.3, "end": 3.0, "text": "fois je vous dis oui", "speaker": "SPEAKER_00"},
+        ]
+        out = absorb_orphan_speaker_fragments(segments)
+        self.assertEqual(out[1]["speaker"], "SPEAKER_00")
+
+    def test_orphan_long_segment_kept_unattributed(self):
+        # Longer than ``max_orphan_duration`` — we don't guess
+        # because the user may have a real silence / unidentified
+        # voice they want to surface.
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Salut", "speaker": "SPEAKER_00"},
+            {"start": 1.2, "end": 3.5, "text": "...", "speaker": None},
+            {"start": 3.6, "end": 5.0, "text": "Bonjour", "speaker": "SPEAKER_01"},
+        ]
+        out = absorb_orphan_speaker_fragments(segments)
+        self.assertIsNone(out[1]["speaker"])
+
+    def test_merge_fuses_adjacent_same_speaker(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Bonjour", "speaker": "Manon",
+             "avg_logprob": -0.2, "no_speech_prob": 0.01},
+            {"start": 2.3, "end": 4.0, "text": "ravi de vous voir", "speaker": "Manon",
+             "avg_logprob": -0.4, "no_speech_prob": 0.05},
+            {"start": 4.5, "end": 6.0, "text": "Très bien", "speaker": "Robin"},
+        ]
+        out = merge_adjacent_same_speaker_segments(segments)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0]["text"], "Bonjour ravi de vous voir")
+        self.assertAlmostEqual(out[0]["start"], 0.0)
+        self.assertAlmostEqual(out[0]["end"], 4.0)
+        # Worst-case quality propagated so downstream multipass sees
+        # the hesitation that got absorbed.
+        self.assertAlmostEqual(out[0]["avg_logprob"], -0.4)
+        self.assertAlmostEqual(out[0]["no_speech_prob"], 0.05)
+        # Speaker change still produces its own segment.
+        self.assertEqual(out[1]["speaker"], "Robin")
+
+    def test_merge_keeps_segments_split_when_gap_too_long(self):
+        # 3 s of silence between Manon's two interventions — we don't
+        # fuse those into a single turn since the rendered transcript
+        # would look weird (one timestamp for two unrelated thoughts).
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "OK", "speaker": "Manon"},
+            {"start": 4.5, "end": 5.5, "text": "Carrément", "speaker": "Manon"},
+        ]
+        out = merge_adjacent_same_speaker_segments(segments, max_gap_seconds=1.5)
+        self.assertEqual(len(out), 2)
+
+    def test_merge_does_not_fuse_unattributed_segments(self):
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "...", "speaker": None},
+            {"start": 1.0, "end": 2.0, "text": "...", "speaker": None},
+        ]
+        out = merge_adjacent_same_speaker_segments(segments)
+        # Two ``None``-speaker segments stay separate so we don't
+        # accidentally glue together unrelated silences.
+        self.assertEqual(len(out), 2)
 
     def test_parse_whisper_json_segments_round_trips(self):
         with tempfile.TemporaryDirectory() as d:
