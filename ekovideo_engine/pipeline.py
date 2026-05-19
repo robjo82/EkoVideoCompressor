@@ -243,6 +243,120 @@ def _normalize_word(value: str) -> str:
     return re.sub(r"[\s.,;:!?'\"«»()]+", "", (value or "")).lower()
 
 
+# Number words 1-24 — covers every realistic clock-time mention
+# without taking on the full French numeric parsing surface.
+_HOUR_NUMBER_WORDS = {
+    "zéro": 0,
+    "une": 1, "un": 1,
+    "deux": 2,
+    "trois": 3,
+    "quatre": 4,
+    "cinq": 5,
+    "six": 6,
+    "sept": 7,
+    "huit": 8,
+    "neuf": 9,
+    "dix": 10,
+    "onze": 11,
+    "douze": 12,
+    "treize": 13,
+    "quatorze": 14,
+    "quinze": 15,
+    "seize": 16,
+    "dix-sept": 17,
+    "dix sept": 17,
+    "dix-huit": 18,
+    "dix huit": 18,
+    "dix-neuf": 19,
+    "dix neuf": 19,
+    "vingt": 20,
+    "vingt et un": 21, "vingt-et-un": 21, "vingt-et-une": 21,
+    "vingt-deux": 22, "vingt deux": 22,
+    "vingt-trois": 23, "vingt trois": 23,
+    "vingt-quatre": 24, "vingt quatre": 24,
+}
+
+# Minute fragments that follow ``<N> heures``.
+_HOUR_MINUTE_FRAGMENTS = {
+    "et demie": 30,
+    "et demi": 30,
+    "et quart": 15,
+    "moins le quart": -15,
+    "et quinze": 15,
+    "et trente": 30,
+    "et quarante-cinq": 45,
+    "et quarante cinq": 45,
+    "pile": 0,
+}
+
+# Pattern: ``<number_word> heure(s) [<minute fragment or digits>]``
+# Greedy on the optional suffix so ``neuf heures et demie`` matches
+# ``9h30`` rather than ``9h`` + dangling tail.
+_HOURS_PATTERN_RE = re.compile(
+    r"(?<![\w])"
+    r"(?P<hour>"
+    + "|".join(
+        sorted((re.escape(w) for w in _HOUR_NUMBER_WORDS), key=len, reverse=True)
+    )
+    + r")"
+    r"\s+heure[s]?"
+    r"(?:\s+(?P<suffix>"
+    + "|".join(
+        sorted((re.escape(f) for f in _HOUR_MINUTE_FRAGMENTS), key=len, reverse=True)
+    )
+    + r"|\d{1,2}))?"
+    r"(?![\w])",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def normalize_spoken_clock_times(text: str) -> str:
+    """Convert ``neuf heures`` / ``neuf heures et demie`` /
+    ``neuf heures trente`` into ``9h`` / ``9h30``.
+
+    Whisper transcribes spoken times verbatim ("neuf heures") rather
+    than as digits. Readability suffers; downstream tools (calendar,
+    Notion, search) can't index them. We convert the recognised
+    patterns deterministically, leaving unrecognised number words
+    intact so a "deux mille tonnes" doesn't accidentally become
+    "2000h" or similar.
+
+    Scope :
+    - Hour 0-24 from a fixed table of number words.
+    - Optional minute fragment (``et demie``, ``et quart``, ``moins
+      le quart``, ``pile``, ``et trente``, ``et quarante-cinq``).
+    - Or a bare digit suffix (``neuf heures 30``).
+
+    Anything beyond hour-of-day is intentionally NOT touched — a
+    general French → digits converter would be its own project.
+    """
+    def _convert(match: re.Match) -> str:
+        hour_word = match.group("hour").lower()
+        hour_value = _HOUR_NUMBER_WORDS.get(hour_word)
+        if hour_value is None:
+            return match.group(0)
+        suffix = (match.group("suffix") or "").lower().strip()
+        minutes = 0
+        if suffix:
+            if suffix in _HOUR_MINUTE_FRAGMENTS:
+                offset = _HOUR_MINUTE_FRAGMENTS[suffix]
+                if offset < 0:
+                    # ``neuf heures moins le quart`` → 8h45
+                    hour_value = (hour_value - 1) % 24
+                    minutes = 60 + offset
+                else:
+                    minutes = offset
+            elif suffix.isdigit():
+                m = int(suffix)
+                if 0 <= m < 60:
+                    minutes = m
+        if minutes:
+            return f"{hour_value}h{minutes:02d}"
+        return f"{hour_value}h"
+
+    return _HOURS_PATTERN_RE.sub(_convert, text)
+
+
 # Sequence of single letters separated by hyphens or whitespace,
 # optionally with a final TLD-like suffix attached (``C A S T E.fr``).
 # Min 3 letters so we don't catch "y a" (= "il y a" abbreviation).
@@ -348,14 +462,16 @@ def apply_spoken_punctuation_in_email_contexts(text: str) -> str:
 
 
 def reconstruct_spelled_text(text: str) -> str:
-    """Pipeline-friendly wrapper: collapse letter spellings and then
-    apply spoken-punctuation substitutions in email/URL contexts.
+    """Pipeline-friendly wrapper: collapse letter spellings, apply
+    spoken-punctuation substitutions in email/URL contexts, and
+    convert spoken clock times to digits.
 
-    Both passes are conservative and idempotent — calling twice on
-    the same text returns the same result.
+    All three passes are conservative and idempotent — calling
+    twice on the same text returns the same result.
     """
     text = reconstruct_letter_spellings(text)
     text = apply_spoken_punctuation_in_email_contexts(text)
+    text = normalize_spoken_clock_times(text)
     return text
 
 
