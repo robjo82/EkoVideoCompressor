@@ -243,6 +243,122 @@ def _normalize_word(value: str) -> str:
     return re.sub(r"[\s.,;:!?'\"«»()]+", "", (value or "")).lower()
 
 
+# Sequence of single letters separated by hyphens or whitespace,
+# optionally with a final TLD-like suffix attached (``C A S T E.fr``).
+# Min 3 letters so we don't catch "y a" (= "il y a" abbreviation).
+_SPELLING_SEQUENCE_RE = re.compile(
+    r"(?<![\w])"
+    r"(?P<letters>(?:[A-Za-zÀ-ÖØ-öø-ÿ][\s\.\-]+){2,}[A-Za-zÀ-ÖØ-öø-ÿ])"
+    r"(?P<tld>\.(?:fr|com|org|net|io|app|tech|eu))?"
+    r"(?![\w])",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Map common spoken-punctuation tokens to their symbolic form.
+# Applied case-insensitively, surrounded by whole-word boundaries.
+_SPOKEN_PUNCTUATION = {
+    "arobase": "@",
+    "at": "@",
+    "point": ".",
+    "dot": ".",
+    "tiret": "-",
+    "trait d'union": "-",
+    "underscore": "_",
+    "souligné": "_",
+    "barre oblique": "/",
+    "slash": "/",
+}
+
+# Detector for "email-likely" context. If a span contains an existing
+# ``@`` or a TLD like ``.fr``, we'll apply spoken-punctuation
+# substitutions there. Outside such contexts, ``point`` should
+# remain the French word ``point``.
+_EMAIL_CONTEXT_RE = re.compile(
+    r"[@]|\.(?:fr|com|org|net|io|app|tech|eu)\b",
+    re.IGNORECASE,
+)
+
+
+def reconstruct_letter_spellings(text: str) -> str:
+    """Collapse ``N O U V I A L E`` / ``n-o-u-v-i-a-l-e`` /
+    ``c-a-s-t-e.fr`` style spellings into a single token.
+
+    Whisper struggles with letter-by-letter spelling: when a speaker
+    spells a word aloud, Whisper inserts hyphens or extra spaces
+    between letters. The output is unreadable, particularly for
+    email addresses (``C A S T E . F R`` should be ``caste.fr``).
+
+    Heuristics:
+    - ``<= 3`` letters → preserve uppercase (``API``, ``SQL``, ``RH``).
+    - ``> 3`` letters → lowercase (``nouviale``, ``caste``).
+    - A TLD suffix like ``.fr`` attached to the spelling is preserved
+      and joined directly.
+    """
+    def _collapse(match: re.Match) -> str:
+        letters = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]", match.group("letters"))
+        joined = "".join(letters)
+        if not joined:
+            return match.group(0)
+        tld = match.group("tld") or ""
+        word = joined.upper() if len(joined) <= 3 else joined.lower()
+        return word + tld.lower()
+
+    return _SPELLING_SEQUENCE_RE.sub(_collapse, text)
+
+
+def apply_spoken_punctuation_in_email_contexts(text: str) -> str:
+    """Replace ``arobase`` / ``point`` / ``tiret`` etc. with their
+    symbolic form when the surrounding text reads like an email or
+    URL (carries an ``@`` already, or a TLD suffix).
+
+    Conservative on purpose: ``point`` is a normal French word and
+    we never want to replace it in ``point d'attention``. The
+    context detector restricts substitutions to spans where an
+    email/URL is being dictated.
+    """
+    # Replace at the line level rather than globally so the
+    # email-context detection stays local.
+    out_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        # Only consider the rest of the line beyond the speaker tag
+        # (the `[Speaker] (timestamp)` prefix isn't part of the
+        # email context — strip it for the search but keep it in
+        # the output).
+        bracket_match = re.match(r"^(\s*\[[^\]]*\]\s*(?:\([^)]*\)\s*)?)?(.*)$", line)
+        prefix = bracket_match.group(1) if bracket_match and bracket_match.group(1) else ""
+        body = bracket_match.group(2) if bracket_match else line
+        if not _EMAIL_CONTEXT_RE.search(body):
+            out_lines.append(line)
+            continue
+        transformed = body
+        for spoken, symbol in _SPOKEN_PUNCTUATION.items():
+            transformed = re.sub(
+                rf"(?<!\w){re.escape(spoken)}(?!\w)",
+                symbol,
+                transformed,
+                flags=re.IGNORECASE,
+            )
+        # Tidy up "word @ word" → "word@word", "word . fr" → "word.fr"
+        # while preserving inner sentences.
+        transformed = re.sub(r"\s*@\s*", "@", transformed)
+        transformed = re.sub(r"(?<=\w)\s*\.(?=\s*[a-zA-Z]{2,4}\b)", ".", transformed)
+        transformed = re.sub(r"(?<=\w)\.\s+(?=[a-zA-Z]{2,4}\b)", ".", transformed)
+        out_lines.append(prefix + transformed)
+    return "".join(out_lines)
+
+
+def reconstruct_spelled_text(text: str) -> str:
+    """Pipeline-friendly wrapper: collapse letter spellings and then
+    apply spoken-punctuation substitutions in email/URL contexts.
+
+    Both passes are conservative and idempotent — calling twice on
+    the same text returns the same result.
+    """
+    text = reconstruct_letter_spellings(text)
+    text = apply_spoken_punctuation_in_email_contexts(text)
+    return text
+
+
 def _apply_glossary_capitalization(text: str, glossary_terms: list[str]) -> str:
     """Replace every case-insensitive whole-word occurrence of a
     glossary term with its canonical form.
@@ -1867,6 +1983,13 @@ class TranscriptionPipeline:
             rendered = render_segments_with_speakers(segments, settings.output_format)
         else:
             rendered = render_segments_plain(segments, settings.output_format)
+        # Reconstruct letter-by-letter spellings (``N O U V I A L E``
+        # → ``nouviale``) and verbalised punctuation in email/URL
+        # contexts (``arobase`` → ``@``, ``point`` → ``.``). Whisper
+        # transcribed the Caste call's email as ``n-o-u-v-i-a-l-e
+        # a-v-a-z-cast.fr c-a-s-t-e.fr`` — the new helpers turn that
+        # noise back into ``nouviale@caste.fr``-shaped text.
+        rendered = reconstruct_spelled_text(rendered)
         # Final capitalization sweep: enforce the canonical
         # spelling of every glossary term across the transcript so
         # ``Quadra`` doesn't co-exist with ``quadra``, ``Excel``
@@ -1943,6 +2066,10 @@ class TranscriptionPipeline:
             self._llm_corrections_applied = outcome.applied
             self._llm_corrections_rejected = outcome.rejected
 
+        # Same letter-spelling + spoken-punctuation reconstruction
+        # as the base transcript. Idempotent — re-running over an
+        # already-reconstructed text is a no-op.
+        rendered = reconstruct_spelled_text(rendered)
         # Final capitalization sweep, same as the base transcript.
         # The LLM corrections sometimes touch case (e.g. fixing
         # ``au doute`` would leave a lowercase remnant); enforcing

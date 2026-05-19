@@ -32,6 +32,9 @@ from ekovideo_engine.pipeline import (
     StepResult,
     TranscriptionPipeline,
     apply_meeting_date_to_artifact,
+    apply_spoken_punctuation_in_email_contexts,
+    reconstruct_letter_spellings,
+    reconstruct_spelled_text,
     _apply_glossary_capitalization,
     _filter_tautological_doubts,
     _friendly_ffmpeg_error,
@@ -866,6 +869,88 @@ class QualityPresetTest(unittest.TestCase):
         self.assertFalse(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
         self.assertTrue(settings.per_speaker_enabled)
+
+
+class LetterSpellingReconstructionTest(unittest.TestCase):
+    """PR M — collapse ``N O U V I A L E`` / ``n-o-u-v-i-a-l-e`` /
+    ``c-a-s-t-e.fr`` sequences back into single tokens. The Caste
+    job had ``n-o-u-v-i-a-l-e`` and ``c-a-s-t-e.fr`` in the
+    transcript — unusable as a livrable."""
+
+    def test_collapse_hyphenated_lower(self):
+        text = "C'est manon point n-o-u-v-i-a-l-e arobase caste."
+        out = reconstruct_letter_spellings(text)
+        self.assertIn("nouviale", out)
+        self.assertNotIn("n-o-u-v-i-a-l-e", out)
+
+    def test_collapse_space_separated_caps(self):
+        text = "On épelle N O U V I A L E."
+        out = reconstruct_letter_spellings(text)
+        self.assertIn("nouviale", out)
+
+    def test_short_acronym_kept_uppercase(self):
+        # ≤ 3 letters → API stays API, SQL stays SQL, not "api".
+        text = "Une A P I REST et du S Q L."
+        out = reconstruct_letter_spellings(text)
+        self.assertIn("API", out)
+        self.assertIn("SQL", out)
+        self.assertNotIn("a-p-i", out.lower())
+
+    def test_tld_suffix_preserved(self):
+        text = "c-a-s-t-e.fr"
+        out = reconstruct_letter_spellings(text)
+        self.assertEqual(out, "caste.fr")
+
+    def test_does_not_break_normal_french(self):
+        text = "Il y a des règles, c'est-à-dire des conventions."
+        out = reconstruct_letter_spellings(text)
+        # Hyphens inside compound words shouldn't trigger collapse
+        # (less than 3 single-letter tokens between hyphens).
+        self.assertIn("c'est-à-dire", out)
+
+
+class SpokenPunctuationTest(unittest.TestCase):
+    """PR M — ``arobase`` → ``@`` and ``point`` → ``.`` ONLY in
+    email-like contexts so we don't rewrite ``point d'attention``."""
+
+    def test_email_context_substitutes_arobase_and_point(self):
+        # The ``.fr`` already in the text triggers the email context
+        # detector. The ``arobase`` between two tokens becomes ``@``.
+        text = "C'est manon arobase caste.fr"
+        out = apply_spoken_punctuation_in_email_contexts(text)
+        self.assertIn("manon@caste.fr", out)
+
+    def test_no_substitution_when_no_email_context(self):
+        # No TLD nearby, no `@` — leave ``point`` alone as a word.
+        text = "Le point d'attention principal."
+        out = apply_spoken_punctuation_in_email_contexts(text)
+        self.assertEqual(out, text)
+
+
+class ReconstructSpelledTextEndToEndTest(unittest.TestCase):
+    """End-to-end wrapper — pin the Caste-style input gets cleaned up."""
+
+    def test_caste_email_pattern(self):
+        # Whisper output approximation: spelling then verbalised
+        # punctuation, all jumbled in the email context.
+        text = "C'est manon point n-o-u-v-i-a-l-e arobase c-a-s-t-e.fr."
+        out = reconstruct_spelled_text(text)
+        self.assertIn("nouviale", out)
+        self.assertIn("caste.fr", out)
+        self.assertIn("@", out)
+
+    def test_idempotent(self):
+        text = "C'est manon point n-o-u-v-i-a-l-e arobase c-a-s-t-e.fr."
+        once = reconstruct_spelled_text(text)
+        twice = reconstruct_spelled_text(once)
+        self.assertEqual(once, twice)
+
+    def test_preserves_speaker_brackets(self):
+        # Speaker prefix shouldn't be touched even when the body
+        # carries a TLD that triggers the context detector.
+        text = "[SPEAKER_00] (00:11:15) c-a-s-t-e.fr"
+        out = reconstruct_spelled_text(text)
+        self.assertTrue(out.startswith("[SPEAKER_00] (00:11:15)"))
 
 
 class TautologicalDoubtFilterTest(unittest.TestCase):
