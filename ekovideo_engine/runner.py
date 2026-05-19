@@ -15,7 +15,7 @@ from .models import (
     ProgressEvent,
     WarningEvent,
 )
-from .library import database, library_remember_speaker_names
+from .library import database, library_enroll_speakers_for_job, library_remember_speaker_names
 from .pipeline import (
     CompressionPipeline,
     StepResult,
@@ -498,6 +498,42 @@ class EngineRunner:
                     speakers=speaker_context or None,
                     technical_terms=pipeline.final_technical_terms or None,
                 )
+            # Auto-enrol the friendly-named clusters into the voice
+            # profile store so the NEXT job recognises them without
+            # the user having to open the rename sheet. Previously
+            # ``library_enroll_speakers_for_job`` only fired from the
+            # rename flow — which left every voice profile at
+            # ``sample_count=0`` for users who confirmed the LLM-
+            # detected names by simply *not* editing them. The
+            # ``current_user_name`` heuristic from
+            # ``_pre_attribute_current_user`` lands here too, so
+            # Robin's voice gets enrolled the first time he runs
+            # any job with his name in Réglages.
+            if pipeline.final_speaker_map:
+                enrolment = {
+                    label: name
+                    for label, name in pipeline.final_speaker_map.items()
+                    if name
+                    and label
+                    and not label.upper().startswith("SPEAKER_")
+                    and name.strip().lower() == label.strip().lower()
+                }
+                if enrolment:
+                    try:
+                        enrolled_count = library_enroll_speakers_for_job(
+                            job_id, enrolment, db=db
+                        )
+                        append_app_log(
+                            f"engine_auto_enrol job_id={job_id} count={enrolled_count}"
+                        )
+                    except Exception as exc:
+                        # Enrolment is best-effort. Logging the
+                        # failure is enough — never sink a successful
+                        # transcription on a downstream embedding
+                        # glitch.
+                        append_app_log(
+                            f"engine_auto_enrol_failed job_id={job_id} error={exc!r}"
+                        )
             db.update_job_progress(job_id, step="Transcription terminée", progress_pct=100, eta_seconds=0)
 
         if request.mode in {"enhance", "review"}:

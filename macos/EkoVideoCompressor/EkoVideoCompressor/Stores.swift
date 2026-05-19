@@ -253,6 +253,11 @@ final class SettingsStore: ObservableObject {
     @AppStorage("glossary") var glossary = ""
     @AppStorage("glossaryUsageJSON") private var glossaryUsageJSON = "{}"
     @AppStorage("hfToken") var hfToken = ""
+    /// Name of the person running the app — surfaced to the engine
+    /// so it can pre-attribute the cluster that speaks first to
+    /// them, before any voiceprint has been enrolled. Optional;
+    /// blank disables the heuristic.
+    @AppStorage("currentUserName") var currentUserName = ""
     @AppStorage("githubToken") var githubToken = ""
     @AppStorage("whisperModel") var whisperModel = "mlx-community/whisper-large-v3-turbo"
     // Active models for the other roles the Models tab now lists.

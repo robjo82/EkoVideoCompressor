@@ -698,6 +698,19 @@ class TranscriptionPipeline:
                 recognized_speakers = self._run_speaker_recognition(
                     diar_source, segments
                 )
+                # If voice matching didn't catch the user themselves
+                # (typical on first runs: empty voice profile, so no
+                # centroid match), attribute the first cluster that
+                # speaks to ``current_user_name``. The phone-call
+                # / meeting heuristic is reliable enough for the
+                # 80 % case (user initiates / picks up the call,
+                # speaks first) and gets confirmed at end of job via
+                # auto-enrolment so future runs use voice matching.
+                pre_attribution = self._pre_attribute_current_user(
+                    segments, already_recognized=recognized_speakers
+                )
+                if pre_attribution:
+                    recognized_speakers = {**recognized_speakers, **pre_attribution}
                 if recognized_speakers:
                     segments = self._apply_speaker_renames(
                         segments, recognized_speakers
@@ -1464,6 +1477,65 @@ class TranscriptionPipeline:
             )
         )
         return recognized
+
+    def _pre_attribute_current_user(
+        self,
+        segments: list[dict],
+        *,
+        already_recognized: dict[str, str],
+    ) -> dict[str, str]:
+        """Attribute the cluster that speaks first to the user.
+
+        Used when voice matching couldn't pick the user out of the
+        stored profiles (typical on a first run: ``sample_count=0``
+        profile means no centroid, so the recognition step skips
+        them). Without this, ``SPEAKER_00`` lingers as a placeholder
+        in the transcript even when the user has explicitly told
+        Réglages "I am Robin".
+
+        Rules:
+        - Skip when ``current_user_name`` is blank.
+        - Skip when no SPEAKER_NN clusters remain (everything's
+          already named).
+        - Skip when the user's name is already in
+          ``already_recognized.values()`` — voice match wins, the
+          heuristic just confirms.
+        - Otherwise attribute the SPEAKER_NN cluster with the lowest
+          segment start_time.
+
+        Returns ``{cluster_label: current_user_name}`` to merge into
+        the recognised map. Empty dict means no attribution.
+        """
+        name = (self.request.transcription_settings.current_user_name or "").strip()
+        if not name:
+            return {}
+        existing_names = {v.strip().lower() for v in already_recognized.values() if v}
+        if name.lower() in existing_names:
+            return {}
+        first_start_by_cluster: dict[str, float] = {}
+        for seg in segments:
+            label = (seg.get("speaker") or "").strip()
+            if not label or not label.upper().startswith("SPEAKER_"):
+                continue
+            if label in already_recognized:
+                # Voice match has already claimed this cluster — never
+                # overwrite a centroid match with a heuristic guess.
+                continue
+            try:
+                start = float(seg.get("start") or 0)
+            except (TypeError, ValueError):
+                continue
+            previous = first_start_by_cluster.get(label)
+            if previous is None or start < previous:
+                first_start_by_cluster[label] = start
+        if not first_start_by_cluster:
+            return {}
+        first_cluster = min(first_start_by_cluster.items(), key=lambda kv: kv[1])[0]
+        append_app_log(
+            "engine_current_user_preattributed "
+            f"cluster={first_cluster!r} name={name!r}"
+        )
+        return {first_cluster: name}
 
     # Embedding-extraction tuning constants kept identical to the
     # ones the library uses for explicit re-recognition, so a job

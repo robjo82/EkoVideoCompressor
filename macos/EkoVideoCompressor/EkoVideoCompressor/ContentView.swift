@@ -319,7 +319,8 @@ struct ContentView: View {
                     rawValue: settings.qualityPreset
                 )?.rawValue ?? TranscriptionQualityPreset.balanced.rawValue,
                 expected_min_speakers: item.expectedSpeakerCount,
-                expected_max_speakers: item.expectedSpeakerCount
+                expected_max_speakers: item.expectedSpeakerCount,
+                current_user_name: settings.currentUserName.trimmingCharacters(in: .whitespacesAndNewlines)
             ),
             glossary_terms: termsForRun,
             speaker_overrides: overrides,
@@ -2665,6 +2666,20 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     Text(
                         "La détection des locuteurs nécessite un token Hugging Face. Le nombre d'intervenants attendu se règle au lancement de chaque traitement."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                Section("Identité") {
+                    // Pre-attribution heuristic: the cluster that
+                    // speaks first in any recording gets this name
+                    // before voice matching runs. Fixes the cold
+                    // start where every meeting's SPEAKER_00
+                    // lingered unresolved because voice profiles
+                    // were still empty.
+                    TextField("Vous êtes", text: $settings.currentUserName)
+                    Text(
+                        "Le moteur attribuera votre nom au premier locuteur de chaque enregistrement quand aucune voix mémorisée ne correspond. Laissez vide pour désactiver."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
