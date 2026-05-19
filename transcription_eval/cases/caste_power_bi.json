@@ -1,0 +1,39 @@
+{
+  "name": "caste_power_bi_discovery",
+  "expected_terms": [
+    "Odoo",
+    "Caste",
+    "Power BI",
+    "SharePoint",
+    "Outlook",
+    "Ekonum",
+    "Mirandol",
+    "DSL",
+    "Prios",
+    "Rossignol",
+    "Manon Nouviale",
+    "ERP",
+    "PostgreSQL"
+  ],
+  "expected_speakers": [
+    "Robin",
+    "Manon Nouviale"
+  ],
+  "forbidden_substrings": [
+    "au doubs",
+    "au doute",
+    "pouvoir bien",
+    "Neuveur",
+    "le cher pointe",
+    "c-a-s-t-e",
+    "n-o-u-v-i-a-l-e",
+    "a-v-a-z",
+    "Poivillaye",
+    "pour RBI",
+    "Cast.fr",
+    "tout à n'un",
+    "à l'espérance",
+    "[?]"
+  ],
+  "transcript": "[Robin] (00:00:00) Robin chez Ekonum, oui, complètement, il m'en a parlé.\n[Manon Nouviale] (00:00:03) Ah super. Et donc du coup, je ne sais pas si vous avez le temps, j'aurais aimé discuter avec vous des projets que l'on a et voir si on pouvait se rencontrer.\n[Robin] (00:00:13) Eh ben oui, avec grand plaisir. Nous, on est à Mirandol-Cambon, il y a 20 minutes, donc si vous voulez qu'on se rencontre en présentiel cette semaine, c'est carrément possible.\n[Manon Nouviale] (00:00:23) Écoutez oui, je vous dis oui. Pour vous situer, on est une usine d'aliments pour animaux d'élevage. Aujourd'hui, on travaille sur plusieurs systèmes : 365, SharePoint, Outlook, et deux autres systèmes qui ne sont pas très connus : Prios et DSL. Tous ces logiciels ont des bases de données exploitables en SQL.\n[Robin] (00:01:08) Ouais, OK, très bien, je vois le tableau.\n[Manon Nouviale] (00:01:10) Et moi je suis responsable administrative et financière. Je travaille un tout petit peu sur Power BI. Notre directeur, Monsieur Rossignol, s'est tourné vers nos experts-comptables en demandant des solutions de contrôle de gestion simples. Notre volonté est d'aller plus loin, on a acquis un serveur de développement et on aimerait un entrepôt de données propre.\n[Robin] (00:02:03) OK, très clair. Notre spécialité ce n'est pas Power BI, c'est Odoo, un logiciel de gestion tout-en-un. C'est un ERP qui centralise compta, facturation électronique, gestion du stock, production. Ce n'est pas une base SQL au sens strict — c'est PostgreSQL.\n[Manon Nouviale] (00:08:00) Bon, écoutez, venez jeudi à 9h, j'invite mon directeur et on discutera de tout ça.\n[Robin] (00:09:02) Très bien, 9h à Mirandol-Cambon.\n[Manon Nouviale] (00:11:15) C'est manon.nouviale@caste.fr.\n[Robin] (00:11:27) Parfait, je vous envoie ça en début d'après-midi. Très bonne journée à vous.\n[Manon Nouviale] (00:11:33) À vous aussi, au revoir."
+}

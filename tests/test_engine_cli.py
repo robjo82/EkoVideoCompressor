@@ -202,6 +202,33 @@ class TranscriptionEvalTest(unittest.TestCase):
         self.assertEqual(result.missing_speakers, [])
         self.assertEqual(result.score, 1.0)
 
+    def test_caste_reference_case_scores_perfectly(self):
+        # PR K reference case: cleaned-up Caste transcript should
+        # pass every criterion. When the user reruns the actual
+        # Caste job, ``transcript_path`` override on the case can
+        # point at the live ``.txt`` and we'll re-evaluate.
+        path = Path("transcription_eval/cases/caste_power_bi.json")
+        result = evaluate_case(path)
+        self.assertEqual(result.missing_terms, [])
+        self.assertEqual(result.forbidden_hits, [])
+        self.assertEqual(result.missing_speakers, [])
+        self.assertEqual(result.score, 1.0)
+
+    def test_fragmentation_indicators_count_orphans_and_short_lines(self):
+        from transcription_eval.evaluate import count_fragmentation_indicators
+        transcript = (
+            "[?] des\n"
+            "[Robin] (00:00:00) Oui.\n"
+            "[Manon] (00:00:05) Bonjour ravi de vous voir.\n"
+            "[?] fois\n"
+        )
+        fragments, orphans = count_fragmentation_indicators(transcript)
+        # Two ``[?]`` lines.
+        self.assertEqual(orphans, 2)
+        # Two short lines: ``Oui.`` (1 word), and the ``[?]`` lines
+        # don't count toward fragments (they're orphans).
+        self.assertEqual(fragments, 1)
+
 
 class FriendlyFfmpegErrorTest(unittest.TestCase):
     """The dyld error a broken Homebrew-linked bundle produced in
