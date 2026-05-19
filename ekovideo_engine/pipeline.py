@@ -30,6 +30,7 @@ from speaker_recognition import (
 )
 from multipass import (
     group_into_clip_ranges,
+    identify_boundary_segments,
     identify_weak_segments,
     merge_repass_segments,
 )
@@ -1054,6 +1055,24 @@ class TranscriptionPipeline:
                         segments, recognized_speakers
                     )
                     analysis_segments = segments
+                # --- step 3ter: boundary multipass ----------------------
+                # Re-Whisper short segments adjacent to a speaker
+                # change. The first multipass (step 2bis) only
+                # targets low-confidence avg_logprob segments — but
+                # Whisper also fails at clean-confidence-but-wrong
+                # words when its 30s context spans a turn boundary
+                # (Caste pattern). The boundary pass uses the same
+                # high-quality multipass model and is cost-bounded.
+                if (
+                    self.request.transcription_settings.multipass_enabled
+                    and self._should_run_diarisation()
+                ):
+                    boundary_result, segments = self._run_boundary_multipass(
+                        whisper_wav, workspace, segments
+                    )
+                    if boundary_result is not None:
+                        results.append(boundary_result)
+                    analysis_segments = segments
 
         # --- step 4: write the base transcript -----------------------
         transcript_path = self._write_transcript(segments, workspace)
@@ -1593,6 +1612,173 @@ class TranscriptionPipeline:
             ),
             merged,
         )
+
+    # ------------------------------------------------------------------
+    # Step 3ter — boundary multipass (post-diarisation)
+    # ------------------------------------------------------------------
+
+    def _run_boundary_multipass(
+        self,
+        whisper_wav: Path,
+        workspace: Path,
+        segments: list[dict],
+    ) -> tuple[StepResult | None, list[dict]]:
+        """Re-Whisper short segments adjacent to a speaker change.
+
+        The first multipass (``_run_multipass``) only targets
+        avg_logprob-weak segments. But Whisper also produces wrong
+        words at clean-confidence-but-misaligned-boundary positions:
+        its 30s context window crosses a turn boundary and conditions
+        on the wrong voice. This pass catches that failure mode after
+        diarisation has shown us where the boundaries actually are.
+
+        Cost guard: cap at 8 clip ranges per job. Beyond that the
+        recording is too conversational for a per-boundary repass to
+        be cost-effective — the user should rerun on the Max preset
+        which will eventually carry the per-speaker pass (PR E).
+        """
+        ts = time.monotonic()
+        settings = self.request.transcription_settings
+        boundary = identify_boundary_segments(segments)
+        if not boundary:
+            return None, segments
+        clip_ranges = group_into_clip_ranges(boundary, max_segments_per_clip=4)
+        if not clip_ranges or len(clip_ranges) > 8:
+            if clip_ranges:
+                append_app_log(
+                    f"engine_boundary_multipass_skipped reason=too_many "
+                    f"ranges={len(clip_ranges)}"
+                )
+            return None, segments
+
+        repass_model = canonical_multipass_model_id(settings.multipass_model)
+        self.sink(
+            ProgressEvent(
+                "multipass_boundary",
+                0,
+                f"Repass on {len(clip_ranges)} speaker-boundary zone(s)",
+            )
+        )
+        new_segments: list[dict] = []
+        glossary = "\n".join([*self.request.glossary_terms, *self.request.technical_terms])
+        for idx, (cs, ce) in enumerate(clip_ranges):
+            target = workspace / f"boundary_repass_{idx}.json"
+            cmd = build_mlx_whisper_cmd(
+                mlx_whisper_path=settings.mlx_whisper_path or "mlx_whisper",
+                audio_path=str(whisper_wav),
+                output_path=str(target),
+                model=repass_model,
+                language=settings.language,
+                output_format="json",
+                initial_prompt=structured_initial_prompt(
+                    glossary,
+                    expected_speaker_names=self._expected_speaker_names(),
+                    meeting_context=self._meeting_context(),
+                ),
+                condition_on_previous_text=False,
+                clip_timestamps=f"{cs:.2f},{ce:.2f}",
+                word_timestamps=True,
+            )
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=self._subprocess_env(),
+            )
+            if proc.returncode != 0 or not target.exists():
+                append_app_log(
+                    f"engine_boundary_multipass_clip_failed rc={proc.returncode} "
+                    f"stderr={tail_text(proc.stderr)!r}"
+                )
+                continue
+            try:
+                clip_segments = parse_whisper_json_segments(str(target))
+            except Exception as exc:
+                append_app_log(
+                    f"engine_boundary_multipass_clip_parse_failed error={exc!r}"
+                )
+                continue
+            for seg in clip_segments:
+                try:
+                    seg["start"] = float(seg.get("start") or 0.0) + cs
+                    seg["end"] = float(seg.get("end") or 0.0) + cs
+                except (TypeError, ValueError):
+                    continue
+            new_segments.extend(clip_segments)
+
+        if not new_segments:
+            return None, segments
+        # Reuse the merge helper from the regular multipass — it
+        # already knows how to splice repassed clips into the
+        # original timeline. Speaker labels are dropped during merge
+        # (the new clip has none), so we run the diarisation
+        # projection again on the merged segments.
+        merged, replaced = merge_repass_segments(segments, new_segments, clip_ranges)
+        # Re-project speakers onto the freshly-transcribed clip text.
+        # We don't have the diarisation turns object here, so reuse
+        # the existing labels in the original segments where they
+        # cover the same timestamps.
+        merged = self._fill_speakers_from_neighbours(merged, segments)
+        duration = time.monotonic() - ts
+        self.sink(
+            ProgressEvent(
+                "multipass_boundary",
+                100,
+                f"Boundary repass replaced {replaced} segment(s)",
+            )
+        )
+        return (
+            StepResult(
+                "multipass_boundary",
+                True,
+                model=repass_model,
+                duration_seconds=duration,
+                metrics={"replaced": replaced, "clip_ranges": len(clip_ranges)},
+            ),
+            merged,
+        )
+
+    def _fill_speakers_from_neighbours(
+        self,
+        merged: list[dict],
+        original: list[dict],
+    ) -> list[dict]:
+        """Restore speaker labels on segments that lost them through
+        the boundary repass merge.
+
+        The merge helper concatenates new clips into the original
+        timeline; the new clips have no ``speaker`` field. We rebuild
+        it by looking at the overlap with the original (pre-repass)
+        segments — whichever speaker dominated the timespan keeps
+        that label.
+        """
+        if not merged or not original:
+            return merged
+        for seg in merged:
+            if (seg.get("speaker") or "").strip():
+                continue
+            try:
+                s = float(seg.get("start") or 0)
+                e = float(seg.get("end") or 0)
+            except (TypeError, ValueError):
+                continue
+            per_speaker: dict[str, float] = {}
+            for o in original:
+                speaker = (o.get("speaker") or "").strip()
+                if not speaker:
+                    continue
+                try:
+                    os_ = float(o.get("start") or 0)
+                    oe_ = float(o.get("end") or 0)
+                except (TypeError, ValueError):
+                    continue
+                overlap = max(0.0, min(e, oe_) - max(s, os_))
+                if overlap > 0:
+                    per_speaker[speaker] = per_speaker.get(speaker, 0.0) + overlap
+            if per_speaker:
+                seg["speaker"] = max(per_speaker.items(), key=lambda kv: kv[1])[0]
+        return merged
 
     # ------------------------------------------------------------------
     # Step 2quater — phonetic glossary post-processor

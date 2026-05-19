@@ -3,6 +3,7 @@ import unittest
 from multipass import (
     DEFAULT_WEAK_SCORE,
     group_into_clip_ranges,
+    identify_boundary_segments,
     identify_weak_segments,
     merge_repass_segments,
     score_segment,
@@ -129,6 +130,56 @@ class MergeRepassSegmentsTest(unittest.TestCase):
         out, replaced = merge_repass_segments(base, [], [])
         self.assertEqual(out, base)
         self.assertEqual(replaced, 0)
+
+
+class IdentifyBoundarySegmentsTest(unittest.TestCase):
+    """PR I — boundary multipass targets short segments at speaker
+    changes, where Whisper's 30s context window often conditioned
+    on the wrong voice."""
+
+    def test_flags_short_segment_at_boundary(self):
+        segments = [
+            {"start": 0.0, "end": 5.0, "speaker": "Robin", "text": "Bonjour."},
+            {"start": 5.0, "end": 6.2, "speaker": "Manon", "text": "Salut."},
+            {"start": 6.2, "end": 10.0, "speaker": "Manon", "text": "Comment ça va."},
+        ]
+        out = identify_boundary_segments(segments)
+        # Segment 0 (Robin → Manon change) AND segment 1 (Robin →
+        # Manon, short) qualify. Segment 2 doesn't (no change after).
+        labels = {(int(w.start), int(w.end)) for w in out}
+        self.assertIn((5, 6), labels)  # segment 1, the short Manon turn
+
+    def test_skips_long_segments(self):
+        # Long monologues at boundaries don't qualify — repassing
+        # 30s of audio for a wrong-speaker hint is expensive.
+        segments = [
+            {"start": 0.0, "end": 5.0, "speaker": "Robin", "text": "Bonjour."},
+            {"start": 5.0, "end": 35.0, "speaker": "Manon", "text": "Long monologue."},
+        ]
+        out = identify_boundary_segments(segments)
+        # Manon's 30s segment is too long for boundary repass.
+        long_segments = [w for w in out if w.end - w.start > 2.5]
+        self.assertEqual(long_segments, [])
+
+    def test_skips_when_no_speaker_change(self):
+        segments = [
+            {"start": 0.0, "end": 1.5, "speaker": "Robin", "text": "Un."},
+            {"start": 1.5, "end": 3.0, "speaker": "Robin", "text": "Deux."},
+        ]
+        self.assertEqual(identify_boundary_segments(segments), [])
+
+    def test_skips_very_short_fragments(self):
+        # Anything below ``min_duration`` is too short to repass
+        # — model load alone would dwarf the savings.
+        segments = [
+            {"start": 0.0, "end": 5.0, "speaker": "Robin", "text": "Bonjour."},
+            {"start": 5.0, "end": 5.1, "speaker": "Manon", "text": "Oui."},
+            {"start": 5.1, "end": 8.0, "speaker": "Manon", "text": "Carrément."},
+        ]
+        out = identify_boundary_segments(segments)
+        # The 100ms "Oui" fragment is excluded.
+        for w in out:
+            self.assertGreaterEqual(w.end - w.start, 0.4)
 
 
 if __name__ == "__main__":
