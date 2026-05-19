@@ -34,9 +34,12 @@ from multipass import (
     merge_repass_segments,
 )
 from transcription_utils import (
+    AUDIO_PROFILE_STANDARD,
+    AUDIO_PROFILE_TELEPHONY,
     assign_speakers_to_segments,
     build_audio_extract_cmd,
     build_diarization_cmd,
+    detect_audio_profile,
     build_embedding_extract_cmd,
     build_llm_corrections_cmd,
     build_llm_title_cmd,
@@ -1196,6 +1199,26 @@ class TranscriptionPipeline:
         ts = time.monotonic()
         settings = self.request.transcription_settings
         ffmpeg = self.request.compression_settings.ffmpeg_path or "ffmpeg"
+        ffprobe = self.request.compression_settings.ffprobe_path or ""
+        # Detect telephony audio so the extraction step swaps in the
+        # narrowband-tuned filter chain (tighter lowpass + FFT
+        # denoise + heavier compression). Falls back to standard on
+        # any probe error so the pipeline never blocks on detection.
+        audio_profile = AUDIO_PROFILE_STANDARD
+        if settings.enhance_audio and ffprobe:
+            audio_profile = detect_audio_profile(source_path, ffprobe_path=ffprobe)
+            if audio_profile != AUDIO_PROFILE_STANDARD:
+                append_app_log(
+                    f"engine_audio_profile detected={audio_profile!r} "
+                    f"source={source_path!r}"
+                )
+                self.sink(
+                    ProgressEvent(
+                        "audio_extract",
+                        0,
+                        "Détection : audio téléphonique — filtre adaptatif activé",
+                    )
+                )
         cmd = build_audio_extract_cmd(
             ffmpeg,
             source_path,
@@ -1208,6 +1231,7 @@ class TranscriptionPipeline:
             if self.request.compression_settings.trim_enabled
             and self.request.compression_settings.trim_end != "00:00:00"
             else None,
+            audio_profile=audio_profile,
         )
         self.sink(ProgressEvent("audio_extract", 0, "Extracting audio"))
         proc = subprocess.run(

@@ -21,9 +21,15 @@ from transcription_utils import (
     DEFAULT_WHISPER_MODEL,
     TEXT_LLM_MODELS,
     WHISPER_MODELS,
+    AUDIO_PROFILE_STANDARD,
+    AUDIO_PROFILE_TELEPHONY,
+    TRANSCRIPTION_AUDIO_FILTERS,
+    TRANSCRIPTION_AUDIO_FILTERS_TELEPHONY,
     absorb_orphan_speaker_fragments,
     assign_speakers_to_segments,
+    detect_audio_profile,
     merge_adjacent_same_speaker_segments,
+    select_transcription_audio_filters,
     audio_llm_label_for,
     build_audio_extract_cmd,
     build_diarization_cmd,
@@ -196,6 +202,98 @@ class TranscriptionCommandTest(unittest.TestCase):
         self.assertIn("-ac", cmd)
         self.assertIn("1", cmd)
         self.assertEqual(cmd[-1], "/tmp/audio.wav")
+
+    def test_build_audio_extract_picks_telephony_chain_when_requested(self):
+        cmd = build_audio_extract_cmd(
+            ffmpeg_path="/usr/local/bin/ffmpeg",
+            in_path="/tmp/in.mp4",
+            wav_path="/tmp/audio.wav",
+            speech_enhance=True,
+            audio_profile=AUDIO_PROFILE_TELEPHONY,
+        )
+        af = cmd[cmd.index("-af") + 1]
+        # Tighter lowpass (3400 Hz) + FFT denoise are the telephony
+        # markers — pin them so a future filter tweak doesn't
+        # silently flip back to the studio chain.
+        self.assertIn("lowpass=f=3400", af)
+        self.assertIn("afftdn", af)
+        self.assertNotIn("lowpass=f=7600", af)
+
+    def test_build_audio_extract_default_uses_standard_chain(self):
+        cmd = build_audio_extract_cmd(
+            ffmpeg_path="/usr/local/bin/ffmpeg",
+            in_path="/tmp/in.mp4",
+            wav_path="/tmp/audio.wav",
+            speech_enhance=True,
+        )
+        af = cmd[cmd.index("-af") + 1]
+        # Backwards-compat: callers that don't pass a profile still
+        # get the established studio chain — telephony chain is
+        # opt-in via detection.
+        self.assertIn("lowpass=f=7600", af)
+        self.assertNotIn("afftdn", af)
+
+    def test_select_filters_falls_back_to_standard_on_unknown(self):
+        self.assertEqual(
+            select_transcription_audio_filters("standard"),
+            TRANSCRIPTION_AUDIO_FILTERS,
+        )
+        self.assertEqual(
+            select_transcription_audio_filters("nonsense"),
+            TRANSCRIPTION_AUDIO_FILTERS,
+        )
+        self.assertEqual(
+            select_transcription_audio_filters("telephony"),
+            TRANSCRIPTION_AUDIO_FILTERS_TELEPHONY,
+        )
+
+    def test_detect_audio_profile_telephony_sample_rate(self):
+        # Stub ffprobe to return a low sample rate.
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        stub_stdout = '{"streams":[{"codec_name":"aac","sample_rate":"8000"}]}'
+        with patch(
+            "subprocess.run",
+            return_value=CompletedProcess(
+                args=[], returncode=0, stdout=stub_stdout, stderr=""
+            ),
+        ):
+            profile = detect_audio_profile("/tmp/in.mp4", ffprobe_path="/usr/local/bin/ffprobe")
+        self.assertEqual(profile, AUDIO_PROFILE_TELEPHONY)
+
+    def test_detect_audio_profile_standard_sample_rate(self):
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        stub_stdout = '{"streams":[{"codec_name":"aac","sample_rate":"48000"}]}'
+        with patch(
+            "subprocess.run",
+            return_value=CompletedProcess(
+                args=[], returncode=0, stdout=stub_stdout, stderr=""
+            ),
+        ):
+            profile = detect_audio_profile("/tmp/in.mp4", ffprobe_path="/usr/local/bin/ffprobe")
+        self.assertEqual(profile, AUDIO_PROFILE_STANDARD)
+
+    def test_detect_audio_profile_g711_codec(self):
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        stub_stdout = '{"streams":[{"codec_name":"pcm_mulaw","sample_rate":"8000"}]}'
+        with patch(
+            "subprocess.run",
+            return_value=CompletedProcess(
+                args=[], returncode=0, stdout=stub_stdout, stderr=""
+            ),
+        ):
+            profile = detect_audio_profile("/tmp/in.mp4", ffprobe_path="/usr/local/bin/ffprobe")
+        self.assertEqual(profile, AUDIO_PROFILE_TELEPHONY)
+
+    def test_detect_audio_profile_missing_ffprobe_returns_standard(self):
+        # Without a probe path we fall through to the safe default
+        # rather than blocking the pipeline.
+        self.assertEqual(
+            detect_audio_profile("/tmp/in.mp4", ffprobe_path=""),
+            AUDIO_PROFILE_STANDARD,
+        )
 
     def test_build_mlx_whisper_command_uses_context_prompt(self):
         cmd = build_mlx_whisper_cmd(
