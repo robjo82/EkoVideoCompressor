@@ -866,5 +866,91 @@ class QualityPresetTest(unittest.TestCase):
         self.assertTrue(settings.per_speaker_enabled)
 
 
+class CurrentUserPreAttributionTest(unittest.TestCase):
+    """PR B — pin the cold-start heuristic that attributes the first
+    cluster to ``current_user_name`` when no voiceprint match was
+    found. Without it, every meeting's SPEAKER_00 lingered as a
+    placeholder because voice profiles started empty (recognition
+    only fires when sample_count > 0)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._tmp.name)
+        self.source = self.workspace / "meeting.mov"
+        self.source.write_bytes(b"fake")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _pipeline(self, current_user: str) -> TranscriptionPipeline:
+        request = _make_request(
+            self.workspace,
+            self.source,
+            transcription_settings={"current_user_name": current_user},
+        )
+        return TranscriptionPipeline(request, lambda _event: None)
+
+    def test_attributes_first_cluster_to_current_user(self):
+        pipeline = self._pipeline("Robin")
+        segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "Allô"},
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_01", "text": "Bonjour"},
+        ]
+        out = pipeline._pre_attribute_current_user(segments, already_recognized={})
+        self.assertEqual(out, {"SPEAKER_00": "Robin"})
+
+    def test_no_op_when_current_user_blank(self):
+        pipeline = self._pipeline("")
+        segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "Allô"},
+        ]
+        self.assertEqual(
+            pipeline._pre_attribute_current_user(segments, already_recognized={}),
+            {},
+        )
+
+    def test_picks_first_unclaimed_cluster_when_voice_match_filled_others(self):
+        # On a 2-person call, if voice match already attributed
+        # Mathilde to SPEAKER_00, the user (Robin) must be the
+        # other cluster. The heuristic walks past claimed clusters
+        # rather than giving up — useful in the 80 % case.
+        pipeline = self._pipeline("Robin")
+        segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "Allô"},
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_01", "text": "Bonjour"},
+        ]
+        out = pipeline._pre_attribute_current_user(
+            segments,
+            already_recognized={"SPEAKER_00": "Mathilde"},
+        )
+        self.assertEqual(out, {"SPEAKER_01": "Robin"})
+
+    def test_skips_when_current_user_already_recognised_elsewhere(self):
+        # Voice match found Robin on SPEAKER_01. Heuristic should
+        # NOT also tag SPEAKER_00 as Robin — would create two
+        # Robins in the same conversation.
+        pipeline = self._pipeline("Robin")
+        segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "Allô"},
+            {"start": 1.0, "end": 2.0, "speaker": "SPEAKER_01", "text": "Bonjour"},
+        ]
+        out = pipeline._pre_attribute_current_user(
+            segments,
+            already_recognized={"SPEAKER_01": "Robin"},
+        )
+        self.assertEqual(out, {})
+
+    def test_picks_lowest_start_time_not_first_segment(self):
+        # Out-of-order Whisper output: SPEAKER_01 has the lowest
+        # actual start time — heuristic must respect that.
+        pipeline = self._pipeline("Robin")
+        segments = [
+            {"start": 5.0, "end": 6.0, "speaker": "SPEAKER_00", "text": "Tard"},
+            {"start": 0.5, "end": 1.5, "speaker": "SPEAKER_01", "text": "Tôt"},
+        ]
+        out = pipeline._pre_attribute_current_user(segments, already_recognized={})
+        self.assertEqual(out, {"SPEAKER_01": "Robin"})
+
+
 if __name__ == "__main__":
     unittest.main()

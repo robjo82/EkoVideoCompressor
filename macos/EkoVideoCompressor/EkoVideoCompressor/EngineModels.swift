@@ -527,4 +527,10 @@ struct TranscriptionSettings: Codable {
     /// bounds gives the cleanest diarisation we've measured.
     var expected_min_speakers: Int = 0
     var expected_max_speakers: Int = 0
+    /// Name the user designates as "themselves" in Réglages. The
+    /// engine uses it to pre-attribute the cluster that speaks first
+    /// to this name when no voiceprint match has been found — fixes
+    /// the cold-start problem where every meeting starts with
+    /// SPEAKER_00 unresolved.
+    var current_user_name: String = ""
 }

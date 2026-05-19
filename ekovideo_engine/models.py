@@ -84,6 +84,12 @@ class TranscriptionSettings:
     # surrounding turn so the transcript stops jumping speaker every
     # other word.
     min_speaker_turn_seconds: float = 0.4
+    # Name the user designates as "themselves" in Réglages. When
+    # set, the pipeline pre-attributes the cluster that speaks first
+    # in the recording to this name — bypassing voice matching for
+    # the user even before any voiceprint has been enrolled. Empty
+    # string disables the heuristic.
+    current_user_name: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":
