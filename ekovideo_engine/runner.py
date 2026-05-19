@@ -369,6 +369,21 @@ class EngineRunner:
             progress_pct=0,
             eta_seconds=estimated_total_seconds,
         )
+        # Heads-up for legacy AppStorage values: the multimodal
+        # audio recheck (Qwen2-Audio) exists in
+        # ``video_compactor.py`` but isn't ported to the new
+        # engine yet. Earlier builds let the user toggle it ON;
+        # the toggle is now hidden but ``@AppStorage`` may still
+        # carry ``true`` on existing installs. Surface a warning
+        # so the user understands the flag is silently ignored
+        # rather than producing the review file they expect.
+        if request.transcription_settings.audio_recheck_enabled:
+            sink(
+                WarningEvent(
+                    "La réécoute multimodale (Qwen2-Audio) n'est pas encore branchée dans le moteur — l'option sera prise en compte dans une prochaine version.",
+                    code="audio_recheck_not_wired",
+                )
+            )
         # Persist the Odoo meeting metadata so the rename sheet can
         # surface attendee hint chips long after the engine exited.
         # Empty dict means "no meeting linked"; the helper takes care

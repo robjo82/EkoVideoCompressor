@@ -610,7 +610,6 @@ struct RunBatchSettingsForm: View {
                 }
                 Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
                 pyannotePreflightBanner
-                Toggle("Réécoute IA des passages douteux", isOn: $settings.audioRecheckEnabled)
             }
 
             if canDeleteOriginalSources {
@@ -2293,6 +2292,15 @@ struct ModelRoleRow: View {
                             .foregroundStyle(.secondary)
                             .help("Modèle protégé Hugging Face — acceptez la licence avant le premier téléchargement.")
                     }
+                    if !row.available {
+                        Text("À venir")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.orange.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.orange)
+                            .help("Cette fonctionnalité n'est pas encore branchée dans le moteur. Le modèle peut être téléchargé mais ne sera pas utilisé pour l'instant.")
+                    }
                 }
                 HStack(spacing: 6) {
                     Text(row.id)
@@ -2322,8 +2330,17 @@ struct ModelRoleRow: View {
             }
 
             // Activate button — only meaningful on user-selectable
-            // roles. Pyannote rows show "Verrouillé" instead.
-            if role.isUserSelectable {
+            // roles. Pyannote rows show "Verrouillé" instead. Roles
+            // marked ``available=false`` in the engine catalog (e.g.
+            // audio_llm today — the multimodal recheck pass isn't
+            // ported to the new engine yet) show an explanation
+            // chip instead of an Activer button so the user isn't
+            // led to think the toggle does anything.
+            if !row.available {
+                Text("Non branché — sera utilisé dans une prochaine version")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if role.isUserSelectable {
                 if isActive {
                     Label("Actif", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(.teal)
@@ -2630,9 +2647,24 @@ struct SettingsView: View {
                 }
                 Section("Avancé") {
                     Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
-                    Toggle("Réécoute IA multimodale", isOn: $settings.audioRecheckEnabled)
+                    // The multimodal audio recheck (Qwen2-Audio) is
+                    // exposed as a setting but the orchestrator
+                    // doesn't run it yet — only the legacy
+                    // ``video_compactor.py`` path implements the
+                    // step. The toggle is replaced by a static
+                    // info line so the user doesn't enable a
+                    // no-op switch. When the engine wires the
+                    // pass we'll restore the Toggle and flip
+                    // ``audio_llm.available`` to True in the
+                    // catalog.
+                    Label(
+                        "Réécoute multimodale (Qwen2-Audio) — à venir dans une prochaine version.",
+                        systemImage: "ear.badge.waveform"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                     Text(
-                        "Ces bascules complètent le réglage Qualité. La détection des locuteurs nécessite un token Hugging Face ; la réécoute IA est expérimentale et coûteuse en temps. Le nombre d'intervenants attendu se règle au lancement de chaque traitement."
+                        "La détection des locuteurs nécessite un token Hugging Face. Le nombre d'intervenants attendu se règle au lancement de chaque traitement."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)

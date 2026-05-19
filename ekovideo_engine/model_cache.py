@@ -75,6 +75,14 @@ def _build_row(entry: dict, canonicalise) -> dict:
         "gated": bool(entry.get("gated") or False),
         "cached": cached,
         "cache_dir": str(model_cache_dir(repo_id)),
+        # Whether the role is actually wired in the new SwiftUI
+        # engine. Defaults to True; entries marked ``available=False``
+        # in the catalog (currently the audio_llm row — the
+        # multimodal recheck pass lives only in the legacy
+        # video_compactor.py and isn't ported yet) are surfaced as
+        # "À venir" in the Models tab and have their Activer button
+        # disabled.
+        "available": bool(entry.get("available", True)),
     }
 
 
