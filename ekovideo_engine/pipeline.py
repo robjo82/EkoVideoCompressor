@@ -229,6 +229,109 @@ def _safe_stem(value: str) -> str:
     return (cleaned or "Transcription")[:80]
 
 
+# Matches "X qui pourrait être Y ou Z" patterns the LLM emits on
+# uncertain passages — captures the two proposed alternatives so we
+# can reject tautological cases (Y == Z, or Y already in the source).
+_DOUBT_ALTERNATIVES_RE = re.compile(
+    r"qui pourrait\s+(?:\s*être)?\s*[\"«']?([^\"»'(),.;]+?)[\"»']?\s+ou\s+[\"«']?([^\"»'(),.;]+?)[\"»'.]?\s*(?:\(|$|\))",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_word(value: str) -> str:
+    """Lowercase + strip punctuation/whitespace for tautology comparison."""
+    return re.sub(r"[\s.,;:!?'\"«»()]+", "", (value or "")).lower()
+
+
+def _apply_glossary_capitalization(text: str, glossary_terms: list[str]) -> str:
+    """Replace every case-insensitive whole-word occurrence of a
+    glossary term with its canonical form.
+
+    Why: Whisper / LLM corrections sometimes leave glossary terms
+    in inconsistent case ("Quadra" then "quadra", "Excel" then
+    "excel"). The user added these to the glossary precisely
+    because they wanted a canonical spelling — we honor that
+    spelling end-to-end.
+
+    Rules:
+    - Word boundaries (``\\b``) so ``quadra`` matches in ``Quadra``
+      and at the start of a sentence but NOT inside ``quadragénaire``.
+    - Skips empty terms, terms with non-word characters that would
+      defeat ``\\b``, and terms shorter than 2 chars (too risky).
+    - Preserves the text inside ``[SPEAKER]`` brackets — speaker
+      names shouldn't be rewritten by glossary substitutions.
+    """
+    if not text or not glossary_terms:
+        return text
+    # Pull bracketed speaker tags out, restore after substitution.
+    placeholders: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        placeholders.append(match.group(0))
+        return f"\x00SPK{len(placeholders) - 1}\x00"
+
+    protected = re.sub(r"\[[^\]\n]*\]", _stash, text)
+    for raw in glossary_terms:
+        term = (raw or "").strip()
+        if len(term) < 2:
+            continue
+        # Only apply when the term is a single word (or hyphenated
+        # multi-token like "Power-BI") — multi-word glossary
+        # entries can have legitimate orthographic variants.
+        if not re.fullmatch(r"[\w\-'.&]+", term, re.UNICODE):
+            continue
+        pattern = re.compile(
+            rf"(?<![\w]){re.escape(term)}(?![\w])",
+            re.IGNORECASE,
+        )
+        protected = pattern.sub(term, protected)
+    return re.sub(
+        r"\x00SPK(\d+)\x00",
+        lambda m: placeholders[int(m.group(1))],
+        protected,
+    )
+
+
+def _filter_tautological_doubts(doubts: list[dict]) -> list[dict]:
+    """Drop uncertain-passage entries whose ``reason`` is auto-
+    referential — patterns where the LLM hallucinated alternatives
+    that are identical to the original or to each other.
+
+    Real-world examples observed on the Cozynergy job:
+        - ``"retraiter" qui pourrait être "retraiter" ou "retraiter"``
+        - ``"mélangeait" qui pourrait être "mélangeait" ou "mélangeait"``
+        - ``"proposait" qui pourrait être "proposait" ou "proposait"``
+    Five out of ten entries in that review file were of this shape.
+    They erode user trust in the entire "Passages douteux" section.
+
+    Strategy:
+    1. Parse ``"qui pourrait être X ou Y"`` from the reason.
+    2. Drop if X == Y (case-insensitive after punctuation strip).
+    3. Drop if X appears verbatim in the original ``text``.
+    4. Drop when the reason is so short it carries no signal (< 8
+       chars, almost always a model fragment).
+    """
+    out: list[dict] = []
+    for entry in doubts:
+        reason = (entry.get("reason") or "").strip()
+        if len(reason) < 8:
+            continue
+        match = _DOUBT_ALTERNATIVES_RE.search(reason)
+        if match:
+            alt1_norm = _normalize_word(match.group(1))
+            alt2_norm = _normalize_word(match.group(2))
+            if alt1_norm and alt2_norm and alt1_norm == alt2_norm:
+                # "X ou X" — pure tautology.
+                continue
+            text_norm = _normalize_word(entry.get("text") or "")
+            if alt1_norm and alt1_norm in text_norm and alt2_norm in text_norm:
+                # Both alternatives are literally in the source — the
+                # LLM is "uncertain" about what's already there.
+                continue
+        out.append(entry)
+    return out
+
+
 def job_workspace_dir(request: JobRequest) -> Path:
     if request.workspace_dir:
         return Path(request.workspace_dir)
@@ -1698,7 +1801,9 @@ class TranscriptionPipeline:
                 )
 
         payload["corrections"] = dedupe_corrections(all_corrections)
-        payload["uncertain_passages"] = dedupe_corrections(all_uncertain)
+        payload["uncertain_passages"] = _filter_tautological_doubts(
+            dedupe_corrections(all_uncertain)
+        )
 
         self.sink(ProgressEvent("llm_corrections", 100, "LLM enhancement done"))
         self._llm_payload = payload
@@ -1762,6 +1867,14 @@ class TranscriptionPipeline:
             rendered = render_segments_with_speakers(segments, settings.output_format)
         else:
             rendered = render_segments_plain(segments, settings.output_format)
+        # Final capitalization sweep: enforce the canonical
+        # spelling of every glossary term across the transcript so
+        # ``Quadra`` doesn't co-exist with ``quadra``, ``Excel``
+        # with ``excel``. The mutation observed on the Cozynergy
+        # and Caste outputs.
+        rendered = _apply_glossary_capitalization(
+            rendered, list(self.request.glossary_terms)
+        )
         transcript_path.write_text(rendered, encoding="utf-8")
         apply_meeting_date_to_artifact(self.request, transcript_path)
         self.sink(
@@ -1818,6 +1931,14 @@ class TranscriptionPipeline:
             rendered = outcome.text
             self._llm_corrections_applied = outcome.applied
             self._llm_corrections_rejected = outcome.rejected
+
+        # Final capitalization sweep, same as the base transcript.
+        # The LLM corrections sometimes touch case (e.g. fixing
+        # ``au doute`` would leave a lowercase remnant); enforcing
+        # glossary canonical case here covers that path too.
+        rendered = _apply_glossary_capitalization(
+            rendered, list(self.request.glossary_terms)
+        )
 
         enhanced_path.write_text(rendered, encoding="utf-8")
         apply_meeting_date_to_artifact(self.request, enhanced_path)
