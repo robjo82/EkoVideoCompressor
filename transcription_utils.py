@@ -1896,6 +1896,228 @@ def render_segments_plain(segments: list[dict], output_format: str) -> str:
     return "\n".join(seg["text"] for seg in segments if seg.get("text")).strip() + "\n"
 
 
+def _smooth_word_assignments(
+    word_speakers: list[str | None],
+    word_starts: list[float],
+    word_ends: list[float],
+    *,
+    min_run_words: int = 2,
+    min_run_seconds: float = 0.4,
+) -> list[str | None]:
+    """Median-filter per-word speaker assignments to suppress
+    1-word flickers between two stable runs of another speaker.
+
+    The PR A motivating case: in the Caste transcript a single
+    Whisper segment containing Manon's "des fois je vous dis oui"
+    came out as three sub-segments — ``[?] des``, ``[SPEAKER_00]
+    fois je vous`` (wrong attribution), ``[Manon] dis oui…``.
+    pyannote's word-level boundaries flickered briefly at the
+    start of Manon's turn. Smoothing collapses the 1-3 wrong words
+    into the dominant neighbouring speaker.
+
+    Algorithm:
+    - Walk the list to compute runs of consecutive same-speaker words.
+    - A run is "short" when it has < ``min_run_words`` words AND
+      its total duration is < ``min_run_seconds`` seconds.
+    - A short run sandwiched between two SAME-speaker neighbours
+      gets absorbed by them.
+    - A short run flanked by two DIFFERENT speakers goes to whichever
+      neighbour the word's midpoint is closer to in time (no
+      arbitrary preference for "next" vs "previous").
+    - A short ``None`` run is treated like any other short run.
+    """
+    if not word_speakers:
+        return word_speakers
+    n = len(word_speakers)
+    # Build (speaker, [word_idx, ...]) runs.
+    runs: list[tuple[str | None, list[int]]] = []
+    for idx, sp in enumerate(word_speakers):
+        if runs and runs[-1][0] == sp:
+            runs[-1][1].append(idx)
+        else:
+            runs.append((sp, [idx]))
+    if len(runs) <= 2:
+        return word_speakers
+    # Mutable copy so we can rewrite assignments in place.
+    out = list(word_speakers)
+    for i in range(1, len(runs) - 1):
+        sp, idxs = runs[i]
+        run_duration = word_ends[idxs[-1]] - word_starts[idxs[0]]
+        if len(idxs) >= min_run_words or run_duration >= min_run_seconds:
+            continue
+        prev_sp = runs[i - 1][0]
+        next_sp = runs[i + 1][0]
+        if prev_sp is None and next_sp is None:
+            continue
+        if prev_sp == next_sp and prev_sp is not None:
+            target = prev_sp
+        elif prev_sp is None:
+            target = next_sp
+        elif next_sp is None:
+            target = prev_sp
+        else:
+            # Flanked by two distinct speakers: route to the closer
+            # one in time. Tie-break favours the upcoming speaker
+            # since the user's mental model is "the new speaker
+            # started speaking around here".
+            midpoint = (word_starts[idxs[0]] + word_ends[idxs[-1]]) / 2.0
+            prev_end = word_ends[runs[i - 1][1][-1]]
+            next_start = word_starts[runs[i + 1][1][0]]
+            target = next_sp if abs(next_start - midpoint) <= abs(midpoint - prev_end) else prev_sp
+        for idx in idxs:
+            out[idx] = target
+    return out
+
+
+def merge_adjacent_same_speaker_segments(
+    segments: list[dict],
+    *,
+    max_gap_seconds: float = 1.5,
+) -> list[dict]:
+    """Fuse consecutive segments by the same speaker when separated
+    by at most ``max_gap_seconds``.
+
+    Why this matters: even after the word-level smoothing, Whisper
+    occasionally emits two adjacent segments for the same speaker
+    (e.g. a brief pause). The textual rendering already groups them
+    visually, but the LLM correction and multipass steps both see
+    the raw list — running them on micro-fragments rather than full
+    turns hurts both passes. Merging upfront gives them context.
+
+    The merged segment carries:
+    - the earliest ``start`` and latest ``end``
+    - the concatenated ``text`` (single-space separator, dedup
+      against double-leading-space artefacts from Whisper's word
+      tokens)
+    - the concatenated ``words`` list when both children had one
+    - the WORST ``avg_logprob`` / highest ``no_speech_prob`` /
+      highest ``compression_ratio`` of the merged children — so
+      downstream confidence-triaged passes see the worst-case
+      signal rather than an artificially-good average.
+    """
+    if not segments:
+        return []
+    out: list[dict] = []
+    for seg in segments:
+        if not out:
+            out.append(dict(seg))
+            continue
+        prev = out[-1]
+        prev_speaker = prev.get("speaker")
+        cur_speaker = seg.get("speaker")
+        if prev_speaker is None or cur_speaker is None or prev_speaker != cur_speaker:
+            out.append(dict(seg))
+            continue
+        try:
+            gap = float(seg["start"]) - float(prev["end"])
+        except (KeyError, TypeError, ValueError):
+            out.append(dict(seg))
+            continue
+        if gap > max_gap_seconds:
+            out.append(dict(seg))
+            continue
+        # Merge into prev.
+        prev["end"] = float(seg["end"])
+        prev_text = (prev.get("text") or "").rstrip()
+        cur_text = (seg.get("text") or "").lstrip()
+        if prev_text and cur_text:
+            prev["text"] = f"{prev_text} {cur_text}"
+        elif cur_text:
+            prev["text"] = cur_text
+        prev_words = prev.get("words") or []
+        cur_words = seg.get("words") or []
+        if prev_words or cur_words:
+            prev["words"] = list(prev_words) + list(cur_words)
+        # Worst-case quality metrics so downstream passes don't miss
+        # a hesitation that got absorbed into a longer turn.
+        for key, reducer in (
+            ("avg_logprob", min),
+            ("no_speech_prob", max),
+            ("compression_ratio", max),
+        ):
+            cur_val = seg.get(key)
+            prev_val = prev.get(key)
+            if cur_val is None:
+                continue
+            if prev_val is None:
+                prev[key] = cur_val
+            else:
+                try:
+                    prev[key] = reducer(prev_val, cur_val)
+                except TypeError:
+                    pass
+    return out
+
+
+def absorb_orphan_speaker_fragments(
+    segments: list[dict],
+    *,
+    max_orphan_duration: float = 0.6,
+    max_neighbor_gap: float = 2.0,
+) -> list[dict]:
+    """Drop the ``None`` (rendered as ``[?]``) label on very short
+    segments flanked by known speakers.
+
+    Concretely fixes the ``L4 [?] des`` pattern in the Caste
+    transcript: a single-word segment of 0.2 s that pyannote
+    couldn't confidently attribute, sandwiched between two known
+    turns. The renderer's ``[?]`` label looks like a third unknown
+    speaker and makes the transcript unreadable.
+
+    Rules:
+    - ``None`` speaker fragments shorter than ``max_orphan_duration``
+      (and within ``max_neighbor_gap`` of at least one labelled
+      neighbour) are absorbed.
+    - Sandwiched between two same-speaker neighbours → absorbed into
+      that speaker.
+    - Otherwise absorbed into the **next** speaker (the one taking
+      over) when both sides are within the neighbour gap, else the
+      single available neighbour.
+    """
+    if not segments:
+        return []
+    out: list[dict] = []
+    for index, raw in enumerate(segments):
+        seg = dict(raw)
+        speaker = seg.get("speaker")
+        if speaker is not None:
+            out.append(seg)
+            continue
+        try:
+            duration = float(seg["end"]) - float(seg["start"])
+        except (KeyError, TypeError, ValueError):
+            duration = float("inf")
+        if duration > max_orphan_duration:
+            out.append(seg)
+            continue
+        prev_seg = out[-1] if out else None
+        next_seg = segments[index + 1] if index + 1 < len(segments) else None
+        prev_speaker = prev_seg.get("speaker") if prev_seg else None
+        next_speaker = next_seg.get("speaker") if next_seg else None
+        prev_end = float(prev_seg["end"]) if prev_seg else float("-inf")
+        next_start = float(next_seg["start"]) if next_seg else float("inf")
+        seg_start = float(seg.get("start") or 0)
+        seg_end = float(seg.get("end") or 0)
+        prev_gap = seg_start - prev_end if prev_seg else float("inf")
+        next_gap = next_start - seg_end if next_seg else float("inf")
+        target: str | None = None
+        if prev_speaker and next_speaker and prev_speaker == next_speaker:
+            # Same speaker on both sides — only a brief pause.
+            target = prev_speaker
+        elif prev_speaker and next_speaker:
+            # Different neighbours: snap to the closer one. Tie goes
+            # to the next speaker (turn-taking heuristic).
+            target = next_speaker if next_gap <= prev_gap else prev_speaker
+        elif next_speaker and next_gap <= max_neighbor_gap:
+            target = next_speaker
+        elif prev_speaker and prev_gap <= max_neighbor_gap:
+            target = prev_speaker
+        if target is not None:
+            seg["speaker"] = target
+        out.append(seg)
+    return out
+
+
 def assign_speakers_to_segments(
     whisper_segments: Iterable[dict],
     diarization_turns: Iterable[dict],
@@ -1945,6 +2167,15 @@ def assign_speakers_to_segments(
         new_seg = dict(seg)
         new_seg["speaker"] = best_speaker
         out.append(new_seg)
+    # Two post-passes that turn a noisy diarisation projection into
+    # a clean, readable speaker list:
+    # 1. Absorb [?] fragments shorter than ~0.6 s into a neighbour
+    #    when one's available (fixes ``[?] des`` orphans).
+    # 2. Fuse adjacent same-speaker segments under a 1.5 s gap so
+    #    downstream passes (LLM corrections, multipass) see full
+    #    turns instead of micro-fragments.
+    out = absorb_orphan_speaker_fragments(out)
+    out = merge_adjacent_same_speaker_segments(out)
     return out
 
 
@@ -1978,15 +2209,29 @@ def _split_segment_on_speaker_changes(
     the same signal — the metrics describe the audio chunk that
     *Whisper* processed, which we haven't re-decoded.
     """
-    groups: list[tuple[str | None, list[dict]]] = []
+    # First pass: per-word speaker assignment from diarisation turns.
+    valid_words: list[dict] = []
+    word_starts: list[float] = []
+    word_ends: list[float] = []
+    word_speakers: list[str | None] = []
     for word in words:
         try:
             wstart = float(word.get("start", 0.0))
             wend = float(word.get("end", 0.0))
         except (TypeError, ValueError):
             continue
+        valid_words.append(word)
+        word_starts.append(wstart)
+        word_ends.append(wend)
         midpoint = (wstart + wend) / 2.0
-        speaker = _speaker_at(midpoint, turns)
+        word_speakers.append(_speaker_at(midpoint, turns))
+    # Second pass: smooth out 1-word "speaker flickers" so a brief
+    # mis-attribution at a turn boundary doesn't produce a fragment.
+    # See the Caste transcript L4-7 pattern in ``_smooth_word_assignments``.
+    smoothed = _smooth_word_assignments(word_speakers, word_starts, word_ends)
+
+    groups: list[tuple[str | None, list[dict]]] = []
+    for word, speaker in zip(valid_words, smoothed):
         if groups and groups[-1][0] == speaker:
             groups[-1][1].append(word)
         else:
