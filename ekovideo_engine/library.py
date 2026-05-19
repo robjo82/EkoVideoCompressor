@@ -977,40 +977,102 @@ def _diarisation_audio_path(job: dict[str, Any]) -> Path | None:
     return None
 
 
+# Lower bound of clean speech we try to accumulate per cluster
+# before stopping. Hitting this gives a stable centroid; cluster
+# without that much speech still gets enrolled, just with fewer
+# samples than ideal.
+_EMBEDDING_TARGET_SECONDS = 30.0
+# Upper bound on individual turns we'll feed to pyannote per
+# cluster, even if we haven't hit the target. Each turn costs
+# ~0.5 s of inference, and past 5 the centroid stops improving
+# materially.
+_EMBEDDING_MAX_TURNS = 5
+# Two clusters' turns are considered "overlapping" if their
+# timestamps interlock by more than this. Shorter overlaps are
+# usually back-channel "ouais" / "hm" — harmless for the centroid.
+_EMBEDDING_OVERLAP_TOLERANCE_SECONDS = 0.1
+
+
 def _segments_per_cluster(
     segments: list[dict],
     labels: list[str],
 ) -> dict[str, list[dict]]:
-    """Pick the longest turns per cluster for embedding extraction.
+    """Pick the cleanest turns per cluster for embedding extraction.
 
-    Sorted longest-first; capped at ``_EMBEDDING_TURNS_PER_CLUSTER``.
-    Turns shorter than ``_EMBEDDING_MIN_TURN_SECONDS`` are dropped
-    so the centroid isn't poisoned by 200 ms back-channels.
+    PR J improvements over the previous "top-3 by duration":
+    - **Overlap filter**: a turn that interlocks with another
+      cluster's turn by > 100 ms is dropped. Otherwise pyannote
+      computes a centroid that's polluted by the other speaker's
+      timbre — destroys cross-meeting recognition accuracy.
+    - **Target accumulation**: stop sampling once we have 30 s of
+      clean speech per cluster (stable centroid) rather than
+      taking exactly N turns regardless of total duration.
+    - **Hard cap**: never feed more than 5 turns to pyannote — the
+      centroid stops improving past that point and the inference
+      cost adds up on a 10-speaker meeting.
+    - Turns shorter than ``_EMBEDDING_MIN_TURN_SECONDS`` (2 s) are
+      still dropped as before so back-channels don't poison the
+      centroid.
     """
-    by_label: dict[str, list[dict]] = {label: [] for label in labels}
+    # Build per-label turn lists with their numeric bounds.
+    by_label_raw: dict[str, list[dict]] = {label: [] for label in labels}
+    # Plus a flat list of ``(start, end, owner_label)`` for the
+    # overlap check across all labels (NOT just the enrolment ones).
+    flat_segments: list[tuple[float, float, str]] = []
     for segment in segments:
         label = (segment.get("speaker") or "").strip()
-        if label not in by_label:
-            continue
         try:
             start = float(segment.get("start_time") or segment.get("start") or 0)
             end = float(segment.get("end_time") or segment.get("end") or 0)
         except (TypeError, ValueError):
             continue
+        if end <= start:
+            continue
+        flat_segments.append((start, end, label))
+        if label not in by_label_raw:
+            continue
         duration = end - start
         if duration < _EMBEDDING_MIN_TURN_SECONDS:
             continue
-        by_label[label].append({"start": start, "end": end, "duration": duration})
+        by_label_raw[label].append({"start": start, "end": end, "duration": duration})
+
+    def _overlaps_another_speaker(start: float, end: float, owner: str) -> bool:
+        """True if any other-cluster segment interlocks by more
+        than the tolerance with ``[start, end]``."""
+        for s, e, label in flat_segments:
+            if label == owner:
+                continue
+            overlap = min(end, e) - max(start, s)
+            if overlap > _EMBEDDING_OVERLAP_TOLERANCE_SECONDS:
+                return True
+        return False
 
     out: dict[str, list[dict]] = {}
-    for label, turns in by_label.items():
+    for label, turns in by_label_raw.items():
         if not turns:
             continue
-        turns.sort(key=lambda t: t["duration"], reverse=True)
-        out[label] = [
-            {"start": t["start"], "end": t["end"]}
-            for t in turns[:_EMBEDDING_TURNS_PER_CLUSTER]
+        clean = [
+            t
+            for t in turns
+            if not _overlaps_another_speaker(t["start"], t["end"], label)
         ]
+        # Fall back to the original turns if overlap filter wiped
+        # everything — a single contaminated centroid is still
+        # better than no centroid at all (the user can fix it later
+        # by enroling on a cleaner job).
+        candidates = clean or turns
+        candidates.sort(key=lambda t: t["duration"], reverse=True)
+        picked: list[dict] = []
+        accumulated = 0.0
+        for t in candidates:
+            if len(picked) >= _EMBEDDING_MAX_TURNS:
+                break
+            picked.append({"start": t["start"], "end": t["end"]})
+            accumulated += t["duration"]
+            if accumulated >= _EMBEDDING_TARGET_SECONDS and len(picked) >= 2:
+                break
+        if picked:
+            out[label] = picked
     return out
 
 

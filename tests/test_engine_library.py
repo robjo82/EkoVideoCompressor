@@ -12,6 +12,7 @@ from unittest.mock import patch
 from ekovideo_engine.library import (
     _discover_speakers_from_text,
     _looks_like_engine_workspace,
+    _segments_per_cluster,
     database,
     library_delete,
     library_delete_speaker_profile,
@@ -1357,6 +1358,80 @@ class LibraryDetachOdooMeetingTest(unittest.TestCase):
 
             assert row is not None
             self.assertFalse((row.get("odoo_meeting_json") or "").strip())
+
+
+class SegmentsPerClusterTest(unittest.TestCase):
+    """PR J — tighter selection of enrolment samples. Should exclude
+    turns that overlap another speaker (centroid contamination
+    risk), accumulate up to ~30 s of clean speech per cluster,
+    cap at 5 turns regardless."""
+
+    def test_skips_turns_overlapping_other_speaker(self):
+        # Robin's "Bonjour" overlaps Manon's "Salut" — that turn
+        # would pollute Robin's centroid with Manon's voice.
+        segments = [
+            # Robin clean
+            {"start": 0.0, "end": 5.0, "speaker": "Robin"},
+            # Robin overlapping Manon → must be dropped
+            {"start": 10.0, "end": 15.0, "speaker": "Robin"},
+            {"start": 12.0, "end": 14.0, "speaker": "Manon"},
+            # Manon clean
+            {"start": 20.0, "end": 25.0, "speaker": "Manon"},
+        ]
+        out = _segments_per_cluster(segments, ["Robin", "Manon"])
+        # Robin's overlapping turn (10-15) is excluded → only the
+        # clean 0-5 turn remains.
+        self.assertEqual(len(out["Robin"]), 1)
+        self.assertAlmostEqual(out["Robin"][0]["start"], 0.0)
+        # Manon's two turns: 12-14 overlaps Robin too, so dropped.
+        # Only 20-25 remains.
+        self.assertEqual(len(out["Manon"]), 1)
+        self.assertAlmostEqual(out["Manon"][0]["start"], 20.0)
+
+    def test_caps_at_five_turns(self):
+        # 10 long clean turns for Robin — we should only feed
+        # the top 5 to pyannote.
+        segments = [
+            {"start": float(i * 10), "end": float(i * 10 + 6), "speaker": "Robin"}
+            for i in range(10)
+        ]
+        out = _segments_per_cluster(segments, ["Robin"])
+        self.assertEqual(len(out["Robin"]), 5)
+
+    def test_stops_early_once_target_seconds_hit(self):
+        # Two ~20 s turns hit the 30 s target — no need to
+        # accumulate more even if available.
+        segments = [
+            {"start": 0.0, "end": 20.0, "speaker": "Robin"},
+            {"start": 30.0, "end": 50.0, "speaker": "Robin"},
+            {"start": 60.0, "end": 80.0, "speaker": "Robin"},
+            {"start": 90.0, "end": 100.0, "speaker": "Robin"},
+        ]
+        out = _segments_per_cluster(segments, ["Robin"])
+        # 2 turns × 20 s = 40 s > 30 s target → stop.
+        self.assertEqual(len(out["Robin"]), 2)
+
+    def test_falls_back_to_contaminated_when_no_clean(self):
+        # Every turn overlaps the other speaker — we still emit
+        # SOME samples rather than 0 (a contaminated centroid is
+        # still better than no centroid at all).
+        segments = [
+            {"start": 0.0, "end": 5.0, "speaker": "Robin"},
+            {"start": 1.0, "end": 4.0, "speaker": "Manon"},
+        ]
+        out = _segments_per_cluster(segments, ["Robin", "Manon"])
+        self.assertEqual(len(out.get("Robin", [])), 1)
+        self.assertEqual(len(out.get("Manon", [])), 1)
+
+    def test_drops_short_turns(self):
+        # < 2 s turns are dropped (centroid would be unstable).
+        segments = [
+            {"start": 0.0, "end": 1.0, "speaker": "Robin"},  # 1s — dropped
+            {"start": 5.0, "end": 8.0, "speaker": "Robin"},  # 3s — kept
+        ]
+        out = _segments_per_cluster(segments, ["Robin"])
+        self.assertEqual(len(out["Robin"]), 1)
+        self.assertAlmostEqual(out["Robin"][0]["start"], 5.0)
 
 
 if __name__ == "__main__":
