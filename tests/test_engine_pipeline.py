@@ -1119,6 +1119,84 @@ class GlossaryCapitalizationTest(unittest.TestCase):
         self.assertEqual(_apply_glossary_capitalization("text", ["a"]), "text")
 
 
+class WebEnrichmentPipelineHookTest(unittest.TestCase):
+    """PR H — pipeline mutates ``request.glossary_terms`` in place
+    when ``web_enrichment_enabled`` is True and the enrichment
+    function returns confirmed entities."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._tmp.name)
+        self.source = self.workspace / "meeting.mov"
+        self.source.write_bytes(b"fake")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _pipeline(self, web_enabled: bool) -> TranscriptionPipeline:
+        request = _make_request(
+            self.workspace,
+            self.source,
+            transcription_settings={
+                "web_enrichment_enabled": web_enabled,
+                "quality_preset": "custom",  # don't let preset force-off
+            },
+            glossary_terms=["Odoo"],
+        )
+        return TranscriptionPipeline(request, lambda _event: None)
+
+    def test_no_op_when_flag_disabled(self):
+        pipeline = self._pipeline(web_enabled=False)
+        with patch("web_context.enrich_glossary_via_web") as mock_enrich:
+            pipeline._maybe_enrich_glossary_from_web("Cozynergy is a company.")
+            mock_enrich.assert_not_called()
+        # Glossary unchanged.
+        self.assertEqual(list(pipeline.request.glossary_terms), ["Odoo"])
+
+    def test_adds_confirmed_terms_to_glossary(self):
+        pipeline = self._pipeline(web_enabled=True)
+        # Stub the returned WebEnrichmentResult.
+        from web_context import WebEnrichmentResult
+        stub_results = [
+            WebEnrichmentResult(
+                candidate="Cozynergy",
+                confirmed_term="Cozynergy",
+                citation="Cozynergy — company",
+                snippet="...",
+            )
+        ]
+        with patch("web_context.enrich_glossary_via_web", return_value=stub_results):
+            pipeline._maybe_enrich_glossary_from_web("Mathilde Gérard de Cozynergy.")
+        self.assertIn("Cozynergy", pipeline.request.glossary_terms)
+        # Existing term preserved.
+        self.assertIn("Odoo", pipeline.request.glossary_terms)
+
+    def test_dedups_against_existing_glossary(self):
+        pipeline = self._pipeline(web_enabled=True)
+        from web_context import WebEnrichmentResult
+        stub_results = [
+            WebEnrichmentResult(
+                candidate="odoo",  # different case than existing "Odoo"
+                confirmed_term="odoo",
+                citation="...",
+                snippet="...",
+            )
+        ]
+        with patch("web_context.enrich_glossary_via_web", return_value=stub_results):
+            pipeline._maybe_enrich_glossary_from_web("Some text about odoo.")
+        # ``odoo`` wasn't added — ``Odoo`` is already in the glossary
+        # (case-insensitive dedup).
+        self.assertEqual(list(pipeline.request.glossary_terms), ["Odoo"])
+
+    def test_swallows_exception(self):
+        # Network errors must NOT sink the LLM step.
+        pipeline = self._pipeline(web_enabled=True)
+        with patch("web_context.enrich_glossary_via_web", side_effect=RuntimeError("network down")):
+            # Should not raise.
+            pipeline._maybe_enrich_glossary_from_web("Some text.")
+        self.assertEqual(list(pipeline.request.glossary_terms), ["Odoo"])
+
+
 class CurrentUserPreAttributionTest(unittest.TestCase):
     """PR B — pin the cold-start heuristic that attributes the first
     cluster to ``current_user_name`` when no voiceprint match was

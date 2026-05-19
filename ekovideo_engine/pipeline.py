@@ -2124,6 +2124,83 @@ class TranscriptionPipeline:
     # Step 5 — LLM post-process
     # ------------------------------------------------------------------
 
+    def _maybe_enrich_glossary_from_web(self, transcript_text: str) -> None:
+        """Optional web enrichment pass that confirms proper-noun
+        candidates against DuckDuckGo and adds the confirmed ones
+        to the glossary.
+
+        Gated by ``transcription_settings.web_enrichment_enabled``
+        (forced off in every preset today; only the ``custom``
+        preset honours the user-set value). Best-effort: any
+        exception is swallowed and the pipeline continues with the
+        unenriched glossary.
+
+        The Odoo recursive context pack already mutates
+        ``request.glossary_terms`` once per job — this pass appends
+        on top, so the two enrichment sources compose naturally.
+        """
+        settings = self.request.transcription_settings
+        if not settings.web_enrichment_enabled:
+            return
+        if not transcript_text:
+            return
+        try:
+            from web_context import enrich_glossary_via_web
+        except Exception:
+            return
+        ts = time.monotonic()
+        self.sink(
+            ProgressEvent(
+                "web_enrichment",
+                0,
+                "Confirmation web des entités candidates",
+            )
+        )
+        try:
+            results = enrich_glossary_via_web(
+                transcript_text,
+                list(self.request.glossary_terms),
+            )
+        except Exception as exc:
+            append_app_log(f"engine_web_enrichment_failed error={exc!r}")
+            self.sink(
+                WarningEvent(
+                    f"Enrichissement web : indisponible ({exc})",
+                    code="web_enrichment_failed",
+                )
+            )
+            return
+        if not results:
+            self.sink(
+                ProgressEvent(
+                    "web_enrichment",
+                    100,
+                    "Aucune entité supplémentaire confirmée",
+                )
+            )
+            return
+        # Append to the glossary in place, dedup against existing
+        # terms (case-insensitive).
+        existing = {t.strip().lower() for t in self.request.glossary_terms if t.strip()}
+        added = 0
+        for result in results:
+            term = (result.confirmed_term or result.candidate or "").strip()
+            if not term or term.lower() in existing:
+                continue
+            self.request.glossary_terms = [*self.request.glossary_terms, term]
+            existing.add(term.lower())
+            added += 1
+        append_app_log(
+            f"engine_web_enrichment added={added} elapsed={time.monotonic() - ts:.1f}s"
+        )
+        self.sink(
+            ProgressEvent(
+                "web_enrichment",
+                100,
+                f"Enrichissement web : +{added} terme(s) confirmé(s)",
+            )
+        )
+
     def _run_llm_post(
         self,
         analysis_segments: list[dict],
@@ -2144,6 +2221,13 @@ class TranscriptionPipeline:
         analysis_text = render_segments_with_speakers(analysis_segments, "txt")
         analysis_path = transcript_path.parent / "transcript_for_local_analysis.txt"
         analysis_path.write_text(analysis_text, encoding="utf-8")
+        # Web enrichment fires HERE rather than earlier so it sees
+        # the cleanest transcript text we have (post-multipass,
+        # post-diarisation, post-PR-A smoothing). Mutates
+        # ``request.glossary_terms`` in place — same pattern as the
+        # Odoo context pack — so the LLM correction pass picks up
+        # the newly-confirmed entities automatically.
+        self._maybe_enrich_glossary_from_web(analysis_text)
         glossary_text = "\n".join(
             [*self.request.glossary_terms, *self.request.technical_terms]
         )
