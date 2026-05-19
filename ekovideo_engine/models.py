@@ -125,21 +125,17 @@ def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSet
         settings.audio_recheck_enabled = False
         settings.web_enrichment_enabled = False
     elif preset == "max":
-        # Everything the engine actually wires today: VAD with the
-        # safety-net fallback, multipass with the higher-accuracy
-        # large-v3 repass, diarisation with word-level speaker
-        # attribution, LLM post-process. ``per_speaker_enabled``,
-        # ``audio_recheck_enabled``, ``web_enrichment_enabled`` are
-        # *intentionally off* — the orchestrator doesn't run them
-        # yet. Promising "Whisper par locuteur + réécoute IA +
-        # enrichissement web" while doing none of those was a false
-        # advertisement; once any of them ships we'll re-enable
-        # them here.
+        # Everything wired in the engine today: VAD, multipass
+        # (low-confidence + boundary), diarisation with word-level
+        # speaker attribution, LLM post-process, per-speaker Whisper
+        # pass (PR E), web enrichment (PR H, gated by network).
+        # ``audio_recheck_enabled`` (Qwen2-Audio) stays off until
+        # PR F ports the legacy multimodal recheck pass.
         settings.vad_enabled = True
         settings.multipass_enabled = True
-        settings.per_speaker_enabled = False
+        settings.per_speaker_enabled = True
         settings.audio_recheck_enabled = False
-        settings.web_enrichment_enabled = False
+        settings.web_enrichment_enabled = True
     # 'custom' (or any other value) is a passthrough — leave the
     # individual flags as the caller set them.
     return settings
