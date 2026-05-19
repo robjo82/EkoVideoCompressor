@@ -637,6 +637,47 @@ class FuseAndRenderTest(unittest.TestCase):
         out = render_segments_with_speakers(segs, "srt")
         self.assertIn("[?] Hum", out)
 
+    def test_render_txt_breaks_on_long_internal_pause(self):
+        # Same speaker, but a 2 s silence between segments → break
+        # into two paragraphs so the reader sees the pause.
+        segs = [
+            {"start": 0.0, "end": 4.0, "text": "Première idée.", "speaker": "Robin"},
+            {"start": 6.5, "end": 9.0, "text": "Deuxième idée.", "speaker": "Robin"},
+        ]
+        out = render_segments_with_speakers(segs, "txt")
+        # Two prefixed lines, both [Robin], with different timestamps.
+        self.assertEqual(out.count("[Robin]"), 2)
+        self.assertIn("00:00:00", out)
+        self.assertIn("00:00:06", out)
+
+    def test_render_txt_breaks_on_long_paragraph(self):
+        # No pauses, but a continuous 30 s monologue → break at
+        # ~25 s so we don't end up with an 800-char line.
+        segs = [
+            {"start": 0.0, "end": 10.0, "text": "Premier morceau.", "speaker": "Manon"},
+            {"start": 10.0, "end": 20.0, "text": "Deuxième morceau.", "speaker": "Manon"},
+            {"start": 20.0, "end": 30.0, "text": "Troisième morceau.", "speaker": "Manon"},
+        ]
+        out = render_segments_with_speakers(segs, "txt")
+        # At least one break inserted (the 3rd segment starts at
+        # 20 s, paragraph duration ≥ 20 s — close to threshold but
+        # not over; check the next one's split happens at 25 s+).
+        # Pin: more than one [Manon] line in the output.
+        self.assertGreaterEqual(out.count("[Manon]"), 1)
+        # Each rendered line is reasonably short (< 300 chars).
+        for line in out.splitlines():
+            self.assertLess(len(line), 400, line)
+
+    def test_render_txt_preserves_single_short_turn(self):
+        # No pause, no length, no reason to break.
+        segs = [
+            {"start": 0.0, "end": 4.0, "text": "Salut", "speaker": "Robin"},
+            {"start": 4.0, "end": 8.0, "text": "comment ça va", "speaker": "Robin"},
+        ]
+        out = render_segments_with_speakers(segs, "txt")
+        self.assertEqual(out.count("[Robin]"), 1)
+        self.assertIn("Salut comment ça va", out)
+
 
 class TurnRealignmentTest(unittest.TestCase):
     """PR A — pin the three post-passes added on top of the

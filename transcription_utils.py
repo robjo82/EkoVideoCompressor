@@ -2444,19 +2444,25 @@ def render_segments_with_speakers(segments: list[dict], output_format: str) -> s
             lines.append("")
         return "\n".join(lines)
 
-    # txt: one block per consecutive run of the same speaker, prefixed with
-    # the speaker tag and the start timestamp. Easier for humans to read
-    # than a per-segment dump.
-    lines = []
+    # txt: one block per consecutive run of the same speaker, prefixed
+    # with the speaker tag and the start timestamp. Long monologues are
+    # broken at internal pauses > 1.2 s or every ~25 s so a 5-minute
+    # explanation doesn't end up on a single 800-character line.
+    lines: list[str] = []
     current_speaker: str | None = None
-    current_start: float | None = None
-    current_text: list[str] = []
+    current_segs: list[dict] = []
 
     def flush():
-        if current_text:
+        if not current_segs:
+            return
+        speaker_tag = f"[{current_speaker or '?'}]"
+        for paragraph in _split_turn_into_paragraphs(current_segs):
+            start = float(paragraph[0].get("start") or 0.0)
+            text = " ".join(str(s.get("text") or "") for s in paragraph).strip()
+            if not text:
+                continue
             lines.append(
-                f"[{current_speaker or '?'}] ({_format_timestamp_short(current_start or 0)}) "
-                + " ".join(current_text).strip()
+                f"{speaker_tag} ({_format_timestamp_short(start)}) {text}"
             )
 
     for seg in segments:
@@ -2464,12 +2470,53 @@ def render_segments_with_speakers(segments: list[dict], output_format: str) -> s
         if speaker != current_speaker:
             flush()
             current_speaker = speaker
-            current_start = seg["start"]
-            current_text = [seg["text"]]
+            current_segs = [seg]
         else:
-            current_text.append(seg["text"])
+            current_segs.append(seg)
     flush()
     return "\n".join(lines) + "\n"
+
+
+def _split_turn_into_paragraphs(
+    segs: list[dict],
+    *,
+    max_paragraph_seconds: float = 25.0,
+    min_pause_seconds: float = 1.2,
+) -> list[list[dict]]:
+    """Split a same-speaker run into paragraph-sized chunks.
+
+    Two break triggers:
+    - A pause between consecutive segments ≥ ``min_pause_seconds``
+      (matches the natural rhythm of a speaker taking a breath
+      between thoughts).
+    - A cumulative paragraph duration ≥ ``max_paragraph_seconds``
+      (prevents 5-minute monologues from sitting on one line).
+
+    Each paragraph is returned as a list of segments so the caller
+    can pick the start timestamp of the first one for the line
+    prefix. Empty input returns an empty list.
+    """
+    if not segs:
+        return []
+    paragraphs: list[list[dict]] = [[segs[0]]]
+    for i in range(1, len(segs)):
+        try:
+            prev_end = float(segs[i - 1].get("end") or 0.0)
+            cur_start = float(segs[i].get("start") or 0.0)
+            paragraph_start = float(paragraphs[-1][0].get("start") or 0.0)
+        except (TypeError, ValueError):
+            paragraphs[-1].append(segs[i])
+            continue
+        gap = cur_start - prev_end
+        paragraph_duration = cur_start - paragraph_start
+        if (
+            gap >= min_pause_seconds
+            or paragraph_duration >= max_paragraph_seconds
+        ):
+            paragraphs.append([segs[i]])
+        else:
+            paragraphs[-1].append(segs[i])
+    return paragraphs
 
 
 _MULTIMODAL_AUDIO_SCRIPT = '''
