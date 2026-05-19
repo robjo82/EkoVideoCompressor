@@ -29,6 +29,7 @@ from speaker_recognition import (
     match_cluster_against_profiles,
 )
 from multipass import (
+    WeakSegment,
     group_into_clip_ranges,
     identify_boundary_segments,
     identify_weak_segments,
@@ -1073,6 +1074,23 @@ class TranscriptionPipeline:
                     if boundary_result is not None:
                         results.append(boundary_result)
                     analysis_segments = segments
+                # --- step 3quater: per-speaker Whisper pass --------------
+                # Re-transcribe each speaker's segments separately so
+                # Whisper conditions on a homogeneous voice — fixes
+                # the failure mode where the model leaks one speaker's
+                # vocabulary / accent into another's segments. Heavy
+                # (multiplies Whisper invocations by N speakers) so
+                # gated on the ``per_speaker_enabled`` flag.
+                if (
+                    self.request.transcription_settings.per_speaker_enabled
+                    and self._should_run_diarisation()
+                ):
+                    per_speaker_result, segments = self._run_per_speaker_pass(
+                        whisper_wav, workspace, segments
+                    )
+                    if per_speaker_result is not None:
+                        results.append(per_speaker_result)
+                    analysis_segments = segments
 
         # --- step 4: write the base transcript -----------------------
         transcript_path = self._write_transcript(segments, workspace)
@@ -1737,6 +1755,182 @@ class TranscriptionPipeline:
                 metrics={"replaced": replaced, "clip_ranges": len(clip_ranges)},
             ),
             merged,
+        )
+
+    def _run_per_speaker_pass(
+        self,
+        whisper_wav: Path,
+        workspace: Path,
+        segments: list[dict],
+    ) -> tuple[StepResult | None, list[dict]]:
+        """Re-Whisper each speaker's segments separately.
+
+        The Whisper context window (30 s) crosses speaker boundaries
+        on conversational recordings. When two voices have distinct
+        timbres / accents the model can "leak" vocabulary between
+        them ("Sudokiz" once leaked into the other speaker's line).
+        Running Whisper on a per-speaker chunk eliminates that
+        cross-contamination at the cost of one extra invocation per
+        speaker.
+
+        Implementation:
+        - Group segments by speaker (skip ``None`` and short
+          fragments < 1 s).
+        - For each speaker, group consecutive segments into clip
+          ranges (same helper as multipass uses).
+        - Run Whisper on each clip range with the higher-quality
+          multipass model, then merge the resulting text back in.
+
+        Cost guard: skip clusters with < 6 s total speech (centroid
+        wouldn't benefit, and short clusters are usually the user's
+        "merci / oui" channel that doesn't need a quality boost).
+        """
+        ts = time.monotonic()
+        settings = self.request.transcription_settings
+        # Group eligible segments by speaker.
+        per_speaker: dict[str, list[dict]] = {}
+        for idx, seg in enumerate(segments):
+            speaker = (seg.get("speaker") or "").strip()
+            if not speaker:
+                continue
+            try:
+                s = float(seg.get("start") or 0)
+                e = float(seg.get("end") or 0)
+            except (TypeError, ValueError):
+                continue
+            if e - s < 0.4:
+                continue
+            per_speaker.setdefault(speaker, []).append({"index": idx, "start": s, "end": e})
+
+        # Discard speakers with too little speech to repass usefully.
+        eligible: dict[str, list[dict]] = {}
+        for speaker, segs in per_speaker.items():
+            total = sum(s["end"] - s["start"] for s in segs)
+            if total >= 6.0:
+                eligible[speaker] = segs
+
+        if not eligible:
+            return None, segments
+
+        repass_model = canonical_multipass_model_id(settings.multipass_model)
+        self.sink(
+            ProgressEvent(
+                "multipass_per_speaker",
+                0,
+                f"Per-speaker repass on {len(eligible)} cluster(s)",
+            )
+        )
+
+        replacements: list[tuple[int, dict]] = []
+        for sp_index, (speaker, segs) in enumerate(sorted(eligible.items())):
+            # Build clip ranges from this speaker's segments. The
+            # ``group_into_clip_ranges`` helper merges close-together
+            # entries with a 1 s pad, exactly what we want here.
+            weak = [
+                WeakSegment(
+                    index=s["index"], start=s["start"], end=s["end"],
+                    score=0.0, reason="per_speaker",
+                )
+                for s in segs
+            ]
+            clip_ranges = group_into_clip_ranges(
+                weak, max_segments_per_clip=20
+            )
+            if not clip_ranges:
+                continue
+            new_clip_segments: list[dict] = []
+            for idx, (cs, ce) in enumerate(clip_ranges):
+                target = workspace / f"per_speaker_{sp_index}_{idx}.json"
+                cmd = build_mlx_whisper_cmd(
+                    mlx_whisper_path=settings.mlx_whisper_path or "mlx_whisper",
+                    audio_path=str(whisper_wav),
+                    output_path=str(target),
+                    model=repass_model,
+                    language=settings.language,
+                    output_format="json",
+                    initial_prompt=structured_initial_prompt(
+                        "\n".join(
+                            [*self.request.glossary_terms, *self.request.technical_terms]
+                        ),
+                        expected_speaker_names=self._expected_speaker_names(),
+                        meeting_context=self._meeting_context(),
+                    ),
+                    condition_on_previous_text=False,
+                    clip_timestamps=f"{cs:.2f},{ce:.2f}",
+                    word_timestamps=True,
+                )
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    env=self._subprocess_env(),
+                )
+                if proc.returncode != 0 or not target.exists():
+                    append_app_log(
+                        f"engine_per_speaker_clip_failed speaker={speaker!r} "
+                        f"rc={proc.returncode}"
+                    )
+                    continue
+                try:
+                    clip_segments = parse_whisper_json_segments(str(target))
+                except Exception:
+                    continue
+                for seg in clip_segments:
+                    try:
+                        seg["start"] = float(seg.get("start") or 0.0) + cs
+                        seg["end"] = float(seg.get("end") or 0.0) + cs
+                        # Tag with the speaker we know — bypass
+                        # the diarisation re-projection step since
+                        # we extracted by speaker upfront.
+                        seg["speaker"] = speaker
+                    except (TypeError, ValueError):
+                        continue
+                    new_clip_segments.append(seg)
+            if not new_clip_segments:
+                continue
+            replacements.append((sp_index, {
+                "speaker": speaker,
+                "clip_ranges": clip_ranges,
+                "segments": new_clip_segments,
+            }))
+
+        if not replacements:
+            return None, segments
+
+        # Splice the per-speaker results into the original timeline.
+        # For each speaker we run ``merge_repass_segments`` with the
+        # clip ranges as targets; same logic as the global multipass.
+        merged_segments = segments
+        replaced_total = 0
+        for _, payload in replacements:
+            merged_segments, replaced = merge_repass_segments(
+                merged_segments,
+                payload["segments"],
+                payload["clip_ranges"],
+            )
+            replaced_total += replaced
+
+        duration = time.monotonic() - ts
+        self.sink(
+            ProgressEvent(
+                "multipass_per_speaker",
+                100,
+                f"Per-speaker repass: {replaced_total} segment(s) replaced",
+            )
+        )
+        return (
+            StepResult(
+                "multipass_per_speaker",
+                True,
+                model=repass_model,
+                duration_seconds=duration,
+                metrics={
+                    "speakers": len(eligible),
+                    "replaced": replaced_total,
+                },
+            ),
+            merged_segments,
         )
 
     def _fill_speakers_from_neighbours(

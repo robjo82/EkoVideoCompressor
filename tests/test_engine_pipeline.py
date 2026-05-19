@@ -834,11 +834,10 @@ class QualityPresetTest(unittest.TestCase):
         self.assertFalse(settings.per_speaker_enabled)
 
     def test_max_preset_enables_only_wired_phases(self):
-        # Pin the audit: ``per_speaker``, ``audio_recheck`` and
-        # ``web_enrichment`` are off until the orchestrator actually
-        # runs them. Promising features the engine doesn't deliver
-        # showed up in the field as "max prend des heures pour le
-        # même résultat que balanced".
+        # Audit: PR E wired per_speaker, PR H wired web_enrichment,
+        # both now flipped on in max preset. ``audio_recheck``
+        # (Qwen2-Audio) stays off until PR F ports the legacy
+        # multimodal recheck.
         settings = JobRequest.from_dict(
             {
                 "source_path": "/tmp/x.mov",
@@ -849,9 +848,9 @@ class QualityPresetTest(unittest.TestCase):
         ).transcription_settings
         self.assertTrue(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
-        self.assertFalse(settings.per_speaker_enabled)
+        self.assertTrue(settings.per_speaker_enabled)
         self.assertFalse(settings.audio_recheck_enabled)
-        self.assertFalse(settings.web_enrichment_enabled)
+        self.assertTrue(settings.web_enrichment_enabled)
 
     def test_custom_preset_passes_individual_flags_through(self):
         settings = JobRequest.from_dict(
