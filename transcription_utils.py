@@ -14,6 +14,111 @@ TRANSCRIPTION_AUDIO_FILTERS = [
     "loudnorm=I=-16:TP=-1.5:LRA=11",
 ]
 
+# Telephony chain: phone audio is narrowband (G.711, 8 kHz sample
+# rate, 4 kHz Nyquist). The signal above 3400 Hz is dead spectrum.
+# We swap the lowpass for a tighter one, add an FFT-based denoise
+# pass tuned for narrowband background, and compress harder to
+# bring up the quiet speech that's typical of distant callers.
+# Empirically improves Whisper on phone recordings (the Caste job
+# audio confirmed how much the default chain leaves on the table).
+TRANSCRIPTION_AUDIO_FILTERS_TELEPHONY = [
+    "highpass=f=80",
+    # Above 3400 Hz is interpolation artefact from the resampler,
+    # not signal. Trimming it stops Whisper from leaning on noise.
+    "lowpass=f=3400",
+    # FFT denoise. ``nr=18`` ≈ -18 dB attenuation on stationary
+    # background; ``nf=-25`` sets the noise floor estimator.
+    # Stronger than default because phone lines carry hum + hiss.
+    "afftdn=nr=18:nf=-25",
+    # Harder compression than the studio chain — caller may switch
+    # between speakerphone and handset, big dynamic range to flatten.
+    "acompressor=threshold=-22dB:ratio=3:attack=4:release=180",
+    "loudnorm=I=-16:TP=-1.5:LRA=11",
+]
+
+# Audio profile names that ``select_transcription_audio_filters``
+# returns. Pipeline + UI logging keys off these strings.
+AUDIO_PROFILE_STANDARD = "standard"
+AUDIO_PROFILE_TELEPHONY = "telephony"
+
+
+def select_transcription_audio_filters(profile: str) -> list[str]:
+    """Pick the right filter chain for ``profile``.
+
+    Unknown values fall back to ``standard`` so a misconfigured
+    caller still gets reasonable enhancement rather than nothing.
+    """
+    if profile == AUDIO_PROFILE_TELEPHONY:
+        return list(TRANSCRIPTION_AUDIO_FILTERS_TELEPHONY)
+    return list(TRANSCRIPTION_AUDIO_FILTERS)
+
+
+def detect_audio_profile(
+    in_path: str,
+    *,
+    ffprobe_path: str | None = None,
+    bandwidth_threshold_hz: int = 12000,
+) -> str:
+    """Return ``"telephony"`` when the source audio is narrowband,
+    ``"standard"`` otherwise.
+
+    Heuristic :
+    - Sample rate ≤ 11.025 kHz → telephony (G.711 is 8 kHz).
+    - Codec in the narrowband family (``pcm_alaw``, ``pcm_mulaw``,
+      ``g711``, ``g729``, ``opus`` with the narrowband ramp) → also
+      telephony.
+    - Anything else, or any probe error → ``standard`` (safe
+      default: the existing chain still helps studio audio without
+      the harsh telephony lowpass).
+
+    Cheap probe (single ``ffprobe`` call, json output). Returns
+    ``standard`` on missing ffprobe or any exception — never crashes
+    the pipeline.
+    """
+    if not ffprobe_path:
+        return AUDIO_PROFILE_STANDARD
+    try:
+        import subprocess
+        out = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate,codec_name",
+                "-of",
+                "json",
+                in_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception:
+        return AUDIO_PROFILE_STANDARD
+    if out.returncode != 0 or not out.stdout.strip():
+        return AUDIO_PROFILE_STANDARD
+    try:
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return AUDIO_PROFILE_STANDARD
+    streams = payload.get("streams") or []
+    if not streams:
+        return AUDIO_PROFILE_STANDARD
+    stream = streams[0]
+    codec = str(stream.get("codec_name") or "").lower()
+    try:
+        sample_rate = int(stream.get("sample_rate") or 0)
+    except (TypeError, ValueError):
+        sample_rate = 0
+    if codec in {"pcm_alaw", "pcm_mulaw", "g711", "g729"}:
+        return AUDIO_PROFILE_TELEPHONY
+    if 0 < sample_rate <= bandwidth_threshold_hz:
+        return AUDIO_PROFILE_TELEPHONY
+    return AUDIO_PROFILE_STANDARD
+
 # Hugging Face model IDs used for diarisation. Both require accepting the
 # license on huggingface.co before a token can download them.
 PYANNOTE_DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
@@ -611,6 +716,7 @@ def build_audio_extract_cmd(
     speech_enhance: bool = True,
     ss: str | None = None,
     to: str | None = None,
+    audio_profile: str = AUDIO_PROFILE_STANDARD,
 ) -> list[str]:
     cmd = [ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error"]
 
@@ -622,7 +728,7 @@ def build_audio_extract_cmd(
     cmd += ["-i", in_path, "-vn"]
 
     if speech_enhance:
-        cmd += ["-af", ",".join(TRANSCRIPTION_AUDIO_FILTERS)]
+        cmd += ["-af", ",".join(select_transcription_audio_filters(audio_profile))]
 
     cmd += [
         "-acodec",
