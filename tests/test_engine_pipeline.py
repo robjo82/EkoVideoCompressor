@@ -32,6 +32,8 @@ from ekovideo_engine.pipeline import (
     StepResult,
     TranscriptionPipeline,
     apply_meeting_date_to_artifact,
+    _apply_glossary_capitalization,
+    _filter_tautological_doubts,
     _friendly_ffmpeg_error,
 )
 
@@ -864,6 +866,104 @@ class QualityPresetTest(unittest.TestCase):
         self.assertFalse(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
         self.assertTrue(settings.per_speaker_enabled)
+
+
+class TautologicalDoubtFilterTest(unittest.TestCase):
+    """PR C — drop the auto-referential "X qui pourrait être X ou X"
+    entries that polluted the Cozynergy review file (5 out of 10
+    uncertain passages were tautologies)."""
+
+    def test_drops_X_ou_X_pattern(self):
+        doubts = [
+            {
+                "timestamp": "00:03:01",
+                "text": "nous on peut retraiter la donnée",
+                "reason": 'doute sur le "retraiter" qui pourrait être "retraiter" ou "retraiter"',
+            },
+            {
+                "timestamp": "00:00:00",
+                "text": "Mathilde Gérard, c'est Cozynergy. Ah",
+                "reason": 'doute sur le "Ah" final, possible coupure',
+            },
+        ]
+        out = _filter_tautological_doubts(doubts)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["timestamp"], "00:00:00")
+
+    def test_drops_when_both_alternatives_already_in_source(self):
+        # The LLM hallucinates "uncertainty" between two words that
+        # both appear in the original text — pointless to surface.
+        doubts = [
+            {
+                "timestamp": "00:01:00",
+                "text": "Pour passer commande on regarde le système",
+                "reason": 'doute sur "passer" qui pourrait être "passer" ou "système"',
+            }
+        ]
+        self.assertEqual(_filter_tautological_doubts(doubts), [])
+
+    def test_keeps_real_alternatives(self):
+        doubts = [
+            {
+                "timestamp": "00:02:35",
+                "text": "On peut sortir un fake",
+                "reason": 'doute sur le mot "fake" qui pourrait être "FEC"',
+            }
+        ]
+        out = _filter_tautological_doubts(doubts)
+        self.assertEqual(len(out), 1)
+
+    def test_drops_very_short_reasons(self):
+        # Garbage fragments from a misbehaving LLM — < 8 chars
+        # carries no actionable signal.
+        doubts = [
+            {"timestamp": "00:00:01", "text": "Allô", "reason": "doute"},
+            {"timestamp": "00:00:02", "text": "Allô", "reason": "X"},
+        ]
+        self.assertEqual(_filter_tautological_doubts(doubts), [])
+
+
+class GlossaryCapitalizationTest(unittest.TestCase):
+    """PR C — enforce canonical case for glossary terms in the final
+    rendered transcript. The user added ``Quadra`` / ``Excel`` /
+    ``Odoo`` to the glossary specifically to get those spellings;
+    Whisper + LLM steps don't always honor them.
+    """
+
+    def test_replaces_lowercase_with_canonical(self):
+        text = "On utilise quadra et excel."
+        out = _apply_glossary_capitalization(text, ["Quadra", "Excel"])
+        self.assertEqual(out, "On utilise Quadra et Excel.")
+
+    def test_respects_word_boundaries(self):
+        # ``quadra`` in ``quadragénaire`` is NOT the glossary term —
+        # word-boundary regex must protect it.
+        text = "C'est un quadragénaire qui utilise quadra."
+        out = _apply_glossary_capitalization(text, ["Quadra"])
+        self.assertEqual(
+            out, "C'est un quadragénaire qui utilise Quadra."
+        )
+
+    def test_preserves_speaker_brackets(self):
+        # Speaker names live inside ``[...]`` — never rewrite them
+        # via glossary substitution (could collide with a partner
+        # name like "Audoo" hypothetically matching "Odoo").
+        text = "[Odoo] On parle de odoo."
+        out = _apply_glossary_capitalization(text, ["Odoo"])
+        self.assertEqual(out, "[Odoo] On parle de Odoo.")
+
+    def test_skips_multi_word_terms(self):
+        # Multi-word glossary entries can have legitimate variants
+        # ("Power BI" vs "Power-BI"). Skip them rather than do
+        # brittle multi-token matching.
+        text = "On utilise power bi."
+        out = _apply_glossary_capitalization(text, ["Power BI"])
+        self.assertEqual(out, "On utilise power bi.")
+
+    def test_handles_empty_inputs_safely(self):
+        self.assertEqual(_apply_glossary_capitalization("", ["Odoo"]), "")
+        self.assertEqual(_apply_glossary_capitalization("text", []), "text")
+        self.assertEqual(_apply_glossary_capitalization("text", ["a"]), "text")
 
 
 class CurrentUserPreAttributionTest(unittest.TestCase):
