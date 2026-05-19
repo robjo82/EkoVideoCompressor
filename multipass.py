@@ -110,6 +110,74 @@ def score_segment(segment: dict) -> float:
     return 0.75 * lp_score + 0.15 * ns_score + 0.10 * cr_score
 
 
+def identify_boundary_segments(
+    segments: list[dict],
+    *,
+    max_duration: float = 2.0,
+    min_duration: float = 0.4,
+) -> list[WeakSegment]:
+    """Flag segments adjacent to a speaker change for re-transcription.
+
+    The diarisation projection from PR A handles MIS-LABELLED words
+    at boundaries (smoothing, orphan absorption, same-speaker merge).
+    But Whisper sometimes produces the WRONG WORDS at those bounds —
+    a single Whisper segment that spans an interruption gets the
+    whole sentence wrong because the model conditioned on the wrong
+    voice. Re-running Whisper on a tight clip around the boundary
+    with the higher-quality multipass model usually recovers it.
+
+    Heuristic :
+    - Speaker changes from one segment to the next.
+    - The shorter of the two adjacent segments is ≤ ``max_duration``.
+    - Each candidate must be ≥ ``min_duration`` (no point repassing
+      a 200 ms fragment — the model wouldn't even produce text).
+    - We deduplicate by index so a single segment in the middle of
+      a "ping-pong" exchange isn't repassed twice.
+    """
+    out: list[WeakSegment] = []
+    seen_indices: set[int] = set()
+    for i in range(len(segments)):
+        seg = segments[i]
+        try:
+            s = float(seg.get("start") or 0.0)
+            e = float(seg.get("end") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        duration = e - s
+        if duration < min_duration or duration > max_duration:
+            continue
+        speaker = (seg.get("speaker") or "").strip() or None
+        prev_speaker = (
+            (segments[i - 1].get("speaker") or "").strip()
+            if i > 0
+            else None
+        ) or None
+        next_speaker = (
+            (segments[i + 1].get("speaker") or "").strip()
+            if i + 1 < len(segments)
+            else None
+        ) or None
+        adjacent_change = (
+            (prev_speaker is not None and speaker is not None and prev_speaker != speaker)
+            or (next_speaker is not None and speaker is not None and next_speaker != speaker)
+        )
+        if not adjacent_change:
+            continue
+        if i in seen_indices:
+            continue
+        seen_indices.add(i)
+        out.append(
+            WeakSegment(
+                index=i,
+                start=s,
+                end=e,
+                score=0.5,
+                reason="frontière de diarisation",
+            )
+        )
+    return out
+
+
 def identify_weak_segments(
     segments: list[dict],
     *,
