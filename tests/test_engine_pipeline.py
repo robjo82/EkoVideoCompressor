@@ -835,9 +835,9 @@ class QualityPresetTest(unittest.TestCase):
 
     def test_max_preset_enables_only_wired_phases(self):
         # Audit: PR E wired per_speaker, PR H wired web_enrichment,
-        # both now flipped on in max preset. ``audio_recheck``
-        # (Qwen2-Audio) stays off until PR F ports the legacy
-        # multimodal recheck.
+        # PR F wired audio_recheck (Qwen2-Audio). All on by default
+        # in the max preset; the audio_recheck step degrades to a
+        # silent no-op when ``mlx_vlm`` isn't installed in the venv.
         settings = JobRequest.from_dict(
             {
                 "source_path": "/tmp/x.mov",
@@ -849,7 +849,7 @@ class QualityPresetTest(unittest.TestCase):
         self.assertTrue(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
         self.assertTrue(settings.per_speaker_enabled)
-        self.assertFalse(settings.audio_recheck_enabled)
+        self.assertTrue(settings.audio_recheck_enabled)
         self.assertTrue(settings.web_enrichment_enabled)
 
     def test_custom_preset_passes_individual_flags_through(self):

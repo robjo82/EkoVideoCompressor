@@ -169,13 +169,15 @@ QUALITY_PRESETS: dict[str, dict[str, bool]] = {
         # Everything wired in the engine today: VAD, multipass
         # (low-confidence + boundary), per-speaker Whisper pass
         # (PR E), web enrichment (PR H), context-aware Whisper
-        # + hot prompt enrichment (PR D). ``audio_recheck_enabled``
-        # (Qwen2-Audio) stays off until PR F ports the legacy
-        # multimodal recheck pass — see ``_MAX_PRESET_PENDING``.
+        # + hot prompt enrichment (PR D), multimodal audio recheck
+        # (PR F — Qwen2-Audio via ``mlx_vlm``). When the venv
+        # doesn't ship ``mlx_vlm`` the recheck step degrades to a
+        # silent no-op with a warning, so flipping it on here is safe
+        # even on machines that haven't installed the audio LLM yet.
         "vad_enabled": True,
         "multipass_enabled": True,
         "per_speaker_enabled": True,
-        "audio_recheck_enabled": False,
+        "audio_recheck_enabled": True,
         "web_enrichment_enabled": True,
         "condition_on_previous_text": True,
         "hot_prompt_enrichment": True,
@@ -186,11 +188,10 @@ QUALITY_PRESETS: dict[str, dict[str, bool]] = {
 # feature isn't wired in the new engine yet). The sentinel test in
 # ``tests/test_quality_presets.py`` uses this set to allow the gap
 # without losing the "max really is max" invariant for everything else.
-_MAX_PRESET_PENDING: frozenset[str] = frozenset(
-    {
-        "audio_recheck_enabled",  # PR F — Qwen2-Audio recheck port
-    }
-)
+# Empty now that PR F landed — the set stays around so future work
+# can re-introduce a pending knob without having to re-add the
+# scaffolding.
+_MAX_PRESET_PENDING: frozenset[str] = frozenset()
 
 
 def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSettings":
