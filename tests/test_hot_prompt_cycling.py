@@ -176,10 +176,14 @@ class ExtractNewProperNounsTests(unittest.TestCase):
         self.assertEqual(result[:2], ["Manon", "Robin"])
 
     def test_max_terms_caps_the_result(self):
-        # 5 repeated proper nouns; ask for only 3.
+        # 5 repeated proper nouns; ask for only 3. PR S adds a
+        # context-diversity guard so each candidate needs ≥ 2
+        # distinct preceding-word contexts. We rotate them so all
+        # five qualify.
         segments = self._segs(
-            "Manon Robin Léa Paul Théo.",
-            "Manon Robin Léa Paul Théo.",
+            "Avec Manon, puis Robin et ensuite Léa, on traite Paul ainsi que Théo.",
+            "Robin propose Manon, Léa demande Théo, et Paul valide.",
+            "Théo écoute Léa, Robin répond Paul, ensuite Manon enchaîne.",
         )
         result = extract_new_proper_nouns_from_segments(
             segments,
@@ -195,6 +199,76 @@ class ExtractNewProperNounsTests(unittest.TestCase):
         result = extract_new_proper_nouns_from_segments(segments)
         self.assertNotIn("A", result)
         self.assertNotIn("B", result)
+
+    # ---- PR S — anti-hallucination filters ------------------------
+
+    def test_phonetic_collision_with_existing_term_rejects_candidate(self):
+        # The canonical CVR-control regression: Whisper hallucinated
+        # ``Audoo`` (capitalised) ≥ 2 times in different contexts.
+        # Without the PR S filter, the extractor would learn it.
+        # With ``Odoo`` already in the glossary, the phonetic key
+        # collides → candidate refused.
+        segments = self._segs(
+            "On configure Audoo pour la partie e-commerce.",
+            "Et puis Audoo gère aussi la facturation.",
+        )
+        result = extract_new_proper_nouns_from_segments(
+            segments,
+            existing_terms=["Odoo"],
+        )
+        self.assertNotIn("Audoo", result)
+
+    def test_phonetic_collision_levenshtein_neighbours(self):
+        # ``Castell`` (Lev=1 on phonetic key vs ``Castel``) is
+        # still rejected — most likely a typo of an existing term.
+        segments = self._segs(
+            "Bonjour Castell, comment ça va ?",
+            "Le projet Castell avance bien.",
+        )
+        result = extract_new_proper_nouns_from_segments(
+            segments,
+            existing_terms=["Castel"],
+        )
+        self.assertNotIn("Castell", result)
+
+    def test_decoder_loop_repeated_inside_one_segment_rejected(self):
+        # ``application`` showing up 50× inside a single segment is
+        # a decoder loop signature, not a real proper noun. Our
+        # ``max_per_segment=3`` (default) refuses it.
+        loop_text = "Le site de " + "l'Application " * 20 + "fin."
+        segments = [
+            {"start": 0, "end": 10, "text": loop_text},
+            # Force ≥ 2 occurrences across segments so the
+            # ``min_occurrences`` check passes — otherwise the
+            # test would also pass for the wrong reason.
+            {"start": 11, "end": 12, "text": "Encore une Application."},
+        ]
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertNotIn("Application", result)
+        self.assertNotIn("application", result)
+
+    def test_locked_context_rejects_candidate(self):
+        # When every occurrence has the same preceding word, the
+        # candidate is part of a fixed phrase — not a name. The
+        # min_distinct_contexts=2 default rejects it.
+        segments = self._segs(
+            "On utilise le mode Standard.",
+            "On utilise le mode Standard.",
+            "On utilise le mode Standard.",
+        )
+        # "Standard" appears 3× but always preceded by "mode".
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertNotIn("Standard", result)
+
+    def test_diverse_contexts_keep_candidate(self):
+        # Same frequency but varied contexts → real name, kept.
+        segments = self._segs(
+            "On parle avec Manon de la migration.",
+            "Et puis Manon valide le devis.",
+            "Manon présente le résultat.",
+        )
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertIn("Manon", result)
 
 
 class PipelineHotEnrichmentTests(unittest.TestCase):
