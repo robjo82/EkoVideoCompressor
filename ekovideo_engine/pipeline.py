@@ -48,6 +48,7 @@ from transcription_utils import (
     build_mlx_whisper_cmd,
     canonical_multipass_model_id,
     default_transcript_path,
+    extract_new_proper_nouns_from_segments,
     fuse_micro_turns,
     parse_diarization_output,
     parse_embedding_output,
@@ -946,6 +947,64 @@ class TranscriptionPipeline:
         even after the recursion rewrite."""
         return str(self._ensure_odoo_pack().get("summary") or "")
 
+    def _hot_enrich_glossary(self, segments: list[dict]) -> None:
+        """
+        Fold proper-noun candidates discovered in the first Whisper
+        pass into ``self.request.glossary_terms`` so the multipass,
+        boundary multipass, per-speaker pass and LLM correction step
+        all see them in their ``--initial-prompt``.
+
+        Bounded to 20 new terms by default to keep the prompt under
+        ``INITIAL_PROMPT_MAX_CHARS`` (the prompt builder truncates
+        but truncation is silent — better to cap upstream).
+        """
+        try:
+            existing = [
+                *(self.request.glossary_terms or []),
+                *(self.request.technical_terms or []),
+                *(self._expected_speaker_names() or []),
+            ]
+            new_terms = extract_new_proper_nouns_from_segments(
+                segments,
+                existing_terms=existing,
+                min_occurrences=2,
+                max_terms=20,
+            )
+        except Exception as exc:  # pragma: no cover — guard rail
+            append_app_log(f"engine_hot_prompt_enrichment_failed err={exc!r}")
+            return
+
+        if not new_terms:
+            return
+
+        # Mutate the request in place so the downstream passes (which
+        # rebuild their initial_prompt from these lists every call)
+        # see the enriched vocabulary. Append rather than prepend so
+        # the user-provided / Odoo-derived glossary keeps priority in
+        # the prompt slots that fit before INITIAL_PROMPT_MAX_CHARS.
+        self.request.glossary_terms = [
+            *self.request.glossary_terms,
+            *new_terms,
+        ]
+        append_app_log(
+            "engine_hot_prompt_enrichment added="
+            + ",".join(new_terms[:10])
+            + (f" (+{len(new_terms) - 10} more)" if len(new_terms) > 10 else "")
+        )
+        # Surface the discovery to the UI as a ContextEvent so the
+        # rename sheet / glossary chips reflect the boosted vocabulary
+        # without the user having to inspect the JSONL stream.
+        try:
+            self.sink(
+                ContextEvent(
+                    technical_terms=list(new_terms),
+                )
+            )
+        except Exception:
+            # ContextEvent emission is decorative — never let it
+            # break the pipeline.
+            pass
+
     def _meeting_context(self) -> str:
         """Short topic line surfaced to Whisper as semantic prior.
 
@@ -1007,6 +1066,21 @@ class TranscriptionPipeline:
         results.append(whisper_result)
         if not whisper_result.ok or not segments:
             return results
+
+        # --- step 2*: hot prompt enrichment (PR D) --------------------
+        # Mine the first-pass transcript for repeated capitalised
+        # tokens that weren't in the glossary and fold them into
+        # ``self.request.glossary_terms`` *in place*. The downstream
+        # passes (multipass, boundary multipass, LLM, phonetic
+        # post-process) all read from that list when building their
+        # initial_prompt, so a single mutation propagates the
+        # discovery without re-Whispering the file in chunks.
+        if getattr(
+            self.request.transcription_settings,
+            "hot_prompt_enrichment",
+            False,
+        ):
+            self._hot_enrich_glossary(segments)
 
         # --- step 2bis: confidence-triaged second pass ----------------
         if self.request.transcription_settings.multipass_enabled:
@@ -1466,7 +1540,14 @@ class TranscriptionPipeline:
                 expected_speaker_names=self._expected_speaker_names(),
                 meeting_context=self._meeting_context(),
             ),
-            condition_on_previous_text=False,
+            # Context-aware decoding (PR D): off by default — the
+            # ``max`` preset turns it on. ``clean_whisper_segments``
+            # downstream drops decoder loops of length > 2 so a
+            # rogue hallucinated phrase can't poison more than two
+            # consecutive windows.
+            condition_on_previous_text=bool(
+                getattr(settings, "condition_on_previous_text", False)
+            ),
             word_timestamps=request_word_timestamps,
         )
         self.sink(ProgressEvent("whisper", 0, f"Running Whisper ({settings.model})"))

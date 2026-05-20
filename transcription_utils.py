@@ -1050,6 +1050,132 @@ def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
     return out
 
 
+# Short French function words / pronouns / forms that show up
+# capitalised at sentence-start but never qualify as proper nouns.
+# Kept folded (NFD-ascii lowercase) for the matcher.
+_FR_SENTENCE_START_NOISE: frozenset[str] = frozenset(
+    {
+        "a", "ah", "alors", "apres", "as", "au", "aussi", "autre", "autres",
+        "avec", "bah", "bien", "bon", "bonjour", "bonsoir", "ca", "car",
+        "ce", "ces", "cet", "cette", "chez", "comme", "comment", "d",
+        "dans", "de", "des", "deux", "dix", "donc", "donne", "donner",
+        "dont", "du", "elle", "elles", "en", "encore", "enfin", "entre",
+        "est", "et", "etre", "eu", "fait", "faire", "faut", "il", "ils",
+        "j", "je", "juste", "l", "la", "le", "les", "leur", "leurs", "lui",
+        "ma", "mais", "merci", "mes", "mois", "mon", "moi", "n", "ne",
+        "non", "nos", "notre", "nous", "ok", "on", "ou", "oui", "par",
+        "pas", "peu", "peut", "plus", "pour", "pourquoi", "quand", "que",
+        "quel", "quelle", "qu", "qui", "quoi", "s", "sa", "sans", "se",
+        "ses", "si", "soit", "son", "sont", "sous", "sur", "t", "ta",
+        "tes", "ton", "tout", "tous", "toute", "toutes", "tres", "trois",
+        "tu", "un", "une", "voici", "voila", "votre", "vos", "vous", "y",
+        # Common verb forms that begin sentences after a clause break and
+        # would otherwise sneak in (capitalised by Whisper after a period).
+        "c", "c'est", "qu'est", "qu'on", "qu'il", "qu'elle",
+    }
+)
+
+
+_PROPER_NOUN_TOKEN_RE = re.compile(
+    # Capitalised word (with optional intra-word apostrophe / hyphen)
+    # made of at least 2 letters. Accents accepted. We do not require
+    # the next character to be lowercase — proper nouns sometimes
+    # appear at end-of-sentence too.
+    r"\b([A-ZÀ-ÖØ-Þ][a-zà-öø-ÿĀ-ſ]{1,}(?:[-’'][A-ZÀ-ÖØ-Þa-zà-öø-ÿ]+)*)\b"
+)
+
+
+def _fold_term(value: str) -> str:
+    """Lowercased + accent-stripped form used as a dedupe / stopword key."""
+    folded = _fold_for_matching(value or "").lower()
+    return folded.strip()
+
+
+def extract_new_proper_nouns_from_segments(
+    segments: Iterable[dict],
+    *,
+    existing_terms: Iterable[str] = (),
+    min_occurrences: int = 2,
+    max_terms: int = 20,
+    min_length: int = 3,
+) -> list[str]:
+    """
+    Mine the first-pass Whisper transcript for proper-noun candidates
+    we can fold back into the prompt of subsequent passes (multipass,
+    boundary multipass, LLM).
+
+    "Hot prompt cycling" in the PR D sense: instead of re-running
+    Whisper on 5-minute chunks (which would 5× the wall time and
+    blow out the model's prompt-cache), we let the first pass
+    discover entities — repeated capitalised tokens — and feed them
+    back into the *next* pass's glossary. Because the multipass /
+    boundary / per-speaker passes all build their ``--initial-prompt``
+    from ``self.request.glossary_terms``, enriching that list in
+    place is enough to propagate the discovery.
+
+    A token qualifies when:
+      • It looks like a proper noun (initial capital, ≥ ``min_length``
+        letters, optional intra-word apostrophe / hyphen).
+      • It is *not* a French function word capitalised at sentence
+        start (``_FR_SENTENCE_START_NOISE``).
+      • It appears ``min_occurrences`` times or more across the
+        transcript (one-off mentions are too noisy to risk).
+      • It is not already present in ``existing_terms`` (case-
+        insensitive, accent-insensitive — so adding "Castel" is
+        skipped when the glossary already has "Castel").
+
+    Returns up to ``max_terms`` candidates ordered by descending
+    occurrence (then by first-occurrence order to keep results
+    deterministic on ties).
+    """
+    existing_keys = {
+        _fold_term(term)
+        for term in (existing_terms or [])
+        if _fold_term(term)
+    }
+
+    counts: dict[str, int] = {}
+    first_seen: dict[str, int] = {}
+    canonical: dict[str, str] = {}
+
+    order_idx = 0
+    for seg in segments or []:
+        text = str(seg.get("text", "") or "")
+        if not text:
+            continue
+        for match in _PROPER_NOUN_TOKEN_RE.finditer(text):
+            token = match.group(1)
+            if len(token) < min_length:
+                continue
+            key = _fold_term(token)
+            if not key:
+                continue
+            # Strip the apostrophe-suffix forms ("l'Adèle" → "Adèle")
+            # by re-running the matcher only on the head form. This
+            # also covers the elision case "d'Adèle".
+            if key in _FR_SENTENCE_START_NOISE:
+                continue
+            if key in existing_keys:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            if key not in first_seen:
+                first_seen[key] = order_idx
+                # Keep the first surface form we saw (likely mid-
+                # sentence, so capitalisation is meaningful rather
+                # than an artefact of sentence-start).
+                canonical[key] = token
+            order_idx += 1
+
+    qualifying = [
+        (key, count)
+        for key, count in counts.items()
+        if count >= min_occurrences
+    ]
+    qualifying.sort(key=lambda kv: (-kv[1], first_seen[kv[0]]))
+
+    return [canonical[key] for key, _ in qualifying[:max_terms]]
+
+
 # The LLM post-process used to ask the model for {title, speakers,
 # corrections, uncertain_passages} in a single 1800-token JSON blob.
 # In practice mlx_lm + Mistral-7B-4bit drifts past ~700 tokens of JSON
