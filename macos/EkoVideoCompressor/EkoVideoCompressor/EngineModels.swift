@@ -486,10 +486,11 @@ enum TranscriptionQualityPreset: String, Codable, CaseIterable, Identifiable {
             return "VAD + repasse haute qualité + relecture LLM. Recommandé pour la plupart des réunions."
         case .max:
             // Honest description of what the orchestrator actually
-            // wires today. Kept tight on purpose — adding "réécoute
-            // IA" / "enrichissement web" promised features the
-            // engine didn't deliver, and users noticed.
-            return "Tout activer : VAD + repasse large-v3 sur les zones douteuses + diarisation + relecture LLM."
+            // wires today. The list is kept in sync with
+            // ``QUALITY_PRESETS["max"]`` in the engine (PR L) ;
+            // ``audio_recheck_enabled`` is the only quality knob
+            // that ``max`` still leaves off — pending PR F.
+            return "Tout activer : VAD + repasses haute qualité (zones douteuses + frontières de locuteurs) + passe per-locuteur + relecture LLM + enrichissement web du glossaire + Whisper contexte croisé."
         case .custom:
             return "Conserve les bascules avancées telles que définies."
         }
