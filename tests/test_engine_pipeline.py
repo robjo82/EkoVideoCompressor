@@ -993,6 +993,15 @@ class SpokenPunctuationTest(unittest.TestCase):
         out = apply_spoken_punctuation_in_email_contexts(text)
         self.assertEqual(out, text)
 
+    def test_arobas_variants_also_substitute(self):
+        # PR P — Whisper transcribes "arobase" as ``Arrobas`` /
+        # ``arobas`` on the Caste call. All these variants now
+        # map to ``@`` in email context.
+        for variant in ("Arrobas", "Arobas", "arobaze"):
+            text = f"C'est manon {variant} caste.fr"
+            out = apply_spoken_punctuation_in_email_contexts(text)
+            self.assertIn("manon@caste.fr", out, variant)
+
 
 class ReconstructSpelledTextEndToEndTest(unittest.TestCase):
     """End-to-end wrapper — pin the Caste-style input gets cleaned up."""
