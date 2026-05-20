@@ -533,4 +533,17 @@ struct TranscriptionSettings: Codable {
     /// the cold-start problem where every meeting starts with
     /// SPEAKER_00 unresolved.
     var current_user_name: String = ""
+    /// Whisper ``--condition-on-previous-text``. When True, decoded
+    /// text from window N is fed into the prompt of window N+1 to
+    /// stabilise proper nouns across the meeting. The ``max`` preset
+    /// enables it; balanced/fast keep it off because runaway decoder
+    /// loops on long silences are harder to detect than they're
+    /// worth in those modes. Engine clamps decoder loops > 2
+    /// downstream so the worst case is bounded.
+    var condition_on_previous_text: Bool = false
+    /// When True, after the first Whisper pass the engine mines the
+    /// transcript for repeated proper nouns and folds them into the
+    /// glossary in-process. Cheaper alternative to chunked re-passes
+    /// at 5-minute boundaries. ``max`` preset toggles this on.
+    var hot_prompt_enrichment: Bool = false
 }

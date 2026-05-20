@@ -90,6 +90,24 @@ class TranscriptionSettings:
     # the user even before any voiceprint has been enrolled. Empty
     # string disables the heuristic.
     current_user_name: str = ""
+    # Whisper's ``--condition-on-previous-text`` propagates the
+    # decoded text of window N into the prompt of window N+1, which
+    # boosts coherence and proper-noun stability across the meeting
+    # (a name decoded right in minute 5 carries into minute 10).
+    # Historically disabled because the decoder can latch onto a
+    # hallucinated phrase and repeat it for minutes; we mitigate
+    # downstream with ``clean_whisper_segments`` (drops decoder loops
+    # of length > 2) and the multipass on weak segments. Off by
+    # default for fast/balanced/custom — enabled by the ``max`` preset.
+    condition_on_previous_text: bool = False
+    # When True, after the first Whisper pass the engine scans the
+    # transcript for repeated capitalised tokens not already in the
+    # glossary and folds them into ``glossary_terms`` *in-process*
+    # so the downstream passes (multipass, boundary multipass, LLM)
+    # see an enriched prompt. Cheaper than re-running Whisper on
+    # 5-minute chunks while still capturing the "name learned in
+    # minute 5 helps minute 10" effect. Enabled by ``max`` preset.
+    hot_prompt_enrichment: bool = False
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":
@@ -128,7 +146,8 @@ def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSet
         # Everything wired in the engine today: VAD, multipass
         # (low-confidence + boundary), diarisation with word-level
         # speaker attribution, LLM post-process, per-speaker Whisper
-        # pass (PR E), web enrichment (PR H, gated by network).
+        # pass (PR E), web enrichment (PR H, gated by network),
+        # context-aware Whisper + hot prompt enrichment (PR D).
         # ``audio_recheck_enabled`` (Qwen2-Audio) stays off until
         # PR F ports the legacy multimodal recheck pass.
         settings.vad_enabled = True
@@ -136,6 +155,8 @@ def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSet
         settings.per_speaker_enabled = True
         settings.audio_recheck_enabled = False
         settings.web_enrichment_enabled = True
+        settings.condition_on_previous_text = True
+        settings.hot_prompt_enrichment = True
     # 'custom' (or any other value) is a passthrough — leave the
     # individual flags as the caller set them.
     return settings
