@@ -49,7 +49,12 @@ from transcription_utils import (
     canonical_multipass_model_id,
     default_transcript_path,
     extract_new_proper_nouns_from_segments,
+    build_multimodal_audio_cmd,
+    build_multimodal_recheck_prompt,
+    format_seconds_for_clip,
     fuse_micro_turns,
+    parse_multimodal_audio_response,
+    _timestamp_text_to_seconds as timestamp_text_to_seconds,
     parse_diarization_output,
     parse_embedding_output,
     parse_llm_corrections_markdown,
@@ -796,6 +801,12 @@ class TranscriptionPipeline:
         self.final_speaker_map: dict[str, str] = {}
         self.final_technical_terms: list[str] = []
         self.final_title: str = ""
+        # ``mlx_vlm`` probe is cached because importing it can take
+        # ~1 s and the audio recheck step runs N subprocesses in
+        # sequence — probing once per pipeline is plenty. ``None``
+        # means "not probed yet", True / False are the resolved
+        # values.
+        self._mlx_vlm_available: bool | None = None
 
     def _resolve_managed_python(self) -> None:
         settings = self.request.transcription_settings
@@ -1186,6 +1197,17 @@ class TranscriptionPipeline:
         llm_result = self._run_llm_post(analysis_segments, transcript_path)
         if llm_result is not None:
             results.append(llm_result)
+
+        # --- step 5ter: multimodal audio recheck (PR F) ---------------
+        # Re-listen to every passage the text LLM flagged as uncertain
+        # with Qwen2-Audio via ``mlx_vlm``. Mutates the doubt entries
+        # in place so ``_write_review_markdown`` can surface the
+        # multimodal suggestions next to the original passage. Opt-in
+        # via ``audio_recheck_enabled`` (Max preset turns it on once
+        # the venv ships ``mlx_vlm``).
+        audio_recheck_result = self._run_audio_recheck(whisper_wav, workspace)
+        if audio_recheck_result is not None:
+            results.append(audio_recheck_result)
 
         # --- step 5bis: apply LLM speaker renames if any --------------
         speakers = self._llm_payload.get("speakers") or {}
@@ -2643,6 +2665,239 @@ class TranscriptionPipeline:
         )
 
     # ------------------------------------------------------------------
+    # Step 5ter — multimodal audio recheck (Qwen2-Audio via mlx_vlm)
+    # ------------------------------------------------------------------
+
+    _AUDIO_RECHECK_MAX_PASSAGES = 10
+    _AUDIO_RECHECK_PRE_SECONDS = 5.0
+    _AUDIO_RECHECK_POST_SECONDS = 10.0
+    _AUDIO_RECHECK_TIMEOUT_SECONDS = 600
+
+    def _ensure_mlx_vlm_available(self) -> bool:
+        """Probe whether ``mlx_vlm`` is importable in the managed venv.
+
+        Cached: the probe runs at most once per pipeline. Unlike the
+        legacy ``video_compactor`` we *don't* auto-install — the new
+        engine pins its dependencies via ``managed_venv`` and a
+        surprise ``pip install`` from inside the runner has historically
+        deadlocked the SwiftUI progress bar. If ``mlx_vlm`` is missing
+        the user can opt back out of ``audio_recheck_enabled`` (or
+        let the preset turn it on once the venv ships with it).
+        """
+        if self._mlx_vlm_available is not None:
+            return self._mlx_vlm_available
+        venv_python = self.request.transcription_settings.venv_python_path
+        if not venv_python or not Path(venv_python).exists():
+            self._mlx_vlm_available = False
+            return False
+        try:
+            probe = subprocess.run(
+                [venv_python, "-c", "import mlx_vlm"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=self._subprocess_env(),
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            append_app_log(f"engine_mlx_vlm_probe_error err={exc!r}")
+            self._mlx_vlm_available = False
+            return False
+        ok = probe.returncode == 0
+        self._mlx_vlm_available = ok
+        if not ok:
+            append_app_log(
+                f"engine_mlx_vlm_unavailable rc={probe.returncode} "
+                f"stderr={tail_text(probe.stderr)!r}"
+            )
+        return ok
+
+    def _run_audio_recheck(
+        self, whisper_wav: Path, workspace: Path
+    ) -> StepResult | None:
+        """
+        Run a short multimodal pass (Qwen2-Audio via ``mlx_vlm``) on
+        every passage the text LLM flagged as uncertain. Each
+        passage is re-listened to in isolation (clip window = pre/post
+        seconds around the timestamp) so the audio model can suggest
+        a transcription that lines up with the meeting's vocabulary.
+
+        Returns ``None`` (no StepResult appended) when the feature is
+        off, gated by a missing dependency, or there's nothing to
+        recheck — so the SwiftUI step list only grows when actual
+        work was done.
+
+        Mutates ``self._llm_payload["uncertain_passages"]`` in place:
+        each processed passage gains a ``suggestion`` (and a
+        ``clip_path`` for the review markdown to optionally render
+        an audio link). This is the same contract the legacy
+        ``_run_clip_rechecks`` produced.
+        """
+        settings = self.request.transcription_settings
+        if not getattr(settings, "audio_recheck_enabled", False):
+            return None
+        passages = list(self._llm_payload.get("uncertain_passages") or [])
+        if not passages:
+            return None
+        venv_python = settings.venv_python_path
+        if not venv_python or not Path(venv_python).exists():
+            append_app_log(
+                "engine_audio_recheck_skipped reason=no_venv_python"
+            )
+            return None
+        if not self._ensure_mlx_vlm_available():
+            self.sink(
+                WarningEvent(
+                    "Réécoute IA ignorée (mlx-vlm indisponible).",
+                    code="audio_recheck_mlx_vlm_missing",
+                )
+            )
+            return None
+        if not whisper_wav.exists():
+            return None
+
+        clip_dir = workspace / "audio_recheck_clips"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+
+        glossary_text = "\n".join(
+            [
+                *(self.request.glossary_terms or []),
+                *(self.request.technical_terms or []),
+            ]
+        )
+
+        ts = time.monotonic()
+        total = min(len(passages), self._AUDIO_RECHECK_MAX_PASSAGES)
+        self.sink(
+            ProgressEvent(
+                "audio_recheck",
+                0,
+                f"Réécoute IA des passages douteux ({total}× Qwen2-Audio)",
+            )
+        )
+
+        suggestions = 0
+        failures = 0
+        ffmpeg_path = self.request.compression_settings.ffmpeg_path or "ffmpeg"
+
+        for index, passage in enumerate(passages[:total], start=1):
+            if not isinstance(passage, dict):
+                continue
+            timestamp = str(passage.get("timestamp") or "").strip()
+            if not timestamp:
+                continue
+            try:
+                center = timestamp_text_to_seconds(timestamp)
+            except Exception:
+                continue
+            if center <= 0:
+                continue
+            start = max(0.0, center - self._AUDIO_RECHECK_PRE_SECONDS)
+            end = center + self._AUDIO_RECHECK_POST_SECONDS
+
+            clip_wav = clip_dir / f"clip_{index:02d}.wav"
+            extract_cmd = build_audio_extract_cmd(
+                ffmpeg_path,
+                str(whisper_wav),
+                str(clip_wav),
+                # The recheck clip is short (≤ 15 s); the heavier
+                # enhancement filters add little here and can mask the
+                # very phoneme cue the user wants Qwen2-Audio to hear.
+                speech_enhance=False,
+                ss=format_seconds_for_clip(start),
+                to=format_seconds_for_clip(end),
+            )
+            try:
+                subprocess.run(
+                    extract_cmd,
+                    capture_output=True,
+                    timeout=60,
+                    env=self._subprocess_env(),
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                append_app_log(
+                    f"engine_audio_recheck_clip_extract_failed "
+                    f"timestamp={timestamp!r} err={exc!r}"
+                )
+                failures += 1
+                continue
+            if not clip_wav.exists():
+                failures += 1
+                continue
+
+            passage["clip_path"] = str(clip_wav)
+
+            prompt = build_multimodal_recheck_prompt(
+                whisper_text=str(passage.get("text") or ""),
+                reason=str(passage.get("reason") or ""),
+                glossary=glossary_text,
+            )
+
+            cmd = build_multimodal_audio_cmd(
+                venv_python_path=venv_python,
+                model_path=settings.audio_llm_model,
+                audio_path=str(clip_wav),
+                prompt=prompt,
+            )
+            self.sink(
+                ProgressEvent(
+                    "audio_recheck",
+                    int(100 * index / max(total, 1)),
+                    f"Réécoute IA {index}/{total} ({timestamp})",
+                )
+            )
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._AUDIO_RECHECK_TIMEOUT_SECONDS,
+                    env=self._subprocess_env(),
+                )
+            except subprocess.TimeoutExpired:
+                append_app_log(
+                    f"engine_audio_recheck_timeout timestamp={timestamp!r}"
+                )
+                failures += 1
+                continue
+            if proc.returncode != 0:
+                append_app_log(
+                    f"engine_audio_recheck_failed timestamp={timestamp!r} "
+                    f"rc={proc.returncode} stderr={tail_text(proc.stderr)!r}"
+                )
+                failures += 1
+                continue
+
+            payload = parse_multimodal_audio_response(proc.stdout)
+            suggestion = str(payload.get("suggestion") or "").strip()
+            if not suggestion:
+                # ``mlx_vlm`` returned either an error JSON or
+                # something we couldn't parse — keep going but log.
+                err = str(payload.get("error") or "").strip()
+                append_app_log(
+                    f"engine_audio_recheck_no_suggestion "
+                    f"timestamp={timestamp!r} err={err!r}"
+                )
+                failures += 1
+                continue
+
+            passage["suggestion"] = suggestion
+            suggestions += 1
+
+        self.sink(ProgressEvent("audio_recheck", 100, "Réécoute IA terminée"))
+        duration = time.monotonic() - ts
+        return StepResult(
+            "audio_recheck",
+            True,
+            model=settings.audio_llm_model,
+            duration_seconds=duration,
+            metrics={
+                "rechecked": total,
+                "suggestions": suggestions,
+                "failures": failures,
+            },
+        )
+
+    # ------------------------------------------------------------------
     # Speaker rename + transcript writers
     # ------------------------------------------------------------------
 
@@ -2929,6 +3184,17 @@ class TranscriptionPipeline:
                     f"- `{d.get('timestamp', '—')}` {d.get('text', '')} "
                     f"_(raison : {d.get('reason', '—')})_"
                 )
+                # PR F: surface the multimodal recheck suggestion when
+                # the audio model produced one. Rendered as an indented
+                # bullet so the relationship to the parent doubt stays
+                # visible at a glance — the user can scan the column
+                # for "📣" markers and judge in seconds whether
+                # Qwen2-Audio caught what Whisper missed.
+                suggestion = str(d.get("suggestion") or "").strip()
+                if suggestion:
+                    lines.append(
+                        f"  - 📣 Réécoute IA suggère : {suggestion}"
+                    )
             lines.append("")
 
         review_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

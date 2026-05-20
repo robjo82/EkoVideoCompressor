@@ -181,8 +181,10 @@ class ApplyQualityPresetTests(unittest.TestCase):
         self.assertTrue(result.web_enrichment_enabled)
         self.assertTrue(result.condition_on_previous_text)
         self.assertTrue(result.hot_prompt_enrichment)
-        # Still off — pending PR F.
-        self.assertFalse(result.audio_recheck_enabled)
+        # PR F: ``audio_recheck_enabled`` now wired in the engine —
+        # the step is opt-in via this flag and degrades to a silent
+        # no-op when ``mlx_vlm`` isn't installed.
+        self.assertTrue(result.audio_recheck_enabled)
 
     def test_custom_preset_is_passthrough(self):
         settings = TranscriptionSettings(

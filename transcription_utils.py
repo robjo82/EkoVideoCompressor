@@ -461,6 +461,20 @@ def _timestamp_text_to_seconds(value: str) -> float:
     return 0.0
 
 
+def format_seconds_for_clip(seconds: float) -> str:
+    """Render a duration as a short ``ffmpeg``-compatible string.
+
+    ``-ss`` / ``-to`` accept plain decimal seconds; we trim trailing
+    zeros so the audit log line shows ``"42"`` instead of
+    ``"42.00"`` for the common integer case. Negative inputs clamp
+    to 0 — every caller (clip extraction, repass timestamps) is
+    upstream-protected against negative ranges but we belt-and-
+    braces it here too.
+    """
+    seconds = max(0.0, float(seconds))
+    return f"{seconds:.2f}".rstrip("0").rstrip(".")
+
+
 def _person_aliases_from_terms(glossary_terms: list[str]) -> dict[str, set[str]]:
     """
     Extract likely person names from glossary terms.
@@ -2685,3 +2699,65 @@ def build_multimodal_audio_cmd(
     prompt: str,
 ) -> list[str]:
     return [venv_python_path, "-c", _MULTIMODAL_AUDIO_SCRIPT, model_path, audio_path, prompt]
+
+
+def parse_multimodal_audio_response(stdout: str) -> dict:
+    """Decode the JSON line emitted by ``_MULTIMODAL_AUDIO_SCRIPT``.
+
+    The embedded script prints exactly one JSON object on its last
+    line — either ``{"suggestion": "..."}`` on success or
+    ``{"error": "..."}`` on failure. Earlier lines may contain
+    progress chatter from ``mlx_vlm`` itself, so we always parse
+    the last non-empty line.
+
+    Returns an empty dict on parse failure rather than raising —
+    the caller treats "no suggestion" as "skip this passage" and
+    keeps going.
+    """
+    if not stdout:
+        return {}
+    lines = [line for line in stdout.strip().splitlines() if line.strip()]
+    if not lines:
+        return {}
+    last = lines[-1].strip()
+    try:
+        payload = json.loads(last)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def build_multimodal_recheck_prompt(
+    *,
+    whisper_text: str,
+    reason: str,
+    glossary: str = "",
+) -> str:
+    """Compose the French prompt sent to Qwen2-Audio.
+
+    Ported verbatim from the legacy ``_run_clip_rechecks`` (with the
+    glossary-priority sentence) so the new engine and the old app
+    produce comparable suggestions on the same passage. Kept here
+    rather than buried in the pipeline so we can unit-test the
+    prompt construction without spinning up the orchestrator.
+    """
+    glossary_hint = ""
+    if (glossary or "").strip():
+        glossary_hint = (
+            f"\nVocabulaire métier attendu (priorité absolue) : "
+            f"{glossary.strip()}"
+        )
+    return (
+        "Tu écoutes un court extrait d'une réunion en français.\n"
+        f"Whisper hésite sur : « {whisper_text} ».\n"
+        f"Raison du doute : {reason}.{glossary_hint}\n"
+        "Compare l'audio aux termes du vocabulaire : les noms propres, "
+        "marques, logiciels et acronymes doivent être orthographiés "
+        "exactement comme dans ce vocabulaire si le son correspond. "
+        "Corrige aussi les mots absurdes vers le mot français évident "
+        "quand la proximité phonétique est forte.\n"
+        "Que dit réellement la personne dans cet extrait ? "
+        "Réponds par la phrase exacte, sans commentaire."
+    )
