@@ -404,6 +404,91 @@ def _replace_token_preserve_case(replacement: str, original_token: str) -> str:
     return replacement
 
 
+def _joined_phonetic_key(words: list[str]) -> str:
+    """Concatenate per-word phonetic keys.
+
+    Used by the merged-window matcher to compare a multi-token
+    transcript window against any glossary entry (single or multi-
+    token). Lets us catch ``pouvoir bien`` → ``Power BI`` and similar
+    cases where Whisper hallucinated a multi-word surface for a
+    single glossary token (the existing per-token matcher's surface
+    guard rejects ``pouvoir`` vs ``power`` because their orthographic
+    distance is 4 — but the joined phonetic key only differs by 1).
+    """
+    return "".join(french_phonetic_key(w) for w in words if w)
+
+
+def _try_merged_window_match(
+    tokens: list[str],
+    word_idx: list[int],
+    pos: int,
+    entries: list[_GlossaryEntry],
+    consumed: list[bool],
+) -> tuple[_GlossaryEntry, int, int] | None:
+    """Match a 2-3 token transcript window against any glossary
+    entry's joined phonetic key.
+
+    Returns ``(entry, start_idx, end_idx)`` of the best match, or
+    ``None`` when no entry crosses the threshold. Conservative on
+    purpose: thresholds tighten as the entry key shortens so a
+    3-char key like ``Odoo``'s ADA doesn't sweep half the French
+    language into "matches".
+    """
+    best: tuple[_GlossaryEntry, int, int, int] | None = None
+    for window_size in (2, 3):
+        if pos + window_size > len(word_idx):
+            continue
+        window_indices = word_idx[pos : pos + window_size]
+        if any(consumed[i] for i in window_indices):
+            continue
+        window_words = [tokens[i] for i in window_indices]
+        window_key = _joined_phonetic_key(window_words)
+        if len(window_key) < 5:
+            # Too short — too easy to collide with random French.
+            continue
+        for entry in entries:
+            entry_key = "".join(entry.keys)
+            if len(entry_key) < 4:
+                continue
+            # Scale tolerance with the entry key length so we don't
+            # turn ``Odoo``'s 3-char key into a free-for-all.
+            if len(entry_key) <= 5:
+                threshold = 1
+            elif len(entry_key) <= 8:
+                threshold = 2
+            else:
+                threshold = 3
+            dist = _levenshtein(window_key, entry_key, limit=threshold + 1)
+            if dist > threshold:
+                continue
+            # Surface safety net: the first letters of the joined
+            # transcript window and the entry should share at least
+            # one prefix letter. Stops ``le matin`` from masquerading
+            # as ``Mathieu``-style matches.
+            window_surface = _surface_letters("".join(window_words))
+            entry_surface = _surface_letters("".join(entry.tokens))
+            if not window_surface or not entry_surface:
+                continue
+            if window_surface[:1] != entry_surface[:1]:
+                continue
+            # Anti-collapse guard: if the window already contains the
+            # canonical glossary form as one of its tokens, this is
+            # a real sentence (``Mollie et Klarna``), not a Whisper
+            # hallucination — never collapse it.
+            entry_canonical_lower = entry.term.lower()
+            if any(
+                w.lower() == entry_canonical_lower for w in window_words
+            ):
+                continue
+            score = -dist  # negative so smaller distance is "better"
+            if best is None or score > best[3]:
+                best = (entry, window_indices[0], window_indices[-1], score)
+    if best is None:
+        return None
+    entry, start, end, _ = best
+    return entry, start, end
+
+
 def apply_glossary_to_text(
     text: str,
     terms: list[str],
@@ -497,6 +582,48 @@ def apply_glossary_to_text(
         )
         # Advance past the matched run.
         while pos < len(word_idx) and word_idx[pos] <= end_idx:
+            pos += 1
+
+    # Second pass: merged-window matching. Catches cases where
+    # Whisper hallucinated a multi-token surface for a glossary
+    # term (e.g. ``pouvoir bien`` → ``Power BI`` — the surface
+    # distance per-token is too high for tier 1 but the joined
+    # phonetic key is within 1 edit). Walks the still-unconsumed
+    # word positions only.
+    pos = 0
+    while pos < len(word_idx):
+        idx = word_idx[pos]
+        if consumed[idx]:
+            pos += 1
+            continue
+        match = _try_merged_window_match(tokens, word_idx, pos, entries, consumed)
+        if match is None:
+            pos += 1
+            continue
+        entry, start, end = match
+        # Replace the first token; clear the rest in the window.
+        window_start = max(0, start - 6)
+        window_end = min(len(tokens), end + 7)
+        before_ctx = "".join(tokens[window_start:start]).strip()
+        after_ctx = "".join(tokens[end + 1 : window_end]).strip()
+        original_span = "".join(tokens[start : end + 1])
+        first_replacement = _replace_token_preserve_case(entry.term, tokens[start])
+        tokens[start] = first_replacement
+        for k in range(start + 1, end + 1):
+            tokens[k] = ""
+            consumed[k] = True
+        consumed[start] = True
+        substitutions.append(
+            GlossarySubstitution(
+                original=original_span,
+                replacement=first_replacement,
+                confidence=0.78,
+                method="merged_window",
+                context_before=before_ctx,
+                context_after=after_ctx,
+            )
+        )
+        while pos < len(word_idx) and word_idx[pos] <= end:
             pos += 1
 
     return "".join(tokens), substitutions

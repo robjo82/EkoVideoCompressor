@@ -375,8 +375,15 @@ _SPELLING_SEQUENCE_RE = re.compile(
 
 # Map common spoken-punctuation tokens to their symbolic form.
 # Applied case-insensitively, surrounded by whole-word boundaries.
+# Variants like ``arrobas`` / ``arobas`` cover the typical Whisper
+# transcriptions of ``arobase`` said aloud (the actual Caste call
+# came out as ``Arrobas``).
 _SPOKEN_PUNCTUATION = {
     "arobase": "@",
+    "arrobase": "@",
+    "arrobas": "@",
+    "arobas": "@",
+    "arobaze": "@",
     "at": "@",
     "point": ".",
     "dot": ".",

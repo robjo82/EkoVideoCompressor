@@ -207,5 +207,47 @@ class RobustnessTest(unittest.TestCase):
         self.assertIn("Mollie", new)
 
 
+class MergedWindowMatchingTest(unittest.TestCase):
+    """PR P — catch Whisper's multi-token hallucinations like
+    ``pouvoir bien`` for ``Power BI``. The per-token matcher's
+    surface guard rejects ``pouvoir`` vs ``power`` because Lev=4,
+    but the joined phonetic key only differs by 1."""
+
+    def test_pouvoir_bien_collapses_to_power_bi(self):
+        text = "On utilise du pouvoir bien pour la data."
+        new, subs = apply_glossary_to_text(text, ["Power BI"])
+        self.assertIn("Power BI", new)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0].method, "merged_window")
+
+    def test_short_glossary_term_does_not_overmatch(self):
+        # ``Odoo`` (ADA key, 3 chars) must NOT match arbitrary
+        # 2-token French. The min key length guard (≥ 4 on the
+        # entry side) blocks ``Odoo`` from getting picked at all
+        # by the merged-window pass — it's too phonetically risky.
+        text = "Bonjour à tous, comment ça va ?"
+        new, subs = apply_glossary_to_text(text, ["Odoo"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_first_letter_safety_net(self):
+        # The first letters of the joined window vs the entry's
+        # joined surface must match. Stops cross-letter phonetic
+        # collisions.
+        text = "Le matin nous a surpris."
+        new, subs = apply_glossary_to_text(text, ["Sudokies"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_window_does_not_consume_already_substituted_tokens(self):
+        # When the first pass already substituted a token, the
+        # merged-window pass walks past it instead of re-attempting.
+        text = "Sudokiz et pouvoir bien."
+        new, subs = apply_glossary_to_text(text, ["Sudokies", "Power BI"])
+        # Both substitutions applied independently.
+        self.assertIn("Sudokies", new)
+        self.assertIn("Power BI", new)
+
+
 if __name__ == "__main__":
     unittest.main()
