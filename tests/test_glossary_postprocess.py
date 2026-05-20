@@ -211,22 +211,34 @@ class MergedWindowMatchingTest(unittest.TestCase):
     """PR P — catch Whisper's multi-token hallucinations like
     ``pouvoir bien`` for ``Power BI``. The per-token matcher's
     surface guard rejects ``pouvoir`` vs ``power`` because Lev=4,
-    but the joined phonetic key only differs by 1."""
+    but the joined phonetic key only differs by 1.
+
+    PR R — merged-window is gated behind ``merged_window_enabled``
+    (default False). These tests opt in explicitly to exercise
+    the path. Production callers in ``pipeline.py`` leave it off
+    because the failure modes audited on the CVR run outweighed
+    the win on ``pouvoir bien``-style hallucinations.
+    """
 
     def test_pouvoir_bien_collapses_to_power_bi(self):
         text = "On utilise du pouvoir bien pour la data."
-        new, subs = apply_glossary_to_text(text, ["Power BI"])
+        new, subs = apply_glossary_to_text(
+            text, ["Power BI"], merged_window_enabled=True
+        )
         self.assertIn("Power BI", new)
         self.assertEqual(len(subs), 1)
         self.assertEqual(subs[0].method, "merged_window")
 
     def test_short_glossary_term_does_not_overmatch(self):
         # ``Odoo`` (ADA key, 3 chars) must NOT match arbitrary
-        # 2-token French. The min key length guard (≥ 4 on the
-        # entry side) blocks ``Odoo`` from getting picked at all
-        # by the merged-window pass — it's too phonetically risky.
+        # 2-token French. PR R raised the minimum entry key length
+        # to 5, so ``Odoo`` is rejected for merged-window outright
+        # — the per-token matcher already handles single-token
+        # glossary terms.
         text = "Bonjour à tous, comment ça va ?"
-        new, subs = apply_glossary_to_text(text, ["Odoo"])
+        new, subs = apply_glossary_to_text(
+            text, ["Odoo"], merged_window_enabled=True
+        )
         self.assertEqual(new, text)
         self.assertEqual(subs, [])
 
@@ -235,7 +247,9 @@ class MergedWindowMatchingTest(unittest.TestCase):
         # joined surface must match. Stops cross-letter phonetic
         # collisions.
         text = "Le matin nous a surpris."
-        new, subs = apply_glossary_to_text(text, ["Sudokies"])
+        new, subs = apply_glossary_to_text(
+            text, ["Sudokies"], merged_window_enabled=True
+        )
         self.assertEqual(new, text)
         self.assertEqual(subs, [])
 
@@ -243,10 +257,68 @@ class MergedWindowMatchingTest(unittest.TestCase):
         # When the first pass already substituted a token, the
         # merged-window pass walks past it instead of re-attempting.
         text = "Sudokiz et pouvoir bien."
-        new, subs = apply_glossary_to_text(text, ["Sudokies", "Power BI"])
+        new, subs = apply_glossary_to_text(
+            text,
+            ["Sudokies", "Power BI"],
+            merged_window_enabled=True,
+        )
         # Both substitutions applied independently.
         self.assertIn("Sudokies", new)
         self.assertIn("Power BI", new)
+
+    # -- PR R regression tests --------------------------------------
+
+    def test_merged_window_disabled_by_default(self):
+        # Same input as test_pouvoir_bien_collapses_to_power_bi but
+        # without opting in. The merged-window pass stays silent.
+        text = "On utilise du pouvoir bien pour la data."
+        new, subs = apply_glossary_to_text(text, ["Power BI"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_stoplist_rejects_function_word_window_par(self):
+        # The canonical CVR-control failure: ``par`` is on the
+        # stoplist, so even with merged_window on it never gets
+        # rewritten to ``Parce``.
+        text = "Donc par exemple on regarde."
+        new, subs = apply_glossary_to_text(
+            text, ["Parce"], merged_window_enabled=True
+        )
+        self.assertIn("par", new)
+        self.assertNotIn("Parce", new)
+
+    def test_stoplist_rejects_function_word_window_vient_ici(self):
+        # ``vient ici`` got rewritten to ``Vincent`` (a glossary
+        # speaker name) on the CVR audit. ``vient`` and ``ici``
+        # are both on the stoplist → window refused.
+        text = "Le commercial vient ici tous les jeudis."
+        new, subs = apply_glossary_to_text(
+            text, ["Vincent"], merged_window_enabled=True
+        )
+        self.assertNotIn("Vincent", new)
+        self.assertEqual(subs, [])
+
+    def test_stoplist_rejects_function_word_window_du_coup_sur(self):
+        # ``Du coup, sur`` → ``Document`` was another offender.
+        # ``du`` and ``sur`` are both stoplisted.
+        text = "Du coup, sur la facture il y a un lien."
+        new, subs = apply_glossary_to_text(
+            text, ["Document"], merged_window_enabled=True
+        )
+        self.assertNotIn("Document", new)
+
+    def test_two_letter_surface_guard(self):
+        # ``le sont`` (LS surface) used to match ``Laurent`` (LRN
+        # surface) because they share the first letter ``L``. PR R
+        # raised the shared-prefix requirement to 2 letters → window
+        # rejected. Plus ``le`` and ``sont`` are both stoplisted —
+        # this test pins the surface guard layer specifically with
+        # non-stoplisted tokens.
+        text = "Lutter contre l'évasion fiscale."
+        new, subs = apply_glossary_to_text(
+            text, ["Laurent"], merged_window_enabled=True
+        )
+        self.assertNotIn("Laurent", new)
 
 
 if __name__ == "__main__":
