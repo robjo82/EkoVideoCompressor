@@ -352,6 +352,18 @@ def _match_score(
     if surface.lower() == entry_surface.lower():
         return (True, 1.0, "exact")
 
+    # PR R: per-token stoplist. Common French function words are
+    # the dominant source of phonetic false positives we audited
+    # on the CVR-control run (``par`` → ``Parce``, ``ou`` →
+    # ``Audoo``, etc.). Refuse phonetic / edit tiers when the
+    # transcript word is on the stoplist — those tokens have a
+    # frequency floor (they appear every sentence) and Whisper's
+    # priors keep them stable. The only safe match is tier 0
+    # exact, handled above.
+    normalised = surface.lower().replace("’", "'")
+    if normalised in _MERGED_WINDOW_STOPLIST:
+        return (False, 0.0, "")
+
     transcript_key = french_phonetic_key(surface)
     if not transcript_key:
         return (False, 0.0, "")
@@ -404,6 +416,59 @@ def _replace_token_preserve_case(replacement: str, original_token: str) -> str:
     return replacement
 
 
+# PR R: tighter guards on merged-window matching.
+#
+# The PR P matcher caught a real failure mode (``pouvoir bien`` →
+# ``Power BI``), but the loose Levenshtein-on-phonetic-keys logic
+# generates catastrophic false positives on production audio. The
+# canonical example from the CVR run was a flood of:
+#   - ``par`` → ``Parce``
+#   - ``vient ici`` → ``Vincent``
+#   - ``Du coup, sur`` → ``Document``
+#   - ``Odoo`` → ``Audoo``  (when ``Audoo`` was a hallucination PR D
+#     had injected into the glossary)
+#
+# A common pattern: any 2-token window that contains a French
+# function word (``par``, ``de``, ``une``, ``ici``) collapses to a
+# glossary entry whose phonetic key happens to be short.
+#
+# This stoplist rejects the window outright when ANY of its tokens
+# is a common French word. We trade off recall on phonetic
+# corrections that legitimately involve function words (rare) for
+# precision on the everyday "par/voir/vient" failure mode (common
+# enough to make the whole feature net-negative in PR R's audit).
+_MERGED_WINDOW_STOPLIST: frozenset[str] = frozenset(
+    {
+        # Pronouns / articles / determiners.
+        "a", "à", "ai", "au", "aux", "ça", "ce", "ces", "cet", "cette",
+        "c'est", "ci", "d", "de", "des", "du", "elle", "elles", "en",
+        "es", "est", "et", "eu", "il", "ils", "j", "je", "l", "la", "le",
+        "les", "leur", "leurs", "lui", "m", "ma", "me", "mes", "moi",
+        "mon", "n", "ne", "nos", "notre", "nous", "on", "ou", "où",
+        "par", "pas", "qu", "que", "qui", "quoi", "s", "sa", "se",
+        "ses", "si", "son", "sont", "sur", "t", "ta", "te", "tes",
+        "toi", "ton", "tout", "tous", "toute", "toutes", "tu", "un",
+        "une", "vos", "votre", "vous", "y",
+        # Prepositions + common adverbs. ``bien`` is intentionally
+        # NOT included: ``pouvoir bien`` → ``Power BI`` is the
+        # canonical merged-window win we want to preserve.
+        "alors", "après", "aussi", "avec", "avant", "bon",
+        "car", "chez", "comme", "comment", "dans", "déjà", "donc",
+        "encore", "ensuite", "ici", "jamais", "juste", "là", "mais",
+        "même", "moins", "non", "oui", "peu", "plus", "pour",
+        "pourquoi", "puis", "quand", "rien", "sans", "selon", "seul",
+        "seule", "seules", "seuls", "sinon", "sous", "très", "trop",
+        "voici", "voilà",
+        # High-frequency verbs (3rd person, imperative, common forms).
+        "fait", "fais", "faut", "faire", "peut", "peux", "veut", "veux",
+        "doit", "dois", "voir", "vient", "vais", "vas", "va", "as",
+        "avais", "avait", "avez", "avons", "ai", "aurai", "aurez",
+        "était", "étaient", "étant", "été", "étiez", "êtes", "êtes",
+        "soit", "suis", "sait", "sais", "savoir",
+    }
+)
+
+
 def _joined_phonetic_key(words: list[str]) -> str:
     """Concatenate per-word phonetic keys.
 
@@ -418,6 +483,22 @@ def _joined_phonetic_key(words: list[str]) -> str:
     return "".join(french_phonetic_key(w) for w in words if w)
 
 
+def _window_contains_stopword(words: list[str]) -> bool:
+    """True if any token in the window is on
+    ``_MERGED_WINDOW_STOPLIST``.
+
+    The stoplist matches **after** lowercasing and stripping French
+    apostrophes (``c'est`` ↔ ``c'est``). When any function word
+    appears in the window, the matcher refuses to fire — those
+    windows are real sentences, not glossary collisions.
+    """
+    for token in words:
+        normalised = (token or "").strip().lower().replace("’", "'")
+        if normalised in _MERGED_WINDOW_STOPLIST:
+            return True
+    return False
+
+
 def _try_merged_window_match(
     tokens: list[str],
     word_idx: list[int],
@@ -429,10 +510,9 @@ def _try_merged_window_match(
     entry's joined phonetic key.
 
     Returns ``(entry, start_idx, end_idx)`` of the best match, or
-    ``None`` when no entry crosses the threshold. Conservative on
-    purpose: thresholds tighten as the entry key shortens so a
-    3-char key like ``Odoo``'s ADA doesn't sweep half the French
-    language into "matches".
+    ``None`` when no entry crosses the threshold. PR R: tightened
+    guards so a 3-char key like ``Odoo``'s ADA can no longer sweep
+    half the French language into "matches".
     """
     best: tuple[_GlossaryEntry, int, int, int] | None = None
     for window_size in (2, 3):
@@ -442,39 +522,53 @@ def _try_merged_window_match(
         if any(consumed[i] for i in window_indices):
             continue
         window_words = [tokens[i] for i in window_indices]
+        # PR R guard #1: reject windows that contain any common
+        # French function word. This is the single biggest source
+        # of false positives we audited (``par`` → ``Parce``,
+        # ``vient ici`` → ``Vincent``, ``Du coup, sur`` → ``Document``).
+        if _window_contains_stopword(window_words):
+            continue
         window_key = _joined_phonetic_key(window_words)
-        if len(window_key) < 5:
-            # Too short — too easy to collide with random French.
+        # PR R guard #2: raise the minimum joined-key length from 5
+        # to 6. Below 6 the search space is too small — random French
+        # bigrams collide with 4-5 char glossary keys.
+        if len(window_key) < 6:
             continue
         for entry in entries:
             entry_key = "".join(entry.keys)
-            if len(entry_key) < 4:
+            # PR R guard #3: raise the minimum entry key length
+            # from 4 to 5. ``Odoo`` (key ADA, 3 chars) no longer
+            # qualifies for merged-window — the per-token matcher
+            # already handles single-token glossary terms.
+            if len(entry_key) < 5:
                 continue
-            # Scale tolerance with the entry key length so we don't
-            # turn ``Odoo``'s 3-char key into a free-for-all.
+            # PR R guard #4: tighter Levenshtein scaling. Old
+            # values ({≤5:1, ≤8:2, else:3}) were lenient enough
+            # that "Du coup l'idée" (DK-PL-T) matched "Document"
+            # (DKMT) with dist=2. New values: {≤5:0, ≤8:1, else:2}.
             if len(entry_key) <= 5:
-                threshold = 1
+                threshold = 0
             elif len(entry_key) <= 8:
-                threshold = 2
+                threshold = 1
             else:
-                threshold = 3
+                threshold = 2
             dist = _levenshtein(window_key, entry_key, limit=threshold + 1)
             if dist > threshold:
                 continue
-            # Surface safety net: the first letters of the joined
-            # transcript window and the entry should share at least
-            # one prefix letter. Stops ``le matin`` from masquerading
-            # as ``Mathieu``-style matches.
+            # PR R guard #5: surface safety net upgraded from
+            # 1-letter to 2-letter shared prefix. Stops
+            # ``le sont`` (LS) from matching ``Laurent`` (LRN).
             window_surface = _surface_letters("".join(window_words))
             entry_surface = _surface_letters("".join(entry.tokens))
-            if not window_surface or not entry_surface:
+            if len(window_surface) < 2 or len(entry_surface) < 2:
                 continue
-            if window_surface[:1] != entry_surface[:1]:
+            if window_surface[:2] != entry_surface[:2]:
                 continue
-            # Anti-collapse guard: if the window already contains the
-            # canonical glossary form as one of its tokens, this is
-            # a real sentence (``Mollie et Klarna``), not a Whisper
-            # hallucination — never collapse it.
+            # Anti-collapse guard (unchanged from PR P): if the
+            # window already contains the canonical glossary form
+            # as one of its tokens, this is a real sentence
+            # (``Mollie et Klarna``), not a Whisper hallucination —
+            # never collapse it.
             entry_canonical_lower = entry.term.lower()
             if any(
                 w.lower() == entry_canonical_lower for w in window_words
@@ -494,9 +588,19 @@ def apply_glossary_to_text(
     terms: list[str],
     *,
     min_confidence: float = 0.8,
+    merged_window_enabled: bool = False,
 ) -> tuple[str, list[GlossarySubstitution]]:
     """
     Pure-text version (no segments). Returns (new_text, substitutions).
+
+    ``merged_window_enabled`` (PR R, default False) controls the
+    multi-token phonetic matcher that catches cases like
+    ``pouvoir bien`` → ``Power BI``. Off by default because the
+    PR P feature, even with the PR R guards in place, can still
+    fire on edge cases that aren't worth the false-positive risk
+    in production. The single-token phonetic matcher (which fixes
+    the bulk of Whisper's surface errors) stays active either way.
+    Tests opt in explicitly to exercise the multi-token path.
     """
     if not text or not terms:
         return text, []
@@ -590,41 +694,57 @@ def apply_glossary_to_text(
     # distance per-token is too high for tier 1 but the joined
     # phonetic key is within 1 edit). Walks the still-unconsumed
     # word positions only.
-    pos = 0
-    while pos < len(word_idx):
-        idx = word_idx[pos]
-        if consumed[idx]:
-            pos += 1
-            continue
-        match = _try_merged_window_match(tokens, word_idx, pos, entries, consumed)
-        if match is None:
-            pos += 1
-            continue
-        entry, start, end = match
-        # Replace the first token; clear the rest in the window.
-        window_start = max(0, start - 6)
-        window_end = min(len(tokens), end + 7)
-        before_ctx = "".join(tokens[window_start:start]).strip()
-        after_ctx = "".join(tokens[end + 1 : window_end]).strip()
-        original_span = "".join(tokens[start : end + 1])
-        first_replacement = _replace_token_preserve_case(entry.term, tokens[start])
-        tokens[start] = first_replacement
-        for k in range(start + 1, end + 1):
-            tokens[k] = ""
-            consumed[k] = True
-        consumed[start] = True
-        substitutions.append(
-            GlossarySubstitution(
-                original=original_span,
-                replacement=first_replacement,
-                confidence=0.78,
-                method="merged_window",
-                context_before=before_ctx,
-                context_after=after_ctx,
+    #
+    # PR R: gated behind ``merged_window_enabled`` (default False).
+    # The CVR-control audit showed this pass producing catastrophic
+    # rewrites (``par`` → ``Parce``, ``vient ici`` → ``Vincent``,
+    # ``Odoo`` → ``Audoo``) even with the original guards. The
+    # tighter guards above + the opt-in default together stop the
+    # bleeding.
+    if merged_window_enabled:
+        pos = 0
+        while pos < len(word_idx):
+            idx = word_idx[pos]
+            if consumed[idx]:
+                pos += 1
+                continue
+            match = _try_merged_window_match(
+                tokens, word_idx, pos, entries, consumed
             )
-        )
-        while pos < len(word_idx) and word_idx[pos] <= end:
-            pos += 1
+            if match is None:
+                pos += 1
+                continue
+            entry, start, end = match
+            # Replace the first token; clear the rest in the window.
+            window_start = max(0, start - 6)
+            window_end = min(len(tokens), end + 7)
+            before_ctx = "".join(tokens[window_start:start]).strip()
+            after_ctx = "".join(tokens[end + 1 : window_end]).strip()
+            original_span = "".join(tokens[start : end + 1])
+            first_replacement = _replace_token_preserve_case(
+                entry.term, tokens[start]
+            )
+            tokens[start] = first_replacement
+            for k in range(start + 1, end + 1):
+                tokens[k] = ""
+                consumed[k] = True
+            consumed[start] = True
+            # PR R bump: confidence 0.78 → 0.85. Honest signal that
+            # this path is harder to verify than per-token matching;
+            # also lets callers filter merged-window subs with a
+            # ``confidence >= 0.85`` predicate when needed.
+            substitutions.append(
+                GlossarySubstitution(
+                    original=original_span,
+                    replacement=first_replacement,
+                    confidence=0.85,
+                    method="merged_window",
+                    context_before=before_ctx,
+                    context_after=after_ctx,
+                )
+            )
+            while pos < len(word_idx) and word_idx[pos] <= end:
+                pos += 1
 
     return "".join(tokens), substitutions
 
@@ -634,6 +754,7 @@ def apply_glossary_to_segments(
     terms: list[str],
     *,
     min_confidence: float = 0.8,
+    merged_window_enabled: bool = False,
 ) -> tuple[list[dict], list[GlossarySubstitution]]:
     """
     Walk Whisper segments, rewrite each `text` in place, and stamp
@@ -649,7 +770,10 @@ def apply_glossary_to_segments(
         new_seg = dict(seg)
         original_text = str(seg.get("text") or "")
         new_text, subs = apply_glossary_to_text(
-            original_text, terms, min_confidence=min_confidence
+            original_text,
+            terms,
+            min_confidence=min_confidence,
+            merged_window_enabled=merged_window_enabled,
         )
         new_seg["text"] = new_text
         for sub in subs:
