@@ -229,3 +229,71 @@ def match_cluster_against_profiles(
         profile_name=best_name,
         similarity=best_score,
     )
+
+
+def score_cluster_against_all_profiles(
+    cluster_centroid: list[float],
+    profiles: list[dict],
+) -> list[tuple[str, float]]:
+    """Return ``[(profile_name, score), ...]`` sorted descending.
+
+    PR T diagnostic helper: lets the pipeline log the TOP-K profiles
+    for every cluster, not just the winning match. Without this,
+    the only signal in app_log is "best match was Clothilde" — and
+    when that turns out to be the WRONG speaker (the case we
+    audited on the CVR run), there's no way to tell whether
+    Clothilde was a marginal-pass or whether Robin's profile
+    scored almost as high.
+
+    Profiles with empty embeddings (``embedding_json`` blank or
+    invalid) are skipped silently — they would be dead weight in
+    the diagnostic too.
+    """
+    if not cluster_centroid or not profiles:
+        return []
+    scored: list[tuple[str, float]] = []
+    for profile in profiles:
+        embedding = decode_embedding(profile.get("embedding_json") or "")
+        if not embedding:
+            continue
+        name = str(profile.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            score = cosine_similarity(cluster_centroid, embedding)
+        except EmbeddingMismatchError:
+            continue
+        scored.append((name, score))
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored
+
+
+def filter_usable_profiles(profiles: list[dict]) -> list[dict]:
+    """Drop profiles that have no usable embedding.
+
+    PR T defense in depth: a stale ``speaker_profiles`` row with an
+    empty ``embedding_json`` (or one that decodes to an empty list)
+    should not even reach the matcher. The audit on the CVR run
+    showed the library had accumulated rows like
+    ``Benjamin`` whose samples were 78-byte WAV stubs from a
+    previous failed enrollment — their embeddings are unusable but
+    the row is still listed.
+
+    Also requires ``sample_count`` ≥ 1 when the column is present:
+    a profile that has never been confirmed by the user is a guess,
+    not a match anchor.
+    """
+    out: list[dict] = []
+    for profile in profiles or []:
+        if not decode_embedding(profile.get("embedding_json") or ""):
+            continue
+        sample_count = profile.get("sample_count")
+        if sample_count is not None:
+            try:
+                if int(sample_count) < 1:
+                    continue
+            except (TypeError, ValueError):
+                # Unknown column type → don't filter on it.
+                pass
+        out.append(profile)
+    return out

@@ -26,7 +26,9 @@ from llm_corrections import (
 from speaker_recognition import (
     DEFAULT_MATCH_THRESHOLD,
     aggregate_embeddings,
+    filter_usable_profiles,
     match_cluster_against_profiles,
+    score_cluster_against_all_profiles,
 )
 from multipass import (
     WeakSegment,
@@ -2243,11 +2245,30 @@ class TranscriptionPipeline:
 
         try:
             db = database()
-            profiles = db.list_speaker_profiles()
+            raw_profiles = db.list_speaker_profiles()
         except Exception as exc:
             append_app_log(f"engine_speaker_recog_no_db error={exc!r}")
             return {}
+        if not raw_profiles:
+            return {}
+        # PR T: drop stale rows (no embedding, sample_count=0) so they
+        # can't pollute the matcher. The CVR-control library had
+        # leftover ``Benjamin`` / ``Laurent`` rows from prior failed
+        # enrolments — their embeddings were unusable but the rows
+        # were still listed.
+        profiles = filter_usable_profiles(raw_profiles)
+        dropped = len(raw_profiles) - len(profiles)
+        if dropped:
+            append_app_log(
+                f"engine_speaker_recog_filtered_stale "
+                f"raw={len(raw_profiles)} usable={len(profiles)} "
+                f"dropped={dropped}"
+            )
         if not profiles:
+            append_app_log(
+                "engine_speaker_recog_no_usable_profiles "
+                f"raw_count={len(raw_profiles)}"
+            )
             return {}
 
         settings = self.request.transcription_settings
@@ -2317,15 +2338,43 @@ class TranscriptionPipeline:
             if not vectors:
                 continue
             centroid = aggregate_embeddings(vectors)
+            # PR T diagnostic: log the top-3 profile candidates for
+            # this cluster, regardless of whether any of them passes
+            # the threshold. Lets us tell the difference between
+            # "Clothilde at 0.79, Robin at 0.78" (a marginal pass we
+            # should second-guess) and "Clothilde at 0.91, all others
+            # below 0.4" (a confident match). The CVR audit had no
+            # signal at all here — the log only said "best=Clothilde".
+            all_scores = score_cluster_against_all_profiles(centroid, profiles)
+            top_three = all_scores[:3]
+            top_summary = ", ".join(
+                f"{name}={score:.3f}" for name, score in top_three
+            ) or "none"
             match = match_cluster_against_profiles(
                 centroid, profiles, threshold=DEFAULT_MATCH_THRESHOLD
             )
             if not match or not match.profile_name:
+                append_app_log(
+                    f"engine_speaker_recog_cluster_unmatched "
+                    f"cluster={label!r} threshold={DEFAULT_MATCH_THRESHOLD:.2f} "
+                    f"top={top_summary}"
+                )
                 continue
             if match.profile_name in used_names:
+                append_app_log(
+                    f"engine_speaker_recog_cluster_collision "
+                    f"cluster={label!r} winner={match.profile_name!r} "
+                    f"score={match.similarity:.3f} already_claimed=true "
+                    f"top={top_summary}"
+                )
                 continue
             used_names.add(match.profile_name)
             recognized[label] = match.profile_name
+            append_app_log(
+                f"engine_speaker_recog_cluster_matched "
+                f"cluster={label!r} winner={match.profile_name!r} "
+                f"score={match.similarity:.3f} top={top_summary}"
+            )
         duration = time.monotonic() - ts
         self.sink(
             ProgressEvent(
@@ -2337,13 +2386,21 @@ class TranscriptionPipeline:
         )
         return recognized
 
+    # PR T: window over which we weigh "who's dominating the
+    # conversation start". The user usually opens the call ("Bonjour,
+    # vous m'entendez ?") then lets the others speak — so the
+    # *dominant* speaker in the first minute is a far more reliable
+    # signal than the literal first-to-speak.
+    _PRE_ATTRIBUTION_WINDOW_SECONDS = 60.0
+
     def _pre_attribute_current_user(
         self,
         segments: list[dict],
         *,
         already_recognized: dict[str, str],
     ) -> dict[str, str]:
-        """Attribute the cluster that speaks first to the user.
+        """Attribute the cluster dominating the first 60 seconds to
+        the user named in ``current_user_name``.
 
         Used when voice matching couldn't pick the user out of the
         stored profiles (typical on a first run: ``sample_count=0``
@@ -2352,6 +2409,19 @@ class TranscriptionPipeline:
         in the transcript even when the user has explicitly told
         Réglages "I am Robin".
 
+        PR T heuristic upgrade — was: "first cluster to emit any
+        segment". The CVR-control run exposed the failure mode:
+        Robin says ``Bonjour, vous m'entendez ?`` (3 s), then
+        Vincent answers ``...pas de son...`` (12 s of struggling
+        audio), then Robin resumes for the rest of the meeting. The
+        old heuristic latched onto Vincent's cluster because his
+        very-first segment started a fraction earlier when Whisper
+        timestamped the silence-prefixed ``...pas de son...``
+        — even though Robin overwhelmingly dominates speech time.
+        Switching to "most cumulative speech time in [0, 60 s]"
+        fixes this: the cluster that talks longest in the opening
+        window is overwhelmingly the user on every call we audit.
+
         Rules:
         - Skip when ``current_user_name`` is blank.
         - Skip when no SPEAKER_NN clusters remain (everything's
@@ -2359,8 +2429,8 @@ class TranscriptionPipeline:
         - Skip when the user's name is already in
           ``already_recognized.values()`` — voice match wins, the
           heuristic just confirms.
-        - Otherwise attribute the SPEAKER_NN cluster with the lowest
-          segment start_time.
+        - Otherwise attribute the SPEAKER_NN cluster with the most
+          cumulative speech time in [0, _PRE_ATTRIBUTION_WINDOW_SECONDS].
 
         Returns ``{cluster_label: current_user_name}`` to merge into
         the recognised map. Empty dict means no attribution.
@@ -2371,6 +2441,9 @@ class TranscriptionPipeline:
         existing_names = {v.strip().lower() for v in already_recognized.values() if v}
         if name.lower() in existing_names:
             return {}
+
+        window_end = self._PRE_ATTRIBUTION_WINDOW_SECONDS
+        speech_time_by_cluster: dict[str, float] = {}
         first_start_by_cluster: dict[str, float] = {}
         for seg in segments:
             label = (seg.get("speaker") or "").strip()
@@ -2382,19 +2455,61 @@ class TranscriptionPipeline:
                 continue
             try:
                 start = float(seg.get("start") or 0)
+                end = float(seg.get("end") or 0)
             except (TypeError, ValueError):
                 continue
+            if end <= 0 or end <= start:
+                continue
+            # Clip the segment to the [0, window_end] window so a
+            # 10-minute monologue counts only what falls inside the
+            # opening minute.
+            clipped_start = max(0.0, start)
+            clipped_end = min(window_end, end)
+            if clipped_end <= clipped_start:
+                continue
+            speech_time_by_cluster[label] = (
+                speech_time_by_cluster.get(label, 0.0)
+                + (clipped_end - clipped_start)
+            )
             previous = first_start_by_cluster.get(label)
-            if previous is None or start < previous:
-                first_start_by_cluster[label] = start
-        if not first_start_by_cluster:
+            if previous is None or clipped_start < previous:
+                first_start_by_cluster[label] = clipped_start
+
+        if not speech_time_by_cluster:
             return {}
-        first_cluster = min(first_start_by_cluster.items(), key=lambda kv: kv[1])[0]
+
+        # Tie-break: prefer the cluster that started earlier in the
+        # window. Keeps deterministic behaviour on short fixtures
+        # where speech time is identical (the test we audited had
+        # two 1-second segments — symmetric). Negate the
+        # ``first_start`` so ``max()`` ranks "earlier" higher.
+        winning_cluster, winning_seconds = max(
+            speech_time_by_cluster.items(),
+            key=lambda kv: (
+                kv[1],
+                -first_start_by_cluster.get(kv[0], float("inf")),
+            ),
+        )
+        # Sanity floor: when ALL clusters speak < 1 s in the window
+        # (e.g. mostly-silent meeting opening), the signal is too
+        # weak to attribute confidently. Falls back to "no
+        # attribution" rather than guessing wrong.
+        if winning_seconds < 1.0:
+            append_app_log(
+                "engine_current_user_preattribution_skipped "
+                f"reason=signal_too_weak winner={winning_cluster!r} "
+                f"seconds={winning_seconds:.2f}"
+            )
+            return {}
+
         append_app_log(
             "engine_current_user_preattributed "
-            f"cluster={first_cluster!r} name={name!r}"
+            f"cluster={winning_cluster!r} name={name!r} "
+            f"window_seconds={window_end:.0f} "
+            f"speech_in_window={winning_seconds:.2f} "
+            f"distribution={dict(sorted(speech_time_by_cluster.items()))!r}"
         )
-        return {first_cluster: name}
+        return {winning_cluster: name}
 
     # Embedding-extraction tuning constants kept identical to the
     # ones the library uses for explicit re-recognition, so a job
