@@ -117,49 +117,110 @@ class TranscriptionSettings:
         return apply_quality_preset(instance)
 
 
+# ---------------------------------------------------------------------
+# Quality preset matrix (PR L)
+# ---------------------------------------------------------------------
+#
+# Single source of truth for what each preset turns on. Centralising
+# the matrix here lets us:
+#   • Document the trade-off in one place (preset name → row).
+#   • Sentinel-test that ``max`` enables every quality knob the
+#     engine actually wires up (catches future PRs that add a flag
+#     but forget to flip it on in ``max`` — which was the whole
+#     point of the "Maximale" preset breaking down over time).
+#   • Surface the matrix to docs / the SwiftUI summary without
+#     copy-pasting strings.
+#
+# The keys are field names on ``TranscriptionSettings`` ; the values
+# are booleans the preset writes when the user selects that preset.
+# Fields not listed in a preset row are left untouched (so the user's
+# advanced toggles in "custom" mode keep working). ``max`` is the
+# only preset that the sentinel test enforces to be "true max" —
+# explicitly listed exclusions (audio_recheck pending PR F) live in
+# ``_MAX_PRESET_PENDING`` so we know exactly what's still missing.
+
+QUALITY_PRESETS: dict[str, dict[str, bool]] = {
+    "fast": {
+        # Pure baseline: Whisper only. No VAD, no multipass, no LLM,
+        # no diarisation, no context propagation. Roughly real-time
+        # on M1.
+        "vad_enabled": False,
+        "multipass_enabled": False,
+        "per_speaker_enabled": False,
+        "audio_recheck_enabled": False,
+        "web_enrichment_enabled": False,
+        "condition_on_previous_text": False,
+        "hot_prompt_enrichment": False,
+    },
+    "balanced": {
+        # Default. VAD + multipass + LLM post-pass (when the venv
+        # exists). No per-speaker (doubles the runtime), no context
+        # propagation (extra repetition-loop surface for a marginal
+        # gain when meetings are short).
+        "vad_enabled": True,
+        "multipass_enabled": True,
+        "per_speaker_enabled": False,
+        "audio_recheck_enabled": False,
+        "web_enrichment_enabled": False,
+        "condition_on_previous_text": False,
+        "hot_prompt_enrichment": False,
+    },
+    "max": {
+        # Everything wired in the engine today: VAD, multipass
+        # (low-confidence + boundary), per-speaker Whisper pass
+        # (PR E), web enrichment (PR H), context-aware Whisper
+        # + hot prompt enrichment (PR D). ``audio_recheck_enabled``
+        # (Qwen2-Audio) stays off until PR F ports the legacy
+        # multimodal recheck pass — see ``_MAX_PRESET_PENDING``.
+        "vad_enabled": True,
+        "multipass_enabled": True,
+        "per_speaker_enabled": True,
+        "audio_recheck_enabled": False,
+        "web_enrichment_enabled": True,
+        "condition_on_previous_text": True,
+        "hot_prompt_enrichment": True,
+    },
+}
+
+# Knobs that ``max`` deliberately leaves off (because the underlying
+# feature isn't wired in the new engine yet). The sentinel test in
+# ``tests/test_quality_presets.py`` uses this set to allow the gap
+# without losing the "max really is max" invariant for everything else.
+_MAX_PRESET_PENDING: frozenset[str] = frozenset(
+    {
+        "audio_recheck_enabled",  # PR F — Qwen2-Audio recheck port
+    }
+)
+
+
 def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSettings":
     """Resolve the boolean flags from the ``quality_preset`` selector.
 
-    Centralising the mapping here means the SwiftUI app only needs to
-    send a single string (``"fast" / "balanced" / "max"``) and the
-    engine derives the right knobs. Custom mode (or any unknown
-    value) is a passthrough — power users keep full control.
+    Centralising the mapping in ``QUALITY_PRESETS`` means the SwiftUI
+    app only needs to send a single string (``"fast" / "balanced" /
+    "max"``) and the engine derives the right knobs. ``custom`` (or
+    any unknown value) is a passthrough — power users keep full
+    control.
     """
-    preset = (settings.quality_preset or "balanced").strip().lower()
-    if preset == "fast":
-        # Pure baseline: Whisper only. No VAD, no multipass, no LLM,
-        # no diarisation. Roughly real-time on M1.
-        settings.vad_enabled = False
-        settings.multipass_enabled = False
-        settings.per_speaker_enabled = False
-        settings.audio_recheck_enabled = False
-        settings.web_enrichment_enabled = False
-    elif preset == "balanced":
-        # Default. VAD + multipass + LLM post-pass (when the venv
-        # exists). No per-speaker (it doubles the runtime).
-        settings.vad_enabled = True
-        settings.multipass_enabled = True
-        settings.per_speaker_enabled = False
-        settings.audio_recheck_enabled = False
-        settings.web_enrichment_enabled = False
-    elif preset == "max":
-        # Everything wired in the engine today: VAD, multipass
-        # (low-confidence + boundary), diarisation with word-level
-        # speaker attribution, LLM post-process, per-speaker Whisper
-        # pass (PR E), web enrichment (PR H, gated by network),
-        # context-aware Whisper + hot prompt enrichment (PR D).
-        # ``audio_recheck_enabled`` (Qwen2-Audio) stays off until
-        # PR F ports the legacy multimodal recheck pass.
-        settings.vad_enabled = True
-        settings.multipass_enabled = True
-        settings.per_speaker_enabled = True
-        settings.audio_recheck_enabled = False
-        settings.web_enrichment_enabled = True
-        settings.condition_on_previous_text = True
-        settings.hot_prompt_enrichment = True
-    # 'custom' (or any other value) is a passthrough — leave the
-    # individual flags as the caller set them.
+    preset_key = (settings.quality_preset or "balanced").strip().lower()
+    spec = QUALITY_PRESETS.get(preset_key)
+    if spec is None:
+        # 'custom' or anything else — leave the individual flags as
+        # the caller set them.
+        return settings
+    for field_name, value in spec.items():
+        setattr(settings, field_name, value)
     return settings
+
+
+def quality_preset_levers(preset: str) -> dict[str, bool]:
+    """Return the ``{field: bool}`` matrix the given preset writes.
+
+    Returns an empty dict for ``custom`` / unknown presets. Exposed
+    for tests and for docs that want to render the matrix without
+    duplicating the strings.
+    """
+    return dict(QUALITY_PRESETS.get((preset or "").strip().lower(), {}))
 
 
 @dataclass(slots=True)
