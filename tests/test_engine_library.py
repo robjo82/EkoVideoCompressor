@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ekovideo_engine.library import (
+    _clip_window,
     _discover_speakers_from_text,
     _looks_like_engine_workspace,
     _segments_per_cluster,
@@ -159,7 +160,10 @@ class EngineLibraryActionsTest(unittest.TestCase):
                 )
 
                 def fake_run(cmd, *args, **kwargs):
-                    Path(cmd[-1]).write_bytes(b"sample")
+                    # PR Q: the sample extractor now refuses to
+                    # surface < 2 KB files. Make the stub generate a
+                    # bytes payload that clears the threshold.
+                    Path(cmd[-1]).write_bytes(b"\0" * 4096)
                     return subprocess.CompletedProcess(cmd, 0, "", "")
 
                 with patch("ekovideo_engine.library.subprocess.run", side_effect=fake_run):
@@ -195,7 +199,10 @@ class EngineLibraryActionsTest(unittest.TestCase):
                 )
 
                 def fake_run(cmd, *args, **kwargs):
-                    Path(cmd[-1]).write_bytes(b"sample")
+                    # PR Q: the sample extractor now refuses to
+                    # surface < 2 KB files. Make the stub generate a
+                    # bytes payload that clears the threshold.
+                    Path(cmd[-1]).write_bytes(b"\0" * 4096)
                     return subprocess.CompletedProcess(cmd, 0, "", "")
 
                 with patch("ekovideo_engine.library.subprocess.run", side_effect=fake_run):
@@ -1358,6 +1365,115 @@ class LibraryDetachOdooMeetingTest(unittest.TestCase):
 
             assert row is not None
             self.assertFalse((row.get("odoo_meeting_json") or "").strip())
+
+
+class ClipWindowTest(unittest.TestCase):
+    """PR Q — for long segments the sample window now CENTERS in
+    the segment instead of starting at the beginning. Reduces the
+    risk of capturing the previous speaker's audio when Whisper's
+    30 s context window crossed a boundary."""
+
+    def test_short_segment_uses_whole_audio(self):
+        seg = {"start": 5.0, "end": 7.5}  # 2.5 s
+        start, duration = _clip_window(seg, seconds=8.0)
+        # Just trim the edges, return start ≈ 5.05.
+        self.assertAlmostEqual(start, 5.05, places=2)
+        self.assertAlmostEqual(duration, 2.4, places=1)
+
+    def test_long_segment_centered(self):
+        # 30 s segment, 8 s clip → centered around midpoint (start
+        # + 15 s). Clip should start at 11 (midpoint 20 − half 4),
+        # cover 11-19.
+        seg = {"start": 5.0, "end": 35.0}
+        start, duration = _clip_window(seg, seconds=8.0)
+        self.assertAlmostEqual(start, 16.0, places=1)
+        self.assertEqual(duration, 8.0)
+
+    def test_zero_duration_segment_returns_zero(self):
+        seg = {"start": 10.0, "end": 10.0}
+        start, duration = _clip_window(seg, seconds=8.0)
+        self.assertEqual(duration, 0.0)
+
+
+class SampleExtractionRobustnessTest(unittest.TestCase):
+    """PR Q — refuse < 2 KB sample files; re-extract instead of
+    accepting a previous failed run's empty WAV."""
+
+    def test_truncated_existing_sample_gets_reextracted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            workspace.mkdir()
+            (workspace / "audio.wav").write_bytes(b"fake wav")
+            sample_dir = workspace / "speaker_samples"
+            sample_dir.mkdir()
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                db.add_segments(
+                    job_id,
+                    [{"start": 1.0, "end": 4.0, "speaker": "SPEAKER_00", "text": "Hi."}],
+                )
+                # Pre-place a "stale" truncated file at the path the
+                # extractor would pick. Old behaviour: accepted as-is.
+                # PR Q behaviour: detect tiny size and re-extract.
+                pre_existing = sample_dir / "SPEAKER_00_1_1.05.wav"
+                pre_existing.write_bytes(b"X")  # 1 byte → too small
+
+                runs: list[list[str]] = []
+
+                def fake_run(cmd, *args, **kwargs):
+                    runs.append(list(cmd))
+                    Path(cmd[-1]).write_bytes(b"\0" * 4096)
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    samples = library_speaker_samples(job_id, seconds=3)
+
+            self.assertEqual(len(samples), 1)
+            # The truncated file was rewritten — ffmpeg fired once.
+            self.assertEqual(len(runs), 1)
+
+    def test_extraction_failure_skips_sample(self):
+        # If ffmpeg returns successfully but the file stays under
+        # threshold, drop the sample rather than surface an empty
+        # play button in the rename sheet.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "work"
+            workspace.mkdir()
+            (workspace / "audio.wav").write_bytes(b"fake wav")
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(
+                    source_path=str(root / "source.mov"),
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                db.add_segments(
+                    job_id,
+                    [{"start": 1.0, "end": 4.0, "speaker": "SPEAKER_00", "text": "Hi."}],
+                )
+
+                def fake_run(cmd, *args, **kwargs):
+                    # Simulate ffmpeg "succeeding" but writing junk.
+                    Path(cmd[-1]).write_bytes(b"\0" * 100)
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with patch(
+                    "ekovideo_engine.library.subprocess.run",
+                    side_effect=fake_run,
+                ):
+                    samples = library_speaker_samples(job_id, seconds=3)
+
+            self.assertEqual(samples, [])
 
 
 class SegmentsPerClusterTest(unittest.TestCase):

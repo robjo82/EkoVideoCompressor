@@ -465,15 +465,34 @@ def _sample_isolation_score(
 
 
 def _clip_window(segment: dict[str, Any], seconds: float) -> tuple[float, float]:
+    """Pick a ``seconds``-long window inside the segment for sample
+    extraction.
+
+    Short segments (≤ ``seconds``) → use the whole thing.
+    Long segments (> ``seconds``) → pick a window CENTERED on the
+    segment instead of starting at the beginning. The beginning of
+    a long segment is most often a boundary transition (Whisper's
+    30 s window crossing a speaker change) where audio is more
+    likely to contain the previous speaker; the middle is more
+    likely to be the target speaker's central speech.
+    """
     start = _segment_start(segment)
     end = _segment_end(segment)
     duration = max(0.0, end - start)
     if duration <= 0:
         return start, 0.0
     trim = 0.05 if duration > 1.2 else 0.0
-    clip_start = max(start + trim, 0)
-    clip_duration = max(min(seconds, duration - (trim * 2)), min(duration, 1.0))
-    return clip_start, clip_duration
+    if duration <= seconds + 2 * trim:
+        # Short enough to use whole — just trim the edges.
+        clip_start = max(start + trim, 0)
+        clip_duration = max(min(seconds, duration - (trim * 2)), min(duration, 1.0))
+        return clip_start, clip_duration
+    # Long segment: centre the clip window. Pulls the sample
+    # away from likely-boundary edges.
+    midpoint = start + duration / 2.0
+    half_clip = seconds / 2.0
+    clip_start = max(0.0, midpoint - half_clip)
+    return clip_start, seconds
 
 
 def library_speaker_samples(
@@ -515,7 +534,22 @@ def library_speaker_samples(
             if duration <= 0:
                 continue
             out_path = sample_dir / f"{_safe_filename(speaker)}_{index}_{start:.2f}.wav"
-            if not out_path.exists():
+            # Treat truncated / zero-byte WAVs as "needs re-extraction".
+            # A 16 kHz mono WAV under ~2 KB is essentially empty —
+            # ffmpeg failed silently on a previous run. The old check
+            # ``not out_path.exists()`` accepted those files as-is and
+            # the rename sheet ended up with empty audio samples.
+            needs_extract = True
+            if out_path.exists():
+                try:
+                    needs_extract = out_path.stat().st_size < 2048
+                except OSError:
+                    needs_extract = True
+            if needs_extract:
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
                 cmd = [
                     ffmpeg,
                     "-y",
@@ -536,6 +570,15 @@ def library_speaker_samples(
                     str(out_path),
                 ]
                 subprocess.run(cmd, capture_output=True, text=True, check=False)
+            # Skip the entry entirely if extraction left us with a
+            # tiny/missing file — the UI would show an "empty" play
+            # button otherwise.
+            try:
+                final_size = out_path.stat().st_size if out_path.exists() else 0
+            except OSError:
+                final_size = 0
+            if final_size < 2048:
+                continue
             if out_path.exists():
                 speaker_stats = stats.get(speaker, {"utterance_count": 0, "total_duration": 0.0})
                 samples.append(

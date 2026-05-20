@@ -1667,7 +1667,13 @@ class TranscriptionPipeline:
         boundary = identify_boundary_segments(segments)
         if not boundary:
             return None, segments
-        clip_ranges = group_into_clip_ranges(boundary, max_segments_per_clip=4)
+        # max_segments_per_clip=1 keeps each repass clip bounded to a
+        # SINGLE original segment. Groups of 4 used to span multiple
+        # speakers' turns; the new Whisper output for that range got
+        # one speaker label via majority overlap, but its audio range
+        # then mixed multiple voices — visible in the rename sheet
+        # samples as "voices mélangées".
+        clip_ranges = group_into_clip_ranges(boundary, max_segments_per_clip=1)
         if not clip_ranges or len(clip_ranges) > 8:
             if clip_ranges:
                 append_app_log(
@@ -1840,8 +1846,12 @@ class TranscriptionPipeline:
                 )
                 for s in segs
             ]
+            # Same constraint as boundary multipass: keep each
+            # Whisper repass bounded to a SINGLE original segment so
+            # the per-speaker audio range never accidentally covers
+            # an adjacent other-speaker turn.
             clip_ranges = group_into_clip_ranges(
-                weak, max_segments_per_clip=20
+                weak, max_segments_per_clip=1
             )
             if not clip_ranges:
                 continue
