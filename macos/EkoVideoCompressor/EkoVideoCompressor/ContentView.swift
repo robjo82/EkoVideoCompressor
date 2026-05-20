@@ -2880,7 +2880,15 @@ struct StatusBarView: View {
 
         var parts = [message, "écoulé \(formatDuration(now.timeIntervalSince(startedAt)))"]
         if let eta = latestProgressEvent?.eta_seconds, eta.isFinite, eta > 0 {
-            parts.append("reste ~\(formatDuration(eta))")
+            // PR U: switch from seconds-precise "reste ~MM:SS" to the
+            // Apple-style "Il reste environ N minutes" bucket. The
+            // old rendering thrashed the status line every second
+            // (watch the value count down 4:59 → 4:58 → 4:57 …) and
+            // gave a false sense of precision on a value that comes
+            // out of a regression with ±30 s noise. macOS Finder /
+            // Time Machine use 5-minute buckets — mirror that for
+            // consistency with the platform.
+            parts.append(formatRemainingApproximate(seconds: eta))
         }
         return parts.joined(separator: " · ")
     }
@@ -2894,6 +2902,45 @@ struct StatusBarView: View {
             return "\(hours):\(String(format: "%02d", minutes)):\(String(format: "%02d", seconds))"
         }
         return "\(minutes):\(String(format: "%02d", seconds))"
+    }
+
+    /// PR U — Apple-HIG-style "Il reste environ N minutes".
+    ///
+    /// Buckets the remaining seconds into one of:
+    ///   • "Il reste moins d'une minute"
+    ///   • "Il reste environ N minutes"  (N = 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55)
+    ///   • "Il reste environ N heures"   (N = 1, 2, 3, …)
+    ///   • "Il reste environ N heures et M minutes" when between 1 h and 24 h
+    ///
+    /// We round UP to the next 5-minute step so the value never
+    /// appears to *re-grow* (which an honest ceiling would), and never
+    /// flickers between adjacent buckets (which an honest round-half
+    /// would). When the true ETA crosses a bucket boundary, the
+    /// displayed value only moves in one direction.
+    func formatRemainingApproximate(seconds: TimeInterval) -> String {
+        let total = max(seconds, 0)
+        if total < 60 {
+            return "Il reste moins d'une minute"
+        }
+        let minutes = Int(total / 60.0)
+        if minutes < 5 {
+            // 1–4 minutes : show as "moins de 5 minutes" rather than
+            // bouncing through three buckets in 4 seconds.
+            return "Il reste moins de 5 minutes"
+        }
+        // Round UP to the nearest 5-minute step.
+        let bucketed5 = ((minutes + 4) / 5) * 5
+        if bucketed5 < 60 {
+            return "Il reste environ \(bucketed5) minutes"
+        }
+        let hours = bucketed5 / 60
+        let remMinutes = bucketed5 % 60
+        if remMinutes == 0 {
+            return hours == 1 ? "Il reste environ 1 heure"
+                              : "Il reste environ \(hours) heures"
+        }
+        let hourLabel = hours == 1 ? "1 heure" : "\(hours) heures"
+        return "Il reste environ \(hourLabel) et \(remMinutes) minutes"
     }
 
     var body: some View {
