@@ -1105,6 +1105,89 @@ def _fold_term(value: str) -> str:
     return folded.strip()
 
 
+# PR S: hallucination guards for the hot prompt enrichment path.
+#
+# The CVR-control audit caught the canonical failure mode:
+#   1. Whisper hallucinates ``Audoo`` once with a leading capital
+#      (because the meeting is about Odoo — phonetic neighbour).
+#   2. ``condition_on_previous_text=True`` propagates ``Audoo``
+#      into adjacent windows.
+#   3. PR D extractor sees ``Audoo`` ≥ 2 occurrences, classifies it
+#      as a proper noun, injects it into ``glossary_terms``.
+#   4. PR P phonetic matcher then rewrites every real ``Odoo`` to
+#      ``Audoo`` because they have the same french_phonetic_key.
+#
+# The three checks below break the loop at step 3:
+#   A. **Phonetic collision** with any existing glossary term →
+#      candidate is a mangled version of a real term; refuse.
+#   B. **Context diversity**: if every occurrence has the same
+#      preceding word, the candidate is locked into a recurring
+#      phrase (typical of decoder loops). A real proper noun
+#      appears in varied contexts.
+#   C. **Per-segment dominance**: if more than ``max_per_segment``
+#      occurrences land in a single segment, it's a decoder loop
+#      ("application de l'application de l'application…"), not a
+#      mention.
+
+_HOT_PROMPT_MAX_PER_SEGMENT = 3
+_HOT_PROMPT_MIN_DISTINCT_CONTEXTS = 2
+
+
+def _candidate_phonetic_key(value: str) -> str:
+    """Phonetic key used to detect collisions with an existing
+    glossary term. Mirrors ``french_phonetic_key`` (per word) on
+    the folded surface; multi-word terms get their per-word keys
+    concatenated so ``Power BI`` yields a single canonical key
+    without needing to align the tokens.
+
+    Local import on ``glossary_postprocess`` keeps ``transcription
+    _utils`` importable in callers that don't ship the phonetic
+    module (legacy paths, tests). When the import fails, the
+    function returns an empty string — downstream collision check
+    short-circuits to "no collision" and the candidate goes
+    through, which is the safe failure mode for hot prompt
+    enrichment (worst case: a stale hallucination slips through
+    one more pass).
+    """
+    folded = _fold_for_matching(value or "")
+    tokens = re.split(r"[\s'’\-]+", folded.lower())
+    try:
+        from glossary_postprocess import french_phonetic_key
+    except Exception:
+        return ""
+    return "".join(french_phonetic_key(tok) for tok in tokens if tok)
+
+
+def _phonetic_collides_with_existing(
+    candidate_key: str, existing_keys: set[str]
+) -> bool:
+    """True when ``candidate_key`` matches any existing glossary
+    term's phonetic key (exact or within Levenshtein 1). Cheap to
+    compute because the existing glossary is small (≤ tens).
+    """
+    if not candidate_key:
+        return False
+    for ex_key in existing_keys:
+        if not ex_key:
+            continue
+        if ex_key == candidate_key:
+            return True
+        # ``Audoo`` (ADA) vs ``Odoo`` (ADA) collide exactly. For
+        # near-collisions like ``Castell`` vs ``Castel``, we accept
+        # Lev=1 on the phonetic key as enough signal.
+        if abs(len(ex_key) - len(candidate_key)) <= 1:
+            try:
+                # ``_levenshtein`` lives in ``glossary_postprocess``
+                # — keep the dependency loose to avoid a cycle.
+                from glossary_postprocess import _levenshtein
+
+                if _levenshtein(candidate_key, ex_key, limit=2) <= 1:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 def extract_new_proper_nouns_from_segments(
     segments: Iterable[dict],
     *,
@@ -1112,6 +1195,8 @@ def extract_new_proper_nouns_from_segments(
     min_occurrences: int = 2,
     max_terms: int = 20,
     min_length: int = 3,
+    min_distinct_contexts: int = _HOT_PROMPT_MIN_DISTINCT_CONTEXTS,
+    max_per_segment: int = _HOT_PROMPT_MAX_PER_SEGMENT,
 ) -> list[str]:
     """
     Mine the first-pass Whisper transcript for proper-noun candidates
@@ -1137,26 +1222,72 @@ def extract_new_proper_nouns_from_segments(
       • It is not already present in ``existing_terms`` (case-
         insensitive, accent-insensitive — so adding "Castel" is
         skipped when the glossary already has "Castel").
+      • **PR S — anti-hallucination**: its phonetic key does NOT
+        collide (Lev ≤ 1) with any existing glossary term's key.
+        Stops ``Audoo`` from being learned when ``Odoo`` is already
+        on the list.
+      • **PR S — context diversity**: appears with at least
+        ``min_distinct_contexts`` (default 2) different preceding
+        word contexts. A candidate that always follows the same
+        word is locked into a recurring phrase — usually a decoder
+        loop, not a mention.
+      • **PR S — per-segment cap**: no more than ``max_per_segment``
+        occurrences in any single segment (default 3). Catches
+        intra-segment decoder loops where ``application`` repeats
+        50× in one bubble.
 
     Returns up to ``max_terms`` candidates ordered by descending
     occurrence (then by first-occurrence order to keep results
     deterministic on ties).
     """
-    existing_keys = {
+    existing_keys_folded = {
         _fold_term(term)
         for term in (existing_terms or [])
         if _fold_term(term)
+    }
+    existing_phonetic_keys = {
+        _candidate_phonetic_key(term)
+        for term in (existing_terms or [])
+        if (term or "").strip()
     }
 
     counts: dict[str, int] = {}
     first_seen: dict[str, int] = {}
     canonical: dict[str, str] = {}
+    per_segment_counts: dict[str, dict[int, int]] = {}
+    preceding_contexts: dict[str, set[str]] = {}
 
     order_idx = 0
-    for seg in segments or []:
+    for seg_idx, seg in enumerate(segments or []):
         text = str(seg.get("text", "") or "")
         if not text:
             continue
+        # Build a word list with positions so we can look up the
+        # preceding token for each match. Cheap enough at segment
+        # scale.
+        tokens_in_segment = re.findall(
+            r"[A-ZÀ-ÖØ-Þa-zà-öø-ÿĀ-ſ'’\-]+",
+            text,
+        )
+        token_positions = {idx: tok for idx, tok in enumerate(tokens_in_segment)}
+        token_index_of: dict[int, int] = {}
+        # Walk the matches in order and pair each with a token index.
+        cursor = 0
+        for match in _PROPER_NOUN_TOKEN_RE.finditer(text):
+            token = match.group(1)
+            # Find the next position in tokens_in_segment that
+            # equals the matched token. Cheap linear scan; segments
+            # rarely exceed a few hundred tokens.
+            while cursor < len(tokens_in_segment) and tokens_in_segment[cursor] != token:
+                cursor += 1
+            if cursor >= len(tokens_in_segment):
+                # Defensive: token didn't line up; skip context
+                # tracking for this match but still count it.
+                token_index_of[id(match)] = -1
+            else:
+                token_index_of[id(match)] = cursor
+                cursor += 1
+
         for match in _PROPER_NOUN_TOKEN_RE.finditer(text):
             token = match.group(1)
             if len(token) < min_length:
@@ -1164,29 +1295,43 @@ def extract_new_proper_nouns_from_segments(
             key = _fold_term(token)
             if not key:
                 continue
-            # Strip the apostrophe-suffix forms ("l'Adèle" → "Adèle")
-            # by re-running the matcher only on the head form. This
-            # also covers the elision case "d'Adèle".
             if key in _FR_SENTENCE_START_NOISE:
                 continue
-            if key in existing_keys:
+            if key in existing_keys_folded:
                 continue
             counts[key] = counts.get(key, 0) + 1
+            seg_bucket = per_segment_counts.setdefault(key, {})
+            seg_bucket[seg_idx] = seg_bucket.get(seg_idx, 0) + 1
             if key not in first_seen:
                 first_seen[key] = order_idx
-                # Keep the first surface form we saw (likely mid-
-                # sentence, so capitalisation is meaningful rather
-                # than an artefact of sentence-start).
                 canonical[key] = token
+            # Track distinct preceding-word contexts.
+            t_idx = token_index_of.get(id(match), -1)
+            if t_idx > 0:
+                prev = token_positions.get(t_idx - 1, "").lower()
+                preceding_contexts.setdefault(key, set()).add(prev)
+            else:
+                # Sentence-initial position — count as a distinct
+                # "boundary" context so a true proper noun that
+                # always opens sentences isn't unfairly rejected.
+                preceding_contexts.setdefault(key, set()).add("<BOS>")
             order_idx += 1
 
-    qualifying = [
-        (key, count)
-        for key, count in counts.items()
-        if count >= min_occurrences
-    ]
-    qualifying.sort(key=lambda kv: (-kv[1], first_seen[kv[0]]))
+    qualifying: list[tuple[str, int]] = []
+    for key, count in counts.items():
+        if count < min_occurrences:
+            continue
+        # PR S anti-hallucination filters.
+        candidate_key = _candidate_phonetic_key(canonical[key])
+        if _phonetic_collides_with_existing(candidate_key, existing_phonetic_keys):
+            continue
+        if max(per_segment_counts.get(key, {}).values(), default=0) > max_per_segment:
+            continue
+        if len(preceding_contexts.get(key, set())) < min_distinct_contexts:
+            continue
+        qualifying.append((key, count))
 
+    qualifying.sort(key=lambda kv: (-kv[1], first_seen[kv[0]]))
     return [canonical[key] for key, _ in qualifying[:max_terms]]
 
 
