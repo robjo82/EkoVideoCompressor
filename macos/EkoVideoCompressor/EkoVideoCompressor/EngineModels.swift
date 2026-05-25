@@ -487,11 +487,11 @@ enum TranscriptionQualityPreset: String, Codable, CaseIterable, Identifiable {
         case .max:
             // Honest description of what the orchestrator actually
             // wires today. The list is kept in sync with
-            // ``QUALITY_PRESETS["max"]`` in the engine (PR L) ;
-            // the multimodal recheck (PR F) is now on by default.
-            // When the venv doesn't ship ``mlx_vlm`` the recheck
-            // step degrades to a silent no-op with a warning.
-            return "Tout activer : VAD + repasses haute qualité (zones douteuses + frontières de locuteurs) + passe per-locuteur + relecture LLM + enrichissement web du glossaire + Whisper contexte croisé + réécoute IA Qwen2-Audio des passages douteux."
+            // ``QUALITY_PRESETS["max"]`` in the engine (PR L). PR Y
+            // removed "Whisper contexte croisé" from this preset
+            // after the audit found it causing 70-minute decoder
+            // loops on long meetings.
+            return "Tout activer : VAD + repasses haute qualité (zones douteuses + frontières de locuteurs) + passe per-locuteur + relecture LLM + enrichissement web du glossaire + réécoute IA Qwen2-Audio des passages douteux."
         case .custom:
             return "Conserve les bascules avancées telles que définies."
         }

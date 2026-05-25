@@ -168,30 +168,45 @@ QUALITY_PRESETS: dict[str, dict[str, bool]] = {
     "max": {
         # Everything wired in the engine today: VAD, multipass
         # (low-confidence + boundary), per-speaker Whisper pass
-        # (PR E), web enrichment (PR H), context-aware Whisper
-        # + hot prompt enrichment (PR D), multimodal audio recheck
-        # (PR F — Qwen2-Audio via ``mlx_vlm``). When the venv
-        # doesn't ship ``mlx_vlm`` the recheck step degrades to a
-        # silent no-op with a warning, so flipping it on here is safe
-        # even on machines that haven't installed the audio LLM yet.
+        # (PR E), web enrichment (PR H), hot prompt enrichment
+        # (PR D), multimodal audio recheck (PR F — Qwen2-Audio via
+        # ``mlx_vlm``). When the venv doesn't ship ``mlx_vlm`` the
+        # recheck step degrades to a silent no-op with a warning,
+        # so flipping it on here is safe even on machines that
+        # haven't installed the audio LLM yet.
+        #
+        # PR Y — ``condition_on_previous_text`` deliberately stays
+        # OFF in max. The audit on two 1-2 h meetings (CVR, Caste)
+        # showed Whisper hallucinating a phrase (e.g. ``"On est sur
+        # Zindoc pour la gestion des fichiers."``) and the
+        # propagated context locking it in for 70+ minutes of audio.
+        # ``clean_whisper_segments`` then drops the looped segments
+        # (correct), but ~50 % of the recorded content vanishes from
+        # the final transcript with no warning. The win on
+        # proper-noun stability does not justify silently losing an
+        # hour of meeting. Re-enabling requires a recovery mechanism
+        # (re-Whisper the failed range without context).
         "vad_enabled": True,
         "multipass_enabled": True,
         "per_speaker_enabled": True,
         "audio_recheck_enabled": True,
         "web_enrichment_enabled": True,
-        "condition_on_previous_text": True,
+        "condition_on_previous_text": False,
         "hot_prompt_enrichment": True,
     },
 }
 
-# Knobs that ``max`` deliberately leaves off (because the underlying
-# feature isn't wired in the new engine yet). The sentinel test in
+# Knobs that ``max`` deliberately leaves off. Each entry needs a
+# comment block in the ``max`` row above explaining the engine work
+# that re-enabling would require. The sentinel test in
 # ``tests/test_quality_presets.py`` uses this set to allow the gap
 # without losing the "max really is max" invariant for everything else.
-# Empty now that PR F landed — the set stays around so future work
-# can re-introduce a pending knob without having to re-add the
-# scaffolding.
-_MAX_PRESET_PENDING: frozenset[str] = frozenset()
+_MAX_PRESET_PENDING: frozenset[str] = frozenset(
+    {
+        # PR Y — pending a re-Whisper recovery for loop ranges.
+        "condition_on_previous_text",
+    }
+)
 
 
 def apply_quality_preset(settings: "TranscriptionSettings") -> "TranscriptionSettings":
