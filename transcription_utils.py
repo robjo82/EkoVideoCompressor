@@ -1529,6 +1529,42 @@ Règles strictes :
 - Si un même SPEAKER_XX semble contenir plusieurs personnes (standard téléphonique, transfert, mauvaise diarisation), laisse sa valeur vide.
 - Ne renomme pas un SPEAKER_XX d'après une seule formule d'accueil si le même label répond ensuite à un autre nom.
 - Ne mets que les SPEAKER_XX présents dans la transcription.
+
+# RÈGLE CRITIQUE — IDENTITÉ vs MENTION (lis attentivement)
+
+Un PRÉNOM cité dans le discours d'un SPEAKER_XX n'est PAS le nom de ce SPEAKER_XX dans la grande majorité des cas. Un participant nomme :
+- son interlocuteur (« merci Marie »)
+- une tierce personne absente (« j'ai vu Pierre hier »)
+- un collègue dont on parle (« il faudrait demander à Sophie »)
+
+Tu ne peux attribuer un prénom à un SPEAKER_XX QUE SI tu vois un signal d'auto-présentation EXPLICITE dans son propre discours, par exemple :
+- « Bonjour, je suis Robin. »
+- « Robin Joseph à l'appareil. »
+- « Moi c'est Manon. »
+- « Je m'appelle Vincent. »
+
+Tu ne dois PAS attribuer un prénom à un SPEAKER_XX juste parce que ce prénom est mentionné dans ses tours de parole. Exemple typique d'erreur à éviter :
+
+  Transcription (extrait) :
+    [SPEAKER_00] Bonjour, vous avez vu Nicolas Lacombe c'est ça ?
+    [SPEAKER_01] Oui, il a travaillé avec mon père pendant 15 ans.
+
+  Mauvaise sortie (INTERDITE) :
+    {{"speakers": {{"SPEAKER_00": "Nicolas"}}}}
+
+  Bonne sortie : laisse les deux SPEAKER vides — Nicolas Lacombe n'est PAS dans la conversation, il est juste mentionné.
+
+Autre exemple :
+  [SPEAKER_00] Manon, est-ce que tu peux nous montrer le tableau ?
+  [SPEAKER_01] Bien sûr, je le partage maintenant.
+
+  Bonne sortie : {{"speakers": {{"SPEAKER_00": "", "SPEAKER_01": "Manon"}}}}
+  Justification : SPEAKER_00 ADRESSE Manon (donc ce n'est pas lui), SPEAKER_01 répond et est implicitement Manon.
+
+Quand tu hésites, laisse la chaîne vide. Une attribution fausse pollue le compte rendu et la base de profils vocaux.
+
+# Autres règles
+
 - "technical_terms" contient 0 à 20 termes, sans doublons, orthographiés proprement.
 - Priorise les termes du vocabulaire métier quand ils apparaissent même phonétiquement.
 - Le titre doit décrire le sujet global de toute la réunion, pas recopier une phrase locale.
