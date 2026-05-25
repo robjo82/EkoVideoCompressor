@@ -1031,6 +1031,138 @@ def is_hallucinated_whisper_segment(segment: dict) -> bool:
     return False
 
 
+# PR V: intra-segment decoder loop detection.
+#
+# The CVR-control / Caste-Power-BI runs caught a failure mode that
+# ``clean_whisper_segments`` couldn't see: Whisper hallucinates a
+# short phrase ("de la Fondation") and ``condition_on_previous_text``
+# makes it loop INSIDE a single window, producing one segment like
+#   "Je vous présente le groupe de la Fondation de la Fondation de
+#    la Fondation de la Fondation … (×100)"
+#
+# The repetition is wholly within ``seg["text"]``, so the per-segment
+# normalisation in ``clean_whisper_segments`` (which compares the
+# CURRENT segment to the previous one) treats it as one legitimate
+# turn. The LLM post-process later tries to fix it but our anti-
+# hallucination guard in PR N rejects the rewrite as "too large a
+# change". So the loop sails through to the final transcript.
+#
+# This helper collapses any n-gram (1 ≤ n ≤ 6 words) that repeats
+# 4+ consecutive times to a single occurrence + an ellipsis marker
+# so the user can see something was truncated. The 4-rep threshold
+# is conservative: legitimate French repetitions ("oui oui oui",
+# "non non non non", "très très bien") almost never cross 3.
+
+_INTRA_SEGMENT_MIN_REPETITIONS = 4
+_INTRA_SEGMENT_MAX_NGRAM = 6
+
+
+def collapse_intra_segment_loops(text: str) -> tuple[str, int]:
+    """Collapse any n-gram repeated ``_INTRA_SEGMENT_MIN_REPETITIONS``
+    times or more into a single occurrence followed by an ellipsis
+    marker. Returns ``(new_text, collapsed_count)``.
+
+    Scans n-gram sizes from longest to shortest so ``de la Fondation``
+    (3-gram) is caught before its smaller ``de la`` (2-gram)
+    subpattern. We keep the first occurrence plus a "…" marker so
+    the user can tell the segment was truncated.
+
+    The function is whitespace-aware (tokenisation is on whitespace
+    after collapsing runs of spaces). Punctuation attached to the
+    last word of the n-gram is kept as part of the n-gram, which
+    means ``Fondation. Fondation. Fondation.`` collapses correctly
+    even when the model alternated punctuation.
+
+    Returns ``(text, 0)`` when nothing was collapsed — caller can
+    cheaply check whether to log a metric.
+    """
+    if not text or not text.strip():
+        return text, 0
+
+    # Normalise whitespace so n-gram matching is reliable. We
+    # preserve the original punctuation; only spaces collapse.
+    normalized = re.sub(r"\s+", " ", text.strip())
+    words = normalized.split(" ")
+    if len(words) < (
+        _INTRA_SEGMENT_MIN_REPETITIONS * 1
+    ):  # need at least 4 words to have a 4-fold 1-gram repetition
+        return text, 0
+
+    collapsed_total = 0
+    # PR V: try SHORTER n-grams first. A long n-gram (say 6 words)
+    # is often just two copies of a 3-word loop glued together —
+    # the matcher then leaves two copies of the inner loop in the
+    # output ("de la Fondation de la Fondation … fin." instead of
+    # just "de la Fondation … fin."). Iterating from 1 upward
+    # collapses the loop at its most compact size first, so the
+    # longer n-grams have nothing left to chew on.
+    changed = True
+    pass_count = 0
+    # Iterate at most ``_INTRA_SEGMENT_MAX_NGRAM`` times because each
+    # pass at one n-gram size can only collapse non-overlapping
+    # repetitions; further n-gram sizes may catch what remained.
+    while changed and pass_count < _INTRA_SEGMENT_MAX_NGRAM:
+        changed = False
+        pass_count += 1
+        for n in range(1, _INTRA_SEGMENT_MAX_NGRAM + 1):
+            new_words, n_collapsed = _collapse_ngram_at_size(words, n)
+            if n_collapsed > 0:
+                words = new_words
+                collapsed_total += n_collapsed
+                changed = True
+                # Restart the n-gram sweep because collapsing one
+                # loop can expose another at a different n-gram size.
+                break
+
+    if collapsed_total == 0:
+        return text, 0
+    return " ".join(words), collapsed_total
+
+
+def _collapse_ngram_at_size(
+    words: list[str], n: int
+) -> tuple[list[str], int]:
+    """Single-pass collapse for one n-gram size. Returns the new
+    word list and the number of repetition groups collapsed.
+    """
+    if n < 1 or len(words) < n * _INTRA_SEGMENT_MIN_REPETITIONS:
+        return words, 0
+    out: list[str] = []
+    collapsed = 0
+    i = 0
+    while i < len(words):
+        # Try to read a repeating n-gram starting at i.
+        if i + n * _INTRA_SEGMENT_MIN_REPETITIONS > len(words):
+            out.append(words[i])
+            i += 1
+            continue
+        candidate = words[i : i + n]
+        # Reject n-grams that contain only punctuation / are empty.
+        if not any(tok.strip(".,;:!?…\"'()«»") for tok in candidate):
+            out.append(words[i])
+            i += 1
+            continue
+        reps = 1
+        j = i + n
+        # Count consecutive matches.
+        while (
+            j + n <= len(words) and words[j : j + n] == candidate
+        ):
+            reps += 1
+            j += n
+        if reps >= _INTRA_SEGMENT_MIN_REPETITIONS:
+            # Keep one occurrence + an ellipsis marker so the user
+            # sees the truncation.
+            out.extend(candidate)
+            out.append("…")
+            i = j  # skip all repeated runs
+            collapsed += 1
+        else:
+            out.append(words[i])
+            i += 1
+    return out, collapsed
+
+
 def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
     """
     Drop obvious Whisper hallucinations without rewriting real speech.
@@ -1038,6 +1170,12 @@ def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
     This targets the common local-Whisper failure mode on long recordings:
     silence or room noise produces "..." or stock subtitle artefacts, then
     `condition_on_previous_text=True` propagates that failure for minutes.
+
+    PR V: also catches **intra-segment** decoder loops where a short
+    phrase repeats 4+ times within one segment ("de la Fondation de
+    la Fondation de la Fondation …"). The repeated phrase is
+    collapsed to a single occurrence + "…" so the user can see
+    something was truncated.
     """
     out: list[dict] = []
     last_norm = ""
@@ -1048,7 +1186,17 @@ def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
             continue
 
         cleaned = dict(seg)
-        cleaned["text"] = str(cleaned.get("text", "")).strip()
+        raw_text = str(cleaned.get("text", "")).strip()
+        # PR V: collapse intra-segment loops BEFORE the cross-segment
+        # dedup runs so the normalised key reflects the cleaned
+        # text. Otherwise a looped segment followed by a normal one
+        # would never cross-dedup against anything because the loop
+        # makes the normalised forms different.
+        collapsed_text, collapsed_count = collapse_intra_segment_loops(raw_text)
+        if collapsed_count:
+            cleaned["text"] = collapsed_text
+        else:
+            cleaned["text"] = raw_text
         normalized = _normalize_segment_text(cleaned["text"])
         if normalized and normalized == last_norm:
             repeat_count += 1
