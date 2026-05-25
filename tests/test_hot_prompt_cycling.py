@@ -51,10 +51,15 @@ class TranscriptionSettingsContextFlagTests(unittest.TestCase):
         self.assertFalse(settings.condition_on_previous_text)
         self.assertFalse(settings.hot_prompt_enrichment)
 
-    def test_max_preset_enables_both_flags(self):
+    def test_max_preset_enables_hot_prompt_but_not_context(self):
+        # PR Y: ``condition_on_previous_text`` is OFF in max pending
+        # a recovery mechanism for decoder loops (the Caste audit
+        # showed 70-min stretches of looped audio dropped silently).
+        # Hot prompt enrichment stays on — it doesn't share the
+        # decoder-loop failure mode.
         settings = TranscriptionSettings(quality_preset="max")
         settings = apply_quality_preset(settings)
-        self.assertTrue(settings.condition_on_previous_text)
+        self.assertFalse(settings.condition_on_previous_text)
         self.assertTrue(settings.hot_prompt_enrichment)
 
     def test_custom_preset_passthrough_respects_caller(self):

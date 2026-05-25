@@ -179,12 +179,16 @@ class ApplyQualityPresetTests(unittest.TestCase):
         self.assertTrue(result.multipass_enabled)
         self.assertTrue(result.per_speaker_enabled)
         self.assertTrue(result.web_enrichment_enabled)
-        self.assertTrue(result.condition_on_previous_text)
         self.assertTrue(result.hot_prompt_enrichment)
         # PR F: ``audio_recheck_enabled`` now wired in the engine —
         # the step is opt-in via this flag and degrades to a silent
         # no-op when ``mlx_vlm`` isn't installed.
         self.assertTrue(result.audio_recheck_enabled)
+        # PR Y: ``condition_on_previous_text`` is now DELIBERATELY
+        # OFF in max (added back to ``_MAX_PRESET_PENDING``). The
+        # audit on long meetings showed it causing 70-minute decoder
+        # loops, costing more than the proper-noun stability win.
+        self.assertFalse(result.condition_on_previous_text)
 
     def test_custom_preset_is_passthrough(self):
         settings = TranscriptionSettings(
@@ -220,8 +224,10 @@ class ApplyQualityPresetTests(unittest.TestCase):
     def test_from_dict_applies_preset_round_trip(self):
         settings = TranscriptionSettings.from_dict({"quality_preset": "max"})
         self.assertTrue(settings.per_speaker_enabled)
-        self.assertTrue(settings.condition_on_previous_text)
         self.assertTrue(settings.hot_prompt_enrichment)
+        # PR Y: condition_on_previous_text is off in max (pending
+        # decoder-loop recovery work).
+        self.assertFalse(settings.condition_on_previous_text)
 
 
 class QualityPresetLeversTests(unittest.TestCase):

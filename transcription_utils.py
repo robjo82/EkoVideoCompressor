@@ -1163,7 +1163,43 @@ def _collapse_ngram_at_size(
     return out, collapsed
 
 
-def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
+# PR Y: an "extended decoder loop" is a run of N+ consecutive
+# identical normalised segments. ``clean_whisper_segments`` already
+# drops them after the 2nd repeat, but historically dropped them
+# silently. When the loop spans dozens of segments and minutes of
+# audio (the Caste run had a 70 min stretch of repeated phrase
+# ``"On est sur Zindoc pour la gestion des fichiers."``), the
+# caller needs to know — that audio range produced no usable text
+# and the user is missing meeting content. We expose detected loops
+# as ``DroppedLoop`` records so the pipeline can emit a
+# WarningEvent.
+EXTENDED_LOOP_MIN_DROPS = 5  # ≥ 5 consecutive drops = obvious loop
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DroppedLoop:
+    """A run of dropped repeated segments.
+
+    ``start`` / ``end`` are the original segment timestamps (seconds
+    on the Whisper timeline). ``text`` is the repeated normalised
+    text. ``dropped`` is the number of consecutive segments dropped
+    (≥ ``EXTENDED_LOOP_MIN_DROPS``).
+    """
+
+    start: float
+    end: float
+    text: str
+    dropped: int
+
+
+def clean_whisper_segments(
+    segments: Iterable[dict],
+    *,
+    dropped_loops: list[DroppedLoop] | None = None,
+) -> list[dict]:
     """
     Drop obvious Whisper hallucinations without rewriting real speech.
 
@@ -1176,10 +1212,38 @@ def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
     la Fondation de la Fondation …"). The repeated phrase is
     collapsed to a single occurrence + "…" so the user can see
     something was truncated.
+
+    PR Y: when ``dropped_loops`` is provided, the function appends a
+    ``DroppedLoop`` record for every loop of ≥
+    ``EXTENDED_LOOP_MIN_DROPS`` consecutive dropped segments. The
+    pipeline uses this to surface a WarningEvent so the user knows
+    audio content was lost (rather than silently disappearing).
+    Default ``None`` preserves the historical signature for legacy
+    callers / tests.
     """
     out: list[dict] = []
     last_norm = ""
     repeat_count = 0
+    # PR Y bookkeeping for the current loop, if any.
+    loop_start: float | None = None
+    loop_end: float | None = None
+    loop_dropped = 0
+
+    def _flush_loop() -> None:
+        if dropped_loops is None:
+            return
+        if loop_dropped < EXTENDED_LOOP_MIN_DROPS:
+            return
+        if loop_start is None or loop_end is None:
+            return
+        dropped_loops.append(
+            DroppedLoop(
+                start=loop_start,
+                end=loop_end,
+                text=last_norm[:120],
+                dropped=loop_dropped,
+            )
+        )
 
     for seg in segments:
         if is_hallucinated_whisper_segment(seg):
@@ -1201,14 +1265,33 @@ def clean_whisper_segments(segments: Iterable[dict]) -> list[dict]:
         if normalized and normalized == last_norm:
             repeat_count += 1
         else:
+            # Different text → if we were inside a loop, flush
+            # the record before resetting state.
+            _flush_loop()
+            loop_start = None
+            loop_end = None
+            loop_dropped = 0
             last_norm = normalized
             repeat_count = 1
 
         # Keep the first repeated phrase because people do repeat themselves;
         # discard long decoder loops.
         if repeat_count > 2:
+            # We're now dropping a segment. Track the loop range so
+            # PR Y can surface the warning with accurate timestamps.
+            try:
+                seg_start = float(seg.get("start") or 0.0)
+                seg_end = float(seg.get("end") or seg_start)
+            except (TypeError, ValueError):
+                seg_start = seg_end = 0.0
+            if loop_start is None:
+                loop_start = seg_start
+            loop_end = seg_end
+            loop_dropped += 1
             continue
         out.append(cleaned)
+    # End of input — flush any trailing loop.
+    _flush_loop()
     return out
 
 
@@ -2387,7 +2470,11 @@ def parse_diarization_output(stdout: str) -> list[dict]:
     return list(payload.get("turns", []))
 
 
-def parse_whisper_json_segments(json_path: str) -> list[dict]:
+def parse_whisper_json_segments(
+    json_path: str,
+    *,
+    dropped_loops: list[DroppedLoop] | None = None,
+) -> list[dict]:
     """
     MLX Whisper's --output-format json writes {"text": ..., "segments": [...],
     "language": ...}. We only care about the segments list.
@@ -2397,6 +2484,12 @@ def parse_whisper_json_segments(json_path: str) -> list[dict]:
     those so the speaker-assignment pass downstream can split a
     segment on the actual word boundary when the diarisation turn
     changes mid-sentence.
+
+    PR Y: pass ``dropped_loops=[]`` to receive a list of
+    ``DroppedLoop`` records for any run of ≥
+    ``EXTENDED_LOOP_MIN_DROPS`` consecutive dropped segments. The
+    pipeline uses this to surface a WarningEvent so the user knows
+    audio content was lost to a Whisper decoder loop.
     """
     raw = Path(json_path).read_text(encoding="utf-8")
     payload = json.loads(raw)
@@ -2426,7 +2519,7 @@ def parse_whisper_json_segments(json_path: str) -> list[dict]:
             "no_speech_prob": seg.get("no_speech_prob"),
             "words": words,
         })
-    return clean_whisper_segments(out)
+    return clean_whisper_segments(out, dropped_loops=dropped_loops)
 
 
 def render_segments_plain(segments: list[dict], output_format: str) -> str:

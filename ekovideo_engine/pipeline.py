@@ -1601,7 +1601,38 @@ class TranscriptionPipeline:
                 [],
             )
 
-        segments = parse_whisper_json_segments(str(whisper_json))
+        # PR Y: capture decoder-loop ranges so we can surface a
+        # WarningEvent when the cleaner drops minutes of looped
+        # output. The audit on the Caste run found a 70-minute
+        # stretch of repeated ``"On est sur Zindoc"`` dropped
+        # silently — the user lost an hour of meeting with no signal.
+        dropped_loops: list[Any] = []
+        segments = parse_whisper_json_segments(
+            str(whisper_json), dropped_loops=dropped_loops
+        )
+        if dropped_loops:
+            total_dropped = sum(loop.dropped for loop in dropped_loops)
+            total_seconds = sum(
+                max(0.0, loop.end - loop.start) for loop in dropped_loops
+            )
+            # Most-impactful loop first so the user sees the worst
+            # range in the warning text.
+            worst = max(dropped_loops, key=lambda l: l.end - l.start)
+            self.sink(
+                WarningEvent(
+                    f"Whisper a bouclé sur {len(dropped_loops)} zone(s) "
+                    f"({total_dropped} segments, ~{total_seconds:.0f}s d'audio). "
+                    f"La pire : {worst.start:.0f}s → {worst.end:.0f}s "
+                    f"(\"{worst.text[:60]}…\"). "
+                    f"Le contenu de ces zones n'est pas dans la transcription.",
+                    code="whisper_decoder_loop_dropped",
+                )
+            )
+            append_app_log(
+                "engine_whisper_decoder_loops "
+                f"count={len(dropped_loops)} dropped_segments={total_dropped} "
+                f"dropped_seconds={total_seconds:.1f}"
+            )
         self.sink(
             ProgressEvent("whisper", 100, f"Transcript ready ({len(segments)} segments)")
         )
@@ -1612,7 +1643,10 @@ class TranscriptionPipeline:
                 str(whisper_json),
                 model=settings.model,
                 duration_seconds=duration,
-                metrics={"segments": len(segments)},
+                metrics={
+                    "segments": len(segments),
+                    "decoder_loops": len(dropped_loops),
+                },
             ),
             segments,
         )
