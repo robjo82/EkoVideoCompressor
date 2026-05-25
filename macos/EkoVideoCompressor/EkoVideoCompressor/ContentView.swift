@@ -2648,19 +2648,17 @@ struct SettingsView: View {
                 }
                 Section("Avancé") {
                     Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
-                    // The multimodal audio recheck (Qwen2-Audio) is
-                    // exposed as a setting but the orchestrator
-                    // doesn't run it yet — only the legacy
-                    // ``video_compactor.py`` path implements the
-                    // step. The toggle is replaced by a static
-                    // info line so the user doesn't enable a
-                    // no-op switch. When the engine wires the
-                    // pass we'll restore the Toggle and flip
-                    // ``audio_llm.available`` to True in the
-                    // catalog.
-                    Label(
-                        "Réécoute multimodale (Qwen2-Audio) — à venir dans une prochaine version.",
-                        systemImage: "ear.badge.waveform"
+                    // PR F shipped the multimodal recheck step in the
+                    // engine. The Toggle is back; PR Z restored it.
+                    // The recheck is opt-in (it loads ``mlx_vlm``
+                    // + Qwen2-Audio ~5 GB on first run) and is also
+                    // turned on by the ``Maximale`` preset.
+                    Toggle(
+                        "Réécoute IA des passages douteux (Qwen2-Audio)",
+                        isOn: $settings.audioRecheckEnabled
+                    )
+                    Text(
+                        "La réécoute multimodale relit chaque passage flaggé « douteux » avec Qwen2-Audio et suggère une transcription dans le rapport de relecture. Première activation : ~5 Go de modèle à télécharger."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -2965,15 +2963,21 @@ struct StatusBarView: View {
     }
 }
 
-struct ListHeaderView: View {
+struct ListHeaderView<MenuContent: View>: View {
     var title: String
     var subtitle: String
     var actionTitle: String
     var actionSystemImage: String
     var action: () -> Void
+    /// PR Z — optional overflow menu rendered to the right of the
+    /// primary action button. Lets callers attach secondary
+    /// destructive actions (e.g. "Réinitialiser la library
+    /// vocale…" in SpeakersView) without re-implementing the
+    /// header layout.
+    @ViewBuilder var overflowMenu: () -> MenuContent
 
     var body: some View {
-        HStack {
+        HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.largeTitle.bold())
@@ -2984,8 +2988,33 @@ struct ListHeaderView: View {
             Button(action: action) {
                 Label(actionTitle, systemImage: actionSystemImage)
             }
+            // Render the menu only if a non-empty content was
+            // provided. SwiftUI evaluates the closure lazily so
+            // the EmptyView branch is free.
+            overflowMenu()
         }
         .padding(24)
+    }
+}
+
+extension ListHeaderView where MenuContent == EmptyView {
+    /// Convenience initialiser for callers that don't need the
+    /// overflow menu — preserves the original ListHeaderView
+    /// signature so the other call sites (LibraryView etc.)
+    /// don't have to opt in.
+    init(
+        title: String,
+        subtitle: String,
+        actionTitle: String,
+        actionSystemImage: String,
+        action: @escaping () -> Void
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.actionTitle = actionTitle
+        self.actionSystemImage = actionSystemImage
+        self.action = action
+        self.overflowMenu = { EmptyView() }
     }
 }
 
@@ -4700,21 +4729,19 @@ struct SpeakersView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ZStack(alignment: .topTrailing) {
-                ListHeaderView(
-                    title: "Interlocuteurs",
-                    subtitle: settings.odooConfigured
-                        ? "Voix mémorisées, regroupées par société Odoo."
-                        : "Voix mémorisées localement. Connectez Odoo dans Réglages pour les regrouper par entreprise.",
-                    actionTitle: "Actualiser",
-                    actionSystemImage: "arrow.clockwise"
-                ) {
-                    Task { await reload(force: true) }
-                }
-                // PR X — "Réinitialiser la library vocale" overflow
-                // menu, anchored to the same row as the Actualiser
-                // button. Kept behind a Menu so the destructive
-                // action isn't the first thing the user sees.
+            ListHeaderView(
+                title: "Interlocuteurs",
+                subtitle: settings.odooConfigured
+                    ? "Voix mémorisées, regroupées par société Odoo."
+                    : "Voix mémorisées localement. Connectez Odoo dans Réglages pour les regrouper par entreprise.",
+                actionTitle: "Actualiser",
+                actionSystemImage: "arrow.clockwise",
+                action: { Task { await reload(force: true) } }
+            ) {
+                // PR Z — proper overflow menu, integrated into the
+                // header layout (no more ZStack + magic padding).
+                // The destructive action is the only entry today;
+                // future additions land here naturally.
                 Menu {
                     Button(role: .destructive) {
                         showResetConfirmation = true
@@ -4727,11 +4754,11 @@ struct SpeakersView: View {
                 } label: {
                     Image(systemName: "ellipsis.circle")
                         .imageScale(.large)
+                        .foregroundStyle(.secondary)
                 }
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
-                .padding(.top, 28)
-                .padding(.trailing, 132)
+                .fixedSize()
                 .help("Plus d'actions")
             }
             if let feedback = resetFeedback {
