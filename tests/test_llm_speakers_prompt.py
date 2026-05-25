@@ -76,6 +76,34 @@ class LlmSpeakerPromptContentTests(unittest.TestCase):
         self.assertIn('"speakers"', self.script)
         self.assertIn('"technical_terms"', self.script)
 
+    # -- PR AA: title format "Société - Sujet" -----------------------
+
+    def test_prompt_specifies_company_dash_topic_format(self):
+        # The new title format anchor.
+        self.assertIn("Nom de société - Sujet court", self.script)
+        self.assertIn("FORMAT DU TITRE", self.script)
+
+    def test_prompt_excludes_ekonum_from_company_choice(self):
+        # The user runs the app, so Ekonum is always one of the
+        # parties — but the user wants the CLIENT's name, not their
+        # own. The prompt makes this explicit.
+        self.assertIn("non-Ekonum", self.script)
+
+    def test_prompt_carries_company_title_examples(self):
+        # Positive examples covering our real client cases.
+        for example in (
+            "CVR Contrôles - Configuration site web Odoo",
+            "Caste - Audit système ERP et reporting",
+            "Acritec - Migration facturation vers Odoo",
+        ):
+            self.assertIn(example, self.script)
+
+    def test_prompt_allows_no_company_fallback(self):
+        # When no client company is clear, the prompt allows a
+        # bare topic — better than forcing a wrong company name.
+        self.assertIn("Acceptable sans société", self.script)
+        self.assertIn("omets le préfixe", self.script)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1650,10 +1650,24 @@ Quand tu hésites, laisse la chaîne vide. Une attribution fausse pollue le comp
 
 - "technical_terms" contient 0 à 20 termes, sans doublons, orthographiés proprement.
 - Priorise les termes du vocabulaire métier quand ils apparaissent même phonétiquement.
-- Le titre doit décrire le sujet global de toute la réunion, pas recopier une phrase locale.
-- Le titre doit être nominal, sans première personne : pas de titre commençant par "J'ai", "Je", "On va", "Nous allons".
-- Mauvais titre : "J'ai pris une facture fournisseur basique, c'est PayFit".
-- Bon titre : "Traitement des factures fournisseurs avec PayFit".
+
+# FORMAT DU TITRE
+
+Format strict : "Nom de société - Sujet court".
+
+- La société est celle des interlocuteurs **non-Ekonum** (le client / partenaire), pas Ekonum.
+- Si plusieurs sociétés sont impliquées, prends celle qui pilote le sujet (généralement celle qui pose le plus de questions ou dont le métier est discuté).
+- Si aucune société n'est clairement identifiable, omets le préfixe et garde juste un sujet court.
+- Sujet : 3 à 7 mots, nominal, sans première personne (pas de "J'ai", "Je", "On va", "Nous allons").
+- Le sujet doit décrire le sujet global de toute la réunion, pas recopier une phrase locale.
+
+Exemples :
+- Bon titre : "CVR Contrôles - Configuration site web Odoo"
+- Bon titre : "Caste - Audit système ERP et reporting"
+- Bon titre : "Acritec - Migration facturation vers Odoo"
+- Mauvais titre : "J'ai pris une facture fournisseur basique, c'est PayFit"
+- Mauvais titre : "Discussion sur l'utilisation d'Odoo et d'autres logiciels"  (pas de société, sujet trop vague)
+- Acceptable sans société : "Présentation du nouveau module RH"  (quand aucune entreprise cliente n'est claire)
 
 Schéma exact attendu :
 {{"title": "...", "speakers": {{"SPEAKER_00": "..."}}, "technical_terms": ["Odoo"]}}
