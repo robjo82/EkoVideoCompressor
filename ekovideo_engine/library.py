@@ -1359,3 +1359,36 @@ def library_delete_speaker_profile(profile_id: int | None = None, *, name: str |
         db.delete_speaker_profile(int(existing["id"]))
         return 1
     return 0
+
+
+def library_reset_speaker_profiles() -> dict[str, int]:
+    """PR X — purge ALL stored voice profiles in one call.
+
+    Used by the SwiftUI "Réinitialiser la library vocale" button
+    in Réglages, behind a confirmation modal. The motivating
+    failure mode (CVR / Caste runs) was a feedback loop where:
+    1. wrong attribution in run N → profile enrolled with wrong
+       audio,
+    2. run N+1 voice-matches the same wrong cluster against the
+       polluted profile and reconfirms,
+    3. user can't easily distinguish the cluster has been
+       enrolled wrong because the per-profile delete only takes
+       one row at a time.
+
+    Returns ``{"removed": N}``. Always succeeds — when the table
+    is empty, ``removed=0``. Does NOT touch the ``jobs`` table or
+    the per-job speaker overrides; those carry useful history.
+    """
+    db = database()
+    profiles = db.list_speaker_profiles()
+    removed = 0
+    for row in profiles:
+        try:
+            profile_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if profile_id <= 0:
+            continue
+        db.delete_speaker_profile(profile_id)
+        removed += 1
+    return {"removed": removed}

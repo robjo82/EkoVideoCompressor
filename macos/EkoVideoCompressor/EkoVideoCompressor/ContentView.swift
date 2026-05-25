@@ -4671,6 +4671,9 @@ struct SpeakersView: View {
     @EnvironmentObject private var odoo: OdooStore
     @State private var profileToLink: SpeakerProfile?
     @State private var profileToDelete: SpeakerProfile?
+    // PR X — "Réinitialiser la library vocale" confirmation state.
+    @State private var showResetConfirmation: Bool = false
+    @State private var resetFeedback: String?
 
     private var profiles: [SpeakerProfile] {
         library.speakerProfiles
@@ -4697,15 +4700,46 @@ struct SpeakersView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ListHeaderView(
-                title: "Interlocuteurs",
-                subtitle: settings.odooConfigured
-                    ? "Voix mémorisées, regroupées par société Odoo."
-                    : "Voix mémorisées localement. Connectez Odoo dans Réglages pour les regrouper par entreprise.",
-                actionTitle: "Actualiser",
-                actionSystemImage: "arrow.clockwise"
-            ) {
-                Task { await reload(force: true) }
+            ZStack(alignment: .topTrailing) {
+                ListHeaderView(
+                    title: "Interlocuteurs",
+                    subtitle: settings.odooConfigured
+                        ? "Voix mémorisées, regroupées par société Odoo."
+                        : "Voix mémorisées localement. Connectez Odoo dans Réglages pour les regrouper par entreprise.",
+                    actionTitle: "Actualiser",
+                    actionSystemImage: "arrow.clockwise"
+                ) {
+                    Task { await reload(force: true) }
+                }
+                // PR X — "Réinitialiser la library vocale" overflow
+                // menu, anchored to the same row as the Actualiser
+                // button. Kept behind a Menu so the destructive
+                // action isn't the first thing the user sees.
+                Menu {
+                    Button(role: .destructive) {
+                        showResetConfirmation = true
+                    } label: {
+                        Label(
+                            "Réinitialiser la library vocale…",
+                            systemImage: "trash"
+                        )
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .imageScale(.large)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .padding(.top, 28)
+                .padding(.trailing, 132)
+                .help("Plus d'actions")
+            }
+            if let feedback = resetFeedback {
+                Text(feedback)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 6)
             }
             Divider()
             if library.speakerProfilesLoading && profiles.isEmpty {
@@ -4785,6 +4819,34 @@ struct SpeakersView: View {
             Button("Annuler", role: .cancel) {}
         } message: { profile in
             Text("La prochaine fois que \(profile.name) parlera dans une réunion, l'app demandera à nouveau confirmation.")
+        }
+        .confirmationDialog(
+            "Réinitialiser toutes les voix mémorisées ?",
+            isPresented: $showResetConfirmation
+        ) {
+            Button("Réinitialiser", role: .destructive) {
+                Task {
+                    if let removed = await library.resetAllSpeakerProfiles() {
+                        resetFeedback = removed == 0
+                            ? "Aucune voix à supprimer."
+                            : "\(removed) voix supprimée\(removed > 1 ? "s" : "")."
+                        // Auto-clear the banner after a few seconds
+                        // so it doesn't linger forever.
+                        try? await Task.sleep(nanoseconds: 5_000_000_000)
+                        resetFeedback = nil
+                    } else {
+                        resetFeedback = "Échec de la réinitialisation. Voir les logs."
+                    }
+                }
+            }
+            Button("Annuler", role: .cancel) {}
+        } message: {
+            Text(
+                "Toutes les voix mémorisées (profils + signatures audio) seront supprimées. "
+                + "Vos enregistrements de réunion et les noms confirmés dans le passé restent intacts. "
+                + "Les prochaines transcriptions vous redemanderont qui parle. "
+                + "Utile quand la reconnaissance vocale colle un mauvais nom à un cluster."
+            )
         }
     }
 
