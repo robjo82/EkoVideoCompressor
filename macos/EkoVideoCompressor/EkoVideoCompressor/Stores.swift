@@ -1188,6 +1188,46 @@ final class LibraryStore: ObservableObject {
         return true
     }
 
+    /// PR X — purge ALL stored voice profiles in one shot. Called
+    /// from the "Réinitialiser la library vocale" button in
+    /// Réglages, behind a confirmation modal.
+    ///
+    /// Motivation: a contaminated voice profile (enrolled on a job
+    /// where speaker attribution was wrong) keeps re-matching the
+    /// same wrong cluster on subsequent runs, perpetuating the
+    /// mistake. Per-profile delete addresses this one at a time,
+    /// but when the library has accumulated a half-dozen polluted
+    /// rows from multiple bad runs, the user wants the nuclear
+    /// option. After reset, future runs start fresh and the user
+    /// confirms speaker names from scratch.
+    ///
+    /// Returns the count of removed profiles, or nil on engine
+    /// error.
+    @discardableResult
+    func resetAllSpeakerProfiles() async -> Int? {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-reset-speaker-profiles",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return nil
+        }
+        // Parse the {"removed": N} payload. We're tolerant: if the
+        // JSON is malformed, we still clear the local cache because
+        // a successful exit means the engine purged the DB.
+        var removed = speakerProfiles.count
+        if let data = result.rawOutput.data(using: .utf8),
+           let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let n = payload["removed"] as? Int {
+            removed = n
+        }
+        speakerProfiles = []
+        speakerProfilesLoaded = true
+        return removed
+    }
+
     /// Pair a local voice profile with an Odoo res.partner. The
     /// engine returns the updated profile so the caller can swap
     /// it into its in-memory list without a list-all round-trip.

@@ -11,6 +11,7 @@ from .hf import hf_check
 from .library import (
     library_delete,
     library_delete_speaker_profile,
+    library_reset_speaker_profiles,
     library_detach_odoo_meeting,
     library_discover_speakers,
     library_flag_speaker_sample_review,
@@ -137,6 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
     profile_group = delete_profile.add_mutually_exclusive_group(required=True)
     profile_group.add_argument("--id", type=int, dest="profile_id")
     profile_group.add_argument("--name", type=str)
+
+    # PR X: bulk reset of every stored voice profile, surfaced in
+    # Réglages as "Réinitialiser la library vocale". Confirmation
+    # modal lives on the SwiftUI side.
+    sub.add_parser("library-reset-speaker-profiles")
 
     # Re-run recognition on an existing job (e.g. after the user
     # added a new profile and wants to back-fill an older meeting).
@@ -354,6 +360,11 @@ def main(argv: list[str] | None = None) -> int:
                     "name": args.name,
                 }
             )
+            return 0
+
+        if args.command == "library-reset-speaker-profiles":
+            outcome = library_reset_speaker_profiles()
+            _print_json(outcome)
             return 0
 
         if args.command == "library-recognize-speakers":
