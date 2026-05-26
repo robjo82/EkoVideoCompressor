@@ -101,12 +101,18 @@ class LoopRecoveryHappyPathTests(unittest.TestCase):
                 return MagicMock(returncode=1, stderr="malformed cmd")
 
             recovery_counter["i"] += 1
-            # Write a single segment (relative to clip start = 0).
+            # PR AH: real mlx_whisper with ``--clip-timestamps``
+            # outputs ABSOLUTE timestamps on the audio file's
+            # coordinate system — not relative to the clip start.
+            # The mock now mirrors that, otherwise we'd test
+            # against the wrong contract and miss the double-shift
+            # bug that was costing 2× transcript length on long
+            # meetings.
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps({
                 "segments": [{
-                    "start": 0.0,
-                    "end": 5.0,
+                    "start": clip_start + 0.5,
+                    "end": clip_start + 5.0,
                     "text": f"{recovered_text} #{recovery_counter['i']}",
                 }],
             }))
@@ -149,9 +155,12 @@ class LoopRecoveryHappyPathTests(unittest.TestCase):
             s for s in segs if "Contenu récupéré" in s.get("text", "")
         ]
         self.assertEqual(len(recovered), 1)
-        # Shifted back to the whisper_wav timeline.
-        # clip_start = max(0, 100 - padding=1.0) = 99.0
-        self.assertAlmostEqual(recovered[0]["start"], 99.0, places=1)
+        # PR AH: the recovered segment's start passes through
+        # UNCHANGED from the mocked Whisper output (absolute
+        # timestamps). clip_start = max(0, 100 - padding=1.0) =
+        # 99.0 ; mock wrote start = 99.5 ; expected result = 99.5
+        # (no double shift).
+        self.assertAlmostEqual(recovered[0]["start"], 99.5, places=1)
 
         # State reflects success.
         self.assertEqual(len(pipeline._recovered_loops), 1)
