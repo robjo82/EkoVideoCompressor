@@ -1039,6 +1039,50 @@ def _per_model_excerpt(model: str, record: dict) -> str:
     return ""
 
 
+def extract_company_name_from_pack(pack: dict | None) -> str:
+    """PR AF: pull the client/partner name out of an Odoo context
+    pack so the pipeline can prefix titles with "Company - Topic".
+
+    Looks at the primary record's ``partner_id`` (for sale.order,
+    crm.lead, calendar.event…) and falls back to ``display_name``
+    when no partner is attached. Returns "" when nothing useful
+    is available — the caller treats that as "no prefix".
+
+    Kept here rather than in the pipeline because the Odoo
+    schema knowledge (which model has which field) belongs with
+    the Odoo client. The pipeline only needs a plain string.
+    """
+    if not pack or not isinstance(pack, dict):
+        return ""
+    primary = pack.get("primary") or {}
+    raw = primary.get("raw") or {}
+
+    # Primary: ``partner_id`` on the record. Sale orders, leads,
+    # calendar events all use this many2one.
+    partner_value = raw.get("partner_id")
+    if partner_value:
+        _, partner_name = _scalar_from_many2one(partner_value)
+        if partner_name:
+            cleaned = partner_name.strip()
+            # Many partners in Odoo include the company in
+            # parentheses or after a comma: "Jean Dupont, Caste"
+            # or "Jean Dupont (Caste)". Prefer the company part
+            # because the title needs the org, not the contact.
+            for sep in (", ", " (", ":"):
+                if sep in cleaned:
+                    candidate = cleaned.split(sep, 1)[1].rstrip(")")
+                    if candidate.strip():
+                        return candidate.strip()
+            return cleaned
+
+    # Fallback: the display_name. Useful for project.project / etc.
+    display = str(primary.get("display_name") or "").strip()
+    if display:
+        return display
+
+    return ""
+
+
 def _expand_related_records(
     config: OdooConfig,
     primary: dict,
