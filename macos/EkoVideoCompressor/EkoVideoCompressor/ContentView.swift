@@ -4889,16 +4889,45 @@ struct SpeakerProfileRow: View {
     var onUnlink: () -> Void
     var onDelete: () -> Void
 
+    private var iconName: String {
+        if profile.isLinkedToOdoo {
+            return "person.crop.circle.badge.checkmark"
+        }
+        if profile.isUnvoicedShell {
+            return "person.crop.circle.dashed"
+        }
+        return "person.crop.circle.fill"
+    }
+
+    private var iconColor: Color {
+        if profile.isLinkedToOdoo {
+            return .teal
+        }
+        if profile.isUnvoicedShell {
+            // No native Color.tertiary — fade .secondary to get
+            // the same visual hierarchy.
+            return .secondary.opacity(0.55)
+        }
+        return .secondary
+    }
+
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: profile.isLinkedToOdoo
-                  ? "person.crop.circle.badge.checkmark"
-                  : "person.crop.circle")
-                .foregroundStyle(profile.isLinkedToOdoo ? .teal : .secondary)
+            // PR AG: 3-way icon distinguishing
+            //   • linked to Odoo (badge check, teal)
+            //   • voice memorised (filled circle, secondary)
+            //   • name-only "shell" (dashed circle, tertiary) —
+            //     a rename remembered before the voice was enrolled.
+            //     Without this distinction, a fresh reset followed by
+            //     a rerun looks identical to "library full of real
+            //     profiles" — confusing.
+            Image(systemName: iconName)
+                .foregroundStyle(iconColor)
                 .font(.title3)
             VStack(alignment: .leading, spacing: 1) {
                 Text(profile.odoo_partner_name ?? profile.name)
                     .font(.callout.weight(.medium))
+                    .foregroundStyle(profile.isUnvoicedShell ? .secondary : .primary)
                 if let odooName = profile.odoo_partner_name,
                    odooName.lowercased() != profile.name.lowercased() {
                     Text("voix mémorisée : \(profile.name)")

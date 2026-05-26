@@ -347,6 +347,18 @@ extension SpeakerProfile {
         return "\(sample_count) extrait\(sample_count > 1 ? "s" : "")"
     }
 
+    /// PR AG — true when this row is just a "remembered name"
+    /// (no embedding yet). The engine creates these shells from
+    /// ``speaker_overrides`` at job start so the rename remains
+    /// visible even if pyannote enrolment later fails, but they
+    /// don't actually participate in voice matching (PR T filters
+    /// them server-side). The SwiftUI row uses this to render a
+    /// distinct icon + label so the user doesn't confuse a
+    /// confirmed name with a memorised voice.
+    var isUnvoicedShell: Bool {
+        sample_count <= 0
+    }
+
     func linked(to partner: OdooPartner, companyId: Int?, companyName: String) -> SpeakerProfile {
         var copy = self
         copy.odoo_partner_id = partner.id
