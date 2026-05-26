@@ -1967,15 +1967,13 @@ class TranscriptionPipeline:
                 recovered_count += 1
                 continue
 
-            # Whisper's ``--clip-timestamps`` reports times
-            # relative to the clip start, so shift back to the
-            # whisper_wav timeline.
-            for seg in clip_segments:
-                try:
-                    seg["start"] = float(seg.get("start") or 0.0) + clip_start
-                    seg["end"] = float(seg.get("end") or 0.0) + clip_start
-                except (TypeError, ValueError):
-                    continue
+            # PR AH: mlx_whisper with ``--clip-timestamps`` returns
+            # timestamps ALREADY on the audio file's coordinate
+            # system (absolute), not relative to the clip start.
+            # We used to ``+= clip_start`` here — that was a
+            # double-shift that silently doubled segment timestamps.
+            # No shift needed; the parser output is the source of
+            # truth.
             recovered_segments.extend(clip_segments)
             recovered_count += 1
 
@@ -2126,14 +2124,12 @@ class TranscriptionPipeline:
             except Exception as exc:
                 append_app_log(f"engine_multipass_clip_parse_failed error={exc!r}")
                 continue
-            # Whisper's `--clip-timestamps` reports times relative to
-            # the clip start, so shift back to wav-stream time.
-            for seg in clip_segments:
-                try:
-                    seg["start"] = float(seg.get("start") or 0.0) + cs
-                    seg["end"] = float(seg.get("end") or 0.0) + cs
-                except (TypeError, ValueError):
-                    continue
+            # PR AH: mlx_whisper output is already on the audio
+            # file's coordinate system (absolute timestamps), not
+            # relative to the clip start. No shift needed — the
+            # parser output is the source of truth. The previous
+            # ``+= cs`` was a double-shift that silently doubled
+            # every multipass segment's timestamps.
             new_segments.extend(clip_segments)
 
         if not new_segments:
@@ -2252,12 +2248,9 @@ class TranscriptionPipeline:
                     f"engine_boundary_multipass_clip_parse_failed error={exc!r}"
                 )
                 continue
-            for seg in clip_segments:
-                try:
-                    seg["start"] = float(seg.get("start") or 0.0) + cs
-                    seg["end"] = float(seg.get("end") or 0.0) + cs
-                except (TypeError, ValueError):
-                    continue
+            # PR AH: mlx_whisper output is already absolute. The
+            # ``+= cs`` shift here was a double-shift bug that
+            # doubled boundary-multipass segment timestamps.
             new_segments.extend(clip_segments)
 
         if not new_segments:
@@ -2416,15 +2409,13 @@ class TranscriptionPipeline:
                 except Exception:
                     continue
                 for seg in clip_segments:
-                    try:
-                        seg["start"] = float(seg.get("start") or 0.0) + cs
-                        seg["end"] = float(seg.get("end") or 0.0) + cs
-                        # Tag with the speaker we know — bypass
-                        # the diarisation re-projection step since
-                        # we extracted by speaker upfront.
-                        seg["speaker"] = speaker
-                    except (TypeError, ValueError):
-                        continue
+                    # PR AH: mlx_whisper output is already absolute,
+                    # no ``+= cs`` shift needed (was the source of
+                    # the 2× timestamp inflation on long meetings
+                    # — Caste 21mai's transcript stretched to 3h59
+                    # for a 2h13 audio). Only re-tag the speaker;
+                    # the timestamps are correct as parsed.
+                    seg["speaker"] = speaker
                     new_clip_segments.append(seg)
             if not new_clip_segments:
                 continue
