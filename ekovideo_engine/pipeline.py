@@ -774,6 +774,16 @@ class TranscriptionPipeline:
         self._repass_replaced: int = 0
         self._vad_manifest: list[dict] = []
         self._llm_payload: dict[str, Any] = {}
+        # PR AB: dropped decoder loops surfaced from the cleaner so
+        # the review markdown can render a "⚠️ Zones perdues" section.
+        # Without this the user has no written signal that 60-80 %
+        # of a 2 h meeting was lost to Whisper hallucinations.
+        self._dropped_loops: list[Any] = []
+        # PR AB: total audio duration (Whisper-visible end timestamp,
+        # in seconds). Lets the review markdown compute coverage =
+        # kept / total. Empty when the Whisper step never ran or
+        # failed before populating segments.
+        self._audio_seconds: float = 0.0
         # LLM corrections actually applied vs rejected, captured so
         # the review report can show "12 corrections appliquées, 3
         # refusées (raison: not_found / too_distant / low_confidence)".
@@ -1606,10 +1616,35 @@ class TranscriptionPipeline:
         # output. The audit on the Caste run found a 70-minute
         # stretch of repeated ``"On est sur Zindoc"`` dropped
         # silently — the user lost an hour of meeting with no signal.
+        # PR AB: persist the list on self so ``_write_review_markdown``
+        # can render a "Zones perdues" section. Live WarningEvent
+        # alone wasn't enough — the user reads the .md file long
+        # after the run, when the live events are gone.
         dropped_loops: list[Any] = []
         segments = parse_whisper_json_segments(
             str(whisper_json), dropped_loops=dropped_loops
         )
+        self._dropped_loops = list(dropped_loops)
+        # PR AB: cache the audio duration Whisper saw (last segment
+        # end before cleanup) so the markdown can compute coverage.
+        # We use the post-clean segments here as a floor — the real
+        # audio length might be slightly longer if the trailing
+        # tail was itself dropped, but that's an acceptable
+        # under-estimate (coverage shown will be conservative).
+        try:
+            self._audio_seconds = max(
+                float(seg.get("end") or 0.0) for seg in segments
+            ) if segments else 0.0
+        except (TypeError, ValueError):
+            self._audio_seconds = 0.0
+        # If loops were dropped, their END timestamps are also
+        # audio our microphone captured — bump the cached duration
+        # so coverage doesn't ignore the lost regions.
+        for loop in dropped_loops:
+            try:
+                self._audio_seconds = max(self._audio_seconds, float(loop.end))
+            except (TypeError, ValueError):
+                continue
         if dropped_loops:
             total_dropped = sum(loop.dropped for loop in dropped_loops)
             total_seconds = sum(
@@ -3121,6 +3156,11 @@ class TranscriptionPipeline:
             or self._llm_payload.get("speakers")
             or self._llm_payload.get("technical_terms")
             or self._llm_payload.get("title")
+            # PR AB: a run that ONLY produced decoder loops (no LLM,
+            # no VAD, nothing else worth surfacing) still deserves
+            # the review markdown — that's exactly when the user
+            # most needs to see the "Zones perdues" alert.
+            or self._dropped_loops
         )
 
     def _write_enhanced_transcript(
@@ -3249,6 +3289,89 @@ class TranscriptionPipeline:
                 f"{len(self._vad_manifest)} zones de parole conservées ({kept:.0f} s).",
                 "",
             ]
+
+        # PR AB: surface decoder-loop drops AT THE TOP of the
+        # report (right after VAD, before any text edits) so the
+        # user sees the gravest signal first. Long meetings can
+        # silently lose 60-80 % of content to Whisper hallucination
+        # loops — when that happens, the user needs to know BEFORE
+        # they trust the rest of the transcript.
+        if self._dropped_loops or self._audio_seconds > 0:
+            total_dropped = sum(loop.dropped for loop in self._dropped_loops)
+            total_lost_s = sum(
+                max(0.0, loop.end - loop.start) for loop in self._dropped_loops
+            )
+            kept_s = max(0.0, self._audio_seconds - total_lost_s)
+            coverage_pct = (
+                100.0 * kept_s / self._audio_seconds
+                if self._audio_seconds > 0
+                else 0.0
+            )
+
+            # The header text depends on the severity. ≥ 20 % loss
+            # gets a red-alert framing; < 20 % gets a softer warning;
+            # nothing dropped gets a friendly "✓" coverage line.
+            if not self._dropped_loops:
+                lines += [
+                    "## Couverture audio",
+                    "",
+                    f"✓ Tout l'audio de la réunion est dans la transcription "
+                    f"({self._audio_seconds:.0f} s).",
+                    "",
+                ]
+            else:
+                if coverage_pct < 80.0:
+                    header = "## ⚠️ Zones perdues — relecture impossible"
+                else:
+                    header = "## Zones perdues"
+                lines += [
+                    header,
+                    "",
+                    f"**{total_lost_s:.0f} s d'audio perdues sur {self._audio_seconds:.0f} s** "
+                    f"({100.0 - coverage_pct:.0f}% du fichier). "
+                    f"La transcription ne couvre que **{coverage_pct:.0f} %** de la réunion.",
+                    "",
+                    "Cause : Whisper s'est mis à répéter une même phrase pendant "
+                    "plusieurs minutes (boucle de décodage). Le moteur a supprimé "
+                    "ces segments pour ne pas polluer le texte, mais le contenu "
+                    "réel parlé pendant ces zones n'est PAS récupérable depuis "
+                    "cette transcription.",
+                    "",
+                    f"**{len(self._dropped_loops)} zone(s) perdue(s) "
+                    f"({total_dropped} segments droppés au total) :**",
+                    "",
+                ]
+                # Show worst-first so the most impactful loss is at the top.
+                ordered = sorted(
+                    self._dropped_loops,
+                    key=lambda l: (l.end - l.start),
+                    reverse=True,
+                )
+                for loop in ordered[:10]:
+                    start_min = int(loop.start // 60)
+                    start_sec = int(loop.start % 60)
+                    end_min = int(loop.end // 60)
+                    end_sec = int(loop.end % 60)
+                    duration_s = max(0.0, loop.end - loop.start)
+                    snippet = (loop.text or "").strip()
+                    if len(snippet) > 70:
+                        snippet = snippet[:70] + "…"
+                    lines.append(
+                        f"- `{start_min:02d}:{start_sec:02d}` → "
+                        f"`{end_min:02d}:{end_sec:02d}` "
+                        f"({duration_s:.0f}s, {loop.dropped} segments) "
+                        f": « {snippet} »"
+                    )
+                if len(self._dropped_loops) > 10:
+                    lines.append(
+                        f"- … et {len(self._dropped_loops) - 10} autre(s)."
+                    )
+                lines += [
+                    "",
+                    "Pour récupérer ces zones, ré-enregistrez la conversation "
+                    "ou re-Whisperez manuellement le range audio en question.",
+                    "",
+                ]
 
         if self._repass_replaced:
             lines += [
