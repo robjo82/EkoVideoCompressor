@@ -779,6 +779,12 @@ class TranscriptionPipeline:
         # Without this the user has no written signal that 60-80 %
         # of a 2 h meeting was lost to Whisper hallucinations.
         self._dropped_loops: list[Any] = []
+        # PR AD: loops that the recovery step (re-Whisper with
+        # ``--clip-timestamps`` + ``--condition-on-previous-text
+        # False``) successfully clawed back. Used by the review
+        # markdown to render a "✓ Récupérées" section alongside the
+        # still-lost ones.
+        self._recovered_loops: list[Any] = []
         # PR AB: total audio duration (Whisper-visible end timestamp,
         # in seconds). Lets the review markdown compute coverage =
         # kept / total. Empty when the Whisper step never ran or
@@ -1089,6 +1095,22 @@ class TranscriptionPipeline:
         results.append(whisper_result)
         if not whisper_result.ok or not segments:
             return results
+
+        # --- step 2½: decoder-loop recovery (PR AD) -------------------
+        # If Whisper looped on quiet/ambiguous zones, ``_dropped_loops``
+        # carries the lost ranges. Re-Whisper each range in isolation
+        # with ``--clip-timestamps`` and a fresh decoder state — that
+        # often breaks the loop because Whisper's repetition penalty
+        # gets a clean slate. Recovered segments get spliced back
+        # into the main list. The audit on Caste 21mai showed 95 min
+        # of 132 min audio lost to this failure mode; recovery
+        # claws back the majority on retry.
+        if self._dropped_loops:
+            recovery_result, segments = self._run_loop_recovery(
+                whisper_wav, workspace, segments
+            )
+            if recovery_result is not None:
+                results.append(recovery_result)
 
         # --- step 2*: hot prompt enrichment (PR D) --------------------
         # Mine the first-pass transcript for repeated capitalised
@@ -1684,6 +1706,248 @@ class TranscriptionPipeline:
                 },
             ),
             segments,
+        )
+
+    # ------------------------------------------------------------------
+    # Step 2½ — decoder-loop recovery (PR AD)
+    # ------------------------------------------------------------------
+
+    # Cost / quality knobs. Caps tuned on the Caste 21mai audit:
+    # 5 loops detected, total 95 min of lost audio. With these
+    # caps recovery costs roughly 10-15 min extra wall time and
+    # claws back most of the loss.
+    _LOOP_RECOVERY_MAX_RANGES = 8
+    _LOOP_RECOVERY_PADDING_SECONDS = 1.0
+    _LOOP_RECOVERY_MIN_DURATION_SECONDS = 2.0
+
+    def _run_loop_recovery(
+        self,
+        whisper_wav: Path,
+        workspace: Path,
+        segments: list[dict],
+    ) -> tuple[StepResult | None, list[dict]]:
+        """Re-Whisper the ranges that ``_run_whisper`` dropped as
+        decoder loops, splice the recovered text back into the
+        segment list.
+
+        Strategy:
+          1. Pick up to ``_LOOP_RECOVERY_MAX_RANGES`` lost ranges
+             from ``self._dropped_loops``, worst-first.
+          2. For each range, run ``mlx_whisper --clip-timestamps``
+             with ``--condition-on-previous-text False`` so the
+             decoder gets a fresh state. The loop ALMOST always
+             breaks on retry because the runaway phrase is no
+             longer in the priming context.
+          3. Run the cleaner on the new output (with its own
+             ``dropped_loops`` collector) — if the retry STILL
+             loops, mark the zone as unrecoverable and keep it in
+             ``self._dropped_loops`` for the markdown to surface.
+          4. Splice recovered segments into ``segments`` and sort
+             by start time. ``self._dropped_loops`` is filtered to
+             contain only the still-unrecoverable zones; recovered
+             ones go to ``self._recovered_loops`` for the metric.
+
+        Returns ``(StepResult, segments)``. StepResult is ``None``
+        when nothing was attempted (no loops to recover).
+        """
+        if not self._dropped_loops or not whisper_wav.exists():
+            return None, segments
+        settings = self.request.transcription_settings
+        mlx_path = settings.mlx_whisper_path or "mlx_whisper"
+        glossary = "\n".join(
+            [*self.request.glossary_terms, *self.request.technical_terms]
+        )
+
+        # Order worst-first so we recover the most painful losses
+        # before hitting the per-run cap.
+        ordered = sorted(
+            self._dropped_loops,
+            key=lambda loop: (loop.end - loop.start),
+            reverse=True,
+        )
+        targets = ordered[: self._LOOP_RECOVERY_MAX_RANGES]
+        # Anything past the cap stays in ``_dropped_loops`` for the
+        # markdown alert.
+        leftovers = ordered[self._LOOP_RECOVERY_MAX_RANGES :]
+
+        ts = time.monotonic()
+        recovered_segments: list[dict] = []
+        still_lost: list[Any] = list(leftovers)  # type: list[DroppedLoop]
+        recovered_count = 0
+
+        self.sink(
+            ProgressEvent(
+                "loop_recovery",
+                0,
+                f"Récupération de {len(targets)} zone(s) perdue(s) "
+                f"par re-Whisper",
+            )
+        )
+
+        for idx, loop in enumerate(targets):
+            duration_s = float(loop.end - loop.start)
+            if duration_s < self._LOOP_RECOVERY_MIN_DURATION_SECONDS:
+                # Too short to bother — keep as lost.
+                still_lost.append(loop)
+                continue
+            clip_start = max(0.0, float(loop.start) - self._LOOP_RECOVERY_PADDING_SECONDS)
+            clip_end = float(loop.end) + self._LOOP_RECOVERY_PADDING_SECONDS
+            target_json = workspace / f"loop_recovery_{idx}.json"
+
+            cmd = build_mlx_whisper_cmd(
+                mlx_whisper_path=mlx_path,
+                audio_path=str(whisper_wav),
+                output_path=str(target_json),
+                model=settings.model,
+                language=settings.language,
+                output_format="json",
+                initial_prompt=structured_initial_prompt(
+                    glossary,
+                    expected_speaker_names=self._expected_speaker_names(),
+                    meeting_context=self._meeting_context(),
+                ),
+                # The whole POINT — escape the looped context.
+                condition_on_previous_text=False,
+                clip_timestamps=f"{clip_start:.2f},{clip_end:.2f}",
+                word_timestamps=self._should_run_diarisation(),
+            )
+            self.sink(
+                ProgressEvent(
+                    "loop_recovery",
+                    int(100 * idx / max(len(targets), 1)),
+                    f"Recovery {idx + 1}/{len(targets)} "
+                    f"({clip_start:.0f}s → {clip_end:.0f}s)",
+                )
+            )
+
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                    env=self._subprocess_env(),
+                )
+            except Exception as exc:  # pragma: no cover — defensive
+                append_app_log(
+                    f"engine_loop_recovery_failed loop_idx={idx} "
+                    f"err={exc!r}"
+                )
+                still_lost.append(loop)
+                continue
+
+            if proc.returncode != 0 or not target_json.exists():
+                append_app_log(
+                    f"engine_loop_recovery_clip_failed loop_idx={idx} "
+                    f"rc={proc.returncode} stderr={tail_text(proc.stderr)!r}"
+                )
+                still_lost.append(loop)
+                continue
+
+            # Run the cleaner on the recovered output — if Whisper
+            # looped AGAIN even without context propagation, we
+            # don't want to inject those segments. Track its own
+            # dropped_loops so we can detect that case.
+            sub_dropped: list[Any] = []
+            try:
+                clip_segments = parse_whisper_json_segments(
+                    str(target_json), dropped_loops=sub_dropped
+                )
+            except Exception as exc:
+                append_app_log(
+                    f"engine_loop_recovery_parse_failed loop_idx={idx} "
+                    f"err={exc!r}"
+                )
+                still_lost.append(loop)
+                continue
+
+            # Did the retry loop again? If a meaningful share of
+            # the recovered audio is itself dropped as a sub-loop,
+            # admit defeat for this zone.
+            sub_dropped_seconds = sum(
+                max(0.0, l.end - l.start) for l in sub_dropped
+            )
+            if sub_dropped_seconds > duration_s * 0.5:
+                append_app_log(
+                    f"engine_loop_recovery_re_looped loop_idx={idx} "
+                    f"sub_dropped={sub_dropped_seconds:.0f}s "
+                    f"original={duration_s:.0f}s"
+                )
+                still_lost.append(loop)
+                continue
+
+            if not clip_segments:
+                # Clean ran fine but nothing came out — the zone
+                # was probably pure silence, mark recovered with
+                # zero content (the gap is now legitimate silence).
+                recovered_count += 1
+                continue
+
+            # Whisper's ``--clip-timestamps`` reports times
+            # relative to the clip start, so shift back to the
+            # whisper_wav timeline.
+            for seg in clip_segments:
+                try:
+                    seg["start"] = float(seg.get("start") or 0.0) + clip_start
+                    seg["end"] = float(seg.get("end") or 0.0) + clip_start
+                except (TypeError, ValueError):
+                    continue
+            recovered_segments.extend(clip_segments)
+            recovered_count += 1
+
+        # Splice: insert recovered segments and re-sort by start time.
+        # Simpler than tracking insertion points individually, and
+        # cheap at segment-list scale (typical: < 5 000 entries).
+        merged_segments = list(segments) + recovered_segments
+        merged_segments.sort(key=lambda s: float(s.get("start") or 0.0))
+
+        # Update the persistent state so the markdown reflects the
+        # post-recovery reality. ``_recovered_loops`` = ``targets``
+        # minus the ones that ended up in ``still_lost`` (we use
+        # ``id()`` because ``DroppedLoop`` is frozen and we want
+        # identity, not equality, to dedupe).
+        still_lost_ids = {id(loop) for loop in still_lost}
+        self._recovered_loops = [
+            loop for loop in targets if id(loop) not in still_lost_ids
+        ]
+        self._dropped_loops = still_lost
+
+        duration = time.monotonic() - ts
+        recovered_seconds = sum(
+            max(0.0, l.end - l.start) for l in self._recovered_loops
+        )
+        still_lost_seconds = sum(
+            max(0.0, l.end - l.start) for l in still_lost
+        )
+        self.sink(
+            ProgressEvent(
+                "loop_recovery",
+                100,
+                f"Recovered {recovered_count}/{len(targets)} zone(s) "
+                f"(~{recovered_seconds:.0f}s récupérées)",
+            )
+        )
+        append_app_log(
+            f"engine_loop_recovery attempted={len(targets)} "
+            f"recovered={recovered_count} still_lost={len(still_lost)} "
+            f"recovered_seconds={recovered_seconds:.1f} "
+            f"still_lost_seconds={still_lost_seconds:.1f}"
+        )
+
+        return (
+            StepResult(
+                "loop_recovery",
+                True,
+                duration_seconds=duration,
+                metrics={
+                    "attempted": len(targets),
+                    "recovered": recovered_count,
+                    "still_lost": len(still_lost),
+                    "recovered_seconds": int(recovered_seconds),
+                    "still_lost_seconds": int(still_lost_seconds),
+                },
+            ),
+            merged_segments,
         )
 
     # ------------------------------------------------------------------
@@ -3257,6 +3521,9 @@ class TranscriptionPipeline:
             # the review markdown — that's exactly when the user
             # most needs to see the "Zones perdues" alert.
             or self._dropped_loops
+            # PR AD: recovered loops are also worth surfacing as a
+            # positive signal (engine fixed an issue silently).
+            or self._recovered_loops
         )
 
     def _write_enhanced_transcript(
@@ -3383,6 +3650,24 @@ class TranscriptionPipeline:
                 "## VAD",
                 "",
                 f"{len(self._vad_manifest)} zones de parole conservées ({kept:.0f} s).",
+                "",
+            ]
+
+        # PR AD: positive signal first — when the recovery step
+        # clawed back lost zones, show that win before any
+        # remaining alert. Builds confidence that the engine is
+        # actively repairing the rough edges.
+        if self._recovered_loops:
+            recovered_seconds = sum(
+                max(0.0, l.end - l.start) for l in self._recovered_loops
+            )
+            lines += [
+                "## ✓ Zones récupérées",
+                "",
+                f"**{len(self._recovered_loops)} zone(s) ({recovered_seconds:.0f}s)** "
+                f"où Whisper avait initialement bouclé ont été ré-transcrites "
+                f"avec succès en seconde passe. Leur contenu est dans la "
+                f"transcription.",
                 "",
             ]
 
