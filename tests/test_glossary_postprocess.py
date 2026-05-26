@@ -321,5 +321,82 @@ class MergedWindowMatchingTest(unittest.TestCase):
         self.assertNotIn("Laurent", new)
 
 
+class PrAePhoneticEdgeCasesTest(unittest.TestCase):
+    """PR AE — false positives caught on the CVR/Caste rerun:
+    French words with diacritics rewritten to ASCII proper nouns
+    (``Contrôle → Control``, ``tourné → Tarn``, ``allait → Allix``),
+    plus the ``facturation électronique → facturation électronique``
+    no-op that polluted the review report because of NFC/NFD
+    mismatch."""
+
+    def test_french_diacritic_source_protected_from_ascii_entry(self):
+        # ``Contrôle`` (real FR word, has ``ô``) MUST NOT be
+        # rewritten to ``Control`` (English brand on glossary).
+        text = "Nous avons un Contrôle technique demain."
+        new, subs = apply_glossary_to_text(text, ["Control"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_tourne_not_rewritten_to_tarn(self):
+        # ``tourné`` past participle vs ``Tarn`` region.
+        text = "On a tourné une vidéo dans l'usine."
+        new, subs = apply_glossary_to_text(text, ["Tarn"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_allait_not_rewritten_to_allix(self):
+        # ``allait`` imperfect of "aller" vs ``Allix`` software.
+        text = "Il allait nous présenter le projet."
+        new, subs = apply_glossary_to_text(text, ["Allix"])
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_ascii_source_can_still_match_ascii_entry(self):
+        # The guard only fires when the SOURCE has diacritics.
+        # ``moli`` → ``Mollie`` is still legitimate (both ASCII).
+        text = "On signe avec moli pour le paiement."
+        new, subs = apply_glossary_to_text(text, ["Mollie"])
+        self.assertIn("Mollie", new)
+        self.assertEqual(len(subs), 1)
+
+    def test_accented_entry_can_still_be_canonicalised(self):
+        # The guard checks BOTH sides for diacritics. ``Castelnau``
+        # (no accent) hearing ``Castelnaü`` (accented Whisper
+        # rendering) — both have French character variants in the
+        # comparison set, so the guard doesn't fire. The matcher
+        # should still try.
+        text = "Bonjour à Castelnaü ce matin."
+        # ``Castelnaü`` and ``Castelnau`` differ only by accent.
+        # The source has the accent, the entry has it too →
+        # diacritic guard doesn't fire.
+        new, subs = apply_glossary_to_text(text, ["Castelnaü"])
+        # Already-canonical short-circuit kicks in.
+        self.assertEqual(new, text)
+        self.assertEqual(subs, [])
+
+    def test_facturation_electronique_no_op_squelched_by_nfc(self):
+        # Reproduce the macOS NFD vs NFC mismatch:
+        # Whisper writes the word as NFD (``é``),
+        # user glossary stores it as NFC (``é``). They render
+        # identically but compare unequal as raw strings — the
+        # canonical-form short-circuit missed it, then the
+        # matcher "corrected" NFD → NFC with method=phonetic
+        # and confidence=0.95. The fix: NFC both sides before
+        # comparing.
+        import unicodedata
+        nfd_source = unicodedata.normalize(
+            "NFD", "facturation électronique"
+        )
+        text = f"On utilise la {nfd_source} maintenant."
+        new, subs = apply_glossary_to_text(
+            text, ["facturation électronique"]
+        )
+        # No substitution should fire because it's already the
+        # canonical form (modulo NFC).
+        self.assertEqual(subs, [])
+        # The text might have been NFC-normalised or not, but no
+        # substitution was logged either way.
+
+
 if __name__ == "__main__":
     unittest.main()

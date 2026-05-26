@@ -352,16 +352,26 @@ def _match_score(
     if surface.lower() == entry_surface.lower():
         return (True, 1.0, "exact")
 
-    # PR R: per-token stoplist. Common French function words are
-    # the dominant source of phonetic false positives we audited
-    # on the CVR-control run (``par`` → ``Parce``, ``ou`` →
-    # ``Audoo``, etc.). Refuse phonetic / edit tiers when the
-    # transcript word is on the stoplist — those tokens have a
-    # frequency floor (they appear every sentence) and Whisper's
-    # priors keep them stable. The only safe match is tier 0
-    # exact, handled above.
-    normalised = surface.lower().replace("’", "'")
-    if normalised in _MERGED_WINDOW_STOPLIST:
+    # PR R + PR AE: per-token stoplist. The merged-window stoplist
+    # plus the verb-form extras catch the dominant false positive
+    # patterns from the CVR-control run (``par`` → ``Parce``,
+    # ``ou`` → ``Audoo``, ``allait`` → ``Allix``, etc.). When the
+    # source is a recognised French function/verb form, only
+    # exact (tier 0) matches are allowed — phonetic / edit are
+    # too noisy.
+    if _is_per_token_stopword(surface):
+        return (False, 0.0, "")
+
+    # PR AE: refuse the "real French word vs ASCII proper noun"
+    # collision family. The CVR/Caste audit caught:
+    #   Contrôle  (French word) → Control  (English brand)
+    #   tourné    (verb)        → Tarn     (region)
+    #   allait    (verb)        → Allix    (software)
+    # When the source has French diacritics (è, ô, é, …) AND the
+    # entry doesn't, Whisper most likely heard a legit French
+    # word — refusing protects the everyday vocabulary from being
+    # rewritten to look-alike proper nouns.
+    if _has_french_diacritic(surface) and not _has_french_diacritic(entry_surface):
         return (False, 0.0, "")
 
     transcript_key = french_phonetic_key(surface)
@@ -467,6 +477,76 @@ _MERGED_WINDOW_STOPLIST: frozenset[str] = frozenset(
         "soit", "suis", "sait", "sais", "savoir",
     }
 )
+
+# PR AE: per-token-only stoplist. The MERGED_WINDOW stoplist above
+# stays narrow because it gates a feature (multi-token matching)
+# that legitimately needs to catch ``pouvoir bien → Power BI``
+# (``pouvoir`` would be wrongly stoplisted for that path). The
+# per-token tier doesn't gain from those cases — single-token
+# ``pouvoir → Power`` isn't a goal we want — so we can be more
+# aggressive here without losing merged-window wins.
+#
+# Each entry is a French verb form (imperfect / conditional /
+# infinitive) that the CVR/Caste audit caught getting rewritten
+# to a similar-sounding proper noun on the glossary
+# (``allait → Allix``). High-frequency forms only — adding the
+# whole conjugation table would bloat the set without returns.
+_PER_TOKEN_EXTRA_STOPLIST: frozenset[str] = frozenset(
+    {
+        "allait", "allaient", "allais", "allions", "alliez",
+        "aller", "allons", "allez",
+        "voulait", "voulaient", "voulais", "voulions", "vouliez",
+        "vouloir", "voulons", "voulez",
+        "pouvait", "pouvaient", "pouvais", "pouvions", "pouviez",
+        "pouvons", "pouvez",  # ``pouvoir`` deliberately omitted
+        "devait", "devaient", "devais", "devions", "deviez",
+        "devoir", "devons", "devez",
+        "disait", "disaient", "disais", "disions", "disiez",
+        "disons", "dites",  # ``dire`` deliberately omitted (rare collision)
+        "faisait", "faisaient", "faisais", "faisions", "faisiez",
+        "faisons", "faites",
+        "venait", "venaient", "venais", "venions", "veniez",
+        "venir", "venons", "venez",
+        "savait", "savaient", "savais", "savions", "saviez",
+        "savons", "savez",
+    }
+)
+
+
+def _is_per_token_stopword(token: str) -> bool:
+    """Per-token tier rejects both the merged-window stoplist AND
+    the verb-form extras."""
+    normalised = (token or "").strip().lower().replace("’", "'")
+    return (
+        normalised in _MERGED_WINDOW_STOPLIST
+        or normalised in _PER_TOKEN_EXTRA_STOPLIST
+    )
+
+
+# PR AE: characters whose presence in the source token is a strong
+# signal that Whisper heard a real French word (not a phonetic
+# rendering of a proper noun). When the source has these AND the
+# glossary entry doesn't, refusing the match avoids the
+# ``Contrôle → Control`` / ``tourné → Tarn`` / ``allait → Allix``
+# false-positive family the CVR/Caste audit caught.
+_FR_DIACRITIC_CHARS: frozenset[str] = frozenset(
+    "àâäçèéêëîïôöùûüÿœÀÂÄÇÈÉÊËÎÏÔÖÙÛÜŸŒ"
+)
+
+
+def _has_french_diacritic(value: str) -> bool:
+    return any(ch in _FR_DIACRITIC_CHARS for ch in (value or ""))
+
+
+def _nfc(value: str) -> str:
+    """NFC normalisation. macOS Whisper sometimes returns NFD
+    (``e + COMBINING ACUTE``) for ``é``; user glossaries from
+    SwiftUI are NFC. Without normalisation the canonical-form
+    short-circuit misses cases like ``facturation électronique
+    → facturation électronique`` (visually identical no-op
+    that ends up in the report)."""
+    import unicodedata
+    return unicodedata.normalize("NFC", value or "")
 
 
 def _joined_phonetic_key(words: list[str]) -> str:
@@ -647,8 +727,17 @@ def apply_glossary_to_text(
                 continue
             # Refuse to "correct" a token that's already the canonical
             # form — that's a no-op that would just inflate the report.
-            joined = "".join(tokens[sub_idx[0] : sub_idx[-1] + 1]).strip().lower()
-            if joined == entry.canonical_lower:
+            # PR AE: NFC-normalise both sides so the macOS NFD output
+            # of Whisper (``e + COMBINING ACUTE``) matches the user's
+            # NFC glossary (``é``). Without this, the canonical
+            # check missed the CVR/Caste audit pattern
+            # ``facturation électronique → facturation électronique``
+            # (a no-op that polluted the review report).
+            joined = _nfc(
+                "".join(tokens[sub_idx[0] : sub_idx[-1] + 1]).strip().lower()
+            )
+            canonical_nfc = _nfc(entry.canonical_lower)
+            if joined == canonical_nfc:
                 continue
             primary_method = methods[0] if len(set(methods)) == 1 else "phonetic"
             if best is None or score > best[1] or entry.n > best[0].n:
