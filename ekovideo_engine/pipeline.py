@@ -1034,6 +1034,90 @@ class TranscriptionPipeline:
             # break the pipeline.
             pass
 
+    # ------------------------------------------------------------------
+    # PR AF — title company prefix fallback
+    # ------------------------------------------------------------------
+
+    def _resolve_company_name_for_title(self) -> str:
+        """Find the client/partner company name for the title prefix.
+
+        Strategy (first-match-wins, per user's PR AF answer):
+          1. Odoo context pack (``primary.raw.partner_id`` or
+             ``primary.display_name``). Most reliable when the user
+             paired a CRM lead / sale order / calendar event in Run
+             Setup.
+          2. ``odoo_meeting_metadata.partners`` — the calendar
+             invite's partner list, captured at Run Setup time.
+          3. Speaker overrides values — sometimes the user typed
+             "Nom (Société)" or similar.
+
+        Returns "" when nothing useful — caller leaves the LLM
+        title alone.
+        """
+        # Source 1: Odoo context pack (lazily fetched, already
+        # cached if the LLM step has run).
+        try:
+            from odoo_client import extract_company_name_from_pack
+
+            pack = self._ensure_odoo_pack()
+            name = extract_company_name_from_pack(pack)
+            if name:
+                return name
+        except Exception:  # pragma: no cover — defensive
+            pass
+
+        # Source 2: meeting metadata snapshot (calendar invite).
+        meta = self.request.odoo_meeting_metadata or {}
+        partners = meta.get("partners") if isinstance(meta, dict) else None
+        if isinstance(partners, list):
+            for partner in partners:
+                if not isinstance(partner, dict):
+                    continue
+                name = str(partner.get("name") or "").strip()
+                if name and "ekonum" not in name.lower():
+                    # First non-Ekonum partner is the client.
+                    return name
+
+        # Source 3: speaker overrides — sometimes ``"Nom (Société)"``.
+        for raw_name in (self.request.speaker_overrides or {}).values():
+            name = str(raw_name or "").strip()
+            if "(" in name and ")" in name:
+                inside = name[name.find("(") + 1 : name.find(")")]
+                if inside.strip() and "ekonum" not in inside.lower():
+                    return inside.strip()
+
+        return ""
+
+    def _apply_title_company_prefix(self, title: str) -> str:
+        """Ensure the title is rendered as ``"Société - Sujet"`` when
+        we can resolve a company name. Idempotent : if the title
+        already starts with the resolved company (case-insensitive)
+        or the LLM already produced a ``" - "`` separator that
+        looks like a company prefix, do nothing.
+        """
+        company = self._resolve_company_name_for_title()
+        if not company:
+            return title
+        normalised_title = title.strip()
+        if not normalised_title:
+            return title
+        # Already prefixed? Check both exact and case-insensitive
+        # so "caste - sujet" or "CASTE - Sujet" both count.
+        company_lower = company.lower()
+        if normalised_title.lower().startswith(company_lower + " -"):
+            return normalised_title
+        if normalised_title.lower().startswith(company_lower + " :"):
+            return normalised_title
+        # The LLM may have produced its OWN "Company - Topic" with
+        # a different (wrong) company. We don't second-guess — if
+        # any " - " separator is present in the first ~30 chars,
+        # leave the LLM's choice alone rather than risk doubling up
+        # an incorrect prefix.
+        first_30 = normalised_title[:30]
+        if " - " in first_30:
+            return normalised_title
+        return f"{company} - {normalised_title}"
+
     def _meeting_context(self) -> str:
         """Short topic line surfaced to Whisper as semantic prior.
 
@@ -3026,6 +3110,23 @@ class TranscriptionPipeline:
                 f"engine_llm_title_failed rc={title_proc.returncode} "
                 f"stderr={tail_text(title_proc.stderr)!r}"
             )
+
+        # PR AF: Mistral 7B local routinely ignores the
+        # "Société - Sujet" instruction from PR AA. As a fallback,
+        # resolve the company name from richer sources (Odoo
+        # context, meeting metadata, speaker overrides) and prepend
+        # it ourselves if missing. The LLM keeps its job (deciding
+        # the topic part) but we no longer rely on it for the
+        # structural prefix.
+        existing_title = str(payload.get("title") or "").strip()
+        if existing_title:
+            prefixed = self._apply_title_company_prefix(existing_title)
+            if prefixed != existing_title:
+                payload["title"] = prefixed
+                append_app_log(
+                    f"engine_llm_title_company_prefix "
+                    f"original={existing_title!r} prefixed={prefixed!r}"
+                )
 
         # ---- corrections + doubts (markdown) -------------------------
         # The embedded LLM script truncates its input at 30 000 chars,
