@@ -221,6 +221,114 @@ class EnsureMlxVlmAvailableTests(unittest.TestCase):
         pipeline = _make_pipeline(venv_python="")
         self.assertFalse(pipeline._ensure_mlx_vlm_available())
 
+    # -- PR AC: smarter probe (model-submodule check) --------------
+
+    def test_probe_includes_model_submodule_check_for_qwen2_audio(self):
+        # The user's audio_llm_model in the CVR/Caste rerun was
+        # "mlx-community/Qwen2-Audio-7B-Instruct-4bit". The probe
+        # script we build must reference ``mlx_vlm.models.qwen2_audio``.
+        pipeline = _make_pipeline(venv_python="/usr/bin/python3")
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
+            "ekovideo_engine.pipeline.Path.exists", return_value=True
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            pipeline._ensure_mlx_vlm_available()
+        # Inspect the script the probe sent.
+        cmd_args, _ = mock_run.call_args
+        script = cmd_args[0][2]
+        self.assertIn("import mlx_vlm", script)
+        self.assertIn("mlx_vlm.models.qwen2_audio", script)
+
+    def test_probe_distinguishes_missing_submodule_from_missing_package(self):
+        # Exit code 2 means mlx_vlm is there but the model
+        # submodule isn't — the CVR/Caste failure mode. The probe
+        # must return False AND emit a WarningEvent with the
+        # actionable "update mlx-vlm" message.
+        pipeline = _make_pipeline(venv_python="/usr/bin/python3")
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
+            "ekovideo_engine.pipeline.Path.exists", return_value=True
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=2,
+                stderr="No module named 'mlx_vlm.models.qwen2_audio'",
+            )
+            ok = pipeline._ensure_mlx_vlm_available()
+        self.assertFalse(ok)
+        # Check the WarningEvent payload — sink is a MagicMock.
+        warn_calls = [
+            call for call in pipeline.sink.call_args_list
+            if call.args and getattr(call.args[0], "event", "") == "warning"
+        ]
+        self.assertEqual(len(warn_calls), 1)
+        warning = warn_calls[0].args[0]
+        self.assertIn("qwen2_audio", warning.message.lower())
+        self.assertIn("pip install -U mlx-vlm", warning.message)
+
+    def test_probe_emits_missing_package_message_on_rc_1(self):
+        # Exit code 1 means mlx_vlm itself missing — different
+        # remediation advice.
+        pipeline = _make_pipeline(venv_python="/usr/bin/python3")
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
+            "ekovideo_engine.pipeline.Path.exists", return_value=True
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=1,
+                stderr="ModuleNotFoundError: No module named 'mlx_vlm'",
+            )
+            pipeline._ensure_mlx_vlm_available()
+        warning = next(
+            call.args[0] for call in pipeline.sink.call_args_list
+            if call.args and getattr(call.args[0], "event", "") == "warning"
+        )
+        self.assertIn("n'est pas installé", warning.message)
+
+    def test_probe_skips_submodule_check_for_unknown_model_path(self):
+        # A future model like ``foo-bar-7B`` doesn't match any
+        # slug hint. The probe degrades to the legacy "just
+        # import mlx_vlm" check rather than failing.
+        request = JobRequest(
+            source_path="/tmp/x.mov",
+            output_dir="/tmp/out",
+            mode="transcribe",
+            transcription_settings=TranscriptionSettings(
+                audio_recheck_enabled=True,
+                audio_llm_model="some-vendor/Unknown-Model-7B",
+                venv_python_path="/usr/bin/python3",
+            ),
+        )
+        pipeline = TranscriptionPipeline(request=request, sink=MagicMock())
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
+            "ekovideo_engine.pipeline.Path.exists", return_value=True
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            pipeline._ensure_mlx_vlm_available()
+        cmd_args, _ = mock_run.call_args
+        script = cmd_args[0][2]
+        # No ``mlx_vlm.models.<slug>`` reference in the script.
+        self.assertIn("import mlx_vlm", script)
+        self.assertNotIn("mlx_vlm.models.", script)
+
+    def test_submodule_for_helper_maps_qwen2_audio(self):
+        from ekovideo_engine.pipeline import TranscriptionPipeline
+        self.assertEqual(
+            TranscriptionPipeline._mlx_vlm_submodule_for(
+                "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+            ),
+            "qwen2_audio",
+        )
+        self.assertEqual(
+            TranscriptionPipeline._mlx_vlm_submodule_for("Qwen2_Audio"),
+            "qwen2_audio",
+        )
+        self.assertEqual(
+            TranscriptionPipeline._mlx_vlm_submodule_for(""),
+            "",
+        )
+        self.assertEqual(
+            TranscriptionPipeline._mlx_vlm_submodule_for("foo/Bar-7B"),
+            "",
+        )
+
 
 class RunAudioRecheckHappyPathTests(unittest.TestCase):
     """Mock the subprocesses and verify orchestrator behaviour."""

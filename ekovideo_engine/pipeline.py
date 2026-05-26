@@ -2857,16 +2857,50 @@ class TranscriptionPipeline:
     _AUDIO_RECHECK_POST_SECONDS = 10.0
     _AUDIO_RECHECK_TIMEOUT_SECONDS = 600
 
+    # PR AC: map an ``audio_llm_model`` model path to the
+    # ``mlx_vlm.models`` submodule that must be importable for the
+    # actual ``load(model_path)`` call to succeed. Without this map
+    # the old probe was useless — it OK'd ``import mlx_vlm`` then
+    # the embedded multimodal script crashed with "Model type
+    # qwen2_audio not supported" on every uncertain passage,
+    # leaving a trail of ``engine_audio_recheck_failed`` in app_log.
+    _MLX_VLM_MODEL_SLUG_HINTS = (
+        ("qwen2-audio", "qwen2_audio"),
+        ("qwen2_audio", "qwen2_audio"),
+    )
+
+    @classmethod
+    def _mlx_vlm_submodule_for(cls, model_path: str) -> str:
+        """Return the ``mlx_vlm.models.<slug>`` submodule the given
+        model path requires. Empty string when we don't have a hint —
+        the caller skips the submodule check in that case (we
+        degrade to the legacy "just ``import mlx_vlm``" probe).
+        """
+        lowered = (model_path or "").lower()
+        for needle, slug in cls._MLX_VLM_MODEL_SLUG_HINTS:
+            if needle in lowered:
+                return slug
+        return ""
+
     def _ensure_mlx_vlm_available(self) -> bool:
-        """Probe whether ``mlx_vlm`` is importable in the managed venv.
+        """Probe whether ``mlx_vlm`` AND the specific model submodule
+        for the configured ``audio_llm_model`` are importable.
 
         Cached: the probe runs at most once per pipeline. Unlike the
         legacy ``video_compactor`` we *don't* auto-install — the new
         engine pins its dependencies via ``managed_venv`` and a
         surprise ``pip install`` from inside the runner has historically
-        deadlocked the SwiftUI progress bar. If ``mlx_vlm`` is missing
-        the user can opt back out of ``audio_recheck_enabled`` (or
-        let the preset turn it on once the venv ships with it).
+        deadlocked the SwiftUI progress bar. If the probe fails we
+        emit a single actionable WarningEvent (telling the user
+        whether to install ``mlx-vlm`` or upgrade it) and skip the
+        recheck step for the whole pipeline.
+
+        PR AC: previously the probe only checked ``import mlx_vlm``
+        which succeeded on the bundled venv. The actual
+        ``load(model_path)`` then failed with "Model type qwen2_audio
+        not supported. Error: No module named
+        'mlx_vlm.models.qwen2_audio'" on every recheck attempt.
+        Now we probe the specific submodule the model needs.
         """
         if self._mlx_vlm_available is not None:
             return self._mlx_vlm_available
@@ -2874,9 +2908,33 @@ class TranscriptionPipeline:
         if not venv_python or not Path(venv_python).exists():
             self._mlx_vlm_available = False
             return False
+
+        model_path = self.request.transcription_settings.audio_llm_model or ""
+        submodule_slug = self._mlx_vlm_submodule_for(model_path)
+        # Build a single probe script that returns:
+        #   exit 0 → fully available
+        #   exit 1 → ``mlx_vlm`` itself missing
+        #   exit 2 → ``mlx_vlm`` present but the model submodule
+        #            missing (the canonical CVR/Caste failure mode)
+        probe_script = (
+            "import importlib, sys\n"
+            "try:\n"
+            "    import mlx_vlm\n"
+            "except Exception:\n"
+            "    sys.exit(1)\n"
+        )
+        if submodule_slug:
+            probe_script += (
+                f"try:\n"
+                f"    importlib.import_module('mlx_vlm.models.{submodule_slug}')\n"
+                f"except Exception:\n"
+                f"    sys.exit(2)\n"
+            )
+        probe_script += "sys.exit(0)\n"
+
         try:
             probe = subprocess.run(
-                [venv_python, "-c", "import mlx_vlm"],
+                [venv_python, "-c", probe_script],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -2886,14 +2944,52 @@ class TranscriptionPipeline:
             append_app_log(f"engine_mlx_vlm_probe_error err={exc!r}")
             self._mlx_vlm_available = False
             return False
-        ok = probe.returncode == 0
-        self._mlx_vlm_available = ok
-        if not ok:
-            append_app_log(
-                f"engine_mlx_vlm_unavailable rc={probe.returncode} "
-                f"stderr={tail_text(probe.stderr)!r}"
+
+        rc = probe.returncode
+        if rc == 0:
+            self._mlx_vlm_available = True
+            return True
+
+        # Distinguish the two failure modes so the WarningEvent
+        # gives the user something actionable to do.
+        self._mlx_vlm_available = False
+        if rc == 1:
+            message = (
+                "Réécoute IA ignorée : ``mlx-vlm`` n'est pas installé "
+                "dans l'environnement Python géré. "
+                "Désactive la réécoute IA dans Réglages ou installe "
+                "``mlx-vlm`` dans la venv pour activer Qwen2-Audio."
             )
-        return ok
+            log_reason = "mlx_vlm_missing"
+        elif rc == 2:
+            message = (
+                f"Réécoute IA ignorée : ``mlx-vlm`` est installé mais "
+                f"ne contient pas le support du modèle "
+                f"``{submodule_slug}`` ({model_path}). "
+                f"Mets à jour ``mlx-vlm`` dans la venv "
+                f"(``pip install -U mlx-vlm``) ou choisis un modèle "
+                f"audio LLM supporté dans Réglages."
+            )
+            log_reason = f"model_submodule_missing slug={submodule_slug}"
+        else:
+            message = (
+                "Réécoute IA ignorée : la sonde mlx-vlm a échoué "
+                f"(rc={rc}). Voir app_log pour le détail."
+            )
+            log_reason = f"probe_failed_unknown_rc rc={rc}"
+
+        self.sink(
+            WarningEvent(
+                message,
+                code="audio_recheck_mlx_vlm_unavailable",
+            )
+        )
+        append_app_log(
+            f"engine_mlx_vlm_unavailable reason={log_reason} "
+            f"rc={rc} model_path={model_path!r} "
+            f"stderr={tail_text(probe.stderr)!r}"
+        )
+        return False
 
     def _run_audio_recheck(
         self, whisper_wav: Path, workspace: Path
