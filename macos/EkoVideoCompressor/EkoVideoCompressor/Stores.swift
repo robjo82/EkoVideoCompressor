@@ -284,6 +284,14 @@ final class SettingsStore: ObservableObject {
     @AppStorage("outputDir") var outputDir = "\(NSHomeDirectory())/EkoVideo Compressor"
     @AppStorage("glossary") var glossary = ""
     @AppStorage("glossaryUsageJSON") private var glossaryUsageJSON = "{}"
+    /// PR AJ — co-occurrence map. Encodes ``{term: {co_term:
+    /// count}}``. Updated each time ``recordVocabularyUsage`` runs
+    /// with multiple terms (every unordered pair in the input gets
+    /// its counter bumped, symmetric). Used by
+    /// ``suggestedVocabulary(..., cooccurringWith:)`` so that
+    /// picking "Acritec" surfaces "MGX" before unrelated terms,
+    /// matching how the user actually thinks about meeting vocab.
+    @AppStorage("glossaryCooccurrenceJSON") private var glossaryCooccurrenceJSON = "{}"
     @AppStorage("hfToken") var hfToken = ""
     /// Name of the person running the app — surfaced to the engine
     /// so it can pre-attribute the cluster that speaks first to
@@ -341,6 +349,19 @@ final class SettingsStore: ObservableObject {
         return decoded
     }
 
+    /// PR AJ — decoded co-occurrence matrix. Empty when nothing's
+    /// been recorded yet OR when the persisted JSON is malformed
+    /// (silent fallback rather than crashing the picker UI).
+    var vocabularyCooccurrence: [String: [String: Int]] {
+        guard let data = glossaryCooccurrenceJSON.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(
+                [String: [String: Int]].self, from: data
+              ) else {
+            return [:]
+        }
+        return decoded
+    }
+
     var vocabularyCatalog: [String] {
         let usage = vocabularyUsage
         let terms = Set(glossaryTerms).union(usage.keys)
@@ -354,12 +375,63 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    func suggestedVocabulary(matching query: String, excluding selected: [String]) -> [String] {
+    /// PR AJ — combined co-occurrence score for a candidate term
+    /// against the set of already-selected terms (case-insensitive).
+    /// Sums ``cooccurrence[selected][candidate]`` across all
+    /// selected terms. Returns 0 when there's no overlap (the
+    /// candidate falls back to raw frequency ranking).
+    func vocabularyCooccurrenceScore(
+        for candidate: String,
+        with selected: [String]
+    ) -> Int {
+        guard !selected.isEmpty else { return 0 }
+        let matrix = vocabularyCooccurrence
+        let candidateKey = candidate.lowercased()
+        var total = 0
+        for term in selected {
+            let key = term.lowercased()
+            // The persisted matrix uses the original-cased term as
+            // the outer key. We canonicalise via case-insensitive
+            // lookup so "Acritec" and "acritec" both resolve.
+            for (storedKey, inner) in matrix where storedKey.lowercased() == key {
+                for (innerKey, count) in inner where innerKey.lowercased() == candidateKey {
+                    total += count
+                }
+            }
+        }
+        return total
+    }
+
+    func suggestedVocabulary(
+        matching query: String,
+        excluding selected: [String],
+        cooccurringWith: [String] = []
+    ) -> [String] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let excluded = Set(selected.map { $0.lowercased() })
-        return vocabularyCatalog.filter { term in
+        let candidates = vocabularyCatalog.filter { term in
             guard !excluded.contains(term.lowercased()) else { return false }
             return needle.isEmpty || term.localizedCaseInsensitiveContains(needle)
+        }
+        guard !cooccurringWith.isEmpty else { return candidates }
+        let usage = vocabularyUsage
+        // PR AJ — re-sort by (co-occurrence score with the
+        // selected terms) DESC, then by raw usage DESC, then
+        // alphabetical. Without overlap, behaviour matches the
+        // legacy frequency-only sort because cooccurrence_score=0
+        // for everything.
+        return candidates.sorted { left, right in
+            let leftScore = vocabularyCooccurrenceScore(
+                for: left, with: cooccurringWith
+            )
+            let rightScore = vocabularyCooccurrenceScore(
+                for: right, with: cooccurringWith
+            )
+            if leftScore != rightScore { return leftScore > rightScore }
+            let leftUsage = usage[left] ?? 0
+            let rightUsage = usage[right] ?? 0
+            if leftUsage != rightUsage { return leftUsage > rightUsage }
+            return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
         }
     }
 
@@ -384,19 +456,53 @@ final class SettingsStore: ObservableObject {
 
     func recordVocabularyUsage(_ terms: [String]) {
         var usage = vocabularyUsage
+        // Normalise + dedupe (case-insensitive) early so the
+        // co-occurrence pass below doesn't count duplicates.
+        var normalised: [String] = []
+        var seenKeys = Set<String>()
         for raw in terms {
             let term = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !term.isEmpty else { continue }
+            let key = term.lowercased()
+            guard !seenKeys.contains(key) else { continue }
+            seenKeys.insert(key)
+            normalised.append(term)
             usage[term, default: 0] += 1
             addVocabularyTerm(term)
         }
         writeVocabularyUsage(usage)
+        // PR AJ — bump co-occurrence counters for every unordered
+        // pair in this run. After enough runs the matrix learns
+        // "Acritec usually rides with MGX" patterns and the picker
+        // can suggest them together.
+        recordVocabularyCooccurrence(normalised)
     }
 
     private func writeVocabularyUsage(_ usage: [String: Int]) {
         guard let data = try? JSONEncoder().encode(usage),
               let text = String(data: data, encoding: .utf8) else { return }
         glossaryUsageJSON = text
+    }
+
+    /// PR AJ — update the co-occurrence matrix from a single run's
+    /// term list. Symmetric : both ``[a][b]`` and ``[b][a]`` are
+    /// bumped so suggestion lookups don't depend on which term
+    /// the user selected first.
+    private func recordVocabularyCooccurrence(_ terms: [String]) {
+        guard terms.count >= 2 else { return }
+        var matrix = vocabularyCooccurrence
+        for i in 0 ..< terms.count {
+            for j in (i + 1) ..< terms.count {
+                let a = terms[i]
+                let b = terms[j]
+                guard a.lowercased() != b.lowercased() else { continue }
+                matrix[a, default: [:]][b, default: 0] += 1
+                matrix[b, default: [:]][a, default: 0] += 1
+            }
+        }
+        guard let data = try? JSONEncoder().encode(matrix),
+              let text = String(data: data, encoding: .utf8) else { return }
+        glossaryCooccurrenceJSON = text
     }
 }
 
