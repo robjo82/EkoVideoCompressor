@@ -45,6 +45,15 @@ struct QueueItem: Identifiable, Equatable {
     /// Existing job workspace reused for reruns. Empty on fresh drops;
     /// populated when the user relaunches from the library.
     var workspaceDir: String = ""
+    /// PR AI — pipeline mode (``compress`` / ``compress_transcribe``
+    /// / ``transcribe`` / ``enhance`` / ``review``) captured **at
+    /// add time** from the global picker. Was previously read from
+    /// ``SettingsStore.processingMode`` when each item launched —
+    /// which meant changing the picker mid-queue silently switched
+    /// every still-pending item. Snapshotting per-item fixes that:
+    /// once a drop is in the queue, its mode is locked unless the
+    /// user explicitly edits it from the row picker.
+    var mode: String = "compress_transcribe"
     /// Per-file vocabulary explicitly selected for this run. The global
     /// vocabulary catalog suggests entries, but nothing is sent to
     /// Whisper unless the user chose it here.
@@ -117,7 +126,12 @@ final class QueueStore: ObservableObject {
         odooMeeting: OdooMeetingMetadata? = nil,
         odooContextRef: OdooContextRef? = nil,
         meetingDate: Date? = nil,
-        meetingDateManuallyEdited: Bool = false
+        meetingDateManuallyEdited: Bool = false,
+        /// PR AI — pipeline mode snapshot. Caller passes the
+        /// current global picker value; the item locks it. Defaults
+        /// to ``compress_transcribe`` for the rare programmatic
+        /// caller that doesn't go through the UI.
+        mode: String = "compress_transcribe"
     ) {
         for url in urls {
             if let index = items.firstIndex(where: { $0.sourceURL == url && $0.libraryJobId == libraryJobId }) {
@@ -148,6 +162,10 @@ final class QueueStore: ObservableObject {
                     items[index].meetingDate = meetingDate
                     items[index].meetingDateManuallyEdited = meetingDateManuallyEdited
                 }
+                // PR AI: re-drop on an existing queued item RESETS
+                // the mode to whatever the current picker says. The
+                // user just re-asked, so respect their current intent.
+                items[index].mode = mode
                 if prioritize && index > 0 {
                     let item = items.remove(at: index)
                     items.insert(item, at: 0)
@@ -165,6 +183,7 @@ final class QueueStore: ObservableObject {
             item.odooContextRef = odooContextRef
             item.meetingDate = meetingDate
             item.meetingDateManuallyEdited = meetingDateManuallyEdited
+            item.mode = mode
             if prioritize {
                 items.insert(item, at: 0)
             } else {
@@ -173,11 +192,23 @@ final class QueueStore: ObservableObject {
         }
     }
 
+    /// PR AI — manually change the mode of a queued item that's
+    /// still pending. Called from the per-row picker.
+    func setMode(_ mode: String, for item: QueueItem) {
+        guard let index = items.firstIndex(where: { $0.id == item.id }) else { return }
+        items[index].mode = mode
+    }
+
     func addRerun(
         row: LibraryRow,
         sourcePath: String? = nil,
         focusNote: String? = nil,
-        prioritize: Bool = false
+        prioritize: Bool = false,
+        /// PR AI — pipeline mode for the rerun. Defaults to
+        /// ``compress_transcribe`` ; callers typically pass the
+        /// current ``settings.processingMode`` so the rerun matches
+        /// the user's current intent.
+        mode: String = "compress_transcribe"
     ) {
         let path = sourcePath
             ?? (pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path)
@@ -200,7 +231,8 @@ final class QueueStore: ObservableObject {
                 OdooContextRef(model: $0.model, record_id: $0.id, url: "", database: "", login: "", api_key: "")
             },
             meetingDate: existingMeetingDate,
-            meetingDateManuallyEdited: existingMeetingDate != nil
+            meetingDateManuallyEdited: existingMeetingDate != nil,
+            mode: mode
         )
     }
 
