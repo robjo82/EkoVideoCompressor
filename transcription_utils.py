@@ -1655,19 +1655,39 @@ Quand tu hésites, laisse la chaîne vide. Une attribution fausse pollue le comp
 
 Format strict : "Nom de société - Sujet court".
 
-- La société est celle des interlocuteurs **non-Ekonum** (le client / partenaire), pas Ekonum.
+## ⛔ INTERDICTION ABSOLUE : EKONUM
+
+**Ekonum est l'entreprise du locuteur qui anime cette réunion**
+(c'est nous, le prestataire). Ekonum N'EST JAMAIS la société du
+titre. Sont également interdits comme préfixe : ``Ekonum``,
+``Ekonum -``, ``EKONUM``, ``ekonum``, ``Econum``, ``Ekonom``.
+
+Si tu n'arrives pas à identifier la société CLIENTE distincte
+d'Ekonum, OMETS le préfixe entièrement et garde juste un sujet
+court. Préfixer avec Ekonum, c'est nous adresser à nous-mêmes
+— ça n'a aucun intérêt pour l'utilisateur.
+
+## Autres règles
+
+- La société est celle des interlocuteurs **non-Ekonum** (le client / partenaire), JAMAIS Ekonum.
 - Si plusieurs sociétés sont impliquées, prends celle qui pilote le sujet (généralement celle qui pose le plus de questions ou dont le métier est discuté).
-- Si aucune société n'est clairement identifiable, omets le préfixe et garde juste un sujet court.
+- Si aucune société CLIENTE n'est clairement identifiable, omets le préfixe et garde juste un sujet court.
 - Sujet : 3 à 7 mots, nominal, sans première personne (pas de "J'ai", "Je", "On va", "Nous allons").
 - Le sujet doit décrire le sujet global de toute la réunion, pas recopier une phrase locale.
 
-Exemples :
-- Bon titre : "CVR Contrôles - Configuration site web Odoo"
-- Bon titre : "Caste - Audit système ERP et reporting"
-- Bon titre : "Acritec - Migration facturation vers Odoo"
-- Mauvais titre : "J'ai pris une facture fournisseur basique, c'est PayFit"
-- Mauvais titre : "Discussion sur l'utilisation d'Odoo et d'autres logiciels"  (pas de société, sujet trop vague)
-- Acceptable sans société : "Présentation du nouveau module RH"  (quand aucune entreprise cliente n'est claire)
+## Exemples
+
+✅ Bons titres :
+- "CVR Contrôles - Configuration site web Odoo"
+- "Caste - Audit système ERP et reporting"
+- "Acritec - Migration facturation vers Odoo"
+- "Présentation du nouveau module RH"  (sans société = OK quand pas de client identifiable)
+
+❌ Mauvais titres (à NE JAMAIS produire) :
+- "Ekonum - Audit système ERP"  ← INTERDIT (Ekonum est nous-mêmes)
+- "Ekonum - Migration vers Odoo"  ← INTERDIT
+- "J'ai pris une facture fournisseur basique, c'est PayFit"  ← première personne
+- "Discussion sur l'utilisation d'Odoo et d'autres logiciels"  ← sujet trop vague
 
 Schéma exact attendu :
 {{"title": "...", "speakers": {{"SPEAKER_00": "..."}}, "technical_terms": ["Odoo"]}}
