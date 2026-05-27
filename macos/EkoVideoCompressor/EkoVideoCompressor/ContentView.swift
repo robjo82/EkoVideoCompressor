@@ -174,7 +174,8 @@ struct ContentView: View {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if panel.runModal() == .OK {
-            queue.add(urls: panel.urls)
+            // PR AI — snapshot current global mode for each new item.
+            queue.add(urls: panel.urls, mode: settings.processingMode)
             selectedSection = .queue
         }
     }
@@ -303,7 +304,12 @@ struct ContentView: View {
             source_path: item.sourceURL.path,
             workspace_dir: item.workspaceDir,
             output_dir: settings.outputDir,
-            mode: settings.processingMode,
+            // PR AI — pipeline mode snapshotted on the QueueItem at
+            // add time. Previously read from the GLOBAL
+            // ``settings.processingMode``, which silently switched
+            // every still-pending item when the user changed the
+            // picker mid-queue. Now each item locks its mode.
+            mode: item.mode,
             profile: profile.isEmpty ? "Réunion équilibrée" : profile,
             compression_settings: compressionSettings,
             transcription_settings: TranscriptionSettings(
@@ -486,6 +492,32 @@ struct QueueRowView: View {
     @EnvironmentObject private var queue: QueueStore
     var item: QueueItem
 
+    // PR AI — per-item mode picker binding. The Menu writes back
+    // via ``queue.setMode`` so the change persists on the
+    // QueueItem snapshot (not the global SettingsStore).
+    private var modeBinding: Binding<String> {
+        Binding(
+            get: { item.mode },
+            set: { queue.setMode($0, for: item) }
+        )
+    }
+
+    private static let modeLabels: [(String, String, String)] = [
+        ("compress", "Compresser", "rectangle.compress.vertical"),
+        ("compress_transcribe", "Compresser + transcrire", "rectangle.compress.vertical"),
+        ("transcribe", "Transcrire seulement", "text.bubble"),
+        ("enhance", "Améliorer", "wand.and.stars"),
+        ("review", "Relecture", "checkmark.bubble"),
+    ]
+
+    private var currentModeLabel: String {
+        QueueRowView.modeLabels.first { $0.0 == item.mode }?.1 ?? item.mode
+    }
+
+    private var currentModeIcon: String {
+        QueueRowView.modeLabels.first { $0.0 == item.mode }?.2 ?? "questionmark.circle"
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "line.3.horizontal")
@@ -504,6 +536,29 @@ struct QueueRowView: View {
                     .lineLimit(1)
             }
             Spacer()
+            // PR AI — per-item mode picker as a compact menu so the
+            // user can override the snapshot on a row that's still
+            // pending. Disabled while the row is actually running.
+            Menu {
+                Picker("Mode", selection: modeBinding) {
+                    ForEach(QueueRowView.modeLabels, id: \.0) { mode in
+                        Label(mode.1, systemImage: mode.2).tag(mode.0)
+                    }
+                }
+            } label: {
+                Label(currentModeLabel, systemImage: currentModeIcon)
+                    .labelStyle(.titleAndIcon)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.quaternary, in: Capsule())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .disabled(queue.isBatchRunning && item.status == "En cours")
+            .help("Action pour ce fichier (figée au moment de l'ajout — éditable tant qu'il est en attente)")
             VStack(alignment: .trailing, spacing: 5) {
                 Text(item.status)
                     .font(.caption.weight(.medium))
@@ -1681,7 +1736,10 @@ struct DropTargetView: View {
                             urls.append(url)
                         }
                     }
-                    await MainActor.run { queue.add(urls: urls) }
+                    await MainActor.run {
+                        // PR AI — snapshot current global mode.
+                        queue.add(urls: urls, mode: settings.processingMode)
+                    }
                 }
                 return true
             }
@@ -1691,6 +1749,9 @@ struct DropTargetView: View {
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var queue: QueueStore
+    // PR AI — need the current processingMode to snapshot when
+    // enqueuing a rerun from the library.
+    @EnvironmentObject private var settings: SettingsStore
     @State private var editingRow: LibraryRow?
     @State private var rowToDelete: LibraryRow?
     @State private var expandedJobIDs: Set<Int> = []
@@ -2009,7 +2070,8 @@ struct LibraryView: View {
     }
 
     private func enqueue(_ path: String, label: String) {
-        queue.add(urls: [URL(fileURLWithPath: path)])
+        // PR AI — snapshot current global mode.
+        queue.add(urls: [URL(fileURLWithPath: path)], mode: settings.processingMode)
         withAnimation(.easeInOut(duration: 0.16)) {
             queueNotice = label
         }
@@ -2026,7 +2088,10 @@ struct LibraryView: View {
     }
 
     private func enqueue(_ row: LibraryRow, sourcePath: String? = nil, label: String) {
-        queue.addRerun(row: row, sourcePath: sourcePath)
+        // PR AI — rerun snapshots the current picker as well so a
+        // "transcribe only" relaunch isn't overridden by a later
+        // toolbar tweak.
+        queue.addRerun(row: row, sourcePath: sourcePath, mode: settings.processingMode)
         withAnimation(.easeInOut(duration: 0.16)) {
             queueNotice = label
         }
@@ -3607,6 +3672,8 @@ struct OdooRelatedCell: View {
 struct LibraryContextEditor: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var queue: QueueStore
+    // PR AI — need settings.processingMode to snapshot at rerun time.
+    @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
     var row: LibraryRow
     @State private var speakers: [SpeakerEditRow]
@@ -4301,7 +4368,9 @@ struct LibraryContextEditor: View {
                         row: row,
                         sourcePath: path,
                         focusNote: focusNote(for: sample),
-                        prioritize: true
+                        prioritize: true,
+                        // PR AI — snapshot the current global mode.
+                        mode: settings.processingMode
                     )
                     queue.requestAutoRun()
                 }
