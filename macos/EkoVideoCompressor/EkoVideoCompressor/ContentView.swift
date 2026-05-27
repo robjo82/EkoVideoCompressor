@@ -1203,7 +1203,15 @@ struct VocabularyTokenPicker: View {
     @State private var draft = ""
 
     private var suggestions: [String] {
-        settings.suggestedVocabulary(matching: draft, excluding: selected)
+        // PR AJ — pass the already-selected terms so co-occurring
+        // ones (e.g. "MGX" after "Acritec") rank above unrelated
+        // alphabetic neighbours. Empty ``selected`` falls back to
+        // the legacy frequency-only sort.
+        settings.suggestedVocabulary(
+            matching: draft,
+            excluding: selected,
+            cooccurringWith: selected
+        )
     }
 
     var body: some View {
