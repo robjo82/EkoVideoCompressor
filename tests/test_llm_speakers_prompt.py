@@ -101,8 +101,35 @@ class LlmSpeakerPromptContentTests(unittest.TestCase):
     def test_prompt_allows_no_company_fallback(self):
         # When no client company is clear, the prompt allows a
         # bare topic — better than forcing a wrong company name.
-        self.assertIn("Acceptable sans société", self.script)
+        # PR AL: wording was tightened from "Acceptable sans
+        # société" to "sans société = OK quand pas de client
+        # identifiable" within the examples block. The
+        # "omets le préfixe" instruction is still there (now used
+        # in both the Ekonum ban and the general fallback rules).
         self.assertIn("omets le préfixe", self.script)
+        self.assertIn("sans société = OK", self.script)
+
+    # PR AL — explicit Ekonum ban anchors.
+
+    def test_prompt_explicitly_bans_ekonum_as_company(self):
+        # The CVR rerun produced ``Ekonum - Audit système ERP`` for a
+        # Caste meeting. The prompt now contains an explicit
+        # interdiction block + concrete bad-example bullets.
+        self.assertIn("INTERDICTION ABSOLUE : EKONUM", self.script)
+        self.assertIn("Ekonum est l'entreprise du locuteur", self.script)
+
+    def test_prompt_lists_ekonum_variants_in_ban(self):
+        # The ban enumerates the spelling variants Mistral has
+        # produced (``Ekonum``, ``Econum``, ``EKONUM``) so a
+        # case-fold or typo doesn't slip through.
+        for variant in ("Ekonum", "EKONUM", "Econum"):
+            self.assertIn(variant, self.script)
+
+    def test_prompt_carries_ekonum_bad_examples(self):
+        # Negative examples reproducing the exact CVR/Caste failure
+        # mode so the LLM sees concrete patterns to avoid.
+        self.assertIn("Ekonum - Audit système ERP", self.script)
+        self.assertIn("INTERDIT", self.script)
 
 
 if __name__ == "__main__":
