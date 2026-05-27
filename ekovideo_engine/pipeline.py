@@ -1088,13 +1088,70 @@ class TranscriptionPipeline:
 
         return ""
 
+    # PR AM — spelling variants of "Ekonum" Mistral has produced
+    # in the wild. Used by ``_strip_ekonum_prefix`` below. Folded
+    # accents + lowercased before comparison, so this set only
+    # needs the canonical variants — capitalisation / accent
+    # tweaks are handled by the comparison.
+    _EKONUM_PREFIX_VARIANTS: frozenset[str] = frozenset(
+        {"ekonum", "econum", "ekonom", "ekonun", "ekanum"}
+    )
+
+    @classmethod
+    def _strip_ekonum_prefix(cls, title: str) -> str:
+        """PR AM — strip ``Ekonum - `` or its variants from the
+        front of a title.
+
+        Mistral 7B routinely ignores the prompt-level ban (PR AL),
+        producing titles like ``"Ekonum - Audit système ERP"``
+        even though Ekonum is the user's own company. This veto
+        catches the LLM output before it reaches the user :
+        when the title starts with an Ekonum-family prefix
+        followed by a separator (``-`` / ``:`` / ``—``), the
+        prefix is dropped and what follows becomes the new title.
+
+        Returns the original title when no Ekonum prefix is
+        detected. Comparison is accent-folded + case-insensitive
+        so "EKONUM —" and "Ékonum -" both get stripped.
+        """
+        import unicodedata
+        stripped = title.lstrip()
+        # Iterate over allowed separators ; ``" - "`` is the most
+        # common, but Mistral also emits ``" — "`` (em-dash),
+        # ``" : "``, or a tab-padded variant.
+        for separator in (" - ", " — ", " – ", " : ", " -- "):
+            sep_pos = stripped.find(separator)
+            if sep_pos <= 0 or sep_pos > 30:
+                continue
+            head = stripped[:sep_pos].strip()
+            # Fold accents + lowercase for the comparison only.
+            folded = "".join(
+                ch for ch in unicodedata.normalize("NFD", head.lower())
+                if unicodedata.category(ch) != "Mn"
+            )
+            if folded in cls._EKONUM_PREFIX_VARIANTS:
+                remainder = stripped[sep_pos + len(separator):].lstrip()
+                # If the remainder is empty / pure punctuation,
+                # keep the original — empty title is worse than
+                # an autoreferential one.
+                if any(ch.isalnum() for ch in remainder):
+                    return remainder
+        return title
+
     def _apply_title_company_prefix(self, title: str) -> str:
         """Ensure the title is rendered as ``"Société - Sujet"`` when
         we can resolve a company name. Idempotent : if the title
         already starts with the resolved company (case-insensitive)
         or the LLM already produced a ``" - "`` separator that
         looks like a company prefix, do nothing.
+
+        PR AM: first strip any ``Ekonum -`` prefix the LLM may
+        have produced despite the PR AL ban, THEN apply the
+        normal company-prefix logic.
         """
+        # PR AM — code-side veto for ``Ekonum -`` prefixes the
+        # LLM produced despite the prompt-level ban (PR AL).
+        title = self._strip_ekonum_prefix(title)
         company = self._resolve_company_name_for_title()
         if not company:
             return title
