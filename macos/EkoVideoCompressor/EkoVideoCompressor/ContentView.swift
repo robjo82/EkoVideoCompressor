@@ -1713,6 +1713,10 @@ struct RunSetupView: View {
 
 struct DropTargetView: View {
     @EnvironmentObject private var queue: QueueStore
+    // PR AK hotfix — settings.processingMode is needed to snapshot
+    // the per-item mode on drop (PR AI). The original PR forgot to
+    // inject it here and broke the CI build.
+    @EnvironmentObject private var settings: SettingsStore
     @State private var isTargeted = false
 
     var body: some View {
