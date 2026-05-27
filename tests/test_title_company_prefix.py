@@ -202,5 +202,122 @@ class ApplyTitleCompanyPrefixTests(unittest.TestCase):
         self.assertEqual(pipeline._apply_title_company_prefix("   "), "   ")
 
 
+class StripEkonumPrefixTests(unittest.TestCase):
+    """PR AM — veto code-side pour ``Ekonum -`` prefix produit
+    par Mistral malgré le ban de PR AL."""
+
+    def test_strips_canonical_ekonum_dash(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ekonum - Audit système ERP et reporting"
+        )
+        self.assertEqual(out, "Audit système ERP et reporting")
+
+    def test_strips_lowercase_variant(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "ekonum - Migration vers Odoo"
+        )
+        self.assertEqual(out, "Migration vers Odoo")
+
+    def test_strips_uppercase_variant(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "EKONUM - Discussion sur Odoo"
+        )
+        self.assertEqual(out, "Discussion sur Odoo")
+
+    def test_strips_typo_variants(self):
+        # Mistral has produced these in the wild.
+        for typo in ("Econum", "Ekonom", "Ekonun", "Ekanum"):
+            out = TranscriptionPipeline._strip_ekonum_prefix(
+                f"{typo} - Audit ERP"
+            )
+            self.assertEqual(out, "Audit ERP", f"failed for {typo}")
+
+    def test_strips_accented_variant(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ékonum - Audit ERP"
+        )
+        self.assertEqual(out, "Audit ERP")
+
+    def test_strips_em_dash_separator(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ekonum — Audit ERP"
+        )
+        self.assertEqual(out, "Audit ERP")
+
+    def test_strips_colon_separator(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ekonum : Audit ERP"
+        )
+        self.assertEqual(out, "Audit ERP")
+
+    def test_does_not_strip_legitimate_company_prefix(self):
+        # Companies that contain "ekon" but aren't Ekonum stay.
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ekonum-Suite - Audit ERP"  # hypothetical product name
+        )
+        # The folded comparison is "ekonum-suite" which is NOT in
+        # the variants set → no strip.
+        self.assertEqual(out, "Ekonum-Suite - Audit ERP")
+
+    def test_does_not_strip_when_no_separator(self):
+        # "Ekonum a fait un audit" has no " - " in the first 30
+        # chars → keep the title intact.
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ekonum a fait un audit chez Caste"
+        )
+        self.assertEqual(out, "Ekonum a fait un audit chez Caste")
+
+    def test_does_not_strip_when_remainder_is_empty(self):
+        # ``"Ekonum - "`` (no real topic after) — better keep the
+        # original than produce an empty title.
+        out = TranscriptionPipeline._strip_ekonum_prefix("Ekonum - ")
+        self.assertEqual(out, "Ekonum - ")
+
+    def test_does_not_strip_legitimate_title_starting_with_other_company(self):
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Caste - Audit système ERP"
+        )
+        self.assertEqual(out, "Caste - Audit système ERP")
+
+    def test_separator_past_30_chars_not_a_prefix(self):
+        # A title like "Ekonum a longuement travaillé - Audit ERP"
+        # has the separator past position 30 — not a prefix, leave
+        # it alone.
+        out = TranscriptionPipeline._strip_ekonum_prefix(
+            "Ekonum a longuement travaillé pour le client - Audit ERP"
+        )
+        self.assertTrue(out.startswith("Ekonum a longuement"))
+
+
+class ApplyTitleEkonumPipelineTests(unittest.TestCase):
+    """End-to-end : the Ekonum-strip runs INSIDE
+    ``_apply_title_company_prefix`` before the legacy company
+    logic, so a Mistral-emitted ``"Ekonum - Sujet"`` becomes
+    ``"Caste - Sujet"`` when the Odoo pack carries Caste."""
+
+    def test_ekonum_prefix_replaced_with_resolved_company(self):
+        # The CVR/Caste regression scenario : LLM produced
+        # "Ekonum - Audit ERP", Odoo pack has Caste.
+        pipeline = _make_pipeline(
+            odoo_pack={"primary": {"raw": {"partner_id": [1, "Caste"]}}},
+        )
+        out = pipeline._apply_title_company_prefix(
+            "Ekonum - Audit système ERP et reporting"
+        )
+        self.assertEqual(
+            out, "Caste - Audit système ERP et reporting"
+        )
+
+    def test_ekonum_prefix_stripped_when_no_company_resolved(self):
+        # Same Mistral output but no Odoo / meeting / overrides
+        # → at least we strip the Ekonum self-reference, even if
+        # we can't replace it with a real company.
+        pipeline = _make_pipeline()
+        out = pipeline._apply_title_company_prefix(
+            "Ekonum - Audit système ERP"
+        )
+        self.assertEqual(out, "Audit système ERP")
+
+
 if __name__ == "__main__":
     unittest.main()
