@@ -412,7 +412,11 @@ class EngineRunner:
         active_source = str(working_source)
 
         if request.mode in {"compress", "compress_transcribe"}:
-            result = CompressionPipeline(request, sink).run()
+            # PR AN: pass the resolved working source so compression
+            # reads the workspace copy, not request.source_path which
+            # may have been deleted by prepare_job_workspace when
+            # delete_source_after_copy is set.
+            result = CompressionPipeline(request, sink).run(active_source)
             results.append(result)
             if not result.ok:
                 _persist_step_durations(db, job_id, results)
