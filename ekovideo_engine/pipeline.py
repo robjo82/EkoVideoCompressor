@@ -4015,24 +4015,39 @@ class CompressionPipeline:
         self.request = request
         self.sink = sink
 
-    def run(self) -> StepResult:
+    def run(self, source_path: str | None = None) -> StepResult:
         ts = time.monotonic()
         settings = self.request.compression_settings
+        # PR AN: compress the resolved WORKING source (the workspace
+        # copy) when the runner provides it. ``request.source_path``
+        # may point at a file ``prepare_job_workspace`` already
+        # DELETED when ``delete_source_after_copy`` is set — ffmpeg
+        # then dies with "No such file or directory" (observed on a
+        # screen recording with the delete-after-copy toggle on).
+        # TranscriptionPipeline.run already takes its source as an
+        # argument for exactly this reason; CompressionPipeline now
+        # matches. Falls back to ``request.source_path`` so legacy /
+        # programmatic callers keep working.
+        active_source = source_path or self.request.source_path
         if self.request.workspace_dir:
             out_dir = Path(self.request.workspace_dir)
         else:
             out_dir = job_workspace_dir(self.request)
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Name the output off the ORIGINAL source path so the
+        # artefact keeps the meeting's filename (the workspace copy
+        # has the same basename anyway, but request.source_path is
+        # the canonical name).
         output_path = default_out_path(self.request.source_path, str(out_dir), "_compressed")
         append_app_log(
             "engine_compress_start "
-            f"source={self.request.source_path!r} output={output_path!r} "
+            f"source={active_source!r} output={output_path!r} "
             f"trim_enabled={settings.trim_enabled!r} "
             f"trim_start={settings.trim_start!r} trim_end={settings.trim_end!r}"
         )
         cmd = build_ffmpeg_cmd(
             settings.ffmpeg_path or "ffmpeg",
-            self.request.source_path,
+            active_source,
             output_path,
             crf=settings.crf,
             resolution=settings.resolution,
@@ -4045,7 +4060,7 @@ class CompressionPipeline:
             to=settings.trim_end
             if settings.trim_enabled and settings.trim_end != "00:00:00"
             else None,
-            audio_only=is_audio_only_path(self.request.source_path),
+            audio_only=is_audio_only_path(active_source),
             creation_time=ffmpeg_creation_time_from_request(self.request),
         )
         self.sink(ProgressEvent("compression", 0, "Running FFmpeg"))
