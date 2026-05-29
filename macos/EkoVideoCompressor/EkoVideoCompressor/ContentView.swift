@@ -3999,24 +3999,35 @@ struct LibraryContextEditor: View {
     /// — pointless menu otherwise.
     @ViewBuilder
     private func speakerProfileSuggestionMenu(for speaker: Binding<SpeakerEditRow>) -> some View {
-        let suggestions = recentProfileSuggestions(excluding: speaker.wrappedValue.name)
+        let typed = speaker.wrappedValue.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suggestions = profileSuggestions(matching: speaker.wrappedValue.name)
+        // PR AR — when the user has typed ≥ 2 chars and there are
+        // matches, the menu is a *duplicate-prevention* prompt rather
+        // than a generic "recent people" list: tint it and change the
+        // hint so it reads as "pick the existing person".
+        let isMatchPrompt = typed.count >= 2 && !suggestions.isEmpty
         if !suggestions.isEmpty {
             Menu {
                 ForEach(suggestions) { profile in
                     Button {
-                        speaker.wrappedValue.name = profile.name
+                        speaker.wrappedValue.name = profile.odoo_partner_name ?? profile.name
                     } label: {
                         speakerSuggestionRow(profile)
                     }
                 }
             } label: {
-                Image(systemName: "person.crop.circle.badge.questionmark")
+                Image(systemName: isMatchPrompt
+                      ? "person.crop.circle.badge.checkmark"
+                      : "person.crop.circle.badge.questionmark")
                     .imageScale(.medium)
+                    .foregroundStyle(isMatchPrompt ? AnyShapeStyle(.yellow) : AnyShapeStyle(.secondary))
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-            .help("Suggérer un interlocuteur déjà enregistré")
+            .help(isMatchPrompt
+                  ? "Interlocuteur existant correspondant — sélectionnez-le pour éviter un doublon"
+                  : "Suggérer un interlocuteur déjà enregistré")
         }
     }
 
@@ -4037,36 +4048,77 @@ struct LibraryContextEditor: View {
         }
     }
 
-    private func recentProfileSuggestions(excluding name: String) -> [SpeakerProfile] {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        // We exclude (a) profiles already typed in this sheet —
-        // wouldn't add anything — and (b) the in-progress entry.
-        // The engine returns profiles alphabetically, so we sort
-        // client-side by ``updated_at`` desc to surface the names
-        // the user actually touched recently. Profiles missing the
-        // timestamp fall to the bottom rather than disappearing.
+    /// PR AR — suggestions for the people-picker menu.
+    ///
+    /// Two modes:
+    ///   • **Fuzzy** (query ≥ 2 chars): rank profiles by how well
+    ///     they match the typed text — accent-insensitive, prefix +
+    ///     substring (see ``SpeakerNameMatcher``). Typing "Mathilde"
+    ///     or "gerar" both float "Mathilde Gérard" to the top. This
+    ///     is the duplicate-prevention path.
+    ///   • **Recency** (empty / 1 char): the original behaviour — the
+    ///     8 most recently-touched profiles, so the menu is still a
+    ///     useful "recent people" picker before the user types.
+    ///
+    /// In both modes we drop profiles already assigned to another row
+    /// in this sheet, and the exact in-progress name (nothing to add).
+    private func profileSuggestions(matching name: String) -> [SpeakerProfile] {
+        let query = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let alreadyAssigned = Set(
             speakers
-                .map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .map { SpeakerNameMatcher.fold($0.name) }
                 .filter { !$0.isEmpty }
         )
-        let candidates = library.speakerProfiles.filter { profile in
-            let key = profile.name.lowercased()
-            if key == trimmed { return false }
-            if alreadyAssigned.contains(key) { return false }
-            return true
-        }
-        return candidates
+        let fuzzy = query.count >= 2
+        let scored: [(profile: SpeakerProfile, strength: SpeakerNameMatcher.Strength)] =
+            library.speakerProfiles.compactMap { profile in
+                let folded = SpeakerNameMatcher.fold(profile.name)
+                if alreadyAssigned.contains(folded) { return nil }
+                if fuzzy {
+                    let aliases = [profile.name, profile.odoo_partner_name]
+                        .compactMap { $0 }
+                        .filter { !$0.isEmpty }
+                    let strength = SpeakerNameMatcher.bestStrength(query: query, names: aliases)
+                    // Skip non-matches and the exact name (nothing to propose).
+                    guard strength != .none, strength != .exact else { return nil }
+                    return (profile, strength)
+                }
+                if !query.isEmpty && SpeakerNameMatcher.fold(query) == folded { return nil }
+                return (profile, .none)
+            }
+        return scored
             .sorted { lhs, rhs in
-                let lhsStamp = lhs.updated_at ?? ""
-                let rhsStamp = rhs.updated_at ?? ""
+                if fuzzy && lhs.strength != rhs.strength {
+                    return lhs.strength > rhs.strength
+                }
+                let lhsStamp = lhs.profile.updated_at ?? ""
+                let rhsStamp = rhs.profile.updated_at ?? ""
                 if lhsStamp == rhsStamp {
-                    return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+                    return lhs.profile.name.localizedCaseInsensitiveCompare(rhs.profile.name) == .orderedAscending
                 }
                 return lhsStamp > rhsStamp
             }
             .prefix(8)
-            .map { $0 }
+            .map { $0.profile }
+    }
+
+    /// PR AR — best fuzzy match for the typed name, if any. Drives the
+    /// "you may be about to create a duplicate" warning in the status
+    /// icon. Returns nil when the name is an exact match (no warning
+    /// needed) or nothing comes close.
+    private func nearestProfileMatch(for name: String) -> SpeakerProfile? {
+        let query = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count >= 2 else { return nil }
+        var best: (profile: SpeakerProfile, strength: SpeakerNameMatcher.Strength)?
+        for profile in library.speakerProfiles {
+            let aliases = [profile.name, profile.odoo_partner_name]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+            let strength = SpeakerNameMatcher.bestStrength(query: query, names: aliases)
+            if strength == .none || strength == .exact { continue }
+            if best == nil || strength > best!.strength { best = (profile, strength) }
+        }
+        return best?.profile
     }
 
     /// Status descriptor — symbol, colour, French tooltip — for the
@@ -4086,10 +4138,27 @@ struct LibraryContextEditor: View {
                 tooltip: "Aucun nom saisi — l'extrait restera étiqueté \(speaker.id)."
             )
         }
-        let profile = library.speakerProfiles.first {
-            $0.name.compare(trimmed, options: .caseInsensitive) == .orderedSame
+        // PR AR — match accent-insensitively against the profile name
+        // *and* any linked Odoo partner name, so "Mathilde Gerard"
+        // (no accent) is recognised as the existing "Mathilde Gérard".
+        let foldedTyped = SpeakerNameMatcher.fold(trimmed)
+        let profile = library.speakerProfiles.first { candidate in
+            let aliases = [candidate.name, candidate.odoo_partner_name]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+            return aliases.contains { SpeakerNameMatcher.fold($0) == foldedTyped }
         }
         guard let profile else {
+            // PR AR — no exact profile, but if a close one exists warn
+            // the user before they create a near-duplicate.
+            if let near = nearestProfileMatch(for: trimmed) {
+                let display = near.odoo_partner_name ?? near.name
+                return SpeakerStatusDescriptor(
+                    symbol: "exclamationmark.triangle.fill",
+                    color: .yellow,
+                    tooltip: "Voix proche déjà connue : « \(display) ». Sélectionnez-la dans le menu pour éviter un doublon."
+                )
+            }
             return SpeakerStatusDescriptor(
                 symbol: "person.fill.badge.plus",
                 color: .orange,
@@ -4497,6 +4566,70 @@ struct LibraryContextEditor: View {
 struct SpeakerEditRow: Identifiable, Equatable {
     var id: String
     var name: String
+}
+
+/// PR AR — accent-insensitive fuzzy matching for speaker names at
+/// Run Setup. Root-cause fix for duplicate profiles (« Mathilde
+/// Gérard » ×2): when the user types "Mathilde" — or even "gerar" —
+/// we surface the *existing* "Mathilde Gérard" profile so they pick
+/// it instead of typing a fresh, near-identical name that the engine
+/// stores as a second profile.
+///
+/// Matching is deliberately simple and synchronous so it runs on
+/// every keystroke against the already-loaded profile list — no
+/// engine round-trip. We fold case + diacritics, then score how the
+/// candidate (as a whole and per token) relates to the query:
+/// full-string prefix > token prefix > substring.
+enum SpeakerNameMatcher {
+    /// Match strength, ordered. `.exact` (folded equality) is useful
+    /// to the status logic — "already this person" — but excluded
+    /// from the suggestion menu since there's nothing to propose.
+    enum Strength: Int, Comparable {
+        case none = 0
+        case substring = 1
+        case tokenPrefix = 2
+        case fullPrefix = 3
+        case exact = 4
+        static func < (lhs: Strength, rhs: Strength) -> Bool {
+            lhs.rawValue < rhs.rawValue
+        }
+    }
+
+    /// Comparison key: case- and diacritic-insensitive, trimmed, with
+    /// internal whitespace collapsed to single spaces. "Mathilde
+    /// Gérard" and "mathilde  gerard" fold to the same string.
+    static func fold(_ value: String) -> String {
+        let folded = value.folding(
+            options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "fr_FR")
+        )
+        return folded
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
+    /// Score a query against one candidate name. `.none` when nothing
+    /// lines up. Examples (query → candidate "Mathilde Gérard"):
+    ///   • "mathilde"  → .fullPrefix  (whole string starts with it)
+    ///   • "gerar"     → .tokenPrefix (token "gerard" starts with it)
+    ///   • "rar"       → .substring   (appears mid-token)
+    static func strength(query rawQuery: String, candidate rawCandidate: String) -> Strength {
+        let query = fold(rawQuery)
+        let candidate = fold(rawCandidate)
+        guard !query.isEmpty, !candidate.isEmpty else { return .none }
+        if query == candidate { return .exact }
+        if candidate.hasPrefix(query) { return .fullPrefix }
+        let tokens = candidate.split(separator: " ")
+        if tokens.contains(where: { $0.hasPrefix(query) }) { return .tokenPrefix }
+        if candidate.contains(query) { return .substring }
+        return .none
+    }
+
+    /// Best strength across all of a profile's display aliases (its
+    /// own name + any linked Odoo partner name).
+    static func bestStrength(query: String, names: [String]) -> Strength {
+        names.map { strength(query: query, candidate: $0) }.max() ?? .none
+    }
 }
 
 /// Sheet shown when the user clicks "Supprimer" on a library row.
