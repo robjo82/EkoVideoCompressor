@@ -819,6 +819,16 @@ class TranscriptionPipeline:
         self.final_speaker_map: dict[str, str] = {}
         self.final_technical_terms: list[str] = []
         self.final_title: str = ""
+        # PR AO: speakers resolved by voice-matching + the
+        # "Vous êtes" pre-attribution heuristic, keyed
+        # ``SPEAKER_NN → name``. Stored so ``_write_review_markdown``
+        # can list them under "Interlocuteurs identifiés" alongside
+        # the LLM-named ones. Before PR AO the .md only read
+        # ``_llm_payload["speakers"]`` — so a transcript that showed
+        # ``[Robin]`` (via pre-attribution) reported "no speakers
+        # identified" because the LLM (conservative since PR W)
+        # named nobody.
+        self._recognized_speakers: dict[str, str] = {}
         # ``mlx_vlm`` probe is cached because importing it can take
         # ~1 s and the audio recheck step runs N subprocesses in
         # sequence — probing once per pipeline is plenty. ``None``
@@ -1318,6 +1328,11 @@ class TranscriptionPipeline:
                 )
                 if pre_attribution:
                     recognized_speakers = {**recognized_speakers, **pre_attribution}
+                # PR AO: stash for the review markdown so the
+                # "Interlocuteurs identifiés" section reflects
+                # voice-match + pre-attribution, not just the LLM's
+                # (post-PR-W conservative) speaker guesses.
+                self._recognized_speakers = dict(recognized_speakers)
                 if recognized_speakers:
                     segments = self._apply_speaker_renames(
                         segments, recognized_speakers
@@ -3673,6 +3688,11 @@ class TranscriptionPipeline:
             # PR AD: recovered loops are also worth surfacing as a
             # positive signal (engine fixed an issue silently).
             or self._recovered_loops
+            # PR AO: a run where the only named speaker came from
+            # pre-attribution / voice-match (LLM named nobody)
+            # still deserves the .md so the user sees who was
+            # identified.
+            or self._recognized_speakers
         )
 
     def _write_enhanced_transcript(
@@ -3776,11 +3796,28 @@ class TranscriptionPipeline:
                 "",
             ]
 
-        speakers = {k: v for k, v in (self._llm_payload.get("speakers") or {}).items() if v}
-        if speakers:
+        # PR AO: merge LLM-named speakers with voice-match /
+        # pre-attribution results. The recognised map takes
+        # precedence — it came from a real voice match or the
+        # explicit "Vous êtes" setting, not a probabilistic LLM
+        # guess off the transcript. Annotate the source so the
+        # user knows which names are confident (voix / réglage) vs
+        # inferred (LLM).
+        llm_speakers = {
+            k: v for k, v in (self._llm_payload.get("speakers") or {}).items() if v
+        }
+        recognised = {
+            k: v for k, v in (self._recognized_speakers or {}).items() if v
+        }
+        all_speakers = {**llm_speakers, **recognised}
+        if all_speakers:
             lines += ["## Interlocuteurs identifiés", ""]
-            for sp, name in sorted(speakers.items()):
-                lines.append(f"- `{sp}` → **{name}**")
+            for sp, name in sorted(all_speakers.items()):
+                if sp in recognised:
+                    source = "voix mémorisée / réglage"
+                else:
+                    source = "déduit du texte"
+                lines.append(f"- `{sp}` → **{name}** _({source})_")
             lines.append("")
 
         terms = self._llm_payload.get("technical_terms") or []
