@@ -1766,6 +1766,9 @@ struct LibraryView: View {
     @EnvironmentObject private var settings: SettingsStore
     @State private var editingRow: LibraryRow?
     @State private var rowToDelete: LibraryRow?
+    // PR AP — row whose heavy source the user asked to free; drives
+    // the confirmation dialog.
+    @State private var rowToFreeSource: LibraryRow?
     @State private var expandedJobIDs: Set<Int> = []
     @State private var queueNotice: String?
     // The "Fichier" + "Actions" columns are always on — they're
@@ -2011,13 +2014,28 @@ struct LibraryView: View {
 
                         TableColumn("Actions") { displayRow in
                             if let artifact = displayRow.artifact {
-                                ArtifactInlineActions(row: displayRow.job, artifact: artifact) { path in
-                                    if artifact.canRerun {
-                                        enqueue(displayRow.job, sourcePath: path, label: "Relance ajoutée à la file d'attente")
-                                    } else {
-                                        enqueue(path, label: "Artefact ajouté à la file d'attente")
-                                    }
-                                }
+                                ArtifactInlineActions(
+                                    row: displayRow.job,
+                                    artifact: artifact,
+                                    onRerun: { path in
+                                        if artifact.canRerun {
+                                            // PR AP — relaunching from the compressed
+                                            // artefact transcribes it (no re-compression,
+                                            // the source is gone). Force mode=transcribe.
+                                            let modeOverride = artifact.kind == "compressed"
+                                                ? "transcribe" : nil
+                                            enqueue(
+                                                displayRow.job,
+                                                sourcePath: path,
+                                                label: "Relance ajoutée à la file d'attente",
+                                                modeOverride: modeOverride
+                                            )
+                                        } else {
+                                            enqueue(path, label: "Artefact ajouté à la file d'attente")
+                                        }
+                                    },
+                                    onFreeSource: { rowToFreeSource = displayRow.job }
+                                )
                             } else if let version = displayRow.previousVersion {
                                 PreviousVersionInlineActions(version: version)
                             } else {
@@ -2062,6 +2080,35 @@ struct LibraryView: View {
             LibraryDeletionSheet(row: row)
                 .environmentObject(library)
         }
+        // PR AP — confirm before freeing the heavy source file.
+        // Destructive + irreversible (the original is gone), so we
+        // spell out what's kept (compressed + transcription) vs lost.
+        .confirmationDialog(
+            "Libérer le fichier source ?",
+            isPresented: Binding(
+                get: { rowToFreeSource != nil },
+                set: { if !$0 { rowToFreeSource = nil } }
+            ),
+            presenting: rowToFreeSource
+        ) { row in
+            Button("Libérer la source", role: .destructive) {
+                Task {
+                    let freed = await library.freeSource(row)
+                    await MainActor.run {
+                        if let bytes = freed {
+                            let mb = Double(bytes) / 1_000_000.0
+                            queueNotice = mb >= 1000
+                                ? String(format: "Source libérée · %.1f Go récupérés", mb / 1000)
+                                : String(format: "Source libérée · %.0f Mo récupérés", mb)
+                        }
+                    }
+                }
+                rowToFreeSource = nil
+            }
+            Button("Annuler", role: .cancel) { rowToFreeSource = nil }
+        } message: { _ in
+            Text("Le fichier source original sera définitivement supprimé. La version compressée et la transcription sont conservées. Vous pourrez relancer une transcription sur le fichier compressé, mais plus aucune re-compression ne sera possible.")
+        }
         .task {
             if library.rows.isEmpty {
                 await library.refresh()
@@ -2099,11 +2146,22 @@ struct LibraryView: View {
         }
     }
 
-    private func enqueue(_ row: LibraryRow, sourcePath: String? = nil, label: String) {
-        // PR AI — rerun snapshots the current picker as well so a
-        // "transcribe only" relaunch isn't overridden by a later
-        // toolbar tweak.
-        queue.addRerun(row: row, sourcePath: sourcePath, mode: settings.processingMode)
+    private func enqueue(
+        _ row: LibraryRow,
+        sourcePath: String? = nil,
+        label: String,
+        modeOverride: String? = nil
+    ) {
+        // PR AI — rerun snapshots the current picker so a "transcribe
+        // only" relaunch isn't overridden by a later toolbar tweak.
+        // PR AP — ``modeOverride`` forces a specific mode (e.g.
+        // "transcribe" when relaunching from a compressed artefact
+        // whose source has been freed — re-compression is impossible).
+        queue.addRerun(
+            row: row,
+            sourcePath: sourcePath,
+            mode: modeOverride ?? settings.processingMode
+        )
         withAnimation(.easeInOut(duration: 0.16)) {
             queueNotice = label
         }
@@ -3227,7 +3285,12 @@ extension LibraryRow {
     var artifacts: [LibraryArtifact] {
         [
             LibraryArtifact(kind: "source", title: "Source copiée", path: copiedSourcePath, canRerun: true),
-            LibraryArtifact(kind: "compressed", title: "Compressé", path: compressed_path),
+            // PR AP: the compressed file is rerunnable too — after the
+            // user frees the heavy source, relaunching transcription
+            // on the compressed file is the only path forward (no
+            // source = no re-compression). The Actions column forces
+            // mode=transcribe for this artefact kind.
+            LibraryArtifact(kind: "compressed", title: "Compressé", path: compressed_path, canRerun: true),
             LibraryArtifact(kind: "transcript", title: "Transcription", path: transcript_path),
             LibraryArtifact(kind: "enhanced", title: "Améliorée", path: enhanced_transcript_path),
             LibraryArtifact(kind: "review", title: "Rapport", path: review_path),
@@ -3492,10 +3555,27 @@ struct ArtifactInlineActions: View {
     var row: LibraryRow
     var artifact: LibraryArtifact
     var onRerun: (String) -> Void
+    // PR AP — invoked when the user clicks "Libérer" on the source
+    // artefact. Nil for non-source artefacts / when freeing isn't
+    // possible (no compressed substitute).
+    var onFreeSource: (() -> Void)? = nil
 
     private var existingPath: String? {
         guard let path = artifact.path, !path.isEmpty else { return nil }
         return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    // PR AP — the source can be freed only when a compressed
+    // version exists on disk (the lossy substitute that makes
+    // dropping the heavy original safe). The engine enforces this
+    // too, but gating the button avoids a pointless round-trip.
+    private var canFreeSource: Bool {
+        guard artifact.kind == "source", onFreeSource != nil else { return false }
+        guard existingPath != nil else { return false }  // source still present
+        guard let compressed = row.compressed_path, !compressed.isEmpty else {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: compressed)
     }
 
     var body: some View {
@@ -3524,7 +3604,19 @@ struct ArtifactInlineActions: View {
                         Label("Relancer", systemImage: "arrow.clockwise")
                     }
                     .labelStyle(.iconOnly)
-                    .help("Relancer depuis cette source")
+                    .help(artifact.kind == "compressed"
+                          ? "Relancer la transcription sur le fichier compressé"
+                          : "Relancer depuis cette source")
+                }
+
+                if canFreeSource {
+                    Button(role: .destructive) {
+                        onFreeSource?()
+                    } label: {
+                        Label("Libérer", systemImage: "externaldrive.badge.minus")
+                    }
+                    .labelStyle(.iconOnly)
+                    .help("Supprimer le fichier source lourd (garde la version compressée + la transcription)")
                 }
             }
         }
