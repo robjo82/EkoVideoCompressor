@@ -571,6 +571,41 @@ class DatabaseManager:
             row = cursor.fetchone()
             return int(row[0]) if row else 0
 
+    def get_speaker_profile(self, profile_id: int) -> Optional[dict]:
+        """PR AQ — fetch a single profile by id (the merge flow needs
+        both sides by id, not name)."""
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT id, name, name_key, embedding_json, sample_count, "
+                "created_at, updated_at, odoo_partner_id, odoo_partner_name, "
+                "odoo_company_id, odoo_company_name, linked_at "
+                "FROM speaker_profiles WHERE id = ?",
+                (int(profile_id),),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_speaker_profile_embedding(
+        self,
+        profile_id: int,
+        embedding_json: str,
+        sample_count: int,
+    ) -> None:
+        """PR AQ — overwrite a profile's centroid + sample count by id.
+
+        Used by the merge flow after computing the weighted-average
+        centroid of two profiles. Distinct from ``upsert_speaker_profile``
+        (which keys on ``name_key``); here we update a specific row
+        whose name we keep unchanged.
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE speaker_profiles SET embedding_json = ?, "
+                "sample_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (embedding_json, int(sample_count), int(profile_id)),
+            )
+
     def delete_speaker_profile(self, profile_id: int) -> None:
         with self._get_connection() as conn:
             conn.execute("DELETE FROM speaker_profiles WHERE id = ?", (profile_id,))

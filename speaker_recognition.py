@@ -156,6 +156,49 @@ def aggregate_embeddings(embeddings: list[list[float]]) -> list[float]:
     return _normalise(averaged)
 
 
+def merge_centroids(
+    centroid_a: list[float],
+    count_a: int,
+    centroid_b: list[float],
+    count_b: int,
+) -> tuple[list[float], int]:
+    """PR AQ — weighted-average two stored centroids into one.
+
+    Each input is itself the mean of ``count`` sample embeddings, so
+    the correct combined mean weights each centroid by its count:
+    ``(cA*nA + cB*nB) / (nA + nB)``, re-normalised. Returns
+    ``(centroid, count)`` with ``count = nA + nB``.
+
+    Degenerate inputs heal gracefully:
+      * an empty / zero-count side → return the other side untouched
+        (merging a "shell" profile with no embedding just carries the
+        real one forward and sums the counts).
+      * shape mismatch → fall back to the higher-count side rather
+        than producing a meaningless average.
+    """
+    a_ok = bool(centroid_a) and count_a > 0
+    b_ok = bool(centroid_b) and count_b > 0
+    total = max(0, int(count_a)) + max(0, int(count_b))
+    if not a_ok and not b_ok:
+        return ([], total)
+    if not a_ok:
+        return (list(centroid_b), total)
+    if not b_ok:
+        return (list(centroid_a), total)
+    if len(centroid_a) != len(centroid_b):
+        # Incompatible dims — keep the better-sampled side.
+        keep = centroid_a if count_a >= count_b else centroid_b
+        return (list(keep), total)
+
+    na = int(count_a)
+    nb = int(count_b)
+    merged = [
+        (centroid_a[i] * na + centroid_b[i] * nb) / (na + nb)
+        for i in range(len(centroid_a))
+    ]
+    return (_normalise(merged), na + nb)
+
+
 def merge_into_existing_centroid(
     *,
     existing_centroid: list[float],

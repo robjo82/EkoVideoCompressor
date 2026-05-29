@@ -16,6 +16,7 @@ from speaker_recognition import (
     decode_embedding,
     encode_embedding,
     match_cluster_against_profiles,
+    merge_centroids,
     merge_into_existing_centroid,
 )
 from transcription_utils import (
@@ -1468,6 +1469,123 @@ def library_delete_speaker_profile(profile_id: int | None = None, *, name: str |
         db.delete_speaker_profile(int(existing["id"]))
         return 1
     return 0
+
+
+def library_merge_speaker_profiles(
+    survivor_id: int,
+    absorbed_id: int,
+    *,
+    odoo_from: str = "survivor",
+) -> dict[str, Any]:
+    """PR AQ — merge two voice profiles into one.
+
+    The user spotted duplicates (e.g. two "Mathilde Gérard" rows
+    that differ only by an accent / Odoo link). This folds the
+    ``absorbed`` profile into the ``survivor`` :
+
+      * **Embedding** : weighted-average the two centroids by
+        ``sample_count`` (``merge_centroids``), re-normalised. The
+        merged profile then represents both voices' evidence.
+      * **sample_count** : summed, so future enrolments keep
+        accumulating against a profile that "knows" it has heard
+        this person N+M times.
+      * **Name** : the survivor's name is kept unchanged.
+      * **Odoo link** : ``odoo_from`` decides which side's link
+        wins — ``"survivor"`` (default) or ``"absorbed"``. The
+        SwiftUI layer sets ``"absorbed"`` only when the user
+        explicitly picks the absorbed profile's contact in the
+        conflict prompt.
+      * The absorbed row is deleted.
+
+    Returns an audit dict. ``merged: False`` with a ``reason`` when
+    a precondition fails (same id, missing profile).
+    """
+    summary: dict[str, Any] = {
+        "merged": False,
+        "reason": "",
+        "survivor_id": survivor_id,
+        "absorbed_id": absorbed_id,
+        "survivor_name": "",
+        "sample_count": 0,
+    }
+    if survivor_id == absorbed_id:
+        summary["reason"] = "same_profile"
+        return summary
+
+    db = database()
+    survivor = db.get_speaker_profile(int(survivor_id))
+    absorbed = db.get_speaker_profile(int(absorbed_id))
+    if not survivor:
+        summary["reason"] = "survivor_not_found"
+        return summary
+    if not absorbed:
+        summary["reason"] = "absorbed_not_found"
+        return summary
+
+    centroid_a = decode_embedding(survivor.get("embedding_json") or "")
+    centroid_b = decode_embedding(absorbed.get("embedding_json") or "")
+    count_a = int(survivor.get("sample_count") or 0)
+    count_b = int(absorbed.get("sample_count") or 0)
+
+    merged_centroid, merged_count = merge_centroids(
+        centroid_a, count_a, centroid_b, count_b
+    )
+    merged_json = encode_embedding(merged_centroid) if merged_centroid else "[]"
+
+    db.update_speaker_profile_embedding(
+        int(survivor_id), merged_json, merged_count
+    )
+
+    # Odoo link resolution. Default keeps the survivor's existing
+    # link (no-op). When the user chose the absorbed profile's
+    # contact in the conflict prompt, re-point the survivor's link.
+    if odoo_from == "absorbed" and absorbed.get("odoo_partner_id"):
+        try:
+            db.link_speaker_profile_to_odoo(
+                int(survivor_id),
+                partner_id=int(absorbed["odoo_partner_id"]),
+                partner_name=str(absorbed.get("odoo_partner_name") or ""),
+                company_id=absorbed.get("odoo_company_id"),
+                company_name=str(absorbed.get("odoo_company_name") or ""),
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            append_app_log(
+                f"engine_merge_speakers_odoo_relink_failed "
+                f"survivor={survivor_id} error={exc!r}"
+            )
+    elif (
+        odoo_from == "survivor"
+        and not survivor.get("odoo_partner_id")
+        and absorbed.get("odoo_partner_id")
+    ):
+        # Survivor had no link but the absorbed did — inherit it so
+        # we don't silently drop the only Odoo association. (No
+        # conflict here: the survivor was unlinked.)
+        try:
+            db.link_speaker_profile_to_odoo(
+                int(survivor_id),
+                partner_id=int(absorbed["odoo_partner_id"]),
+                partner_name=str(absorbed.get("odoo_partner_name") or ""),
+                company_id=absorbed.get("odoo_company_id"),
+                company_name=str(absorbed.get("odoo_company_name") or ""),
+            )
+        except Exception as exc:  # pragma: no cover — defensive
+            append_app_log(
+                f"engine_merge_speakers_odoo_inherit_failed "
+                f"survivor={survivor_id} error={exc!r}"
+            )
+
+    db.delete_speaker_profile(int(absorbed_id))
+
+    summary["merged"] = True
+    summary["survivor_name"] = str(survivor.get("name") or "")
+    summary["sample_count"] = merged_count
+    append_app_log(
+        f"engine_merge_speakers survivor={survivor_id} "
+        f"absorbed={absorbed_id} merged_count={merged_count} "
+        f"odoo_from={odoo_from}"
+    )
+    return summary
 
 
 def library_reset_speaker_profiles() -> dict[str, int]:
