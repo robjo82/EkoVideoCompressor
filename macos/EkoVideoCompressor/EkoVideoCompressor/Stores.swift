@@ -967,6 +967,47 @@ final class LibraryStore: ObservableObject {
         isLoading = false
     }
 
+    /// PR AP — free the heavy source file(s) for a job, keeping the
+    /// compressed version + transcripts. The engine refuses unless
+    /// a compressed file exists on disk (the lossy substitute that
+    /// makes dropping the original safe). Returns the bytes freed,
+    /// or ``nil`` on engine error / refusal. Refreshes the library
+    /// on success so the row's artefact dots + actions update.
+    @discardableResult
+    func freeSource(_ row: LibraryRow) async -> Int64? {
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-free-source",
+                "\(row.id)",
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return nil
+        }
+        var freed = false
+        var bytes: Int64 = 0
+        if let data = result.rawOutput.data(using: .utf8),
+           let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            freed = (payload["freed"] as? Bool) ?? false
+            if let b = payload["bytes_removed"] as? Int { bytes = Int64(b) }
+            else if let b = payload["bytes_removed"] as? Int64 { bytes = b }
+            if !freed {
+                // Surface the engine's reason (e.g. no compressed
+                // version) so the SwiftUI layer can show why.
+                let reason = (payload["reason"] as? String) ?? "unknown"
+                errorMessage = "Libération impossible : \(reason)"
+            }
+        }
+        // Reload so the source artefact dot disappears + the
+        // "Libérer" button hides on the next render.
+        await refresh()
+        return freed ? bytes : nil
+    }
+
     /// Preview what would be freed if the workspace got deleted.
     /// Used by the deletion sheet to show the file list + total size
     /// before the user confirms. Returns ``nil`` on engine error so

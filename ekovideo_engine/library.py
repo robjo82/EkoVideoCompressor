@@ -23,6 +23,7 @@ from transcription_utils import (
     parse_embedding_output,
 )
 
+from .logging import append_app_log
 from .paths import library_db_path, managed_venv_python_path
 
 
@@ -101,6 +102,114 @@ def library_delete(job_id: int, *, remove_files: bool = False) -> dict[str, Any]
             summary["bytes_removed"] = removed_bytes
             summary["workspace_removed"] = removed_files > 0
     db.delete_job(job_id)
+    return summary
+
+
+def library_free_source(job_id: int) -> dict[str, Any]:
+    """PR AP — delete a job's heavy source file(s) to reclaim disk,
+    keeping the compressed version + the transcripts.
+
+    Hard precondition (per the product rule): we ONLY free the
+    source when a compressed version exists on disk. Compressing
+    is the lossy substitute that makes the original safe to drop;
+    without it, freeing the source would lose the only media for
+    that meeting. When the precondition isn't met we no-op and
+    return ``{"freed": False, "reason": "..."}``.
+
+    What gets deleted:
+      * the workspace copy ``<workspace>/<source basename>``
+      * the original ``source_path`` file if it still exists
+
+    What is preserved: the compressed file, the transcripts, the
+    review markdown, everything else in the workspace. After this,
+    the compressed file is the only media left — the SwiftUI side
+    surfaces "relancer" on the compressed artefact (transcription
+    only, since re-compression is impossible with no source).
+
+    Never deletes the compressed file itself: its basename
+    (``X_compressed.mp4`` / ``.m4a``) differs from the source's
+    (``X.mov``), and we additionally guard on path-equality.
+
+    Returns an audit dict the SwiftUI layer shows as
+    "Source libérée · 1,2 Go récupérés".
+    """
+    db = database()
+    summary: dict[str, Any] = {
+        "job_id": job_id,
+        "freed": False,
+        "reason": "",
+        "files_removed": 0,
+        "bytes_removed": 0,
+    }
+    job = db.get_job(job_id)
+    if not job:
+        summary["reason"] = "job_not_found"
+        return summary
+
+    compressed = (job.get("compressed_path") or "").strip()
+    if not compressed or not Path(compressed).expanduser().exists():
+        # The whole safety contract: no compressed substitute → refuse.
+        summary["reason"] = "no_compressed_version"
+        return summary
+    compressed_resolved = Path(compressed).expanduser().resolve()
+
+    source_path = (job.get("source_path") or "").strip()
+    workspace = (job.get("workspace_dir") or "").strip()
+
+    # Build the candidate set: original source + workspace copy.
+    candidates: list[Path] = []
+    if source_path:
+        candidates.append(Path(source_path).expanduser())
+        if workspace:
+            candidates.append(
+                Path(workspace).expanduser() / Path(source_path).name
+            )
+
+    files_removed = 0
+    bytes_removed = 0
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Never delete the compressed file, whatever the DB says.
+        if resolved == compressed_resolved:
+            continue
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            size = candidate.stat().st_size
+        except OSError:
+            size = 0
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            append_app_log(
+                f"engine_free_source_unlink_failed job_id={job_id} "
+                f"path={str(candidate)!r} error={exc!r}"
+            )
+            continue
+        files_removed += 1
+        bytes_removed += size
+        append_app_log(
+            f"engine_free_source_removed job_id={job_id} "
+            f"path={str(candidate)!r} bytes={size}"
+        )
+
+    summary["freed"] = files_removed > 0
+    summary["files_removed"] = files_removed
+    summary["bytes_removed"] = bytes_removed
+    if files_removed == 0:
+        summary["reason"] = "no_source_file_on_disk"
+    append_app_log(
+        f"engine_free_source job_id={job_id} freed={summary['freed']} "
+        f"files={files_removed} bytes={bytes_removed}"
+    )
     return summary
 
 

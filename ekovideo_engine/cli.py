@@ -10,6 +10,7 @@ from .events import stdout_event_sink
 from .hf import hf_check
 from .library import (
     library_delete,
+    library_free_source,
     library_delete_speaker_profile,
     library_reset_speaker_profiles,
     library_detach_odoo_meeting,
@@ -88,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also delete the workspace directory on disk.",
     )
+
+    # PR AP: free the heavy source file (keep compressed + transcripts).
+    # Only succeeds when a compressed version exists — the engine
+    # enforces that precondition and returns ``freed: false`` otherwise.
+    library_free_source_parser = sub.add_parser("library-free-source")
+    library_free_source_parser.add_argument("job_id", type=int)
 
     # Quick disk-usage preview so the SwiftUI sheet can show "what
     # will be freed" before the user clicks Supprimer.
@@ -274,6 +281,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "library-delete":
             summary = library_delete(args.job_id, remove_files=args.remove_files)
             _print_json({"deleted": args.job_id, **summary})
+            return 0
+
+        if args.command == "library-free-source":
+            summary = library_free_source(args.job_id)
+            _print_json(summary)
             return 0
 
         if args.command == "library-workspace-usage":
