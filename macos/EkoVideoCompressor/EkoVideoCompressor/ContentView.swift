@@ -4876,6 +4876,25 @@ struct SpeakersView: View {
     // PR X — "Réinitialiser la library vocale" confirmation state.
     @State private var showResetConfirmation: Bool = false
     @State private var resetFeedback: String?
+    // PR AQ — pending merge: survivor (row acted on) + absorbed
+    // (chosen target). Drives the confirmation + Odoo-conflict flow.
+    @State private var pendingMerge: PendingMerge?
+
+    /// PR AQ — a merge the user initiated but hasn't confirmed.
+    /// ``survivor`` keeps its name; ``absorbed`` is folded in.
+    struct PendingMerge: Identifiable {
+        let survivor: SpeakerProfile
+        let absorbed: SpeakerProfile
+        var id: String { "\(survivor.id)-\(absorbed.id)" }
+
+        /// True when both sides are linked to DIFFERENT Odoo
+        /// partners — the conflict the user must resolve.
+        var hasOdooConflict: Bool {
+            guard let s = survivor.odoo_partner_id,
+                  let a = absorbed.odoo_partner_id else { return false }
+            return s != a
+        }
+    }
 
     private var profiles: [SpeakerProfile] {
         library.speakerProfiles
@@ -4967,6 +4986,7 @@ struct SpeakersView: View {
                                         SpeakerProfileRow(
                                             profile: profile,
                                             canLinkToOdoo: settings.odooConfigured,
+                                            mergeCandidates: profiles.filter { $0.id != profile.id },
                                             onLink: { profileToLink = profile },
                                             onUnlink: {
                                                 let snapshot = library.speakerProfiles
@@ -4979,7 +4999,11 @@ struct SpeakersView: View {
                                                     }
                                                 }
                                             },
-                                            onDelete: { profileToDelete = profile }
+                                            onDelete: { profileToDelete = profile },
+                                            onMerge: { absorbed in
+                                                // Row's profile survives; the picked one is absorbed.
+                                                pendingMerge = PendingMerge(survivor: profile, absorbed: absorbed)
+                                            }
                                         )
                                     }
                                 }
@@ -5020,6 +5044,45 @@ struct SpeakersView: View {
         } message: { profile in
             Text("La prochaine fois que \(profile.name) parlera dans une réunion, l'app demandera à nouveau confirmation.")
         }
+        // PR AQ — merge confirmation. When both sides are linked to
+        // different Odoo contacts the user must pick which one to keep
+        // ("Demander à chaque fusion"); otherwise a single confirm.
+        .confirmationDialog(
+            mergeDialogTitle,
+            isPresented: Binding(
+                get: { pendingMerge != nil },
+                set: { if !$0 { pendingMerge = nil } }
+            ),
+            presenting: pendingMerge
+        ) { merge in
+            if merge.hasOdooConflict {
+                Button("Garder « \(merge.survivor.odoo_partner_name ?? merge.survivor.name) »") {
+                    performMerge(merge, odooFrom: "survivor")
+                }
+                Button("Garder « \(merge.absorbed.odoo_partner_name ?? merge.absorbed.name) »") {
+                    performMerge(merge, odooFrom: "absorbed")
+                }
+            } else {
+                Button("Fusionner") {
+                    performMerge(merge, odooFrom: "survivor")
+                }
+            }
+            Button("Annuler", role: .cancel) {}
+        } message: { merge in
+            if merge.hasOdooConflict {
+                Text(
+                    "« \(merge.absorbed.name) » sera fusionnée dans « \(merge.survivor.name) » "
+                    + "(les échantillons vocaux sont combinés, puis « \(merge.absorbed.name) » est supprimée). "
+                    + "Les deux voix sont liées à des contacts Odoo différents — choisissez celui à conserver."
+                )
+            } else {
+                Text(
+                    "« \(merge.absorbed.name) » sera fusionnée dans « \(merge.survivor.name) » : "
+                    + "les échantillons vocaux des deux voix sont combinés, puis « \(merge.absorbed.name) » est supprimée. "
+                    + "Cette action est irréversible."
+                )
+            }
+        }
         .confirmationDialog(
             "Réinitialiser toutes les voix mémorisées ?",
             isPresented: $showResetConfirmation
@@ -5053,14 +5116,45 @@ struct SpeakersView: View {
     private func reload(force: Bool = false) async {
         await library.refreshSpeakerProfiles(force: force)
     }
+
+    // PR AQ — title depends on whether there's an Odoo contact to pick.
+    private var mergeDialogTitle: String {
+        guard let merge = pendingMerge else { return "Fusionner les voix ?" }
+        return "Fusionner « \(merge.absorbed.name) » dans « \(merge.survivor.name) » ?"
+    }
+
+    /// PR AQ — run the merge optimistically: drop the absorbed row from
+    /// the local list immediately, call the engine, and refresh (or
+    /// restore on failure). The engine weighted-averages the centroids
+    /// and resolves the Odoo link per ``odooFrom``.
+    private func performMerge(_ merge: PendingMerge, odooFrom: String) {
+        let snapshot = library.speakerProfiles
+        library.removeSpeakerProfileLocally(merge.absorbed)
+        Task {
+            let count = await library.mergeSpeakerProfiles(
+                survivor: merge.survivor,
+                absorbed: merge.absorbed,
+                odooFrom: odooFrom
+            )
+            if count == nil {
+                // Engine refused / errored — put the row back.
+                library.restoreSpeakerProfiles(snapshot)
+            }
+        }
+        pendingMerge = nil
+    }
 }
 
 struct SpeakerProfileRow: View {
     var profile: SpeakerProfile
     var canLinkToOdoo: Bool
+    // PR AQ — other profiles this row can be merged with (the row's
+    // profile survives, the picked candidate is absorbed into it).
+    var mergeCandidates: [SpeakerProfile]
     var onLink: () -> Void
     var onUnlink: () -> Void
     var onDelete: () -> Void
+    var onMerge: (SpeakerProfile) -> Void
 
     private var iconName: String {
         if profile.isLinkedToOdoo {
@@ -5129,6 +5223,29 @@ struct SpeakerProfileRow: View {
                 .help(canLinkToOdoo
                       ? "Associer un contact Odoo à cette voix"
                       : "Configurez d'abord Odoo dans Réglages")
+            }
+            // PR AQ — "Fusionner avec…" : pick another profile to fold
+            // into this one. This row's profile is the survivor (keeps
+            // its name + Odoo link by default); the picked candidate is
+            // absorbed (its samples are weighted-averaged in, then it's
+            // deleted). Hidden when there's nothing to merge with.
+            if !mergeCandidates.isEmpty {
+                Menu {
+                    ForEach(mergeCandidates) { candidate in
+                        Button {
+                            onMerge(candidate)
+                        } label: {
+                            Text(candidate.odoo_partner_name ?? candidate.name)
+                        }
+                    }
+                } label: {
+                    Label("Fusionner avec…", systemImage: "arrow.triangle.merge")
+                }
+                .labelStyle(.iconOnly)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Fusionner une autre voix dans « \(profile.name) »")
             }
             Button(role: .destructive) {
                 onDelete()

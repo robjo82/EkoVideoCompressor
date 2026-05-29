@@ -12,6 +12,7 @@ from .library import (
     library_delete,
     library_free_source,
     library_delete_speaker_profile,
+    library_merge_speaker_profiles,
     library_reset_speaker_profiles,
     library_detach_odoo_meeting,
     library_discover_speakers,
@@ -145,6 +146,18 @@ def build_parser() -> argparse.ArgumentParser:
     profile_group = delete_profile.add_mutually_exclusive_group(required=True)
     profile_group.add_argument("--id", type=int, dest="profile_id")
     profile_group.add_argument("--name", type=str)
+
+    # PR AQ: merge two voice profiles (folds ``absorbed`` into
+    # ``survivor``). ``--odoo-from`` picks which side's Odoo link
+    # wins on conflict (the SwiftUI conflict prompt sets it).
+    merge_profiles = sub.add_parser("library-merge-speaker-profiles")
+    merge_profiles.add_argument("--survivor", type=int, required=True)
+    merge_profiles.add_argument("--absorbed", type=int, required=True)
+    merge_profiles.add_argument(
+        "--odoo-from",
+        choices=["survivor", "absorbed"],
+        default="survivor",
+    )
 
     # PR X: bulk reset of every stored voice profile, surfaced in
     # Réglages as "Réinitialiser la library vocale". Confirmation
@@ -372,6 +385,15 @@ def main(argv: list[str] | None = None) -> int:
                     "name": args.name,
                 }
             )
+            return 0
+
+        if args.command == "library-merge-speaker-profiles":
+            outcome = library_merge_speaker_profiles(
+                args.survivor,
+                args.absorbed,
+                odoo_from=args.odoo_from,
+            )
+            _print_json(outcome)
             return 0
 
         if args.command == "library-reset-speaker-profiles":

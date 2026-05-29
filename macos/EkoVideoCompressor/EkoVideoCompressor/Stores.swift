@@ -1326,6 +1326,44 @@ final class LibraryStore: ObservableObject {
         return speakerProfiles
     }
 
+    /// PR AQ — merge ``absorbed`` into ``survivor``. The engine
+    /// weighted-averages the two voiceprints, sums sample counts,
+    /// keeps the survivor's name, and resolves the Odoo link via
+    /// ``odooFrom`` ("survivor" or "absorbed"). Refreshes the list
+    /// on success. Returns the merged sample count, or nil on error.
+    @discardableResult
+    func mergeSpeakerProfiles(
+        survivor: SpeakerProfile,
+        absorbed: SpeakerProfile,
+        odooFrom: String = "survivor"
+    ) async -> Int? {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-merge-speaker-profiles",
+                "--survivor", "\(survivor.id)",
+                "--absorbed", "\(absorbed.id)",
+                "--odoo-from", odooFrom,
+            ])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? result.rawOutput
+            return nil
+        }
+        var merged = false
+        var count = 0
+        if let data = result.rawOutput.data(using: .utf8),
+           let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            merged = (payload["merged"] as? Bool) ?? false
+            count = (payload["sample_count"] as? Int) ?? 0
+            if !merged {
+                let reason = (payload["reason"] as? String) ?? "unknown"
+                errorMessage = "Fusion impossible : \(reason)"
+            }
+        }
+        await refreshSpeakerProfiles(force: true)
+        return merged ? count : nil
+    }
+
     func replaceSpeakerProfile(_ profile: SpeakerProfile) {
         if let index = speakerProfiles.firstIndex(where: { $0.id == profile.id }) {
             speakerProfiles[index] = profile
