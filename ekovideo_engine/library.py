@@ -207,11 +207,45 @@ def library_free_source(job_id: int) -> dict[str, Any]:
     summary["bytes_removed"] = bytes_removed
     if files_removed == 0:
         summary["reason"] = "no_source_file_on_disk"
+
+    # PR AS — the library's "Poids" column reads ``jobs.total_bytes``,
+    # a snapshot taken once at job completion (see
+    # runner._snapshot_workspace_size). Freeing the source shrinks the
+    # workspace but left that snapshot stale, so the weight never
+    # dropped. Re-walk the workspace now and persist the new total so
+    # the column updates on the next list refresh. We also hand it back
+    # in the summary so the SwiftUI side can update the row optimistically
+    # (no full reload latency).
+    if summary["freed"] and workspace:
+        workspace_path = Path(workspace).expanduser()
+        if workspace_path.is_dir():
+            new_total = _directory_total_bytes(workspace_path)
+            db.update_job_total_bytes(job_id, new_total)
+            summary["total_bytes"] = new_total
+
     append_app_log(
         f"engine_free_source job_id={job_id} freed={summary['freed']} "
-        f"files={files_removed} bytes={bytes_removed}"
+        f"files={files_removed} bytes={bytes_removed} "
+        f"total_bytes={summary.get('total_bytes')}"
     )
     return summary
+
+
+def _directory_total_bytes(directory: Path) -> int:
+    """Cumulative size of every regular file under ``directory``.
+
+    Mirrors ``runner._snapshot_workspace_size`` (kept separate to
+    avoid importing the heavy runner module here). Symlinks and
+    unreadable entries are skipped rather than raising.
+    """
+    total = 0
+    for child in directory.rglob("*"):
+        try:
+            if child.is_file() and not child.is_symlink():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _safely_remove_workspace(workspace_dir: str) -> tuple[int, int]:
