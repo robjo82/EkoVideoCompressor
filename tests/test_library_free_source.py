@@ -125,6 +125,47 @@ class LibraryFreeSourceTests(unittest.TestCase):
         self.assertFalse(result["freed"])
         self.assertEqual(result["reason"], "job_not_found")
 
+    def test_recomputes_total_bytes_after_freeing(self):
+        # PR AS — after freeing, the workspace weight snapshot must be
+        # refreshed so the library "Poids" column stops showing the
+        # stale pre-deletion size. Here the workspace keeps only the
+        # 500-byte compressed file once the 5000-byte copy is gone.
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            desktop = Path(tmp) / "Desktop"
+            desktop.mkdir()
+            original = desktop / "meeting.mov"
+            original.write_bytes(b"x" * 5000)
+            copy = ws / "meeting.mov"
+            copy.write_bytes(b"x" * 5000)
+            compressed = ws / "meeting_compressed.mp4"
+            compressed.write_bytes(b"y" * 500)
+
+            db = MagicMock()
+            db.get_job.return_value = _job(str(ws), str(original), str(compressed))
+            with patch("ekovideo_engine.library.database", return_value=db):
+                result = library_free_source(7)
+
+            self.assertTrue(result["freed"])
+            # Only the compressed file remains in the workspace.
+            self.assertEqual(result["total_bytes"], 500)
+            db.update_job_total_bytes.assert_called_once_with(7, 500)
+
+    def test_no_total_bytes_recompute_when_refused(self):
+        # When freeing is refused (no compressed), the weight snapshot
+        # must NOT be touched.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "meeting.mov"
+            src.write_bytes(b"x" * 1000)
+            db = MagicMock()
+            db.get_job.return_value = _job(tmp, str(src), "")
+            with patch("ekovideo_engine.library.database", return_value=db):
+                result = library_free_source(7)
+            self.assertFalse(result["freed"])
+            self.assertNotIn("total_bytes", result)
+            db.update_job_total_bytes.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

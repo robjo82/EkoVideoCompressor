@@ -990,11 +990,14 @@ final class LibraryStore: ObservableObject {
         }
         var freed = false
         var bytes: Int64 = 0
+        var newTotalBytes: Int64?
         if let data = result.rawOutput.data(using: .utf8),
            let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             freed = (payload["freed"] as? Bool) ?? false
             if let b = payload["bytes_removed"] as? Int { bytes = Int64(b) }
             else if let b = payload["bytes_removed"] as? Int64 { bytes = b }
+            if let t = payload["total_bytes"] as? Int { newTotalBytes = Int64(t) }
+            else if let t = payload["total_bytes"] as? Int64 { newTotalBytes = t }
             if !freed {
                 // Surface the engine's reason (e.g. no compressed
                 // version) so the SwiftUI layer can show why.
@@ -1002,9 +1005,26 @@ final class LibraryStore: ObservableObject {
                 errorMessage = "Libération impossible : \(reason)"
             }
         }
-        // Reload so the source artefact dot disappears + the
-        // "Libérer" button hides on the next render.
-        await refresh()
+        // PR AS — optimistic update. The source file is already gone on
+        // disk, but the row's source dot (a live ``pathExists`` check)
+        // and the "Poids" column only re-evaluate when ``rows`` is
+        // reassigned. Touch the affected row *now* so SwiftUI re-renders
+        // immediately: the dot disappears (``pathExists`` of the deleted
+        // copy is false) and the weight drops to the engine's freshly
+        // recomputed total. We deliberately keep ``source_path`` intact
+        // — the row's filename derives from it. Reconcile with a full
+        // reload in the background instead of blocking the UI on the
+        // slow ``library-list`` round-trip (the latency the user saw).
+        if freed, let index = rows.firstIndex(where: { $0.id == row.id }) {
+            var updated = rows[index]
+            if let newTotalBytes {
+                updated.total_bytes = newTotalBytes
+            }
+            rows[index] = updated
+        }
+        // Reconcile with the engine's authoritative state in the
+        // background — don't block the (already-updated) UI on it.
+        Task { await self.refresh() }
         return freed ? bytes : nil
     }
 
