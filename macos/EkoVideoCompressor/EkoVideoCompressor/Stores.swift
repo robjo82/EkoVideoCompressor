@@ -656,6 +656,114 @@ final class PyannoteStatusStore: ObservableObject {
     }
 }
 
+// MARK: - PR AT — managed-venv dependency freshness
+
+/// One managed ML package's freshness, mirrors the engine's
+/// ``deps-check`` JSON.
+struct DepPackage: Codable, Identifiable {
+    var pip_name: String
+    var import_name: String
+    var installed: String?
+    var minimum: String
+    var status: String   // "ok" | "outdated" | "missing" | "unknown"
+    var id: String { pip_name }
+
+    var isOK: Bool { status == "ok" }
+}
+
+struct DepsStatus: Codable {
+    var venv_python: String
+    var any_outdated: Bool
+    var packages: [DepPackage]
+}
+
+/// Keeps the managed transcription venv's ML stack fresh.
+///
+/// The venv historically froze at install-time versions (probe-then-skip,
+/// never upgraded) — stranding users on e.g. mlx-vlm 0.4.4, too old for
+/// Gemma 4 audio. This store drives the engine's ``deps-check`` /
+/// ``deps-upgrade`` commands: at launch it auto-enforces the version
+/// floors (only runs pip when something is below floor), and Réglages
+/// exposes a manual "upgrade everything to latest" action.
+@MainActor
+final class DepsStore: ObservableObject {
+    enum Phase: Equatable { case idle, checking, upgrading }
+
+    @Published private(set) var status: DepsStatus?
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var lastMessage: String?
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var lastCheckedAt: Date?
+
+    var outdated: [DepPackage] { status?.packages.filter { !$0.isOK } ?? [] }
+    var hasOutdated: Bool { status?.any_outdated ?? false }
+    var isBusy: Bool { phase != .idle }
+
+    /// Read-only freshness check (no pip). Safe to call often.
+    func check() async {
+        if phase == .upgrading { return }
+        phase = .checking
+        defer { phase = .idle }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["deps-check"])
+        )
+        if result.status != 0 {
+            errorMessage = result.events.last?.message ?? "Vérification des moteurs IA échouée."
+            return
+        }
+        if let data = result.rawOutput.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(DepsStatus.self, from: data) {
+            status = decoded
+            errorMessage = nil
+            lastCheckedAt = Date()
+        }
+    }
+
+    /// Startup path: enforce the version floors. Checks first and only
+    /// runs an upgrade when something is actually below floor, so a
+    /// healthy venv pays nothing.
+    @discardableResult
+    func enforceFloors() async -> Bool {
+        await check()
+        guard hasOutdated, phase == .idle else { return false }
+        return await runUpgrade(allLatest: false)
+    }
+
+    /// Manual "Mettre à jour les moteurs IA" — newest release of every
+    /// managed package.
+    @discardableResult
+    func upgradeToLatest() async -> Bool {
+        await runUpgrade(allLatest: true)
+    }
+
+    private func runUpgrade(allLatest: Bool) async -> Bool {
+        phase = .upgrading
+        defer { phase = .idle }
+        var args = ["deps-upgrade"]
+        if allLatest { args.append("--all-latest") }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(args)
+        )
+        lastMessage = result.events.last(where: { $0.message?.isEmpty == false })?.message
+        let ok = result.status == 0
+        if !ok {
+            errorMessage = lastMessage ?? "Mise à jour des moteurs IA échouée."
+        } else {
+            errorMessage = nil
+        }
+        // Refresh the per-package view from the post-upgrade reality.
+        let result2 = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["deps-check"])
+        )
+        if let data = result2.rawOutput.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(DepsStatus.self, from: data) {
+            status = decoded
+            lastCheckedAt = Date()
+        }
+        return ok
+    }
+}
+
 @MainActor
 final class UpdateStore: ObservableObject {
     @Published var state: UpdateState = .idle

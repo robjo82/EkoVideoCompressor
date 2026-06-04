@@ -42,6 +42,7 @@ struct ContentView: View {
     @EnvironmentObject private var energy: EnergyMonitor
     @EnvironmentObject private var pyannote: PyannoteStatusStore
     @EnvironmentObject private var updater: UpdateStore
+    @EnvironmentObject private var deps: DepsStore
     @State private var selectedSection: AppSection = .queue
     @State private var showingSettings = false
     @State private var showingRunSetup = false
@@ -97,6 +98,21 @@ struct ContentView: View {
                 }
             }
         }
+        .overlay(alignment: .bottom) {
+            // PR AT — non-blocking notice while the launch-time floor
+            // upgrade runs in the background (can be a multi-minute pip).
+            if deps.phase == .upgrading {
+                Label(deps.lastMessage ?? "Mise à jour des moteurs IA…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.callout.weight(.medium))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .foregroundStyle(.teal)
+                    .padding(.bottom, 12)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: deps.phase)
         .sheet(isPresented: $showingSettings) {
             SettingsView()
                 .environmentObject(settings)
@@ -104,6 +120,7 @@ struct ContentView: View {
                 .environmentObject(energy)
                 .environmentObject(pyannote)
                 .environmentObject(updater)
+                .environmentObject(deps)
         }
         .sheet(isPresented: $showingRunSetup) {
             RunSetupView {
@@ -1615,6 +1632,7 @@ struct RunSetupView: View {
     @EnvironmentObject private var energy: EnergyMonitor
     @EnvironmentObject private var pyannote: PyannoteStatusStore
     @EnvironmentObject private var updater: UpdateStore
+    @EnvironmentObject private var deps: DepsStore
     @Environment(\.dismiss) private var dismiss
     @State private var currentIndex = 0
     /// Local sheet for the "Configurer maintenant" deep link from
@@ -1673,6 +1691,7 @@ struct RunSetupView: View {
                     .environmentObject(energy)
                     .environmentObject(pyannote)
                     .environmentObject(updater)
+                    .environmentObject(deps)
             }
 
             Divider()
@@ -2672,6 +2691,7 @@ struct SettingsView: View {
     @EnvironmentObject private var engine: EngineProcess
     @EnvironmentObject private var energy: EnergyMonitor
     @EnvironmentObject private var pyannote: PyannoteStatusStore
+    @EnvironmentObject private var deps: DepsStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -2733,6 +2753,70 @@ struct SettingsView: View {
                     }
                     SecureField("GitHub Token (optionnel)", text: $settings.githubToken)
                     Text("Requis seulement si le dépôt est privé.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                // PR AT — keep the managed MLX venv fresh. Floors are
+                // enforced automatically at launch; this section shows
+                // the per-package state and offers a manual "upgrade
+                // everything to latest".
+                Section("Moteurs IA (MLX)") {
+                    HStack(alignment: .firstTextBaseline) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            switch deps.phase {
+                            case .checking:
+                                Text("Vérification des versions…")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            case .upgrading:
+                                Text(deps.lastMessage ?? "Mise à jour en cours…")
+                                    .font(.caption).foregroundStyle(.teal)
+                            case .idle:
+                                if let err = deps.errorMessage {
+                                    Text(err).font(.caption).foregroundStyle(.red)
+                                } else if deps.hasOutdated {
+                                    Text("\(deps.outdated.count) paquet(s) à mettre à jour")
+                                        .font(.caption).foregroundStyle(.orange)
+                                } else if deps.status != nil {
+                                    Text("Tous les moteurs sont à jour")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                } else {
+                                    Text("État inconnu — cliquez sur Vérifier")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        Spacer()
+                        if deps.isBusy {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Vérifier") { Task { await deps.check() } }
+                            Button("Tout mettre à jour") {
+                                Task { await deps.upgradeToLatest() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                    if let status = deps.status {
+                        ForEach(status.packages) { pkg in
+                            HStack(spacing: 8) {
+                                Image(systemName: pkg.isOK ? "checkmark.circle.fill" : "arrow.up.circle.fill")
+                                    .foregroundStyle(pkg.isOK ? AnyShapeStyle(.green) : AnyShapeStyle(.orange))
+                                    .imageScale(.small)
+                                Text(pkg.pip_name)
+                                    .font(.caption.monospaced())
+                                Spacer()
+                                Text(pkg.installed ?? "absent")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(pkg.isOK ? .secondary : .primary)
+                                if !pkg.isOK {
+                                    Text("→ ≥ \(pkg.minimum)")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    Text("Les versions minimales sont appliquées automatiquement au démarrage. « Tout mettre à jour » installe la dernière version de chaque moteur (peut prendre plusieurs minutes et télécharger plusieurs centaines de Mo).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 

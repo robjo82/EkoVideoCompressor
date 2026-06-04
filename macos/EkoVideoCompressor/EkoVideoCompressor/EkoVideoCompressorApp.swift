@@ -11,6 +11,7 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var odoo = OdooStore()
     @StateObject private var energy = EnergyMonitor()
     @StateObject private var pyannote = PyannoteStatusStore()
+    @StateObject private var deps = DepsStore()
 
     init() {
         let args = CommandLine.arguments
@@ -32,6 +33,7 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(odoo)
                 .environmentObject(energy)
                 .environmentObject(pyannote)
+                .environmentObject(deps)
                 .frame(minWidth: 1180, minHeight: 760)
                 .onAppear {
                     updater.setSettings(settings)
@@ -39,6 +41,14 @@ struct EkoVideoCompressorApp: App {
                     pyannote.bind(settings)
                     Task {
                         await updater.checkUpdates(proactive: true)
+                    }
+                    // PR AT — keep the managed ML venv from rotting:
+                    // enforce version floors at launch (only runs pip
+                    // when something is actually below floor). Runs in
+                    // the background so it never blocks the UI; progress
+                    // surfaces in Réglages + a banner.
+                    Task {
+                        await deps.enforceFloors()
                     }
                 }
         }
