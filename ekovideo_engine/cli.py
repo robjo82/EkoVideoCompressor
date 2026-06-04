@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from .deps import check as deps_check, upgrade as deps_upgrade
 from .events import stdout_event_sink
 from .hf import hf_check
 from .library import (
@@ -242,6 +243,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     logs = sub.add_parser("export-logs")
     logs.add_argument("--output", default="")
+
+    # PR AT — managed-venv dependency freshness.
+    deps_check_parser = sub.add_parser("deps-check")
+    deps_check_parser.add_argument(
+        "--venv", default="", help="venv python path (default: managed venv)"
+    )
+    deps_upgrade_parser = sub.add_parser("deps-upgrade")
+    deps_upgrade_parser.add_argument("--venv", default="")
+    deps_upgrade_parser.add_argument(
+        "--all-latest",
+        action="store_true",
+        help="upgrade every managed package to its latest release "
+        "(manual action); otherwise only enforce version floors",
+    )
     return parser
 
 
@@ -510,6 +525,25 @@ def main(argv: list[str] | None = None) -> int:
             path = export_logs_archive(Path(output))
             _print_json({"path": str(path)})
             return 0
+
+        if args.command == "deps-check":
+            _print_json(deps_check(args.venv or None))
+            return 0
+
+        if args.command == "deps-upgrade":
+            # Stream human-readable progress as ProgressEvents so the
+            # SwiftUI side can show a live status during the (possibly
+            # multi-minute) pip install.
+            def _emit(message: str) -> None:
+                stdout_event_sink(ProgressEvent("deps_upgrade", 0, message))
+
+            result = deps_upgrade(
+                args.venv or None,
+                to_latest=args.all_latest,
+                progress=_emit,
+            )
+            stdout_event_sink(DoneEvent(result))
+            return 0 if result.get("returncode", 1) == 0 else 1
 
         build_parser().print_help()
         return 2
