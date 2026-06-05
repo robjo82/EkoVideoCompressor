@@ -1,0 +1,40 @@
+name: PR title
+
+# Squash-merges use the PR title as the commit message on main, and
+# semantic-release only cuts a version when that message follows
+# Conventional Commits (feat/fix/perf/…). A non-conventional title
+# like "PR AQ — …" is silently ignored by the commit-analyzer, so the
+# Release workflow "succeeds" but publishes nothing — and users can't
+# update. This check fails the PR early when the title isn't
+# conventional, so that footgun can't recur.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $TITLE"
+          # type(scope)!: subject — scope optional, ! optional.
+          pattern='^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([a-z0-9 ._/-]+\))?!?: .+'
+          if printf '%s' "$TITLE" | grep -qiE "$pattern"; then
+            echo "✓ Conventional title."
+            # Remind (without failing) when the type won't trigger a release.
+            if printf '%s' "$TITLE" | grep -qiE '^(feat|fix|perf)(\(|!|:)'; then
+              echo "→ This type will publish a new release."
+            else
+              echo "::warning::Type non publiant (docs/chore/ci/…). Aucune nouvelle version ne sera publiée pour cette PR — c'est voulu ?"
+            fi
+          else
+            echo "::error::Le titre de la PR doit suivre Conventional Commits, ex: 'feat(library): …' ou 'fix(transcripts): …'. Le squash-merge l'utilise comme message de commit, et semantic-release ignore tout titre non conventionnel (→ pas de release, mise à jour impossible)."
+            exit 1
+          fi
