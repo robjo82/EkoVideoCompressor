@@ -195,6 +195,15 @@ class RunAudioRecheckGuardTests(unittest.TestCase):
 
 
 class EnsureMlxVlmAvailableTests(unittest.TestCase):
+    def setUp(self):
+        # PR AW — neutralise the upstream gate so these tests keep
+        # covering the probe logic itself (the gate has its own tests).
+        patcher = patch.object(
+            TranscriptionPipeline, "_AUDIO_RECHECK_UPSTREAM_BLOCK", ""
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_probe_is_cached(self):
         pipeline = _make_pipeline(venv_python="/usr/bin/python3")
         with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
@@ -223,10 +232,9 @@ class EnsureMlxVlmAvailableTests(unittest.TestCase):
 
     # -- PR AC: smarter probe (model-submodule check) --------------
 
-    def test_probe_includes_model_submodule_check_for_qwen2_audio(self):
-        # The user's audio_llm_model in the CVR/Caste rerun was
-        # "mlx-community/Qwen2-Audio-7B-Instruct-4bit". The probe
-        # script we build must reference ``mlx_vlm.models.qwen2_audio``.
+    def test_probe_includes_model_submodule_check_for_gemma4(self):
+        # PR AW — the default audio model is Gemma 4 E4B; the probe
+        # script must reference ``mlx_vlm.models.gemma4``.
         pipeline = _make_pipeline(venv_python="/usr/bin/python3")
         with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
             "ekovideo_engine.pipeline.Path.exists", return_value=True
@@ -237,7 +245,43 @@ class EnsureMlxVlmAvailableTests(unittest.TestCase):
         cmd_args, _ = mock_run.call_args
         script = cmd_args[0][2]
         self.assertIn("import mlx_vlm", script)
-        self.assertIn("mlx_vlm.models.qwen2_audio", script)
+        self.assertIn("mlx_vlm.models.gemma4_unified", script)
+
+    def test_probe_remaps_legacy_qwen_id_to_gemma4(self):
+        # PR AW — upstream mlx-vlm removed ``qwen2_audio``; a persisted
+        # Qwen2-Audio setting must remap to Gemma 4 BEFORE the slug
+        # lookup, otherwise old installs keep probing a module that can
+        # never exist and the recheck stays dead forever.
+        pipeline = _make_pipeline(venv_python="/usr/bin/python3")
+        pipeline.request.transcription_settings.audio_llm_model = (
+            "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+        )
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run, patch(
+            "ekovideo_engine.pipeline.Path.exists", return_value=True
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            pipeline._ensure_mlx_vlm_available()
+        cmd_args, _ = mock_run.call_args
+        script = cmd_args[0][2]
+        self.assertIn("mlx_vlm.models.gemma4_unified", script)
+        self.assertNotIn("qwen2_audio", script)
+
+    def test_slug_hints_distinguish_unified_12b_from_edge(self):
+        # 12B "Unified" checkpoints need gemma4_unified; e2b/e4b use
+        # plain gemma4. The needle order in the hints table keeps that
+        # distinction (specific before generic).
+        self.assertEqual(
+            TranscriptionPipeline._mlx_vlm_submodule_for(
+                "mlx-community/gemma-4-12B-it-4bit"
+            ),
+            "gemma4_unified",
+        )
+        self.assertEqual(
+            TranscriptionPipeline._mlx_vlm_submodule_for(
+                "mlx-community/gemma-4-e4b-it-4bit"
+            ),
+            "gemma4",
+        )
 
     def test_probe_distinguishes_missing_submodule_from_missing_package(self):
         # Exit code 2 means mlx_vlm is there but the model
@@ -261,7 +305,7 @@ class EnsureMlxVlmAvailableTests(unittest.TestCase):
         ]
         self.assertEqual(len(warn_calls), 1)
         warning = warn_calls[0].args[0]
-        self.assertIn("qwen2_audio", warning.message.lower())
+        self.assertIn("gemma4_unified", warning.message.lower())
         self.assertIn("pip install -U mlx-vlm", warning.message)
 
     def test_probe_emits_missing_package_message_on_rc_1(self):
@@ -332,6 +376,14 @@ class EnsureMlxVlmAvailableTests(unittest.TestCase):
 
 class RunAudioRecheckHappyPathTests(unittest.TestCase):
     """Mock the subprocesses and verify orchestrator behaviour."""
+
+    def setUp(self):
+        # PR AW — neutralise the upstream gate (see EnsureMlxVlm tests).
+        patcher = patch.object(
+            TranscriptionPipeline, "_AUDIO_RECHECK_UPSTREAM_BLOCK", ""
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _patch_subprocess(self, mlx_stdout: str = '{"suggestion": "OK"}'):
         """Return a side_effect callable feeding mlx_vlm probe + per-
@@ -486,6 +538,42 @@ class RunAudioRecheckHappyPathTests(unittest.TestCase):
             )
         self.assertEqual(result.metrics["suggestions"], 0)
         self.assertEqual(result.metrics["failures"], 1)
+
+
+
+
+class UpstreamBlockGateTests(unittest.TestCase):
+    """PR AW — the honest gate: while mlx-vlm's Gemma 4 audio
+    generation is broken upstream, the probe refuses with ONE
+    actionable warning and never spawns a subprocess."""
+
+    def test_gate_blocks_with_warning_and_no_subprocess(self):
+        pipeline = _make_pipeline(venv_python="/usr/bin/python3")
+        self.assertTrue(TranscriptionPipeline._AUDIO_RECHECK_UPSTREAM_BLOCK)
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run:
+            ok = pipeline._ensure_mlx_vlm_available()
+        self.assertFalse(ok)
+        mock_run.assert_not_called()
+        warn_calls = [
+            call for call in pipeline.sink.call_args_list
+            if call.args and getattr(call.args[0], "event", "") == "warning"
+        ]
+        self.assertEqual(len(warn_calls), 1)
+        self.assertEqual(
+            warn_calls[0].args[0].code, "audio_recheck_upstream_blocked"
+        )
+
+    def test_gate_result_is_cached(self):
+        pipeline = _make_pipeline(venv_python="/usr/bin/python3")
+        with patch("ekovideo_engine.pipeline.subprocess.run") as mock_run:
+            pipeline._ensure_mlx_vlm_available()
+            pipeline._ensure_mlx_vlm_available()
+        mock_run.assert_not_called()
+        warn_calls = [
+            call for call in pipeline.sink.call_args_list
+            if call.args and getattr(call.args[0], "event", "") == "warning"
+        ]
+        self.assertEqual(len(warn_calls), 1)  # warned once, not per call
 
 
 if __name__ == "__main__":

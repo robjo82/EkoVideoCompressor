@@ -85,21 +85,26 @@ class CatalogRoleCoverageTest(unittest.TestCase):
             self.assertIn("available", row, row["id"])
             self.assertIsInstance(row["available"], bool, row["id"])
 
-    def test_audio_llm_is_marked_unavailable(self):
-        # The multimodal recheck pass lives in video_compactor.py
-        # (legacy PySide path) but isn't ported to
-        # ekovideo_engine.pipeline. Pin the explicit "not yet"
-        # signal so SwiftUI keeps surfacing the warning until the
-        # engine wires it.
+    def test_audio_llm_availability(self):
+        # PR AW — Gemma 4 E4B is the live audio model, selectable in
+        # the Models tab (the recheck pass exists since PR F and the
+        # gemma4 submodule ships in mlx-vlm >= 0.6). The legacy
+        # Qwen2-Audio row is gone entirely: its id canonicalises to
+        # the Gemma checkpoint, so keeping it would render a
+        # duplicate (id, role) row.
         audio = [row for row in model_catalog() if row["role"] == "audio_llm"]
-        self.assertTrue(audio, "expected at least one audio_llm row")
-        for row in audio:
-            self.assertFalse(row["available"], row["id"])
+        self.assertEqual(len(audio), 1)
+        row = audio[0]
+        self.assertEqual(row["id"], "mlx-community/gemma-4-12B-it-4bit")
+        # PR AW — "À venir" while upstream mlx-vlm Gemma 4 audio
+        # generation is broken (see _AUDIO_RECHECK_UPSTREAM_BLOCK).
+        self.assertFalse(row["available"])
+        self.assertTrue(row["default"])
 
     def test_other_roles_stay_available_by_default(self):
         for row in model_catalog():
             if row["role"] == "audio_llm":
-                continue
+                continue  # gated by the PR AW upstream block
             self.assertTrue(row["available"], row["id"])
 
 

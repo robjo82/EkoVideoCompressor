@@ -55,7 +55,12 @@ class TranscriptionSettings:
     hf_token: str = ""
     venv_python_path: str = ""
     text_llm_model: str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
-    audio_llm_model: str = "mlx-community/Qwen2-Audio-7B-Instruct-4bit"
+    # PR AW — Gemma 4 12B Unified: mlx-vlm dropped ``qwen2_audio``
+    # upstream; the 12B is the audio checkpoint verified end-to-end
+    # (mlx_vlm.models.gemma4_unified).
+    # Persisted Qwen2-Audio ids are remapped by
+    # ``canonical_audio_llm_model_id`` at the pipeline's use sites.
+    audio_llm_model: str = "mlx-community/gemma-4-12B-it-4bit"
     # The repass model the pipeline reruns on Whisper's low-confidence
     # segments. Used to be hardcoded inside ``_run_multipass``; now
     # surfaced as a knob so users with the headroom can pin a
@@ -189,7 +194,12 @@ QUALITY_PRESETS: dict[str, dict[str, bool]] = {
         "vad_enabled": True,
         "multipass_enabled": True,
         "per_speaker_enabled": True,
-        "audio_recheck_enabled": True,
+        # PR AW — OFF until upstream mlx-vlm stabilises Gemma 4 audio
+        # generation (qwen2_audio removed upstream; gemma edge fails
+        # to load; gemma 12B loops). See pipeline.
+        # _AUDIO_RECHECK_UPSTREAM_BLOCK for the full empirical dossier
+        # and the single flag to flip when a fixed mlx-vlm ships.
+        "audio_recheck_enabled": False,
         "web_enrichment_enabled": True,
         "condition_on_previous_text": False,
         "hot_prompt_enrichment": True,
@@ -205,6 +215,10 @@ _MAX_PRESET_PENDING: frozenset[str] = frozenset(
     {
         # PR Y — pending a re-Whisper recovery for loop ranges.
         "condition_on_previous_text",
+        # PR AW — pending an upstream mlx-vlm fix for Gemma 4 audio
+        # generation (qwen2_audio gone; gemma4 unstable). Gated by
+        # pipeline._AUDIO_RECHECK_UPSTREAM_BLOCK.
+        "audio_recheck_enabled",
     }
 )
 

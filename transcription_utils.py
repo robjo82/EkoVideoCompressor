@@ -207,22 +207,36 @@ TEXT_LLM_MODELS: list[dict] = [
 
 AUDIO_LLM_MODELS: list[dict] = [
     {
-        "id": "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
-        "label": "Qwen2-Audio 7B Instruct · 4-bit",
-        "family": "Qwen-Audio",
+        # PR AW — Gemma 4 12B Unified replaces Qwen2-Audio as the
+        # recheck model: mlx-vlm removed the ``qwen2_audio`` submodule
+        # upstream, which had silently killed the audio recheck
+        # (engine_mlx_vlm_unavailable on every run). The 12B is the
+        # checkpoint VERIFIED end-to-end on a real meeting clip
+        # (loads via ``mlx_vlm.models.gemma4_unified``, transcribes
+        # French audio, ~7.8 GB peak). The edge checkpoints (e2b/e4b)
+        # are deliberately absent: their mlx-community conversions
+        # ship KV-sharing tensors the mlx-vlm Gemma4 class rejects
+        # ("126 parameters not in model", mlx-vlm#903 / mlx-lm#1242).
+        "id": "mlx-community/gemma-4-12B-it-4bit",
+        "label": "Gemma 4 12B Instruct · 4-bit (audio)",
+        "family": "Gemma",
         "role": _AUDIO_LLM_ROLE,
-        "size_mb": 4500,
-        "tier": "balanced",
-        "language": ["multi"],
+        "size_mb": 6900,
+        "tier": "heavy",
+        "language": ["fr", "en", "multi"],
         "default": True,
-        # ``available=False`` because the new SwiftUI engine doesn't
-        # wire the multimodal recheck pass yet — the orchestrator
-        # in ``ekovideo_engine.pipeline`` has no audio-LLM step (it
-        # only lives in the legacy ``video_compactor.py`` PySide
-        # path). The Models tab surfaces this as "À venir" so the
-        # user doesn't expect the toggle to do anything in v0.
+        # PR AW — "À venir" until upstream mlx-vlm stabilises Gemma 4
+        # audio generation (see pipeline._AUDIO_RECHECK_UPSTREAM_BLOCK).
+        # The 12B is the right checkpoint (loads + hears the audio) but
+        # its generation loops today, so the toggle stays hidden.
         "available": False,
     },
+    # NOTE: the old Qwen2-Audio entry is deliberately GONE from the
+    # catalog (not just unavailable): ``model_catalog()`` canonicalises
+    # ids, so a legacy entry whose id remaps to the Gemma checkpoint
+    # would render as a duplicate (id, role) row in the Models tab.
+    # Migration of persisted Qwen2-Audio settings happens via
+    # ``LEGACY_AUDIO_LLM_MODEL_IDS`` below.
 ]
 
 DEFAULT_TEXT_LLM_MODEL = TEXT_LLM_MODELS[0]["id"]
@@ -231,7 +245,11 @@ DEFAULT_AUDIO_LLM_MODEL = AUDIO_LLM_MODELS[0]["id"]
 LEGACY_AUDIO_LLM_MODEL_IDS: dict[str, str] = {
     # This repo id was listed by mistake in v0.17.0; mlx-community only
     # publishes the 4-bit Qwen2-Audio checkpoint.
-    "mlx-community/Qwen2-Audio-7B-Instruct-8bit": "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+    # PR AW — both Qwen2-Audio ids now migrate to Gemma 4 E4B: the
+    # ``qwen2_audio`` submodule no longer exists in mlx-vlm, so any
+    # persisted Qwen2-Audio setting would just disable the recheck.
+    "mlx-community/Qwen2-Audio-7B-Instruct-8bit": "mlx-community/gemma-4-12B-it-4bit",
+    "mlx-community/Qwen2-Audio-7B-Instruct-4bit": "mlx-community/gemma-4-12B-it-4bit",
 }
 
 LEGACY_WHISPER_MODEL_IDS: dict[str, str] = {
@@ -3131,17 +3149,53 @@ audio_path = sys.argv[2]
 prompt_text = sys.argv[3]
 
 try:
-    model, processor = load(model_path)
-    
-    # Format prompt for Qwen2-Audio or generic Audio model
-    if "qwen" in model_path.lower() and "audio" in model_path.lower():
-        formatted_prompt = f"<|audio_bos|><|AUDIO|><|audio_eos|>{prompt_text}"
-    else:
-        formatted_prompt = prompt_text
-        
-    response = generate(model, processor, prompt=formatted_prompt, audio=audio_path, max_tokens=200, verbose=False)
+    import re
 
-    print(json.dumps({"suggestion": response.strip()}))
+    model, processor = load(model_path)
+
+    # PR AW — model-agnostic prompt formatting. mlx_vlm's
+    # apply_chat_template knows each family's chat markup and audio
+    # placeholders (Gemma 4 included), so we stop hardcoding
+    # Qwen2-Audio's <|audio_bos|> tags. Fallback paths keep the old
+    # behaviour for processors without a chat template.
+    formatted_prompt = None
+    try:
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_config
+        config = load_config(model_path)
+        formatted_prompt = apply_chat_template(
+            processor, config, prompt_text, num_audios=1
+        )
+    except Exception:
+        formatted_prompt = None
+    if formatted_prompt is None:
+        if "qwen" in model_path.lower() and "audio" in model_path.lower():
+            formatted_prompt = f"<|audio_bos|><|AUDIO|><|audio_eos|>{prompt_text}"
+        else:
+            formatted_prompt = prompt_text
+
+    # PR AW — Gemma 4 channel handling. With thinking disabled, the
+    # chat template pre-closes the thought channel and the prompt ends
+    # with "<channel|>". Verified empirically on gemma-4-12B-it-4bit:
+    # left there, AUDIO generation degenerates into an endless loop of
+    # channel markers (text-only is fine); with thinking enabled it
+    # transcribes correctly but ruminates past any sane token budget.
+    # Prefilling the final-channel header puts the model directly in
+    # answer position: bounded, clean output.
+    if isinstance(formatted_prompt, str) and formatted_prompt.rstrip().endswith("<channel|>"):
+        formatted_prompt += "<|channel>final\\n"
+
+    response = generate(model, processor, prompt=formatted_prompt, audio=[audio_path], max_tokens=200, verbose=False)
+
+    # mlx_vlm 0.6.x returns a GenerationResult object; older versions
+    # returned the plain string. Accept both.
+    text = str(getattr(response, "text", response))
+    # Strip any residual Gemma 4 channel markers (a stray
+    # "<|channel>thought\\n<channel|>" pair can still prefix the
+    # answer) — harmless on non-Gemma outputs.
+    text = re.sub(r"<\\|channel>[a-z]*\\n?", "", text)
+    text = text.replace("<channel|>", "")
+    print(json.dumps({"suggestion": text.strip()}))
 
 except Exception as e:
     print(json.dumps({"error": str(e)}))

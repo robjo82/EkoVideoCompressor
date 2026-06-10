@@ -180,10 +180,11 @@ class ApplyQualityPresetTests(unittest.TestCase):
         self.assertTrue(result.per_speaker_enabled)
         self.assertTrue(result.web_enrichment_enabled)
         self.assertTrue(result.hot_prompt_enrichment)
-        # PR F: ``audio_recheck_enabled`` now wired in the engine —
-        # the step is opt-in via this flag and degrades to a silent
-        # no-op when ``mlx_vlm`` isn't installed.
-        self.assertTrue(result.audio_recheck_enabled)
+        # PR AW: ``audio_recheck_enabled`` back OFF in max — upstream
+        # mlx-vlm removed qwen2_audio and its Gemma 4 audio generation
+        # is unstable (see pipeline._AUDIO_RECHECK_UPSTREAM_BLOCK).
+        # Re-add the assertTrue when the upstream gate is lifted.
+        self.assertFalse(result.audio_recheck_enabled)
         # PR Y: ``condition_on_previous_text`` is now DELIBERATELY
         # OFF in max (added back to ``_MAX_PRESET_PENDING``). The
         # audit on long meetings showed it causing 70-minute decoder

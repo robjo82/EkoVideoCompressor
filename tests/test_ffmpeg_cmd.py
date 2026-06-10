@@ -921,9 +921,15 @@ class LlmCatalogTest(unittest.TestCase):
         )
 
     def test_audio_legacy_model_ids_are_canonicalized(self):
+        # PR AW — upstream mlx-vlm removed ``qwen2_audio``, so BOTH
+        # legacy Qwen2-Audio ids migrate to the Gemma 4 replacement.
         self.assertEqual(
             canonical_audio_llm_model_id("mlx-community/Qwen2-Audio-7B-Instruct-8bit"),
-            "mlx-community/Qwen2-Audio-7B-Instruct-4bit",
+            "mlx-community/gemma-4-12B-it-4bit",
+        )
+        self.assertEqual(
+            canonical_audio_llm_model_id("mlx-community/Qwen2-Audio-7B-Instruct-4bit"),
+            "mlx-community/gemma-4-12B-it-4bit",
         )
 
     def test_audio_catalog_has_required_keys(self):
@@ -932,8 +938,12 @@ class LlmCatalogTest(unittest.TestCase):
             self.assertIn("id", entry)
             self.assertIn("label", entry)
             self.assertIn("family", entry)
-            # The audio catalog must point at multimodal-capable repos.
-            self.assertIn("Audio", entry["id"])
+            # The audio catalog must point at multimodal-capable
+            # repos: Gemma 4 edge ("Any-to-Any") or explicit -Audio-.
+            self.assertTrue(
+                "Audio" in entry["id"] or "gemma-4" in entry["id"],
+                entry["id"],
+            )
             self.assertNotIn("8bit", entry["id"])
 
     def test_text_and_audio_catalogs_are_disjoint(self):
@@ -950,7 +960,7 @@ class LlmCatalogTest(unittest.TestCase):
 
     def test_label_helpers_return_humanised_label_for_known_id(self):
         self.assertIn("Mistral", text_llm_label_for(DEFAULT_TEXT_LLM_MODEL))
-        self.assertIn("Qwen", audio_llm_label_for(DEFAULT_AUDIO_LLM_MODEL))
+        self.assertIn("Gemma", audio_llm_label_for(DEFAULT_AUDIO_LLM_MODEL))
 
     def test_label_helpers_fall_back_to_raw_id_for_custom_model(self):
         custom = "user-org/Some-Custom-Model"
