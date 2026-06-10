@@ -183,6 +183,55 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(result["returncode"], 1)
         self.assertIn("boom", result["stderr_tail"])
 
+    def test_torchaudio_floor_exists_on_pypi(self):
+        # Regression for the user's first failed upgrade: a floor that
+        # references a NON-EXISTENT version (torchaudio>=2.12.0 — that
+        # release doesn't exist, torchaudio stops at 2.11.x) makes pip
+        # abort the entire atomic install. Pin the pair coherent.
+        by_name = {r.pip_name: r for r in deps.REQUIREMENTS}
+        self.assertEqual(
+            by_name["torch"].min_version,
+            by_name["torchaudio"].min_version,
+            "torch et torchaudio doivent partager le même plancher",
+        )
+        self.assertTrue(deps.version_lt(by_name["torchaudio"].min_version, "2.12.0"))
+
+    def test_partial_failure_falls_back_per_package(self):
+        # Combined pip call fails (one bad spec) → per-package retry
+        # upgrades what it can and reports only the straggler. This is
+        # exactly the failure mode that froze the user's first upgrade:
+        # one unresolvable spec must no longer block the others.
+        installed = {deps._normalise(r.pip_name): r.min_version for r in deps.REQUIREMENTS}
+        installed["mlx-vlm"] = "0.4.4"          # below floor
+        installed["transformers"] = "5.8.0"      # below floor
+
+        class FakeProc:
+            def __init__(self, rc, err=""):
+                self.returncode = rc
+                self.stdout = ""
+                self.stderr = err
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 1:
+                return FakeProc(1, "combined boom")     # combined fails
+            if len(calls) == 2:
+                return FakeProc(0)                       # mlx-vlm ok
+            return FakeProc(1, "still boom")             # transformers fails
+
+        with patch.object(deps, "read_installed_versions", return_value=installed), \
+             patch.object(deps.subprocess, "run", side_effect=fake_run):
+            result = deps.upgrade("/fake/python")
+
+        self.assertTrue(result["upgraded"])              # something moved
+        self.assertEqual(result["packages"], ["mlx-vlm"])
+        self.assertEqual(len(result["failed"]), 1)
+        self.assertEqual(result["failed"][0]["package"], "transformers")
+        self.assertEqual(result["returncode"], 1)        # partial → non-zero
+        self.assertEqual(len(calls), 3)                  # combined + 2 retries
+
 
 if __name__ == "__main__":
     unittest.main()
