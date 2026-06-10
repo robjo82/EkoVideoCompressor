@@ -276,6 +276,116 @@ class ExtractNewProperNounsTests(unittest.TestCase):
         self.assertIn("Manon", result)
 
 
+class IntraBatchPhoneticDedupTests(unittest.TestCase):
+    """PR AX — the ``Odoo → Oudou`` ×160 incident.
+
+    On a run launched without glossary terms, PR S's phonetic guard
+    (existing-terms only) let "Odoo" AND its mishearings "Oudou" /
+    "Houdou" qualify in the same batch; the phonetic post-processor
+    then had two canonical spellings for one sound and rewrote
+    correct text both ways. The miner must keep only the
+    most-frequent spelling.
+    """
+
+    def _segs(self, *texts: str) -> list[dict]:
+        return [
+            {"start": idx, "end": idx + 1, "text": t}
+            for idx, t in enumerate(texts)
+        ]
+
+    def test_most_frequent_spelling_wins_within_batch(self):
+        # Odoo 3× spread over segments, Oudou 2× — both repeated and
+        # diverse-context, both would have qualified before PR AX.
+        segments = self._segs(
+            "Avec Odoo on gère la facturation.",
+            "Le module Odoo est prêt.",
+            "On migre vers Odoo demain.",
+            "Il a dit Oudou ce matin.",
+            "Encore Oudou dans la démo.",
+        )
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertIn("Odoo", result)
+        self.assertNotIn("Oudou", result)
+
+    def test_batch_dedup_composes_with_existing_terms_guard(self):
+        # Existing glossary already has Odoo → neither variant may
+        # enter (the PR S behaviour, preserved).
+        segments = self._segs(
+            "Il a dit Oudou ce matin.",
+            "Encore Oudou dans la démo.",
+            "Et Houdou aussi.",
+            "Houdou again.",
+        )
+        result = extract_new_proper_nouns_from_segments(
+            segments, existing_terms=["Odoo"]
+        )
+        self.assertNotIn("Oudou", result)
+        self.assertNotIn("Houdou", result)
+
+    def test_rejected_dominant_still_shields_its_family(self):
+        # Real job-26 replay finding: "Odoo" tripped the per-segment
+        # cap (one pitch sentence mentions it 4×) — but its mishearing
+        # "Houdou" must STILL be excluded. The dominant spelling
+        # claims the phonetic key even when itself filtered.
+        segments = self._segs(
+            "Odoo Odoo Odoo Odoo dans la même phrase de pitch.",
+            "Il a dit Houdou ce matin.",
+            "Encore Houdou dans la démo.",
+        )
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertNotIn("Odoo", result)   # rejected by the loop cap
+        self.assertNotIn("Houdou", result)  # shadow stays out too
+
+    def test_distinct_sounds_both_kept(self):
+        # Sanity: dedup must not collapse genuinely different names.
+        segments = self._segs(
+            "Manon présente le projet.",
+            "On demande à Manon de valider les specs.",
+            "Chorus reçoit les factures.",
+            "On envoie vers Chorus directement.",
+        )
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertIn("Manon", result)
+        self.assertIn("Chorus", result)
+
+
+class DiscourseMarkerStoplistTests(unittest.TestCase):
+    """PR AX — spoken-French fillers must never become glossary terms.
+
+    Real incidents (2026-06-04 runs): hot-prompt learned "Ouais",
+    "Parce" (sentence-initial "Parce que") and "Hop".
+    """
+
+    def _segs(self, *texts: str) -> list[dict]:
+        return [
+            {"start": idx, "end": idx + 1, "text": t}
+            for idx, t in enumerate(texts)
+        ]
+
+    def test_fillers_are_stoplisted(self):
+        segments = self._segs(
+            "Ouais c'est ça.",
+            "Ouais on valide.",
+            "Parce que c'est important.",
+            "Parce que sinon rien ne marche.",
+            "Hop on enchaîne.",
+            "Hop voilà le résultat.",
+        )
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertNotIn("Ouais", result)
+        self.assertNotIn("Parce", result)
+        self.assertNotIn("Hop", result)
+
+    def test_real_proper_nouns_still_pass_next_to_fillers(self):
+        segments = self._segs(
+            "Ouais, Sudokeys gère ça.",
+            "Sudokeys a confirmé hier.",
+        )
+        result = extract_new_proper_nouns_from_segments(segments)
+        self.assertIn("Sudokeys", result)
+        self.assertNotIn("Ouais", result)
+
+
 class PipelineHotEnrichmentTests(unittest.TestCase):
     """Top-level wiring: the hook mutates ``request.glossary_terms``."""
 

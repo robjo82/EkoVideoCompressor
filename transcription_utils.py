@@ -1335,6 +1335,30 @@ _FR_SENTENCE_START_NOISE: frozenset[str] = frozenset(
         # Common verb forms that begin sentences after a clause break and
         # would otherwise sneak in (capitalised by Whisper after a period).
         "c", "c'est", "qu'est", "qu'on", "qu'il", "qu'elle",
+        # PR AX — spoken-French discourse markers and interjections.
+        # Real incidents from the 2026-06-04 runs: hot-prompt learned
+        # "Ouais", "Parce" (sentence-initial "Parce que"), "Hop" as
+        # glossary terms, polluting every downstream pass's prompt.
+        # Keys are folded (lowercase, accents stripped) like the rest
+        # of the set.
+        "ouais", "parce", "puisque", "hop", "ben", "bref", "euh",
+        "hein", "hum", "eh", "oh", "ha", "allez", "allo", "salut",
+        "genre", "justement", "effectivement", "exactement",
+        "vraiment", "franchement", "carrement", "apparemment",
+        "normalement", "forcement", "evidemment", "absolument",
+        "completement",
+        "attends", "attendez", "ecoute", "ecoutez", "regarde",
+        "regardez", "tiens", "tenez", "disons", "sinon", "ensuite",
+        "ailleurs", "d'ailleurs", "d'accord", "n'importe",
+        # PR AX — sentence-start compounds spotted in the job-26
+        # replay ("Est-ce", "Aujourd'hui" mined as proper nouns).
+        # ``_fold_term`` does NOT normalise the curly apostrophe (’)
+        # to the straight one, so both spellings are listed.
+        "est-ce", "n'est-ce", "n’est-ce",
+        "aujourd'hui", "aujourd’hui",
+        "peut-etre", "c'est-a-dire", "c’est-a-dire",
+        "quelqu'un", "quelqu’un", "d'abord", "d’abord",
+        "jusqu'a", "jusqu’a", "d’ailleurs", "d’accord", "n’importe",
     }
 )
 
@@ -1566,22 +1590,44 @@ def extract_new_proper_nouns_from_segments(
                 preceding_contexts.setdefault(key, set()).add("<BOS>")
             order_idx += 1
 
-    qualifying: list[tuple[str, int]] = []
-    for key, count in counts.items():
-        if count < min_occurrences:
-            continue
-        # PR S anti-hallucination filters.
+    # PR AX — phonetic dedup, now ALSO within the candidate batch.
+    # PR S only checked candidates against the EXISTING glossary, so
+    # on a run launched without terms, "Odoo" (132×) and the
+    # mishearings "Oudou" (6×) / "Houdou" (4×) all qualified together.
+    # The phonetic post-processor then had two canonical spellings for
+    # the same sound and rewrote correct text both ways (the
+    # ``Odoo → Oudou`` ×160 incident).
+    #
+    # Walk EVERY repeated candidate in descending count order. The
+    # first member of a phonetic family CLAIMS the key — even when it
+    # is itself rejected by the anti-loop filters. Replaying the
+    # incident transcript showed why this matters: "Odoo" tripped the
+    # per-segment cap (a sales-pitch sentence mentions it 4×), and
+    # without the claim its 4-occurrence mishearing "Houdou" became
+    # the family's representative. A shadow spelling must never enter
+    # just because the dominant one was filtered.
+    repeated = [
+        (key, count) for key, count in counts.items() if count >= min_occurrences
+    ]
+    repeated.sort(key=lambda kv: (-kv[1], first_seen[kv[0]]))
+
+    accepted: list[str] = []
+    claimed_keys: set[str] = set(existing_phonetic_keys)
+    for key, _count in repeated:
         candidate_key = _candidate_phonetic_key(canonical[key])
-        if _phonetic_collides_with_existing(candidate_key, existing_phonetic_keys):
+        if _phonetic_collides_with_existing(candidate_key, claimed_keys):
             continue
+        if candidate_key:
+            claimed_keys.add(candidate_key)
+        # Anti-loop filters (PR S) apply to the family winner only —
+        # its shadows are already excluded above.
         if max(per_segment_counts.get(key, {}).values(), default=0) > max_per_segment:
             continue
         if len(preceding_contexts.get(key, set())) < min_distinct_contexts:
             continue
-        qualifying.append((key, count))
-
-    qualifying.sort(key=lambda kv: (-kv[1], first_seen[kv[0]]))
-    return [canonical[key] for key, _ in qualifying[:max_terms]]
+        if len(accepted) < max_terms:
+            accepted.append(canonical[key])
+    return accepted
 
 
 # The LLM post-process used to ask the model for {title, speakers,
