@@ -48,6 +48,7 @@ from transcription_utils import (
     build_llm_corrections_cmd,
     build_llm_title_cmd,
     build_mlx_whisper_cmd,
+    canonical_audio_llm_model_id,
     canonical_multipass_model_id,
     default_transcript_path,
     extract_new_proper_nouns_from_segments,
@@ -3285,6 +3286,28 @@ class TranscriptionPipeline:
     _AUDIO_RECHECK_POST_SECONDS = 10.0
     _AUDIO_RECHECK_TIMEOUT_SECONDS = 600
 
+    # PR AW — honest upstream gate. Non-empty string = the recheck is
+    # blocked and this is the user-facing reason. Empirics behind it
+    # (2026-06, mlx-vlm 0.6.2, gemma-4-12B-it-4bit, real meeting clip):
+    #   • qwen2_audio was REMOVED from mlx-vlm upstream — the legacy
+    #     model can't load at all.
+    #   • Gemma 4 edge (e2b/e4b) checkpoints fail to load (KV-sharing
+    #     tensors rejected, mlx-vlm#903 / mlx-lm#1242).
+    #   • Gemma 4 12B Unified loads and genuinely hears the audio, but
+    #     generation collapses: thinking disabled → endless
+    #     ``<|channel>thought`` marker loops; thinking enabled → the
+    #     thought channel ruminates past 1 500 tokens without ever
+    #     emitting the answer line (deterministic, reproduced 3×).
+    # Running the pass in that state burns ~90 s per passage to produce
+    # nothing. Set this to "" once a fixed mlx-vlm lands (the deps
+    # floor mechanism will deliver it) and the pass re-enables.
+    _AUDIO_RECHECK_UPSTREAM_BLOCK = (
+        "Réécoute IA indisponible pour le moment : mlx-vlm a retiré le "
+        "support Qwen2-Audio et la génération audio Gemma 4 est encore "
+        "instable en amont (mlx-vlm#903). Elle se réactivera via la mise "
+        "à jour des moteurs IA dès qu'un correctif sera publié."
+    )
+
     # PR AC: map an ``audio_llm_model`` model path to the
     # ``mlx_vlm.models`` submodule that must be importable for the
     # actual ``load(model_path)`` call to succeed. Without this map
@@ -3292,7 +3315,15 @@ class TranscriptionPipeline:
     # the embedded multimodal script crashed with "Model type
     # qwen2_audio not supported" on every uncertain passage,
     # leaving a trail of ``engine_audio_recheck_failed`` in app_log.
+    # PR AW — order matters: the 12B "Unified" checkpoints need the
+    # ``gemma4_unified`` submodule while the edge ones (e2b/e4b) use
+    # plain ``gemma4`` (verified on the HF config's ``model_type``),
+    # so the more specific needle comes first.
     _MLX_VLM_MODEL_SLUG_HINTS = (
+        ("gemma-4-12b", "gemma4_unified"),
+        ("gemma-4", "gemma4"),
+        ("gemma4", "gemma4"),
+        ("gemma-3n", "gemma3n"),
         ("qwen2-audio", "qwen2_audio"),
         ("qwen2_audio", "qwen2_audio"),
     )
@@ -3332,12 +3363,31 @@ class TranscriptionPipeline:
         """
         if self._mlx_vlm_available is not None:
             return self._mlx_vlm_available
+        # PR AW — upstream gate first: when the generation stack is
+        # known-broken, skip the pass with one honest warning instead
+        # of burning minutes per run on doomed subprocess calls.
+        if self._AUDIO_RECHECK_UPSTREAM_BLOCK:
+            self._mlx_vlm_available = False
+            self.sink(
+                WarningEvent(
+                    self._AUDIO_RECHECK_UPSTREAM_BLOCK,
+                    code="audio_recheck_upstream_blocked",
+                )
+            )
+            append_app_log(
+                "engine_mlx_vlm_blocked reason=gemma4_generation_unstable_upstream"
+            )
+            return False
         venv_python = self.request.transcription_settings.venv_python_path
         if not venv_python or not Path(venv_python).exists():
             self._mlx_vlm_available = False
             return False
 
-        model_path = self.request.transcription_settings.audio_llm_model or ""
+        # PR AW — canonicalise first: persisted Qwen2-Audio ids remap to
+        # the Gemma 4 replacement (qwen2_audio is gone from mlx-vlm).
+        model_path = canonical_audio_llm_model_id(
+            self.request.transcription_settings.audio_llm_model
+        )
         submodule_slug = self._mlx_vlm_submodule_for(model_path)
         # Build a single probe script that returns:
         #   exit 0 → fully available
@@ -3542,7 +3592,7 @@ class TranscriptionPipeline:
 
             cmd = build_multimodal_audio_cmd(
                 venv_python_path=venv_python,
-                model_path=settings.audio_llm_model,
+                model_path=canonical_audio_llm_model_id(settings.audio_llm_model),
                 audio_path=str(clip_wav),
                 prompt=prompt,
             )
@@ -3596,7 +3646,7 @@ class TranscriptionPipeline:
         return StepResult(
             "audio_recheck",
             True,
-            model=settings.audio_llm_model,
+            model=canonical_audio_llm_model_id(settings.audio_llm_model),
             duration_seconds=duration,
             metrics={
                 "rechecked": total,

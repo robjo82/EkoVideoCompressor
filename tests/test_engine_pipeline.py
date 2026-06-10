@@ -849,7 +849,9 @@ class QualityPresetTest(unittest.TestCase):
         self.assertTrue(settings.vad_enabled)
         self.assertTrue(settings.multipass_enabled)
         self.assertTrue(settings.per_speaker_enabled)
-        self.assertTrue(settings.audio_recheck_enabled)
+        # PR AW — back OFF until the upstream mlx-vlm Gemma 4 audio fix
+        # (see pipeline._AUDIO_RECHECK_UPSTREAM_BLOCK).
+        self.assertFalse(settings.audio_recheck_enabled)
         self.assertTrue(settings.web_enrichment_enabled)
 
     def test_custom_preset_passes_individual_flags_through(self):
