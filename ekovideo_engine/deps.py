@@ -33,6 +33,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from .logging import append_app_log, tail_text
 from .paths import managed_venv_python_path
 
 
@@ -56,8 +57,15 @@ class Requirement:
 # (mlx / mlx-lm / whisper / pyannote / silero) was already current, so
 # their floors pin that; the laggards we deliberately raise — chiefly
 # ``mlx-vlm`` 0.4.4 → 0.6.1 (the Gemma 4 audio blocker), plus
-# transformers / huggingface-hub / torch which had drifted a release or
-# two behind. ``torchaudio`` is kept lockstep with ``torch``.
+# transformers / huggingface-hub which had drifted a release or two.
+#
+# torch / torchaudio are floored at 2.11.0 TOGETHER, not at torch's
+# 2.12: torchaudio's newest release is 2.11.0 (it does NOT track torch
+# lockstep — a ``torchaudio>=2.12`` floor resolves to nothing, pip
+# aborts the whole install, and since one pip call is atomic the user's
+# first "Mettre à jour les moteurs IA" failed entirely on that single
+# bad spec). Keeping the pair at the same version also avoids a torch
+# 2.12 / torchaudio 2.11 mismatch (torchaudio pins its torch peer).
 REQUIREMENTS: tuple[Requirement, ...] = (
     Requirement("mlx", "mlx", "0.31.2"),
     Requirement("mlx-lm", "mlx_lm", "0.31.3"),
@@ -67,8 +75,8 @@ REQUIREMENTS: tuple[Requirement, ...] = (
     Requirement("silero-vad", "silero_vad", "6.2.1"),
     Requirement("transformers", "transformers", "5.10.1"),
     Requirement("huggingface-hub", "huggingface_hub", "1.17.0"),
-    Requirement("torch", "torch", "2.12.0"),
-    Requirement("torchaudio", "torchaudio", "2.12.0"),
+    Requirement("torch", "torch", "2.11.0"),
+    Requirement("torchaudio", "torchaudio", "2.11.0"),
 )
 
 
@@ -274,9 +282,11 @@ def upgrade(
     if not specs:
         if progress:
             progress("Les moteurs IA sont déjà à jour.")
+        append_app_log("engine_deps_upgrade noop (all current)")
         return {
             "upgraded": False,
             "packages": [],
+            "failed": [],
             "returncode": 0,
             "stdout_tail": "",
             "stderr_tail": "",
@@ -284,32 +294,88 @@ def upgrade(
 
     if progress:
         progress(f"Mise à jour de {len(names)} paquet(s) : {', '.join(names)}…")
+    append_app_log(
+        f"engine_deps_upgrade start specs={specs!r} to_latest={to_latest}"
+    )
 
+    # One combined pip call first — the resolver sees every spec at
+    # once and picks mutually-compatible versions (torch/torchaudio
+    # in particular). But pip is all-or-nothing: a single unresolvable
+    # spec aborts the WHOLE install (the exact failure the user hit
+    # when torchaudio>=2.12 didn't exist — even mlx-vlm stayed stuck).
+    # So on failure we retry per-package, upgrading everything that CAN
+    # move and reporting only the stragglers.
+    proc = _pip_install(target, specs)
+    if proc is not None and proc.returncode == 0:
+        append_app_log(f"engine_deps_upgrade ok packages={names}")
+        if progress:
+            progress("Mise à jour terminée.")
+        return {
+            "upgraded": True,
+            "packages": names,
+            "failed": [],
+            "returncode": 0,
+            "stdout_tail": (proc.stdout or "")[-2000:],
+            "stderr_tail": (proc.stderr or "")[-2000:],
+        }
+
+    combined_err = tail_text(
+        (proc.stderr if proc is not None else "") or "", 1500
+    )
+    append_app_log(
+        f"engine_deps_upgrade combined_failed rc="
+        f"{proc.returncode if proc is not None else -1} stderr={combined_err!r}"
+    )
+    if progress:
+        progress("Échec groupé — nouvel essai paquet par paquet…")
+
+    upgraded: list[str] = []
+    failed: list[dict] = []
+    last_err = ""
+    for name, spec in zip(names, specs):
+        single = _pip_install(target, [spec])
+        if single is not None and single.returncode == 0:
+            upgraded.append(name)
+            append_app_log(f"engine_deps_upgrade_pkg ok spec={spec!r}")
+        else:
+            err = tail_text(
+                (single.stderr if single is not None else "") or "", 800
+            )
+            last_err = err
+            failed.append({"package": name, "spec": spec, "error": err})
+            append_app_log(
+                f"engine_deps_upgrade_pkg failed spec={spec!r} error={err!r}"
+            )
+
+    ok = not failed
+    if progress:
+        if ok:
+            progress("Mise à jour terminée.")
+        else:
+            progress(
+                f"{len(upgraded)} paquet(s) mis à jour, "
+                f"{len(failed)} en échec : "
+                + ", ".join(f["package"] for f in failed)
+            )
+    return {
+        "upgraded": bool(upgraded),
+        "packages": upgraded,
+        "failed": failed,
+        "returncode": 0 if ok else 1,
+        "stdout_tail": "",
+        "stderr_tail": last_err or combined_err,
+    }
+
+
+def _pip_install(venv_python: str, specs: list[str]):
+    """Run one ``pip install --upgrade`` call; None on spawn failure."""
     try:
-        proc = subprocess.run(
-            [target, "-m", "pip", "install", "--upgrade", *specs],
+        return subprocess.run(
+            [venv_python, "-m", "pip", "install", "--upgrade", *specs],
             capture_output=True,
             text=True,
             timeout=3600,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        if progress:
-            progress(f"Échec de la mise à jour : {exc!r}")
-        return {
-            "upgraded": False,
-            "packages": names,
-            "returncode": -1,
-            "stdout_tail": "",
-            "stderr_tail": repr(exc),
-        }
-
-    ok = proc.returncode == 0
-    if progress:
-        progress("Mise à jour terminée." if ok else "Échec de la mise à jour (voir les logs).")
-    return {
-        "upgraded": ok,
-        "packages": names,
-        "returncode": proc.returncode,
-        "stdout_tail": (proc.stdout or "")[-2000:],
-        "stderr_tail": (proc.stderr or "")[-2000:],
-    }
+        append_app_log(f"engine_deps_upgrade_spawn_failed error={exc!r}")
+        return None
