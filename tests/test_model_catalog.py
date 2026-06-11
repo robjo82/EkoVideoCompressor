@@ -21,7 +21,7 @@ from transcription_utils import (
 
 
 class CatalogRoleCoverageTest(unittest.TestCase):
-    def test_catalog_carries_all_six_roles(self):
+    def test_catalog_carries_all_seven_roles(self):
         rows = model_catalog()
         roles = {row["role"] for row in rows}
         self.assertEqual(
@@ -33,6 +33,7 @@ class CatalogRoleCoverageTest(unittest.TestCase):
                 "audio_llm",
                 "diarisation",
                 "embedding",
+                "cloud_transcription",
             },
         )
 
@@ -65,11 +66,27 @@ class CatalogRoleCoverageTest(unittest.TestCase):
             "Expected the bofenghuang French distil checkpoint to be surfaced",
         )
 
-    def test_size_mb_is_set_on_every_row(self):
+    def test_size_mb_is_set_on_every_local_row(self):
         # Size powers the download-confirmation dialog. A 0 here
-        # would render "—" in the UI and look weirdly opaque.
+        # would render "—" in the UI and look weirdly opaque. Cloud
+        # rows have nothing on disk — they carry prices instead.
         for row in model_catalog():
-            self.assertGreater(row["size_mb"], 0, row["id"])
+            if row.get("kind") == "cloud":
+                self.assertGreater(row["price_in_per_1m"], 0, row["id"])
+                self.assertGreater(row["price_out_per_1m"], 0, row["id"])
+            else:
+                self.assertGreater(row["size_mb"], 0, row["id"])
+
+    def test_cloud_rows_have_one_default_and_no_download_surface(self):
+        rows = [r for r in model_catalog() if r["role"] == "cloud_transcription"]
+        self.assertGreaterEqual(len(rows), 2)
+        defaults = [r for r in rows if r["default"]]
+        self.assertEqual(len(defaults), 1)
+        for row in rows:
+            self.assertEqual(row["kind"], "cloud")
+            self.assertTrue(row["cached"], row["id"])
+            self.assertEqual(row["cache_dir"], "", row["id"])
+            self.assertFalse(row["gated"], row["id"])
 
     def test_tiers_are_constrained_to_known_values(self):
         allowed = {"light", "balanced", "heavy"}

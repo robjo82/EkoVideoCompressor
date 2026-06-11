@@ -317,6 +317,24 @@ final class SettingsStore: ObservableObject {
     /// derives the real flags from the preset string at job time.
     @AppStorage("qualityPreset") var qualityPreset = TranscriptionQualityPreset.balanced.rawValue
 
+    // Cloud transcription (Gemini). The key lives in @AppStorage like
+    // the other tokens — the Keychain migration is one hardening
+    // pass for all of them. ``cloudBudgetMonthlyUSD`` defaults to a
+    // deliberate non-zero cap: the user opts *out* of the safety
+    // net, never discovers it after a surprise invoice.
+    @AppStorage("transcriptionEngine") var transcriptionEngine = TranscriptionEngineChoice.local.rawValue
+    @AppStorage("cloudApiKey") var cloudApiKey = ""
+    @AppStorage("cloudModel") var cloudModel = "gemini-3.5-flash"
+    @AppStorage("cloudBudgetMonthlyUSD") var cloudBudgetMonthlyUSD: Double = 20
+
+    var cloudConfigured: Bool {
+        !cloudApiKey.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var usesCloudTranscription: Bool {
+        transcriptionEngine == TranscriptionEngineChoice.cloud.rawValue
+    }
+
     // Odoo connection. Stored alongside the other tokens via
     // @AppStorage for cohesion — moving everything to the macOS
     // Keychain is a separate, broader hardening pass. The API key
@@ -1776,6 +1794,72 @@ final class OdooStore: ObservableObject {
     }
 }
 
+/// Cloud API consumption + key validation. Separate from
+/// ``ModelStore``/``LibraryStore`` because its refreshes are tied to
+/// the Réglages sheet and the Run Setup form, not to the library
+/// lifecycle — and a slow engine call here must never spin the
+/// library's loading state.
+@MainActor
+final class CloudUsageStore: ObservableObject {
+    @Published var summary: CloudUsageSummary?
+    @Published var isLoading = false
+    @Published var keyCheck: KeyCheckState = .idle
+
+    enum KeyCheckState: Equatable {
+        case idle
+        case checking
+        case ok(modelCount: Int)
+        case failed(String)
+    }
+
+    var currentMonthSpendUSD: Double {
+        summary?.current_month_cost_usd ?? 0
+    }
+
+    func refresh() async {
+        isLoading = true
+        defer { isLoading = false }
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(["usage-summary"])
+        )
+        guard result.status == 0,
+              let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(CloudUsageSummary.self, from: data)
+        else { return }
+        summary = payload
+    }
+
+    func checkKey(_ apiKey: String) async {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            keyCheck = .failed("Renseignez d'abord la clé API.")
+            return
+        }
+        keyCheck = .checking
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments(
+                ["cloud-check", "--api-key", trimmed]
+            )
+        )
+        struct Payload: Decodable {
+            var ok: Bool?
+            var error: String?
+            var models: [String]?
+        }
+        guard let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(Payload.self, from: data)
+        else {
+            keyCheck = .failed("Réponse du moteur illisible.")
+            return
+        }
+        if result.status == 0, payload.ok == true {
+            keyCheck = .ok(modelCount: payload.models?.count ?? 0)
+        } else {
+            keyCheck = .failed(payload.error ?? "Vérification impossible.")
+        }
+    }
+}
+
 @MainActor
 final class ModelStore: ObservableObject {
     @Published var models: [ModelRow] = []
@@ -1849,6 +1933,14 @@ struct ModelRow: Codable, Identifiable {
     /// aren't run by the pipeline yet (today: ``audio_llm``).
     /// Drives the "À venir" badge in the Models tab.
     var available: Bool
+    /// "local" (HF checkpoint on disk) or "cloud" (remote API). Cloud
+    /// rows have no download surface; they carry per-token prices
+    /// instead of a size.
+    var kind: String
+    var price_in_per_1m: Double
+    var price_out_per_1m: Double
+
+    var isCloud: Bool { kind == "cloud" }
 
     /// Composite identity: the same Whisper checkpoint can appear
     /// in both the ``transcription`` and ``multipass`` roles. The
@@ -1858,6 +1950,7 @@ struct ModelRow: Codable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, family, label, role, size_mb, tier, language, cached, cache_dir, gated, available
+        case kind, price_in_per_1m, price_out_per_1m
         case isDefault = "default"
     }
 
@@ -1878,6 +1971,9 @@ struct ModelRow: Codable, Identifiable {
         // Treat absence as "yes, available" so older catalog
         // outputs don't get tagged "À venir" by accident.
         available = try c.decodeIfPresent(Bool.self, forKey: .available) ?? true
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "local"
+        price_in_per_1m = try c.decodeIfPresent(Double.self, forKey: .price_in_per_1m) ?? 0
+        price_out_per_1m = try c.decodeIfPresent(Double.self, forKey: .price_out_per_1m) ?? 0
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1894,5 +1990,22 @@ struct ModelRow: Codable, Identifiable {
         try c.encode(cached, forKey: .cached)
         try c.encode(cache_dir, forKey: .cache_dir)
         try c.encode(available, forKey: .available)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(price_in_per_1m, forKey: .price_in_per_1m)
+        try c.encode(price_out_per_1m, forKey: .price_out_per_1m)
+    }
+}
+
+extension ModelRow {
+    /// "≈ 0,35 $US / h d'audio" — the figure a user actually
+    /// reasons about, derived from the per-token prices.
+    var estimatedHourlyCostLabel: String {
+        guard isCloud else { return "" }
+        let hourly = estimatedCloudCostUSD(
+            durationSeconds: 3600,
+            priceInPer1M: price_in_per_1m,
+            priceOutPer1M: price_out_per_1m
+        )
+        return String(format: "≈ %.2f $US / h d'audio", hourly)
     }
 }

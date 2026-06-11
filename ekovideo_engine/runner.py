@@ -500,11 +500,29 @@ class EngineRunner:
             pipeline = TranscriptionPipeline(request, sink)
             tx_results = pipeline.run(active_source)
             results.extend(tx_results)
-            failed = [r for r in tx_results if not r.ok and r.name in {"audio_extract", "whisper"}]
+            # Money was spent the moment the API answered — persist the
+            # ledger rows before any failure branch can return, and
+            # denormalise the total onto the job row for the library.
+            if pipeline.cloud_usage_records:
+                cloud_total = 0.0
+                cloud_model = ""
+                for record in pipeline.cloud_usage_records:
+                    db.add_api_usage(job_id=job_id, **record)
+                    cloud_total += float(record.get("cost_usd") or 0)
+                    cloud_model = record.get("model") or cloud_model
+                db.update_job_cloud_cost(job_id, round(cloud_total, 6), cloud_model)
+            failed = [
+                r
+                for r in tx_results
+                if not r.ok
+                and r.name in {"audio_extract", "whisper", "cloud_transcription"}
+            ]
             # Quality steps (VAD, multipass, diarisation, llm_post) are
             # allowed to fail without sinking the whole job — they're
             # opt-in improvements. We only abort on the hard
-            # prerequisites: audio extract and Whisper itself.
+            # prerequisites: audio extract, Whisper itself, and the
+            # cloud engine when the user explicitly selected it
+            # (budget cap or rejected API key).
             if failed:
                 _persist_step_durations(db, job_id, results)
                 # Same rationale as the compression-failure branch:

@@ -64,6 +64,29 @@ Dans l'onglet `Transcrire`, le modèle recommandé par défaut est:
 
 Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper. Le contenu est automatiquement formaté pour Whisper (phrase d'amorce en français — le modèle le traite comme du vocabulaire attendu, pas comme une liste).
 
+## Transcription Cloud (API Gemini)
+
+En complément du moteur local, un mode **Cloud** envoie l'audio à l'API
+Gemini qui renvoie en un seul appel la transcription horodatée, la
+détection des locuteurs, un titre et les termes techniques — souvent
+meilleur que la chaîne locale sur les audios difficiles.
+
+- Choix du moteur (Local / Cloud) au lancement de chaque file, avec le
+  **coût estimé affiché avant l'envoi** (~0,10 à 0,80 $US par heure
+  d'audio selon le modèle).
+- Clé API et **budget mensuel plafond** dans `Réglages` →
+  `Transcription Cloud`. Le moteur refuse tout traitement dont
+  l'estimation dépasse le budget restant ; la consommation réelle
+  (tokens + coût) est suivie par traitement et par mois.
+- Les modèles distants (Gemini 3.5 Flash par défaut) sont listés dans
+  l'onglet `Modèles` avec leur prix au token.
+- L'audio est compressé (MP3 mono 16 kHz), envoyé par fenêtres de
+  30 minutes puis **supprimé des serveurs Google** sitôt la réponse
+  reçue. Les réunions longues conservent des étiquettes de locuteurs
+  cohérentes d'une fenêtre à l'autre.
+- En cas d'erreur réseau ou de quota, le traitement bascule
+  automatiquement sur le moteur local avec un avertissement.
+
 ## Amélioration locale progressive
 
 Après la transcription Whisper, l'app lance une passe locale via MLX-LM si nécessaire.

@@ -43,6 +43,7 @@ struct ContentView: View {
     @EnvironmentObject private var pyannote: PyannoteStatusStore
     @EnvironmentObject private var updater: UpdateStore
     @EnvironmentObject private var deps: DepsStore
+    @EnvironmentObject private var cloudUsage: CloudUsageStore
     @State private var selectedSection: AppSection = .queue
     @State private var showingSettings = false
     @State private var showingRunSetup = false
@@ -121,6 +122,7 @@ struct ContentView: View {
                 .environmentObject(pyannote)
                 .environmentObject(updater)
                 .environmentObject(deps)
+                .environmentObject(cloudUsage)
         }
         .sheet(isPresented: $showingRunSetup) {
             RunSetupView {
@@ -135,6 +137,8 @@ struct ContentView: View {
             .environmentObject(energy)
             .environmentObject(pyannote)
             .environmentObject(updater)
+            .environmentObject(models)
+            .environmentObject(cloudUsage)
         }
         .task {
             guard !didPreloadSecondaryData else { return }
@@ -162,6 +166,9 @@ struct ContentView: View {
             Task { await library.refresh() }
             if event.event == .done {
                 Task { await library.refreshSpeakerProfiles(force: true) }
+                if settings.usesCloudTranscription {
+                    Task { await cloudUsage.refresh() }
+                }
             }
         }
         .task {
@@ -343,7 +350,11 @@ struct ContentView: View {
                 )?.rawValue ?? TranscriptionQualityPreset.balanced.rawValue,
                 expected_min_speakers: item.expectedSpeakerCount,
                 expected_max_speakers: item.expectedSpeakerCount,
-                current_user_name: settings.currentUserName.trimmingCharacters(in: .whitespacesAndNewlines)
+                current_user_name: settings.currentUserName.trimmingCharacters(in: .whitespacesAndNewlines),
+                transcription_engine: settings.transcriptionEngine,
+                cloud_model: settings.cloudModel,
+                cloud_api_key: settings.usesCloudTranscription ? settings.cloudApiKey : "",
+                cloud_budget_monthly_usd: settings.cloudBudgetMonthlyUSD
             ),
             glossary_terms: termsForRun,
             speaker_overrides: overrides,
@@ -641,48 +652,63 @@ struct RunBatchSettingsForm: View {
             }
 
             Section("Moteur de transcription") {
-                Picker("Modèle Whisper", selection: $settings.whisperModel) {
-                    Text("Whisper Large v3 Turbo").tag("mlx-community/whisper-large-v3-turbo")
-                    Text("Whisper Large v3").tag("mlx-community/whisper-large-v3-mlx")
-                    Text("Whisper Medium").tag("mlx-community/whisper-medium-mlx")
-                }
-                Picker("Qualité", selection: $settings.qualityPreset) {
-                    ForEach(TranscriptionQualityPreset.allCases) { preset in
-                        Text(preset.displayName).tag(preset.rawValue)
+                Picker("Moteur", selection: $settings.transcriptionEngine) {
+                    ForEach(TranscriptionEngineChoice.allCases) { choice in
+                        Text(choice.displayName).tag(choice.rawValue)
                     }
                 }
-                // Auto-downgrade if the user unplugs while Max is
-                // selected. The picker itself doesn't try to disable
-                // the individual Max row — Picker option styling is
-                // brittle in SwiftUI — so we surface the constraint
-                // via the warning Label below + this guarded revert.
-                .onChange(of: energy.allowsMaxPreset) { _, allowed in
-                    if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
-                        settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
-                    }
-                }
-                .onAppear {
-                    if !energy.allowsMaxPreset && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
-                        settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
-                    }
-                }
-                if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
-                    Text(preset.summary)
+                .pickerStyle(.segmented)
+                if let choice = TranscriptionEngineChoice(rawValue: settings.transcriptionEngine) {
+                    Text(choice.summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if !energy.allowsMaxPreset {
-                    Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                if settings.usesCloudTranscription {
+                    CloudEngineRunOptions()
+                } else {
+                    Picker("Modèle Whisper", selection: $settings.whisperModel) {
+                        Text("Whisper Large v3 Turbo").tag("mlx-community/whisper-large-v3-turbo")
+                        Text("Whisper Large v3").tag("mlx-community/whisper-large-v3-mlx")
+                        Text("Whisper Medium").tag("mlx-community/whisper-medium-mlx")
+                    }
+                    Picker("Qualité", selection: $settings.qualityPreset) {
+                        ForEach(TranscriptionQualityPreset.allCases) { preset in
+                            Text(preset.displayName).tag(preset.rawValue)
+                        }
+                    }
+                    // Auto-downgrade if the user unplugs while Max is
+                    // selected. The picker itself doesn't try to disable
+                    // the individual Max row — Picker option styling is
+                    // brittle in SwiftUI — so we surface the constraint
+                    // via the warning Label below + this guarded revert.
+                    .onChange(of: energy.allowsMaxPreset) { _, allowed in
+                        if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                            settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
+                        }
+                    }
+                    .onAppear {
+                        if !energy.allowsMaxPreset && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                            settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
+                        }
+                    }
+                    if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
+                        Text(preset.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !energy.allowsMaxPreset {
+                        Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                    if let reason = Optional(energy.blockingReason), !reason.isEmpty {
+                        Label(reason, systemImage: "battery.25percent")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                    Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                    pyannotePreflightBanner
                 }
-                if let reason = Optional(energy.blockingReason), !reason.isEmpty {
-                    Label(reason, systemImage: "battery.25percent")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-                Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
-                pyannotePreflightBanner
             }
 
             if canDeleteOriginalSources {
@@ -758,6 +784,126 @@ struct RunBatchSettingsForm: View {
                     .foregroundStyle(.red)
             }
         }
+    }
+}
+
+/// Cloud-engine block of the Run Setup form: model picker with the
+/// per-hour price, projected cost of the whole queue, and the
+/// month-to-date spend against the budget. Everything a user needs
+/// to decide "is this batch worth it?" *before* a token is billed.
+struct CloudEngineRunOptions: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var queue: QueueStore
+    @EnvironmentObject private var models: ModelStore
+    @EnvironmentObject private var cloudUsage: CloudUsageStore
+
+    private var cloudModels: [ModelRow] {
+        models.models.filter { $0.role == "cloud_transcription" }
+    }
+
+    private var activeModel: ModelRow? {
+        cloudModels.first { $0.id == settings.cloudModel } ?? cloudModels.first { $0.default }
+    }
+
+    /// (total over known durations, number of files whose duration
+    /// isn't probed yet). Durations land when the user previews a
+    /// file in the per-file panel; unknown ones are listed apart so
+    /// the total never silently under-counts.
+    private var queueEstimate: (knownCost: Double, unknownCount: Int) {
+        guard let model = activeModel else { return (0, queue.items.count) }
+        var cost = 0.0
+        var unknown = 0
+        for item in queue.items {
+            let duration = item.mediaDurationSeconds
+                - max(0, item.trimStartSeconds)
+                - max(0, item.trimEndSeconds)
+            if duration > 0 {
+                cost += estimatedCloudCostUSD(
+                    durationSeconds: duration,
+                    priceInPer1M: model.price_in_per_1m,
+                    priceOutPer1M: model.price_out_per_1m
+                )
+            } else {
+                unknown += 1
+            }
+        }
+        return (cost, unknown)
+    }
+
+    private var remainingBudget: Double? {
+        guard settings.cloudBudgetMonthlyUSD > 0 else { return nil }
+        return settings.cloudBudgetMonthlyUSD - cloudUsage.currentMonthSpendUSD
+    }
+
+    var body: some View {
+        if !settings.cloudConfigured {
+            Label {
+                Text("Aucune clé API Gemini configurée. Ajoutez-la dans Réglages → Transcription Cloud avant de lancer.")
+            } icon: {
+                Image(systemName: "key.slash")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+        }
+
+        if cloudModels.isEmpty {
+            Text("Catalogue de modèles non chargé — ouvrez l'onglet Modèles et actualisez.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            Picker("Modèle", selection: $settings.cloudModel) {
+                ForEach(cloudModels, id: \.id) { row in
+                    Text("\(row.label) · \(row.estimatedHourlyCostLabel)").tag(row.id)
+                }
+            }
+        }
+
+        let estimate = queueEstimate
+        if estimate.knownCost > 0 || estimate.unknownCount > 0 {
+            HStack(spacing: 6) {
+                Image(systemName: "dollarsign.circle")
+                    .foregroundStyle(.teal)
+                if estimate.knownCost > 0 {
+                    Text("Coût estimé de la file : \(formatUSD(estimate.knownCost))")
+                        .font(.callout.weight(.medium))
+                }
+                if estimate.unknownCount > 0 {
+                    Text(estimate.knownCost > 0
+                         ? "+ \(estimate.unknownCount) fichier(s) de durée inconnue"
+                         : "Durées inconnues — prévisualisez les fichiers pour estimer, ou comptez \(activeModel?.estimatedHourlyCostLabel ?? "")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+
+        HStack(spacing: 6) {
+            Image(systemName: "gauge.with.needle")
+                .foregroundStyle(.secondary)
+            if let remaining = remainingBudget {
+                Text("Ce mois-ci : \(formatUSD(cloudUsage.currentMonthSpendUSD)) dépensés · reste \(formatUSD(max(remaining, 0))) sur \(formatUSD(settings.cloudBudgetMonthlyUSD))")
+                    .font(.caption)
+                    .foregroundStyle(remaining <= 0 ? .red : .secondary)
+            } else {
+                Text("Ce mois-ci : \(formatUSD(cloudUsage.currentMonthSpendUSD)) dépensés · aucun plafond défini")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        if let remaining = remainingBudget, queueEstimate.knownCost > remaining {
+            Label(
+                "L'estimation dépasse le budget restant — le moteur refusera de lancer. Ajustez le budget dans Réglages ou repassez en local.",
+                systemImage: "exclamationmark.triangle.fill"
+            )
+            .font(.caption)
+            .foregroundStyle(.orange)
+        }
+        EmptyView()
+            .task {
+                if cloudUsage.summary == nil {
+                    await cloudUsage.refresh()
+                }
+            }
     }
 }
 
@@ -1808,6 +1954,7 @@ struct LibraryView: View {
     /// Off by default — surfaces the opportunity / task related to
     /// the event (whatever Odoo returned in ``related_object``).
     @AppStorage("libraryShowsOdooRelatedColumn") private var showsOdooRelatedColumn = false
+    @AppStorage("libraryShowsCloudCostColumn") private var showsCloudCostColumn = false
     /// Sort order driving the table — defaults to most-recently
     /// updated first, mirroring what the engine returns from
     /// ``library_list``. Columns toggle between ascending and
@@ -1862,6 +2009,7 @@ struct LibraryView: View {
                 Toggle("Date réunion", isOn: $showsMeetingDateColumn)
                 Toggle("Interlocuteurs", isOn: $showsSpeakersColumn)
                 Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
+                Toggle("Coût API", isOn: $showsCloudCostColumn)
                 Divider()
                 Toggle("Réunion Odoo", isOn: $showsOdooMeetingColumn)
                 Toggle("Opportunité / tâche Odoo", isOn: $showsOdooRelatedColumn)
@@ -1882,6 +2030,167 @@ struct LibraryView: View {
         .padding(24)
     }
 
+    // The library Table grew past the 10-statement ceiling of
+    // TableColumnBuilder when the Coût API column landed, and the
+    // single expression became un-type-checkable. Each bundle below
+    // is now its own builder property, type-checked independently.
+    @TableColumnBuilder<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>>
+    private var fileColumn: some TableColumnContent<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>> {
+        TableColumn("Fichier", value: \.sortableTitle) { displayRow in
+            if let artifact = displayRow.artifact {
+                ArtifactTreeNameCell(artifact: artifact)
+            } else if let version = displayRow.previousVersion {
+                PreviousVersionTreeNameCell(version: version)
+            } else {
+                HStack(spacing: 8) {
+                    Button {
+                        toggleExpanded(displayRow.job)
+                    } label: {
+                        Image(systemName: expandedJobIDs.contains(displayRow.job.id) ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .frame(width: 18)
+                    Text(displayRow.job.customTitleOrFilename)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    toggleExpanded(displayRow.job)
+                }
+            }
+        }
+        .width(min: 360, ideal: 520)
+    }
+
+    @TableColumnBuilder<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>>
+    private var statusColumns: some TableColumnContent<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>> {
+        if showsStatusColumn {
+            TableColumn("Statut", value: \.sortableStatus) { displayRow in
+                if displayRow.isJobRow {
+                    Image(systemName: statusIconName(displayRow.job.status))
+                        .foregroundStyle(statusColor(displayRow.job.status))
+                        .help(localizedStatus(displayRow.job.status))
+                        // Centre the glyph in the column;
+                        // a left-aligned icon hugged the
+                        // column edge and read like a list
+                        // bullet rather than a status.
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+            }
+            .width(min: 54, ideal: 64, max: 80)
+        }
+
+        if showsUpdatedColumn {
+            TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
+                if displayRow.isJobRow {
+                    Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .width(min: 140, ideal: 170)
+        }
+
+        if showsArtefactsColumn {
+            TableColumn("Artefacts") { displayRow in
+                if let artifact = displayRow.artifact {
+                    Text(artifactSubtitle(artifact))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if let version = displayRow.previousVersion {
+                    Text(version.artefactSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    ArtifactDots(row: displayRow.job)
+                }
+            }
+            .width(min: 190, ideal: 240)
+        }
+    }
+
+    @TableColumnBuilder<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>>
+    private var metadataColumns: some TableColumnContent<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>> {
+        if showsMeetingDateColumn {
+            TableColumn("Date réunion", value: \.sortableMeetingDate) { displayRow in
+                if displayRow.isJobRow {
+                    Text(displayMeetingDate(displayRow.job.meeting_date))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .width(min: 130, ideal: 160)
+        }
+
+        if showsSpeakersColumn {
+            TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
+                if displayRow.isJobRow {
+                    SpeakerListingCell(names: displayRow.job.displayedSpeakerNames)
+                }
+            }
+            .width(min: 160, ideal: 220)
+        }
+
+        if showsProjectSizeColumn {
+            TableColumn("Poids", value: \.sortableTotalBytes) { displayRow in
+                if displayRow.isJobRow {
+                    Text(displayRow.displayedTotalBytes)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+            }
+            .width(min: 80, ideal: 100, max: 140)
+        }
+    }
+
+    @TableColumnBuilder<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>>
+    private var costAndOdooColumns: some TableColumnContent<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>> {
+        if showsCloudCostColumn {
+            TableColumn("Coût API", value: \.sortableCloudCost) { displayRow in
+                if displayRow.isJobRow {
+                    Text(displayRow.displayedCloudCost)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .help(displayRow.job.cloud_model ?? "")
+                }
+            }
+            .width(min: 80, ideal: 100, max: 140)
+        }
+
+        if showsOdooMeetingColumn {
+            TableColumn("Réunion Odoo", value: \.sortableOdooMeeting) { displayRow in
+                if displayRow.isJobRow {
+                    OdooMeetingCell(
+                        row: displayRow.job,
+                        onEdit: { editingRow = displayRow.job }
+                    )
+                }
+            }
+            .width(min: 160, ideal: 200)
+        }
+
+        if showsOdooRelatedColumn {
+            TableColumn("Opportunité / tâche", value: \.sortableOdooRelated) { displayRow in
+                if displayRow.isJobRow {
+                    OdooRelatedCell(
+                        row: displayRow.job,
+                        onEdit: { editingRow = displayRow.job }
+                    )
+                }
+            }
+            .width(min: 160, ideal: 200)
+        }
+    }
+
+
+
     var body: some View {
         VStack(spacing: 0) {
             libraryHeader
@@ -1901,136 +2210,10 @@ struct LibraryView: View {
                         displayRows,
                         sortOrder: $sortOrder
                     ) {
-                        TableColumn("Fichier", value: \.sortableTitle) { displayRow in
-                            if let artifact = displayRow.artifact {
-                                ArtifactTreeNameCell(artifact: artifact)
-                            } else if let version = displayRow.previousVersion {
-                                PreviousVersionTreeNameCell(version: version)
-                            } else {
-                                HStack(spacing: 8) {
-                                    Button {
-                                        toggleExpanded(displayRow.job)
-                                    } label: {
-                                        Image(systemName: expandedJobIDs.contains(displayRow.job.id) ? "chevron.down" : "chevron.right")
-                                            .font(.caption.weight(.semibold))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .frame(width: 18)
-                                    Text(displayRow.job.customTitleOrFilename)
-                                        .font(.headline)
-                                        .lineLimit(1)
-                                        .truncationMode(.tail)
-                                }
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    toggleExpanded(displayRow.job)
-                                }
-                            }
-                        }
-                        .width(min: 360, ideal: 520)
-
-                        if showsStatusColumn {
-                            TableColumn("Statut", value: \.sortableStatus) { displayRow in
-                                if displayRow.isJobRow {
-                                    Image(systemName: statusIconName(displayRow.job.status))
-                                        .foregroundStyle(statusColor(displayRow.job.status))
-                                        .help(localizedStatus(displayRow.job.status))
-                                        // Centre the glyph in the column;
-                                        // a left-aligned icon hugged the
-                                        // column edge and read like a list
-                                        // bullet rather than a status.
-                                        .frame(maxWidth: .infinity, alignment: .center)
-                                }
-                            }
-                            .width(min: 54, ideal: 64, max: 80)
-                        }
-
-                        if showsUpdatedColumn {
-                            TableColumn("Mis à jour", value: \.sortableUpdatedAt) { displayRow in
-                                if displayRow.isJobRow {
-                                    Text(displayRow.job.updated_at ?? displayRow.job.created_at ?? "-")
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(2)
-                                }
-                            }
-                            .width(min: 140, ideal: 170)
-                        }
-
-                        if showsArtefactsColumn {
-                            TableColumn("Artefacts") { displayRow in
-                                if let artifact = displayRow.artifact {
-                                    Text(artifactSubtitle(artifact))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                } else if let version = displayRow.previousVersion {
-                                    Text(version.artefactSummary)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                } else {
-                                    ArtifactDots(row: displayRow.job)
-                                }
-                            }
-                            .width(min: 190, ideal: 240)
-                        }
-
-                        if showsMeetingDateColumn {
-                            TableColumn("Date réunion", value: \.sortableMeetingDate) { displayRow in
-                                if displayRow.isJobRow {
-                                    Text(displayMeetingDate(displayRow.job.meeting_date))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                            }
-                            .width(min: 130, ideal: 160)
-                        }
-
-                        if showsSpeakersColumn {
-                            TableColumn("Interlocuteurs", value: \.sortableSpeakerListing) { displayRow in
-                                if displayRow.isJobRow {
-                                    SpeakerListingCell(names: displayRow.job.displayedSpeakerNames)
-                                }
-                            }
-                            .width(min: 160, ideal: 220)
-                        }
-
-                        if showsProjectSizeColumn {
-                            TableColumn("Poids", value: \.sortableTotalBytes) { displayRow in
-                                if displayRow.isJobRow {
-                                    Text(displayRow.displayedTotalBytes)
-                                        .font(.callout.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                        .frame(maxWidth: .infinity, alignment: .trailing)
-                                }
-                            }
-                            .width(min: 80, ideal: 100, max: 140)
-                        }
-
-                        if showsOdooMeetingColumn {
-                            TableColumn("Réunion Odoo", value: \.sortableOdooMeeting) { displayRow in
-                                if displayRow.isJobRow {
-                                    OdooMeetingCell(
-                                        row: displayRow.job,
-                                        onEdit: { editingRow = displayRow.job }
-                                    )
-                                }
-                            }
-                            .width(min: 160, ideal: 200)
-                        }
-
-                        if showsOdooRelatedColumn {
-                            TableColumn("Opportunité / tâche", value: \.sortableOdooRelated) { displayRow in
-                                if displayRow.isJobRow {
-                                    OdooRelatedCell(
-                                        row: displayRow.job,
-                                        onEdit: { editingRow = displayRow.job }
-                                    )
-                                }
-                            }
-                            .width(min: 160, ideal: 200)
-                        }
-
+                        fileColumn
+                        statusColumns
+                        metadataColumns
+                        costAndOdooColumns
                         TableColumn("Actions") { displayRow in
                             if let artifact = displayRow.artifact {
                                 ArtifactInlineActions(
@@ -2215,8 +2398,8 @@ struct ModelsView: View {
     var body: some View {
         VStack(spacing: 0) {
             ListHeaderView(
-                title: "Modèles locaux",
-                subtitle: "Téléchargez les modèles avant une réunion pour éviter les surprises.",
+                title: "Modèles",
+                subtitle: "Téléchargez les modèles locaux avant une réunion ; les modèles cloud s'activent ici et se facturent au token.",
                 actionTitle: "Actualiser",
                 actionSystemImage: "arrow.clockwise"
             ) {
@@ -2265,6 +2448,7 @@ struct ModelsView: View {
 /// filtering stays a single string compare.
 enum ModelRole: String, Hashable, CaseIterable {
     case transcription
+    case cloudTranscription = "cloud_transcription"
     case multipass
     case textLLM = "text_llm"
     case audioLLM = "audio_llm"
@@ -2272,12 +2456,13 @@ enum ModelRole: String, Hashable, CaseIterable {
     case embedding
 
     static var displayOrder: [ModelRole] {
-        [.transcription, .multipass, .diarisation, .textLLM, .audioLLM, .embedding]
+        [.transcription, .cloudTranscription, .multipass, .diarisation, .textLLM, .audioLLM, .embedding]
     }
 
     var title: String {
         switch self {
         case .transcription: "Transcription"
+        case .cloudTranscription: "Transcription Cloud (API)"
         case .multipass: "Repasse qualité maximale"
         case .diarisation: "Diarisation (détection des locuteurs)"
         case .textLLM: "Correction textuelle (LLM)"
@@ -2290,6 +2475,8 @@ enum ModelRole: String, Hashable, CaseIterable {
         switch self {
         case .transcription:
             return "Le moteur Whisper qui transforme l'audio en texte. Choix par défaut pour chaque réunion."
+        case .cloudTranscription:
+            return "Modèles distants Gemini : transcription + locuteurs + titre en un appel. Facturés au token — clé API et budget dans Réglages."
         case .multipass:
             return "Re-transcrit les zones où Whisper hésite, avec un modèle plus précis. Optionnel."
         case .diarisation:
@@ -2306,6 +2493,7 @@ enum ModelRole: String, Hashable, CaseIterable {
     var icon: String {
         switch self {
         case .transcription: "waveform"
+        case .cloudTranscription: "cloud"
         case .multipass: "arrow.triangle.2.circlepath"
         case .diarisation: "person.2.wave.2"
         case .textLLM: "text.badge.checkmark"
@@ -2319,7 +2507,7 @@ enum ModelRole: String, Hashable, CaseIterable {
     /// the engine picks them from a fixed list, no user choice.
     var isUserSelectable: Bool {
         switch self {
-        case .transcription, .multipass, .textLLM, .audioLLM:
+        case .transcription, .cloudTranscription, .multipass, .textLLM, .audioLLM:
             return true
         case .diarisation, .embedding:
             return false
@@ -2337,6 +2525,7 @@ struct ModelRoleSection: View {
     private var activeID: String? {
         switch role {
         case .transcription: return settings.whisperModel
+        case .cloudTranscription: return settings.cloudModel
         case .multipass: return settings.multipassModel
         case .textLLM: return settings.textLlmModel
         case .audioLLM: return settings.audioLlmModel
@@ -2463,7 +2652,15 @@ struct ModelRoleRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if row.size_mb > 0 {
+                    if row.isCloud {
+                        Text("· \(row.estimatedHourlyCostLabel)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .help(String(
+                                format: "Entrée audio %.2f $US / M tokens · sortie %.2f $US / M tokens",
+                                row.price_in_per_1m, row.price_out_per_1m
+                            ))
+                    } else if row.size_mb > 0 {
                         Text("· \(formattedSize(row.size_mb))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -2472,7 +2669,12 @@ struct ModelRoleRow: View {
             }
             Spacer()
             // State badge — clearer than the previous "État" column.
-            if row.cached {
+            if row.isCloud {
+                Label("API distante", systemImage: "cloud.fill")
+                    .labelStyle(.iconOnly)
+                    .foregroundStyle(.teal)
+                    .help("Modèle distant — rien à télécharger, facturé au token")
+            } else if row.cached {
                 Label("Téléchargé", systemImage: "internaldrive.fill")
                     .labelStyle(.iconOnly)
                     .foregroundStyle(.green)
@@ -2520,7 +2722,7 @@ struct ModelRoleRow: View {
                     .foregroundStyle(.secondary)
             }
 
-            if row.cached {
+            if row.cached && !row.isCloud {
                 Button {
                     Task { await models.delete(row) }
                 } label: {
@@ -2530,14 +2732,16 @@ struct ModelRoleRow: View {
                 .buttonStyle(.borderless)
                 .help("Libérer l'espace disque")
             }
-            Button {
-                revealInFinder(row.cache_dir)
-            } label: {
-                Label("Cache", systemImage: "folder")
+            if !row.isCloud {
+                Button {
+                    revealInFinder(row.cache_dir)
+                } label: {
+                    Label("Cache", systemImage: "folder")
+                }
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .help("Afficher le dossier de cache")
             }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .help("Afficher le dossier de cache")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -2585,6 +2789,7 @@ struct ModelRoleRow: View {
     private func setActive(_ modelID: String) {
         switch role {
         case .transcription: settings.whisperModel = modelID
+        case .cloudTranscription: settings.cloudModel = modelID
         case .multipass: settings.multipassModel = modelID
         case .textLLM: settings.textLlmModel = modelID
         case .audioLLM: settings.audioLlmModel = modelID
@@ -2692,6 +2897,7 @@ struct SettingsView: View {
     @EnvironmentObject private var energy: EnergyMonitor
     @EnvironmentObject private var pyannote: PyannoteStatusStore
     @EnvironmentObject private var deps: DepsStore
+    @EnvironmentObject private var cloudUsage: CloudUsageStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -2901,6 +3107,94 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
+                Section("Transcription Cloud (Gemini)") {
+                    SecureField("Clé API Gemini", text: $settings.cloudApiKey)
+                    HStack {
+                        Button {
+                            if let url = URL(string: "https://aistudio.google.com/apikey") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        } label: {
+                            Label("Créer ou gérer la clé", systemImage: "person.crop.circle.badge.key")
+                        }
+                        Button {
+                            Task { await cloudUsage.checkKey(settings.cloudApiKey) }
+                        } label: {
+                            if cloudUsage.keyCheck == .checking {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("Vérifier la clé", systemImage: "checkmark.shield")
+                            }
+                        }
+                        .disabled(!settings.cloudConfigured || cloudUsage.keyCheck == .checking)
+                    }
+                    switch cloudUsage.keyCheck {
+                    case .ok(let count):
+                        Text("OK · clé valide · \(count) modèle(s) accessibles.")
+                            .font(.callout)
+                            .foregroundStyle(.green)
+                    case .failed(let message):
+                        Text(message)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                    case .idle, .checking:
+                        EmptyView()
+                    }
+                    HStack {
+                        Text("Budget mensuel")
+                        Spacer()
+                        TextField(
+                            "Budget mensuel",
+                            value: $settings.cloudBudgetMonthlyUSD,
+                            format: .number.precision(.fractionLength(0...2))
+                        )
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 90)
+                        .labelsHidden()
+                        Text("$US")
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Plafond strict vérifié avant chaque envoi : un traitement dont l'estimation dépasse le restant est refusé. 0 désactive le plafond.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let summary = cloudUsage.summary {
+                        LabeledContent("Dépensé ce mois-ci") {
+                            Text(formatUSD(summary.current_month_cost_usd))
+                                .font(.callout.monospacedDigit())
+                                .foregroundStyle(
+                                    settings.cloudBudgetMonthlyUSD > 0
+                                        && summary.current_month_cost_usd >= settings.cloudBudgetMonthlyUSD
+                                        ? .red : .primary
+                                )
+                        }
+                        if settings.cloudBudgetMonthlyUSD > 0 {
+                            ProgressView(
+                                value: min(summary.current_month_cost_usd, settings.cloudBudgetMonthlyUSD),
+                                total: settings.cloudBudgetMonthlyUSD
+                            )
+                            .tint(
+                                summary.current_month_cost_usd >= settings.cloudBudgetMonthlyUSD * 0.8
+                                    ? .orange : .teal
+                            )
+                        }
+                        let history = summary.months.filter { $0.month != summary.current_month }
+                        if !history.isEmpty {
+                            DisclosureGroup("Historique") {
+                                ForEach(history) { month in
+                                    LabeledContent(month.month) {
+                                        Text("\(formatUSD(month.cost_usd ?? 0)) · \(month.calls) appel(s)")
+                                            .font(.caption.monospacedDigit())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Text("L'audio est envoyé à l'API Gemini le temps de la transcription puis supprimé des serveurs. Avec une clé d'offre payante, Google n'utilise pas vos données pour l'entraînement.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Section("Voix mémorisées") {
                     SpeakerProfilesSection()
                 }
@@ -2933,6 +3227,11 @@ struct SettingsView: View {
             .padding()
         }
         .frame(minWidth: 620, minHeight: 520)
+        .task {
+            // Refresh the month-to-date spend whenever the sheet
+            // opens — the budget line is only useful if current.
+            await cloudUsage.refresh()
+        }
     }
 
 }
@@ -3459,6 +3758,14 @@ extension LibraryDisplayRow {
     var displayedTotalBytes: String {
         guard let bytes = job.total_bytes else { return "—" }
         return formatFileBytes(bytes)
+    }
+    /// 0 groups local jobs together on either sort direction without
+    /// poisoning the real cloud figures.
+    var sortableCloudCost: Double { job.cloud_cost_usd ?? 0 }
+    /// "—" on local jobs; the per-job spend otherwise.
+    var displayedCloudCost: String {
+        guard let cost = job.cloud_cost_usd else { return "—" }
+        return formatUSD(cost)
     }
     /// Calendar event name when paired, else empty (renders as "—").
     /// Sort key alphabetises detached jobs at the bottom by prefix.

@@ -7,6 +7,9 @@ enum EngineEventKind: String, Codable {
     case warning
     case error
     case done
+    /// Token + cost telemetry emitted by the cloud transcription
+    /// engine after each remote API call.
+    case usage
 }
 
 struct EngineEvent: Codable, Identifiable {
@@ -24,6 +27,11 @@ struct EngineEvent: Codable, Identifiable {
     let speakers: [String: String]?
     let technical_terms: [String]?
     let summary: [String: JSONValue]?
+    // Usage-event payload (nil on every other event kind).
+    let provider: String?
+    let input_tokens: Int?
+    let output_tokens: Int?
+    let cost_usd: Double?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -39,6 +47,10 @@ struct EngineEvent: Codable, Identifiable {
         case speakers
         case technical_terms
         case summary
+        case provider
+        case input_tokens
+        case output_tokens
+        case cost_usd
     }
 }
 
@@ -171,6 +183,13 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     /// so the current run is free to overwrite the originals
     /// without losing work.
     var previous_versions_json: String?
+    /// Total remote-API spend of the job in USD, denormalised from
+    /// the ``api_usage`` ledger. NULL on local-only jobs — the
+    /// optional "Coût API" column renders those as "—".
+    var cloud_cost_usd: Double?
+    /// Remote model that produced the transcript (e.g.
+    /// "gemini-3.5-flash"). NULL on local jobs.
+    var cloud_model: String?
 
     var filename: String {
         URL(fileURLWithPath: source_path ?? "").lastPathComponent
@@ -510,6 +529,71 @@ enum TranscriptionQualityPreset: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Which transcription stack runs the queue: the historic on-device
+/// MLX Whisper pipeline, or a remote API (Gemini) that returns
+/// transcript + diarisation + titre in one call — better quality on
+/// hard audio, but metered. Mirrors the engine's
+/// ``TranscriptionSettings.transcription_engine`` values exactly.
+enum TranscriptionEngineChoice: String, Codable, CaseIterable, Identifiable {
+    case local
+    case cloud
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .local: return "Local (Whisper)"
+        case .cloud: return "Cloud (Gemini)"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .local:
+            return "Tout reste sur ce Mac. Gratuit, plus lent, qualité selon le modèle Whisper choisi."
+        case .cloud:
+            return "L'audio est envoyé à l'API Gemini (transcription + locuteurs + titre en un appel). Facturé au token — le coût estimé s'affiche avant le lancement."
+        }
+    }
+}
+
+/// Client-side mirror of the engine's audio cost model: Gemini
+/// tokenises audio at 32 tokens/s and a dense meeting renders to
+/// ~10 output tokens/s of JSON. Used for the pre-launch estimate
+/// only — the engine re-checks against the real budget before any
+/// upload, and bills from the API's actual counters afterwards.
+func estimatedCloudCostUSD(
+    durationSeconds: Double,
+    priceInPer1M: Double,
+    priceOutPer1M: Double
+) -> Double {
+    guard durationSeconds > 0 else { return 0 }
+    let inputTokens = durationSeconds * 32 + 400
+    let outputTokens = durationSeconds * 10 + 300
+    return (inputTokens * priceInPer1M + outputTokens * priceOutPer1M) / 1_000_000
+}
+
+func formatUSD(_ value: Double) -> String {
+    String(format: "%.2f $US", value)
+}
+
+/// Decoded payload of the engine's ``usage-summary`` command.
+struct CloudUsageSummary: Codable, Equatable {
+    struct Month: Codable, Equatable, Identifiable {
+        var month: String
+        var calls: Int
+        var input_tokens: Int?
+        var output_tokens: Int?
+        var cost_usd: Double?
+
+        var id: String { month }
+    }
+
+    var current_month: String
+    var current_month_cost_usd: Double
+    var months: [Month]
+}
+
 struct TranscriptionSettings: Codable {
     var mlx_whisper_path = "\(NSHomeDirectory())/Library/Application Support/EkoVideo Compressor/mlx-whisper-venv/bin/mlx_whisper"
     var model = "mlx-community/whisper-large-v3-turbo"
@@ -560,4 +644,17 @@ struct TranscriptionSettings: Codable {
     /// glossary in-process. Cheaper alternative to chunked re-passes
     /// at 5-minute boundaries. ``max`` preset toggles this on.
     var hot_prompt_enrichment: Bool = false
+    /// "local" (MLX Whisper on-device) or "cloud" (remote Gemini
+    /// call). The engine routes the whole quality stack on this.
+    var transcription_engine: String = TranscriptionEngineChoice.local.rawValue
+    /// Remote model id; empty falls back to the engine's catalogue
+    /// default.
+    var cloud_model: String = ""
+    /// Gemini API key. Travels on the job request like the Odoo
+    /// credentials; the engine redacts it before persisting
+    /// settings to the library DB.
+    var cloud_api_key: String = ""
+    /// Hard monthly spending cap in USD enforced engine-side
+    /// (0 = no cap). The estimate is checked *before* any upload.
+    var cloud_budget_monthly_usd: Double = 0
 }

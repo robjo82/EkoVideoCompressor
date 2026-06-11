@@ -10,6 +10,7 @@ from .deps import check as deps_check, upgrade as deps_upgrade
 from .events import stdout_event_sink
 from .hf import hf_check
 from .library import (
+    database,
     library_delete,
     library_free_source,
     library_recompute_total_bytes,
@@ -242,6 +243,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     hf = sub.add_parser("hf-check")
     hf.add_argument("--token", required=True)
+
+    # ----- Cloud transcription -------------------------------------
+    # ``cloud-check`` validates the API key behind the Réglages
+    # « Vérifier la clé » button; ``usage-summary`` feeds the monthly
+    # spend display next to the budget field and in Run Setup.
+    cloud_check = sub.add_parser("cloud-check")
+    cloud_check.add_argument("--api-key", required=True)
+
+    usage_summary = sub.add_parser("usage-summary")
+    usage_summary.add_argument("--months", type=int, default=6)
 
     logs = sub.add_parser("export-logs")
     logs.add_argument("--output", default="")
@@ -520,6 +531,31 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "hf-check":
             _print_json(hf_check(args.token))
+            return 0
+
+        if args.command == "cloud-check":
+            from cloud_transcription import CloudTranscriptionError, GeminiClient
+
+            try:
+                payload = GeminiClient(args.api_key).check_access()
+                _print_json(payload)
+                return 0
+            except CloudTranscriptionError as exc:
+                _print_json({"ok": False, "error": str(exc), "code": exc.code})
+                return 1
+
+        if args.command == "usage-summary":
+            from datetime import datetime as _dt
+
+            db = database()
+            current_month = _dt.now().strftime("%Y-%m")
+            _print_json(
+                {
+                    "current_month": current_month,
+                    "current_month_cost_usd": db.month_api_spend_usd(current_month),
+                    "months": db.api_usage_summary(months=args.months),
+                }
+            )
             return 0
 
         if args.command == "export-logs":
