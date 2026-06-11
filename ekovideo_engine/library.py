@@ -231,6 +231,43 @@ def library_free_source(job_id: int) -> dict[str, Any]:
     return summary
 
 
+def library_recompute_total_bytes() -> dict[str, Any]:
+    """PR AY — re-walk every job workspace and refresh the stored
+    ``total_bytes`` snapshot.
+
+    The "Poids" column reads a snapshot taken at job completion;
+    PR AS refreshes it when "Libérer la source" runs — but sources
+    freed on app versions BEFORE that fix left snapshots frozen at
+    the pre-deletion size (the user's job showed 21,5 Go for a
+    950 Mo workspace). One-shot heal pass driven by the SwiftUI
+    launch sequence; cheap enough to re-run (a directory walk per
+    job, ~dozens of folders).
+
+    Jobs whose workspace no longer exists are skipped — NULLing the
+    column would downgrade legacy rows to "—" for no benefit.
+    """
+    db = database()
+    updated = 0
+    skipped = 0
+    for row in db.list_jobs(limit=10_000):
+        workspace = (row.get("workspace_dir") or "").strip()
+        if not workspace:
+            skipped += 1
+            continue
+        workspace_path = Path(workspace).expanduser()
+        if not workspace_path.is_dir():
+            skipped += 1
+            continue
+        new_total = _directory_total_bytes(workspace_path)
+        if new_total != (row.get("total_bytes") or 0):
+            db.update_job_total_bytes(row["id"], new_total)
+            updated += 1
+    append_app_log(
+        f"engine_recompute_total_bytes updated={updated} skipped={skipped}"
+    )
+    return {"updated": updated, "skipped": skipped}
+
+
 def _directory_total_bytes(directory: Path) -> int:
     """Cumulative size of every regular file under ``directory``.
 

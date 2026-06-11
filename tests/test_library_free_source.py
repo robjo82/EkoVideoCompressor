@@ -167,5 +167,47 @@ class LibraryFreeSourceTests(unittest.TestCase):
             db.update_job_total_bytes.assert_not_called()
 
 
+class RecomputeTotalBytesTests(unittest.TestCase):
+    """PR AY — heal stale "Poids" snapshots.
+
+    Sources freed on pre-PR-AS app versions kept total_bytes frozen
+    at the pre-deletion size (job 26 showed 21,5 Go for a 950 Mo
+    workspace). The one-shot heal re-walks every workspace.
+    """
+
+    def test_recomputes_stale_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            (ws / "compressed.mp4").write_bytes(b"y" * 500)
+            db = MagicMock()
+            db.list_jobs.return_value = [
+                {"id": 7, "workspace_dir": str(ws), "total_bytes": 21_000_000_000},
+            ]
+            from ekovideo_engine.library import library_recompute_total_bytes
+            with patch("ekovideo_engine.library.database", return_value=db):
+                result = library_recompute_total_bytes()
+            self.assertEqual(result["updated"], 1)
+            db.update_job_total_bytes.assert_called_once_with(7, 500)
+
+    def test_skips_missing_workspace_and_current_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            ws.mkdir()
+            (ws / "a.bin").write_bytes(b"x" * 100)
+            db = MagicMock()
+            db.list_jobs.return_value = [
+                {"id": 1, "workspace_dir": str(ws), "total_bytes": 100},  # already right
+                {"id": 2, "workspace_dir": f"{tmp}/gone", "total_bytes": 5},  # missing dir
+                {"id": 3, "workspace_dir": "", "total_bytes": 5},  # no workspace
+            ]
+            from ekovideo_engine.library import library_recompute_total_bytes
+            with patch("ekovideo_engine.library.database", return_value=db):
+                result = library_recompute_total_bytes()
+            self.assertEqual(result["updated"], 0)
+            self.assertEqual(result["skipped"], 2)
+            db.update_job_total_bytes.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

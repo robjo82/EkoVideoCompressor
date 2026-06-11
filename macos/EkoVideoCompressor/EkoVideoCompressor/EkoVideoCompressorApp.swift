@@ -71,6 +71,9 @@ struct RootView: View {
     /// when introducing a new migration that needs to run again.
     /// ``@AppStorage`` persists this across launches automatically.
     @AppStorage("librarySpeakerMapsRepaired_v1") private var speakerMapsRepaired = false
+    /// PR AY — once-only "Poids" heal: sources freed on pre-PR-AS app
+    /// versions left ``total_bytes`` frozen at the pre-deletion size.
+    @AppStorage("libraryTotalBytesRepaired_v1") private var totalBytesRepaired = false
 
     var body: some View {
         ZStack {
@@ -117,6 +120,17 @@ struct RootView: View {
                     await library.refresh()
                 }
                 speakerMapsRepaired = true
+            }
+            // PR AY — refresh stale "Poids" snapshots (sources freed
+            // on pre-PR-AS versions kept their pre-deletion size).
+            // Runs after the UI is up; refreshes the list only when
+            // something actually changed.
+            if !totalBytesRepaired {
+                if let summary = await library.recomputeSizes(),
+                   (summary["updated"] ?? 0) > 0 {
+                    await library.refresh()
+                }
+                totalBytesRepaired = true
             }
         }
     }

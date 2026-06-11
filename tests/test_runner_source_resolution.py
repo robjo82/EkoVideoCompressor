@@ -19,6 +19,7 @@ from ekovideo_engine.library import database
 from ekovideo_engine.models import JobRequest
 from ekovideo_engine.runner import (
     _auto_rename_job_from_transcript,
+    _degrade_mode_for_compressed_source,
     _merge_declared_speaker_context,
     _resolve_source_path,
 )
@@ -47,7 +48,7 @@ class ResolveSourcePathTest(unittest.TestCase):
             src = Path(tmp) / "meeting.mp4"
             src.write_bytes(b"fake")
             request = _make_request(source_path=str(src))
-            self.assertEqual(_resolve_source_path(request), src)
+            self.assertEqual(_resolve_source_path(request), (src, "request_source"))
 
     def test_falls_back_to_workspace_copy_when_source_moved(self):
         # The classic re-run case: original was deleted via
@@ -62,7 +63,8 @@ class ResolveSourcePathTest(unittest.TestCase):
                 workspace_dir=str(workspace),
             )
             self.assertEqual(
-                _resolve_source_path(request), workspace / "meeting.mp4"
+                _resolve_source_path(request),
+                (workspace / "meeting.mp4", "workspace_copy"),
             )
 
     def test_falls_back_to_stored_workspace_when_request_lacks_one(self):
@@ -87,8 +89,9 @@ class ResolveSourcePathTest(unittest.TestCase):
                     source_path="/nowhere/meeting.mp4",
                     library_job_id=job_id,
                 )
-                resolved = _resolve_source_path(request)
+                resolved, tier = _resolve_source_path(request)
             self.assertEqual(resolved, workspace / "meeting.mp4")
+            self.assertEqual(tier, "workspace_copy")
 
     def test_returns_none_when_nothing_usable_exists(self):
         # Triggers the ``source_missing`` event the SwiftUI side
@@ -101,7 +104,7 @@ class ResolveSourcePathTest(unittest.TestCase):
                 source_path="/nowhere/meeting.mp4",
                 workspace_dir=str(workspace),
             )
-            self.assertIsNone(_resolve_source_path(request))
+            self.assertEqual(_resolve_source_path(request), (None, ""))
 
     def test_blank_source_path_returns_none(self):
         # JobRequest.from_dict refuses a blank source, so we
@@ -120,7 +123,86 @@ class ResolveSourcePathTest(unittest.TestCase):
             compression_settings=CompressionSettings(),
             transcription_settings=TranscriptionSettings(),
         )
-        self.assertIsNone(_resolve_source_path(request))
+        self.assertEqual(_resolve_source_path(request), (None, ""))
+
+
+class CompressedFallbackTest(unittest.TestCase):
+    """PR AY — relaunching a project whose source was freed (PR AP).
+
+    The user freed the heavy source, kept the compressed version,
+    then hit ``source_missing`` on every rerun path except the one
+    artifact button PR AP had wired. The resolver now falls back to
+    the compressed file itself.
+    """
+
+    def test_falls_back_to_compressed_via_db_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "ws"
+            workspace.mkdir()
+            compressed = workspace / "meeting_compressed.mp4"
+            compressed.write_bytes(b"compressed")
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path="/nowhere/meeting.mp4",
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                db.update_job_artefact(job_id, "compressed", str(compressed))
+                request = _make_request(
+                    source_path="/nowhere/meeting.mp4",
+                    library_job_id=job_id,
+                )
+                resolved, tier = _resolve_source_path(request)
+            self.assertEqual(resolved, compressed)
+            self.assertEqual(tier, "compressed")
+
+    def test_falls_back_to_compressed_via_workspace_glob(self):
+        # Caller without a job id (no DB row): the ``<stem>_compressed.*``
+        # glob in the forwarded workspace still finds the media.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            compressed = workspace / "meeting_compressed.m4a"
+            compressed.write_bytes(b"audio")
+            request = _make_request(
+                source_path="/nowhere/meeting.mp4",
+                workspace_dir=str(workspace),
+            )
+            resolved, tier = _resolve_source_path(request)
+            self.assertEqual(resolved, compressed)
+            self.assertEqual(tier, "compressed")
+
+    def test_workspace_copy_outranks_compressed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            workspace.mkdir()
+            (workspace / "meeting.mp4").write_bytes(b"original copy")
+            (workspace / "meeting_compressed.mp4").write_bytes(b"compressed")
+            request = _make_request(
+                source_path="/nowhere/meeting.mp4",
+                workspace_dir=str(workspace),
+            )
+            resolved, tier = _resolve_source_path(request)
+            self.assertEqual(resolved, workspace / "meeting.mp4")
+            self.assertEqual(tier, "workspace_copy")
+
+
+class DegradeModeForCompressedTest(unittest.TestCase):
+    """Re-compressing a compressed file is forbidden (PR AP rule)."""
+
+    def test_compression_modes_degrade_to_transcribe(self):
+        self.assertEqual(_degrade_mode_for_compressed_source("compress"), "transcribe")
+        self.assertEqual(
+            _degrade_mode_for_compressed_source("compress_transcribe"), "transcribe"
+        )
+
+    def test_non_compression_modes_pass_through(self):
+        for mode in ("transcribe", "enhance", "review"):
+            self.assertEqual(_degrade_mode_for_compressed_source(mode), mode)
 
 
 class AutoRenameFromTranscriptTest(unittest.TestCase):
