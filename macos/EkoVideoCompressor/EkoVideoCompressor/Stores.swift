@@ -1278,6 +1278,24 @@ final class LibraryStore: ObservableObject {
         return payload
     }
 
+    /// PR AY — re-walk every job workspace and refresh the stored
+    /// "Poids" snapshot. Heals rows whose source was freed on app
+    /// versions before PR AS (which started recomputing on free):
+    /// those kept showing the pre-deletion size (e.g. 21,5 Go for a
+    /// 950 Mo workspace). Returns ``{"updated": n, "skipped": m}``.
+    func recomputeSizes() async -> [String: Int]? {
+        let result = await EngineProcess.runCommand(
+            arguments: EngineProcess.defaultPythonArguments([
+                "library-recompute-sizes",
+            ])
+        )
+        guard result.status == 0,
+              let data = result.rawOutput.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Int]
+        else { return nil }
+        return payload
+    }
+
     /// Re-runs ``library-recognize-speakers`` against an existing
     /// job's diarisation embeddings and compares them with every
     /// registered ``speaker_profile``. Anything that crosses the

@@ -12,6 +12,7 @@ from .hf import hf_check
 from .library import (
     library_delete,
     library_free_source,
+    library_recompute_total_bytes,
     library_delete_speaker_profile,
     library_merge_speaker_profiles,
     library_reset_speaker_profiles,
@@ -80,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     # SwiftUI so old jobs whose map drifted before PR #30 land on
     # the canonical shape without the user re-Enregistrer'ing each.
     sub.add_parser("library-repair-speaker-maps")
+    sub.add_parser("library-recompute-sizes")
     library_delete_parser = sub.add_parser("library-delete")
     library_delete_parser.add_argument("job_id", type=int)
     # Opt-in flag: also wipe the workspace dir on disk. Without this
@@ -304,6 +306,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "library-repair-speaker-maps":
             _print_json(library_repair_all_speaker_maps())
+            return 0
+
+        if args.command == "library-recompute-sizes":
+            _print_json(library_recompute_total_bytes())
             return 0
 
         if args.command == "library-delete":

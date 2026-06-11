@@ -97,45 +97,62 @@ def _persist_step_durations(db, job_id: int, results: list[StepResult]) -> None:
     db.update_job_durations(job_id, ffmpeg=ffmpeg, whisper=whisper, diarization=diarization)
 
 
-def _resolve_source_path(request: JobRequest) -> Path | None:
-    """Return the path the runner should actually feed to the
-    pipeline, or ``None`` when nothing usable is on disk.
+def _resolve_source_path(request: JobRequest) -> tuple[Path | None, str]:
+    """Return ``(path, tier)`` — the path the runner should actually
+    feed to the pipeline (or ``None`` when nothing usable is on disk)
+    and which lookup tier produced it.
 
-    Three lookup tiers, ordered by trust:
+    Four lookup tiers, ordered by trust:
 
     1. ``request.source_path`` itself if it exists. Covers the
-       fresh-run case (user just dropped a file).
+       fresh-run case (user just dropped a file). Tier
+       ``"request_source"``.
 
     2. The workspace copy at ``request.workspace_dir / basename``.
        Covers reruns where ``delete_source_after_copy`` cleaned up
        the original. Without this the second run of any meeting
        would dead-lock on "source missing" — the canonical copy is
-       in the workspace, not at the original drop path.
+       in the workspace, not at the original drop path. Tier
+       ``"workspace_copy"``.
 
     3. The library row's stored ``workspace_dir`` when the SwiftUI
        caller didn't bother to forward one. Belt-and-braces for
        legacy callers that re-submit a job_id without a workspace.
+       (Same tier label as 2.)
 
-    None of these touch the network, the DB, or anything stateful
-    beyond ``Path.exists()`` — kept deliberately cheap because
-    every job pays the cost on every launch.
+    4. PR AY — the job's COMPRESSED file when both the original and
+       the workspace copy are gone. This is the "Libérer la source"
+       aftermath (PR AP): the product rule says relaunching such a
+       project transcribes the compressed version. PR AP only wired
+       that on the artifact-level button; every other rerun path
+       (row-level Relancer, context editor, à-revoir priority rerun)
+       still submitted the original path and died on
+       ``source_missing``. Resolving it here fixes them all at once.
+       Sources: the DB row's ``compressed_path``, then a
+       ``<stem>_compressed.*`` glob in the known workspaces for
+       callers without a job id. Tier ``"compressed"`` — the caller
+       degrades compression modes accordingly.
+
+    None of these touch the network beyond one DB read — kept
+    deliberately cheap because every job pays the cost on launch.
     """
     if not request.source_path:
         append_app_log("engine_resolve_source skipped reason='empty_source_path'")
-        return None
+        return None, ""
     candidate = Path(request.source_path).expanduser()
     if candidate.exists():
         append_app_log(f"engine_resolve_source hit='request_source' path={str(candidate)!r}")
-        return candidate
+        return candidate, "request_source"
 
     basename = candidate.name
     if not basename:
         append_app_log(f"engine_resolve_source skipped reason='empty_basename' source={request.source_path!r}")
-        return None
+        return None, ""
 
     workspace_dirs: list[str] = []
     if request.workspace_dir:
         workspace_dirs.append(request.workspace_dir)
+    row = None
     if request.library_job_id is not None:
         try:
             row = database().get_job(request.library_job_id)
@@ -153,12 +170,45 @@ def _resolve_source_path(request: JobRequest) -> Path | None:
                 "engine_resolve_source hit='workspace_copy' "
                 f"requested={str(candidate)!r} resolved={str(workspace_copy)!r}"
             )
-            return workspace_copy
+            return workspace_copy, "workspace_copy"
+
+    # Tier 4 — compressed fallback (PR AY).
+    compressed_candidates: list[Path] = []
+    if row:
+        stored_compressed = (row.get("compressed_path") or "").strip()
+        if stored_compressed:
+            compressed_candidates.append(Path(stored_compressed).expanduser())
+    stem = candidate.stem
+    if stem:
+        for workspace_dir in workspace_dirs:
+            compressed_candidates.extend(
+                sorted(Path(workspace_dir).expanduser().glob(f"{stem}_compressed.*"))
+            )
+    for compressed in compressed_candidates:
+        if compressed.exists() and compressed.is_file():
+            append_app_log(
+                "engine_resolve_source hit='compressed' "
+                f"requested={str(candidate)!r} resolved={str(compressed)!r}"
+            )
+            return compressed, "compressed"
+
     append_app_log(
         "engine_resolve_source miss "
         f"requested={str(candidate)!r} workspaces={workspace_dirs!r}"
     )
-    return None
+    return None, ""
+
+
+def _degrade_mode_for_compressed_source(mode: str) -> str:
+    """PR AY — adjust the job mode when the only media left is the
+    compressed file. Re-compressing a compressed file is pointless
+    (and the product rule from PR AP forbids it: once freed, no
+    re-compression), so compression modes degrade to a plain
+    transcription. Non-compression modes pass through untouched.
+    """
+    if mode in ("compress", "compress_transcribe"):
+        return "transcribe"
+    return mode
 
 
 def _auto_rename_job_from_transcript(
@@ -288,7 +338,7 @@ class EngineRunner:
             f"mode={request.mode!r} source={request.source_path!r} "
             f"workspace={request.workspace_dir!r} library_job_id={request.library_job_id!r}"
         )
-        resolved = _resolve_source_path(request)
+        resolved, resolve_tier = _resolve_source_path(request)
         if resolved is None:
             # ``source_missing`` is the trigger the SwiftUI layer
             # listens for to pop the "Relocaliser la source" sheet.
@@ -311,6 +361,26 @@ class EngineRunner:
         # source. Update the request so downstream code (workspace
         # prep, DB row) sees the path that actually exists.
         request.source_path = str(resolved)
+        if resolve_tier == "compressed":
+            # PR AY — the source was freed (PR AP) and only the
+            # compressed file remains. Degrade compression modes and
+            # tell the user what's happening instead of failing with
+            # ``source_missing`` like before.
+            degraded = _degrade_mode_for_compressed_source(request.mode)
+            if degraded != request.mode:
+                append_app_log(
+                    f"engine_mode_degraded_for_compressed from={request.mode!r} "
+                    f"to={degraded!r}"
+                )
+                request.mode = degraded
+            self.sink(
+                WarningEvent(
+                    "La source originale a été libérée — la version "
+                    "compressée est utilisée pour cette relance "
+                    "(transcription uniquement, re-compression impossible).",
+                    code="source_freed_using_compressed",
+                )
+            )
         Path(request.output_dir).mkdir(parents=True, exist_ok=True)
         db = database()
         estimated_total_seconds = _historical_total_estimate_seconds(db, request)
