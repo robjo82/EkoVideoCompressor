@@ -64,28 +64,47 @@ Dans l'onglet `Transcrire`, le modèle recommandé par défaut est:
 
 Le champ `Contexte` sert à ajouter les noms propres, clients, projets, acronymes et termes métier qui doivent guider Whisper. Le contenu est automatiquement formaté pour Whisper (phrase d'amorce en français — le modèle le traite comme du vocabulaire attendu, pas comme une liste).
 
-## Transcription Cloud (API Gemini)
+## Transcription Cloud (API)
 
-En complément du moteur local, un mode **Cloud** envoie l'audio à l'API
-Gemini qui renvoie en un seul appel la transcription horodatée, la
-détection des locuteurs, un titre et les termes techniques — souvent
-meilleur que la chaîne locale sur les audios difficiles.
+En complément du moteur local, un mode **Cloud** envoie l'audio à une API
+distante, souvent meilleure que la chaîne locale sur les audios
+difficiles. Deux familles de modèles sont prises en charge derrière une
+interface unique :
 
-- Choix du moteur (Local / Cloud) au lancement de chaque file, avec le
-  **coût estimé affiché avant l'envoi** (~0,10 à 0,80 $US par heure
-  d'audio selon le modèle).
-- Clé API et **budget mensuel plafond** dans `Réglages` →
-  `Transcription Cloud`. Le moteur refuse tout traitement dont
-  l'estimation dépasse le budget restant ; la consommation réelle
-  (tokens + coût) est suivie par traitement et par mois.
-- Les modèles distants (Gemini 3.5 Flash par défaut) sont listés dans
-  l'onglet `Modèles` avec leur prix au token.
+- **LLM multimodaux** (Gemini) : un seul appel renvoie la transcription
+  horodatée, la détection des locuteurs, un titre et les termes
+  techniques.
+- **STT dédiés** (AssemblyAI, OpenAI gpt-4o-transcribe, Gladia,
+  Deepgram) : transcription + diarisation native, souvent à plus bas
+  coût ; le titre, les noms d'interlocuteurs et les corrections métier
+  sont ajoutés par la passe LLM locale quand elle est installée.
+
+Fournisseurs et tarifs indicatifs (par heure d'audio) :
+
+| Fournisseur / modèle | ≈ coût/h | Particularité |
+|---|---|---|
+| Gemini 3.5 Flash (défaut) | ~0,50 $ | bundle complet (titre + noms) |
+| Gemini 3.1 Flash-Lite | ~0,11 $ | le moins cher des LLM |
+| AssemblyAI Universal-3 | ~0,21 $ | WER FR de pointe |
+| OpenAI gpt-4o-transcribe (diarisation) | ~0,36 $ | pilotable par prompt |
+| OpenAI gpt-4o-mini-transcribe | ~0,18 $ | sans diarisation |
+| Gladia (Solaria-1) | ~0,20–0,61 $ | **hébergé en UE / RGPD** |
+| Deepgram Nova-3 | ~0,26 $ | rapide |
+
+- Choix du moteur (Local / Cloud) et du modèle au lancement de chaque
+  file, avec le **coût estimé affiché avant l'envoi**.
+- **Une clé API par fournisseur** et un **budget mensuel plafond** dans
+  `Réglages` → `Transcription Cloud`. Le moteur refuse tout traitement
+  dont l'estimation dépasse le budget restant ; la consommation réelle
+  (tokens/durée + coût) est suivie par traitement et par mois.
+- Les modèles distants sont listés dans l'onglet `Modèles` avec leur
+  prix (au token ou à l'heure selon le fournisseur).
 - L'audio est compressé (MP3 mono 16 kHz), envoyé par fenêtres de
-  30 minutes puis **supprimé des serveurs Google** sitôt la réponse
-  reçue. Les réunions longues conservent des étiquettes de locuteurs
-  cohérentes d'une fenêtre à l'autre.
+  30 minutes puis **supprimé des serveurs du fournisseur** sitôt la
+  réponse reçue.
 - En cas d'erreur réseau ou de quota, le traitement bascule
-  automatiquement sur le moteur local avec un avertissement.
+  automatiquement sur le moteur local avec un avertissement ; une clé
+  refusée ou un budget atteint échoue explicitement.
 
 ## Amélioration locale progressive
 

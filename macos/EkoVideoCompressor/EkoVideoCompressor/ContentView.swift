@@ -353,7 +353,7 @@ struct ContentView: View {
                 current_user_name: settings.currentUserName.trimmingCharacters(in: .whitespacesAndNewlines),
                 transcription_engine: settings.transcriptionEngine,
                 cloud_model: settings.cloudModel,
-                cloud_api_key: settings.usesCloudTranscription ? settings.cloudApiKey : "",
+                cloud_api_key: settings.usesCloudTranscription ? settings.activeCloudApiKey : "",
                 cloud_budget_monthly_usd: settings.cloudBudgetMonthlyUSD
             ),
             glossary_terms: termsForRun,
@@ -820,8 +820,10 @@ struct CloudEngineRunOptions: View {
             if duration > 0 {
                 cost += estimatedCloudCostUSD(
                     durationSeconds: duration,
+                    billing: model.billing,
                     priceInPer1M: model.price_in_per_1m,
-                    priceOutPer1M: model.price_out_per_1m
+                    priceOutPer1M: model.price_out_per_1m,
+                    pricePerHour: model.price_per_hour
                 )
             } else {
                 unknown += 1
@@ -838,7 +840,7 @@ struct CloudEngineRunOptions: View {
     var body: some View {
         if !settings.cloudConfigured {
             Label {
-                Text("Aucune clé API Gemini configurée. Ajoutez-la dans Réglages → Transcription Cloud avant de lancer.")
+                Text("Aucune clé API \(CloudProviderInfo.label(for: settings.activeCloudProvider)) configurée. Ajoutez-la dans Réglages → Transcription Cloud avant de lancer.")
             } icon: {
                 Image(systemName: "key.slash")
                     .foregroundStyle(.orange)
@@ -2656,10 +2658,19 @@ struct ModelRoleRow: View {
                         Text("· \(row.estimatedHourlyCostLabel)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .help(String(
-                                format: "Entrée audio %.2f $US / M tokens · sortie %.2f $US / M tokens",
-                                row.price_in_per_1m, row.price_out_per_1m
-                            ))
+                            .help(
+                                row.billing == "per_hour"
+                                    ? String(format: "Facturé %.2f $US par heure d'audio", row.price_per_hour)
+                                    : String(
+                                        format: "Entrée audio %.2f $US / M tokens · sortie %.2f $US / M tokens",
+                                        row.price_in_per_1m, row.price_out_per_1m
+                                    )
+                            )
+                        if row.diarizes {
+                            Text("· locuteurs")
+                                .font(.caption2)
+                                .foregroundStyle(.teal)
+                        }
                     } else if row.size_mb > 0 {
                         Text("· \(formattedSize(row.size_mb))")
                             .font(.caption)
@@ -3107,93 +3118,8 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
-                Section("Transcription Cloud (Gemini)") {
-                    SecureField("Clé API Gemini", text: $settings.cloudApiKey)
-                    HStack {
-                        Button {
-                            if let url = URL(string: "https://aistudio.google.com/apikey") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        } label: {
-                            Label("Créer ou gérer la clé", systemImage: "person.crop.circle.badge.key")
-                        }
-                        Button {
-                            Task { await cloudUsage.checkKey(settings.cloudApiKey) }
-                        } label: {
-                            if cloudUsage.keyCheck == .checking {
-                                ProgressView()
-                                    .controlSize(.small)
-                            } else {
-                                Label("Vérifier la clé", systemImage: "checkmark.shield")
-                            }
-                        }
-                        .disabled(!settings.cloudConfigured || cloudUsage.keyCheck == .checking)
-                    }
-                    switch cloudUsage.keyCheck {
-                    case .ok(let count):
-                        Text("OK · clé valide · \(count) modèle(s) accessibles.")
-                            .font(.callout)
-                            .foregroundStyle(.green)
-                    case .failed(let message):
-                        Text(message)
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                    case .idle, .checking:
-                        EmptyView()
-                    }
-                    HStack {
-                        Text("Budget mensuel")
-                        Spacer()
-                        TextField(
-                            "Budget mensuel",
-                            value: $settings.cloudBudgetMonthlyUSD,
-                            format: .number.precision(.fractionLength(0...2))
-                        )
-                        .multilineTextAlignment(.trailing)
-                        .frame(width: 90)
-                        .labelsHidden()
-                        Text("$US")
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Plafond strict vérifié avant chaque envoi : un traitement dont l'estimation dépasse le restant est refusé. 0 désactive le plafond.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if let summary = cloudUsage.summary {
-                        LabeledContent("Dépensé ce mois-ci") {
-                            Text(formatUSD(summary.current_month_cost_usd))
-                                .font(.callout.monospacedDigit())
-                                .foregroundStyle(
-                                    settings.cloudBudgetMonthlyUSD > 0
-                                        && summary.current_month_cost_usd >= settings.cloudBudgetMonthlyUSD
-                                        ? .red : .primary
-                                )
-                        }
-                        if settings.cloudBudgetMonthlyUSD > 0 {
-                            ProgressView(
-                                value: min(summary.current_month_cost_usd, settings.cloudBudgetMonthlyUSD),
-                                total: settings.cloudBudgetMonthlyUSD
-                            )
-                            .tint(
-                                summary.current_month_cost_usd >= settings.cloudBudgetMonthlyUSD * 0.8
-                                    ? .orange : .teal
-                            )
-                        }
-                        let history = summary.months.filter { $0.month != summary.current_month }
-                        if !history.isEmpty {
-                            DisclosureGroup("Historique") {
-                                ForEach(history) { month in
-                                    LabeledContent(month.month) {
-                                        Text("\(formatUSD(month.cost_usd ?? 0)) · \(month.calls) appel(s)")
-                                            .font(.caption.monospacedDigit())
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Text("L'audio est envoyé à l'API Gemini le temps de la transcription puis supprimé des serveurs. Avec une clé d'offre payante, Google n'utilise pas vos données pour l'entraînement.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Section("Transcription Cloud") {
+                    CloudTranscriptionSettingsSection()
                 }
                 Section("Voix mémorisées") {
                     SpeakerProfilesSection()
@@ -3247,6 +3173,145 @@ struct SettingsView: View {
 ///    licence" → browser opens directly on the model card
 /// 4. click "Vérifier à nouveau"
 /// 5. all green
+/// One API-key row in the Réglages cloud section: provider label,
+/// console link, secure field, and a per-provider "Vérifier" button
+/// whose result renders inline.
+struct CloudProviderKeyRow: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var cloudUsage: CloudUsageStore
+    let info: CloudProviderInfo
+
+    private var isActive: Bool { settings.activeCloudProvider == info.id }
+    private var key: String { settings.cloudApiKey(forProvider: info.id) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(info.label)
+                    .font(.callout.weight(.medium))
+                if isActive {
+                    Text("actif")
+                        .font(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(.teal.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.teal)
+                }
+                Spacer()
+                Button {
+                    if let url = URL(string: info.consoleURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Label("Console", systemImage: "arrow.up.forward.square")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .help("Créer ou gérer la clé \(info.label)")
+            }
+            SecureField("Clé API \(info.label)", text: settings.cloudApiKeyBinding(forProvider: info.id))
+            HStack(spacing: 8) {
+                Button {
+                    Task { await cloudUsage.checkKey(key, provider: info.id) }
+                } label: {
+                    if cloudUsage.keyCheck == .checking && cloudUsage.keyCheckProvider == info.id {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Vérifier", systemImage: "checkmark.shield")
+                    }
+                }
+                .controlSize(.small)
+                .disabled(key.trimmingCharacters(in: .whitespaces).isEmpty
+                          || cloudUsage.keyCheck == .checking)
+                if cloudUsage.keyCheckProvider == info.id {
+                    switch cloudUsage.keyCheck {
+                    case .ok(let count):
+                        Text("OK · \(count) modèle(s)")
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    case .failed(let message):
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .lineLimit(2)
+                    case .idle, .checking:
+                        EmptyView()
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// Multi-provider cloud transcription settings: one key per provider,
+/// the monthly budget cap, and the spend-to-date readout.
+struct CloudTranscriptionSettingsSection: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var cloudUsage: CloudUsageStore
+
+    var body: some View {
+        Text("Une clé par fournisseur. Le moteur utilise celle du fournisseur dont dépend le modèle actif (onglet Modèles).")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        ForEach(CloudProviderInfo.all) { info in
+            CloudProviderKeyRow(info: info)
+        }
+        HStack {
+            Text("Budget mensuel")
+            Spacer()
+            TextField(
+                "Budget mensuel",
+                value: $settings.cloudBudgetMonthlyUSD,
+                format: .number.precision(.fractionLength(0...2))
+            )
+            .multilineTextAlignment(.trailing)
+            .frame(width: 90)
+            .labelsHidden()
+            Text("$US").foregroundStyle(.secondary)
+        }
+        Text("Plafond strict vérifié avant chaque envoi : un traitement dont l'estimation dépasse le restant est refusé. 0 désactive le plafond.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        if let summary = cloudUsage.summary {
+            LabeledContent("Dépensé ce mois-ci") {
+                Text(formatUSD(summary.current_month_cost_usd))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(
+                        settings.cloudBudgetMonthlyUSD > 0
+                            && summary.current_month_cost_usd >= settings.cloudBudgetMonthlyUSD
+                            ? .red : .primary
+                    )
+            }
+            if settings.cloudBudgetMonthlyUSD > 0 {
+                ProgressView(
+                    value: min(summary.current_month_cost_usd, settings.cloudBudgetMonthlyUSD),
+                    total: settings.cloudBudgetMonthlyUSD
+                )
+                .tint(
+                    summary.current_month_cost_usd >= settings.cloudBudgetMonthlyUSD * 0.8
+                        ? .orange : .teal
+                )
+            }
+            let history = summary.months.filter { $0.month != summary.current_month }
+            if !history.isEmpty {
+                DisclosureGroup("Historique") {
+                    ForEach(history) { month in
+                        LabeledContent(month.month) {
+                            Text("\(formatUSD(month.cost_usd ?? 0)) · \(month.calls) appel(s)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        Text("L'audio est compressé puis envoyé au fournisseur le temps de la transcription, et supprimé de ses serveurs ensuite. Pour des réunions internes, Gladia est hébergé en UE ; avec une offre payante les fournisseurs n'utilisent pas vos données pour l'entraînement.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+}
+
 struct HuggingFaceSetupSection: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var pyannote: PyannoteStatusStore

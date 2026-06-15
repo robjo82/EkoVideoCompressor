@@ -250,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     # spend display next to the budget field and in Run Setup.
     cloud_check = sub.add_parser("cloud-check")
     cloud_check.add_argument("--api-key", required=True)
+    cloud_check.add_argument("--provider", default="gemini")
 
     usage_summary = sub.add_parser("usage-summary")
     usage_summary.add_argument("--months", type=int, default=6)
@@ -534,10 +535,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.command == "cloud-check":
-            from cloud_transcription import CloudTranscriptionError, GeminiClient
+            from cloud_transcription import CloudTranscriptionError, get_cloud_provider
 
             try:
-                payload = GeminiClient(args.api_key).check_access()
+                payload = get_cloud_provider(args.provider, args.api_key).check_access()
                 _print_json(payload)
                 return 0
             except CloudTranscriptionError as exc:

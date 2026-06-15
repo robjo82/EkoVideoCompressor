@@ -69,11 +69,15 @@ class CatalogRoleCoverageTest(unittest.TestCase):
     def test_size_mb_is_set_on_every_local_row(self):
         # Size powers the download-confirmation dialog. A 0 here
         # would render "—" in the UI and look weirdly opaque. Cloud
-        # rows have nothing on disk — they carry prices instead.
+        # rows have nothing on disk — they carry prices instead, in
+        # whichever billing model the provider uses.
         for row in model_catalog():
             if row.get("kind") == "cloud":
-                self.assertGreater(row["price_in_per_1m"], 0, row["id"])
-                self.assertGreater(row["price_out_per_1m"], 0, row["id"])
+                if row["billing"] == "per_hour":
+                    self.assertGreater(row["price_per_hour"], 0, row["id"])
+                else:
+                    self.assertGreater(row["price_in_per_1m"], 0, row["id"])
+                    self.assertGreater(row["price_out_per_1m"], 0, row["id"])
             else:
                 self.assertGreater(row["size_mb"], 0, row["id"])
 
@@ -87,6 +91,19 @@ class CatalogRoleCoverageTest(unittest.TestCase):
             self.assertTrue(row["cached"], row["id"])
             self.assertEqual(row["cache_dir"], "", row["id"])
             self.assertFalse(row["gated"], row["id"])
+            self.assertIn(row["billing"], {"per_token", "per_hour"}, row["id"])
+
+    def test_cloud_catalogue_spans_all_providers(self):
+        # The Run Setup / Settings rely on every wired provider being
+        # represented by at least one selectable model.
+        from cloud_transcription import CLOUD_PROVIDERS
+
+        providers = {
+            r["provider"]
+            for r in model_catalog()
+            if r["role"] == "cloud_transcription"
+        }
+        self.assertEqual(providers, set(CLOUD_PROVIDERS))
 
     def test_tiers_are_constrained_to_known_values(self):
         allowed = {"light", "balanced", "heavy"}

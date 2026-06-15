@@ -107,31 +107,31 @@ def _fake_subprocess_run(workspace: Path, duration_seconds: float = 600.0):
     return runner
 
 
-class _FakeClient:
-    """GeminiClient stand-in. Class-level hooks let each test tune
-    behaviour without re-plumbing the constructor patch."""
+class _FakeProvider:
+    """CloudProvider stand-in returned by a patched ``get_cloud_provider``.
+    Class-level hooks let each test tune behaviour without re-plumbing
+    the factory patch."""
 
     response: dict = {}
     fail_with: CloudTranscriptionError | None = None
-    deleted: list = []
 
-    def __init__(self, api_key: str, **kwargs):
-        if not (api_key or "").strip():
-            raise CloudTranscriptionError("clé vide", code="cloud_auth")
+    def __init__(self, *args, **kwargs):
+        pass
 
-    def upload_audio(self, path, display_name=""):
+    def transcribe(self, audio_path, *, model_id, context):
         if self.fail_with is not None:
             raise self.fail_with
-        return {"uri": "files/abc", "name": "files/abc", "state": "ACTIVE", "mimeType": "audio/mp3"}
+        from cloud_transcription import parse_cloud_response
 
-    def wait_until_active(self, info, **kwargs):
-        return info
+        return parse_cloud_response(
+            type(self).response,
+            model_id=model_id,
+            chunk_offset_seconds=context.chunk_offset_seconds,
+        )
 
-    def generate_transcription(self, **kwargs):
-        return self.response
 
-    def delete_file(self, info):
-        type(self).deleted.append(info)
+def _fake_factory(provider_id, api_key, **kwargs):
+    return _FakeProvider()
 
 
 class CloudPipelineTest(unittest.TestCase):
@@ -140,9 +140,8 @@ class CloudPipelineTest(unittest.TestCase):
         self.workspace = Path(self._tmp.name)
         self.source = self.workspace / "meeting.mp4"
         self.source.write_bytes(b"fake video")
-        _FakeClient.response = _gemini_payload()
-        _FakeClient.fail_with = None
-        _FakeClient.deleted = []
+        _FakeProvider.response = _gemini_payload()
+        _FakeProvider.fail_with = None
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -153,7 +152,7 @@ class CloudPipelineTest(unittest.TestCase):
         with patch(
             "ekovideo_engine.pipeline.subprocess.run",
             side_effect=_fake_subprocess_run(self.workspace),
-        ), patch("ekovideo_engine.pipeline.GeminiClient", _FakeClient):
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory):
             results = pipeline.run(str(self.source))
         return pipeline, results, events
 
@@ -191,8 +190,6 @@ class CloudPipelineTest(unittest.TestCase):
         review_text = Path(by_name["review"].artifact_path).read_text(encoding="utf-8")
         self.assertIn("voix faible", review_text)
 
-        # Remote file cleaned up.
-        self.assertEqual(len(_FakeClient.deleted), 1)
 
     def test_budget_guard_blocks_before_upload(self):
         request = _make_cloud_request(
@@ -208,7 +205,7 @@ class CloudPipelineTest(unittest.TestCase):
         with patch(
             "ekovideo_engine.pipeline.subprocess.run",
             side_effect=_fake_subprocess_run(self.workspace),
-        ), patch("ekovideo_engine.pipeline.GeminiClient", _FakeClient), patch(
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
             "ekovideo_engine.library.database", return_value=_FakeDb()
         ):
             results = pipeline.run(str(self.source))
@@ -219,10 +216,9 @@ class CloudPipelineTest(unittest.TestCase):
         self.assertIn("Budget cloud mensuel atteint", results[0].error)
         # Nothing was uploaded, nothing was spent.
         self.assertEqual(pipeline.cloud_usage_records, [])
-        self.assertEqual(_FakeClient.deleted, [])
 
     def test_transient_cloud_failure_falls_back_to_local(self):
-        _FakeClient.fail_with = CloudTranscriptionError(
+        _FakeProvider.fail_with = CloudTranscriptionError(
             "réseau coupé", code="cloud_network"
         )
         request = _make_cloud_request(self.workspace, self.source)
@@ -231,7 +227,7 @@ class CloudPipelineTest(unittest.TestCase):
         with patch(
             "ekovideo_engine.pipeline.subprocess.run",
             side_effect=_fake_subprocess_run(self.workspace),
-        ), patch("ekovideo_engine.pipeline.GeminiClient", _FakeClient):
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory):
             fallback = pipeline._run_cloud_transcription(
                 str(self.source), self.workspace
             )
@@ -242,8 +238,59 @@ class CloudPipelineTest(unittest.TestCase):
             [w.get("message") for w in warnings],
         )
 
+    def test_stt_provider_records_per_hour_usage(self):
+        # A dedicated STT provider (per-hour billing, no full bundle):
+        # transcript is written, usage is attributed to the provider and
+        # billed by duration, and the missing-venv enrichment is skipped
+        # gracefully (no crash, transcript still ships).
+        from cloud_transcription import CloudChunkResult, CloudUsage, cost_for_duration
+
+        model = "assemblyai-universal-3"
+
+        class _STTProvider:
+            def __init__(self, *a, **k):
+                pass
+
+            def transcribe(self, audio_path, *, model_id, context):
+                result = CloudChunkResult(
+                    segments=[
+                        {"start": 1.0 + context.chunk_offset_seconds,
+                         "end": 4.0 + context.chunk_offset_seconds,
+                         "speaker": "Intervenant 1", "text": "Bonjour."},
+                    ],
+                    usage=CloudUsage(
+                        model=model_id,
+                        cost_usd=cost_for_duration(model_id, context.chunk_duration_seconds),
+                    ),
+                )
+                return result
+
+        request = _make_cloud_request(self.workspace, self.source, cloud_model=model)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace, duration_seconds=600.0),
+        ), patch(
+            "ekovideo_engine.pipeline.get_cloud_provider",
+            lambda *a, **k: _STTProvider(),
+        ):
+            results = pipeline.run(str(self.source))
+
+        by_name = {r.name: r for r in results}
+        self.assertTrue(by_name["cloud_transcription"].ok)
+        self.assertTrue(Path(by_name["transcript"].artifact_path).exists())
+        self.assertEqual(len(pipeline.cloud_usage_records), 1)
+        record = pipeline.cloud_usage_records[0]
+        self.assertEqual(record["provider"], "assemblyai")
+        # 600 s of 0.21 $/h.
+        self.assertAlmostEqual(record["cost_usd"], 0.035, places=4)
+        self.assertEqual(record["input_tokens"], 0)
+        # No venv in the test env → enrichment skipped, transcript intact.
+        self.assertTrue(pipeline.final_segments)
+
     def test_auth_failure_is_fatal_not_fallback(self):
-        _FakeClient.fail_with = CloudTranscriptionError(
+        _FakeProvider.fail_with = CloudTranscriptionError(
             "clé refusée", code="cloud_auth"
         )
         request = _make_cloud_request(self.workspace, self.source)
@@ -252,7 +299,7 @@ class CloudPipelineTest(unittest.TestCase):
         with patch(
             "ekovideo_engine.pipeline.subprocess.run",
             side_effect=_fake_subprocess_run(self.workspace),
-        ), patch("ekovideo_engine.pipeline.GeminiClient", _FakeClient):
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory):
             results = pipeline._run_cloud_transcription(
                 str(self.source), self.workspace
             )

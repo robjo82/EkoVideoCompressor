@@ -21,8 +21,10 @@ import unittest
 from pathlib import Path
 
 from cloud_transcription import (
+    CLOUD_PROVIDERS,
     CLOUD_TRANSCRIPTION_MODELS,
     CLOUD_CHUNK_SECONDS,
+    CloudPromptContext,
     CloudTranscriptionError,
     CloudChunkResult,
     CloudUsage,
@@ -33,11 +35,14 @@ from cloud_transcription import (
     canonical_cloud_model_id,
     cloud_model_entry,
     compute_cost_usd,
+    cost_for_duration,
     estimate_cloud_cost,
+    get_cloud_provider,
     merge_chunk_results,
     parse_cloud_response,
     parse_cloud_timestamp,
     plan_audio_chunks,
+    provider_for_model,
 )
 from database_manager import DatabaseManager, _redact_settings
 
@@ -363,6 +368,265 @@ class SettingsRedactionTest(unittest.TestCase):
         self.assertEqual(
             redacted["transcription_settings"]["cloud_model"], "gemini-3.5-flash"
         )
+
+
+class PerHourBillingTest(unittest.TestCase):
+    def test_cost_for_duration_per_hour(self):
+        # AssemblyAI at 0.21 $/h → half an hour = 0.105.
+        self.assertAlmostEqual(
+            cost_for_duration("assemblyai-universal-3", 1800), 0.105, places=4
+        )
+
+    def test_estimate_per_hour_model(self):
+        est = estimate_cloud_cost(3600, "gpt-4o-mini-transcribe")
+        self.assertEqual(est["input_tokens"], 0)
+        self.assertEqual(est["output_tokens"], 0)
+        self.assertAlmostEqual(est["cost_usd"], 0.18, places=4)
+
+    def test_unknown_model_fallback_is_conservative_across_billing(self):
+        # The most expensive known model on a per-hour basis is the
+        # Gemini Pro preview; an unknown id should bill at least that.
+        unknown = estimate_cloud_cost(3600, "brand-new-model")["cost_usd"]
+        known_max = max(
+            estimate_cloud_cost(3600, m["id"])["cost_usd"]
+            for m in CLOUD_TRANSCRIPTION_MODELS
+        )
+        self.assertAlmostEqual(unknown, known_max, places=4)
+
+    def test_provider_for_model(self):
+        self.assertEqual(provider_for_model("assemblyai-universal-3"), "assemblyai")
+        self.assertEqual(provider_for_model("gpt-4o-mini-transcribe"), "openai")
+        self.assertEqual(provider_for_model("gemini-3.5-flash"), "gemini")
+
+
+class ProviderFactoryTest(unittest.TestCase):
+    def test_factory_dispatches_by_provider(self):
+        from cloud_transcription import (
+            AssemblyAIProvider,
+            DeepgramProvider,
+            GeminiProvider,
+            GladiaProvider,
+            OpenAITranscribeProvider,
+        )
+
+        opener = lambda *a, **k: None  # noqa: E731 - never called by ctor
+        self.assertIsInstance(get_cloud_provider("gemini", "k", opener=opener), GeminiProvider)
+        self.assertIsInstance(get_cloud_provider("openai", "k", opener=opener), OpenAITranscribeProvider)
+        self.assertIsInstance(get_cloud_provider("assemblyai", "k", opener=opener), AssemblyAIProvider)
+        self.assertIsInstance(get_cloud_provider("deepgram", "k", opener=opener), DeepgramProvider)
+        self.assertIsInstance(get_cloud_provider("gladia", "k", opener=opener), GladiaProvider)
+
+    def test_unknown_provider_raises(self):
+        with self.assertRaises(CloudTranscriptionError) as ctx:
+            get_cloud_provider("nope", "k")
+        self.assertEqual(ctx.exception.code, "cloud_provider")
+
+    def test_blank_key_refused(self):
+        with self.assertRaises(CloudTranscriptionError) as ctx:
+            get_cloud_provider("assemblyai", "  ")
+        self.assertEqual(ctx.exception.code, "cloud_auth")
+
+    def test_every_listed_provider_is_constructible(self):
+        opener = lambda *a, **k: None  # noqa: E731
+        for provider in CLOUD_PROVIDERS:
+            self.assertIsNotNone(get_cloud_provider(provider, "k", opener=opener))
+
+
+class MultipartTest(unittest.TestCase):
+    def test_multipart_carries_fields_and_file(self):
+        from cloud_transcription import _multipart_body
+
+        body, content_type = _multipart_body(
+            {"model": "gpt-4o-transcribe-diarize", "language": "fr"},
+            file_field="file",
+            filename="a.mp3",
+            file_bytes=b"\x00\x01AUDIO",
+            file_content_type="audio/mpeg",
+        )
+        self.assertIn("multipart/form-data; boundary=", content_type)
+        self.assertIn(b'name="model"', body)
+        self.assertIn(b"gpt-4o-transcribe-diarize", body)
+        self.assertIn(b'filename="a.mp3"', body)
+        self.assertIn(b"\x00\x01AUDIO", body)
+
+
+class _FakeResponse:
+    def __init__(self, body, headers=None):
+        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
+        self.headers = headers or {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _router(routes):
+    """Build a urlopen-style opener that picks a response by
+    (method, url-substring). ``routes`` is a list of
+    ``(method, substring, body)``; first match wins."""
+
+    def opener(request, timeout=None):
+        method = request.get_method()
+        url = request.full_url
+        for want_method, substr, body in routes:
+            if method == want_method and substr in url:
+                return _FakeResponse(body)
+        raise AssertionError(f"no route for {method} {url}")
+
+    return opener
+
+
+def _ctx(duration=600.0):
+    return CloudPromptContext(
+        language="fr",
+        glossary_terms=["Odoo"],
+        chunk_offset_seconds=0.0,
+        chunk_duration_seconds=duration,
+    )
+
+
+class STTProviderParsingTest(unittest.TestCase):
+    """Each STT provider must turn its native response shape into the
+    common segment/usage form, on a per-hour cost basis. HTTP is faked
+    via an injected opener — no network, no real audio decode."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.audio = Path(self._tmp.name) / "chunk.mp3"
+        self.audio.write_bytes(b"fake-mp3-bytes")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_assemblyai(self):
+        opener = _router([
+            ("POST", "/v2/upload", {"upload_url": "https://x/up"}),
+            ("POST", "/v2/transcript", {"id": "t1", "status": "queued"}),
+            ("GET", "/v2/transcript/t1", {
+                "status": "completed",
+                "utterances": [
+                    {"speaker": "A", "start": 1000, "end": 6000, "text": "Bonjour."},
+                    {"speaker": "B", "start": 6000, "end": 9000, "text": "Salut."},
+                ],
+            }),
+        ])
+        provider = get_cloud_provider("assemblyai", "key", opener=opener)
+        result = provider.transcribe(
+            str(self.audio), model_id="assemblyai-universal-3", context=_ctx(600)
+        )
+        self.assertEqual(len(result.segments), 2)
+        self.assertEqual(result.segments[0]["start"], 1.0)  # ms → s
+        self.assertEqual(result.segments[0]["speaker"], "Intervenant 1")
+        self.assertEqual(result.segments[1]["speaker"], "Intervenant 2")
+        # Per-hour billing: 600 s of 0.21 $/h.
+        self.assertAlmostEqual(result.usage.cost_usd, 0.035, places=4)
+        self.assertEqual(result.usage.input_tokens, 0)
+
+    def test_deepgram(self):
+        opener = _router([
+            ("POST", "/v1/listen", {
+                "results": {
+                    "utterances": [
+                        {"speaker": 0, "start": 0.5, "end": 4.0, "transcript": "Bonjour."},
+                        {"speaker": 1, "start": 4.0, "end": 7.0, "transcript": "Salut."},
+                    ]
+                }
+            }),
+        ])
+        provider = get_cloud_provider("deepgram", "key", opener=opener)
+        result = provider.transcribe(
+            str(self.audio), model_id="deepgram-nova-3", context=_ctx(3600)
+        )
+        self.assertEqual([s["text"] for s in result.segments], ["Bonjour.", "Salut."])
+        self.assertEqual(result.segments[0]["speaker"], "Intervenant 1")
+        self.assertAlmostEqual(result.usage.cost_usd, 0.26, places=4)
+
+    def test_gladia(self):
+        opener = _router([
+            ("POST", "/v2/upload", {"audio_url": "https://x/up"}),
+            ("POST", "/v2/pre-recorded", {"id": "g1", "result_url": "https://api.gladia.io/v2/pre-recorded/g1"}),
+            ("GET", "/v2/pre-recorded/g1", {
+                "status": "done",
+                "result": {"transcription": {"utterances": [
+                    {"speaker": 0, "start": 0.0, "end": 3.0, "text": "Bonjour."},
+                ]}},
+            }),
+        ])
+        provider = get_cloud_provider("gladia", "key", opener=opener)
+        result = provider.transcribe(
+            str(self.audio), model_id="gladia-solaria-1", context=_ctx(1800)
+        )
+        self.assertEqual(result.segments[0]["text"], "Bonjour.")
+        self.assertAlmostEqual(result.usage.cost_usd, 0.305, places=4)
+
+    def test_openai_plain_text_is_segmented(self):
+        opener = _router([
+            ("POST", "/v1/audio/transcriptions", {"text": "Bonjour à tous. On démarre la réunion."}),
+        ])
+        provider = get_cloud_provider("openai", "key", opener=opener)
+        result = provider.transcribe(
+            str(self.audio), model_id="gpt-4o-mini-transcribe", context=_ctx(120)
+        )
+        # Flat text split into sentence segments with proportional times.
+        self.assertEqual(len(result.segments), 2)
+        self.assertEqual(result.segments[0]["text"], "Bonjour à tous.")
+        self.assertEqual(result.segments[0]["speaker"], "")  # no diarisation
+        self.assertAlmostEqual(result.usage.cost_usd, 0.006, places=4)  # 120s @0.18/h
+
+    def test_openai_diarized_segments(self):
+        opener = _router([
+            ("POST", "/v1/audio/transcriptions", {
+                "segments": [
+                    {"start": 0.0, "end": 3.0, "speaker": "speaker_1", "text": "Bonjour."},
+                    {"start": 3.0, "end": 5.0, "speaker": "speaker_2", "text": "Salut."},
+                ]
+            }),
+        ])
+        provider = get_cloud_provider("openai", "key", opener=opener)
+        result = provider.transcribe(
+            str(self.audio), model_id="gpt-4o-transcribe-diarize", context=_ctx(60)
+        )
+        self.assertEqual(result.segments[0]["speaker"], "Intervenant 1")
+        self.assertEqual(result.segments[1]["speaker"], "Intervenant 2")
+
+    def test_chunk_offset_applied(self):
+        opener = _router([
+            ("POST", "/v1/listen", {"results": {"utterances": [
+                {"speaker": 0, "start": 1.0, "end": 4.0, "transcript": "Suite."},
+            ]}}),
+        ])
+        provider = get_cloud_provider("deepgram", "key", opener=opener)
+        ctx = CloudPromptContext(chunk_offset_seconds=1800.0, chunk_duration_seconds=600.0)
+        result = provider.transcribe(
+            str(self.audio), model_id="deepgram-nova-3", context=ctx
+        )
+        self.assertEqual(result.segments[0]["start"], 1801.0)
+
+    def test_empty_response_raises(self):
+        opener = _router([
+            ("POST", "/v1/listen", {"results": {"utterances": []}}),
+        ])
+        provider = get_cloud_provider("deepgram", "key", opener=opener)
+        with self.assertRaises(CloudTranscriptionError):
+            provider.transcribe(
+                str(self.audio), model_id="deepgram-nova-3", context=_ctx(600)
+            )
+
+    def test_check_access_smoke(self):
+        for provider_id, route in [
+            ("openai", ("GET", "/v1/models", {"data": [{"id": "gpt-4o-transcribe-diarize"}]})),
+            ("assemblyai", ("GET", "/v2/transcript", {"transcripts": []})),
+            ("deepgram", ("GET", "/v1/projects", {"projects": []})),
+            ("gladia", ("GET", "/v2/pre-recorded", {"items": []})),
+        ]:
+            provider = get_cloud_provider(provider_id, "key", opener=_router([route]))
+            payload = provider.check_access()
+            self.assertTrue(payload["ok"], provider_id)
 
 
 if __name__ == "__main__":
