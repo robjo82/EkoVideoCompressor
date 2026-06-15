@@ -1174,6 +1174,30 @@ class SnapshotExistingArtifactsTest(unittest.TestCase):
             self.assertEqual(summary, {})
             self.assertFalse((workspace / "versions").exists())
 
+    def test_protected_source_is_not_moved(self):
+        # Regression: after "Libérer la source", the rerun's source IS
+        # the compressed file. Snapshotting must leave it in place,
+        # otherwise the pipeline can't read its own input.
+        from ekovideo_engine.pipeline import (
+            _normalized_realpath,
+            snapshot_existing_artifacts,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace, job = self._seed_workspace(root)
+            compressed = job["compressed_path"]
+            summary = snapshot_existing_artifacts(
+                workspace,
+                job,
+                lambda _: None,
+                protected_paths={_normalized_realpath(compressed)},
+            )
+            # Compressed stayed put (it's the active source); the other
+            # artefacts were still snapshotted.
+            self.assertTrue(Path(compressed).exists())
+            self.assertNotIn("compressed_path", summary)
+            self.assertIn("transcript_path", summary)
+
     def test_skips_missing_files_silently(self):
         # A row whose paths point at deleted files (workspace was
         # wiped manually) must not crash — just skip the missing

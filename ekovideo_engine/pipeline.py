@@ -606,10 +606,25 @@ def job_workspace_dir(request: JobRequest) -> Path:
     return root / f"{stamp} - {_safe_stem(Path(request.source_path).stem)}"
 
 
+def _normalized_realpath(path: str | Path) -> str:
+    """Canonical key for path comparison: realpath + NFC normalisation
+    so an artefact stored NFC and the same file listed NFD by macOS
+    still compare equal."""
+    import unicodedata
+
+    try:
+        resolved = os.path.realpath(os.fspath(path))
+    except OSError:
+        resolved = str(path)
+    return unicodedata.normalize("NFC", resolved)
+
+
 def snapshot_existing_artifacts(
     workspace: Path,
     job: dict[str, Any],
     sink: EventSink,
+    *,
+    protected_paths: set[str] | None = None,
 ) -> dict[str, Any]:
     """Move the user-facing outputs of the previous run into a dated
     ``versions/`` subfolder so the rerun about to start can't clobber
@@ -643,10 +658,17 @@ def snapshot_existing_artifacts(
         "enhanced_transcript_path": (job.get("enhanced_transcript_path") or "").strip(),
         "review_path": (job.get("review_path") or "").strip(),
     }
+    # Never relocate a file that is currently serving as the job's
+    # source. After "Libérer la source" the compressed file IS the
+    # rerun's input; moving it into versions/ pulls it out from under
+    # the pipeline → "No such file" on probe/extract (see runner).
+    protected = protected_paths or set()
     existing = {
         column: path
         for column, path in candidates.items()
-        if path and Path(path).exists()
+        if path
+        and Path(path).exists()
+        and _normalized_realpath(path) not in protected
     }
     if not existing:
         return {}

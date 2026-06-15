@@ -41,11 +41,15 @@ def default_out_path(in_path: str, out_dir: str, suffix: str) -> str:
     source = Path(in_path)
     safe_suffix = suffix.strip() or "_compressed"
     ext = ".m4a" if is_audio_only_path(in_path) else ".mp4"
-    base = Path(out_dir) / f"{source.stem}{safe_suffix}{ext}"
+    # Cap the stem so a near-255-char source name + suffix can't push
+    # the output past the filesystem limit (``[Errno 63]``). 80 chars
+    # leaves ample room for the suffix, a "_N" dedup tail and the ext.
+    stem = source.stem[:80].rstrip(" .-_") or "media"
+    base = Path(out_dir) / f"{stem}{safe_suffix}{ext}"
     out = base
     i = 1
     while out.exists():
-        out = Path(out_dir) / f"{source.stem}{safe_suffix}_{i}{ext}"
+        out = Path(out_dir) / f"{stem}{safe_suffix}_{i}{ext}"
         i += 1
     return str(out)
 

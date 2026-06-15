@@ -887,6 +887,24 @@ class AudioOnlyDetectionTest(unittest.TestCase):
             out = default_out_path("/tmp/meeting.mp3", d, "_compressed")
         self.assertTrue(out.endswith("_compressed_1.m4a"), out)
 
+    def test_default_out_path_caps_overlong_stem(self):
+        # Guards against [Errno 63] File name too long: a near-limit
+        # source name + suffix must not produce a > 255-char component.
+        long_stem = "é" * 300  # 300 chars, 600 bytes in UTF-8
+        with tempfile.TemporaryDirectory() as d:
+            out = default_out_path(f"/tmp/{long_stem}.mov", d, "_compressed")
+        name = Path(out).name
+        self.assertLessEqual(len(name.encode("utf-8")), 255, name)
+
+    def test_default_transcript_path_caps_overlong_stem(self):
+        long_stem = "é" * 300
+        with tempfile.TemporaryDirectory() as d:
+            out = transcription_utils.default_transcript_path(
+                f"/tmp/{long_stem}.mov", d, "", "txt"
+            )
+        name = Path(out).name
+        self.assertLessEqual(len(name.encode("utf-8")), 255, name)
+
 
 class LlmCatalogTest(unittest.TestCase):
     """
