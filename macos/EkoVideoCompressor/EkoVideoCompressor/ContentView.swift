@@ -1931,6 +1931,9 @@ struct LibraryView: View {
     // PR AI — need the current processingMode to snapshot when
     // enqueuing a rerun from the library.
     @EnvironmentObject private var settings: SettingsStore
+    // Catalogue, to resolve a model id to its friendly label in the
+    // "Modèle" column.
+    @EnvironmentObject private var models: ModelStore
     @State private var editingRow: LibraryRow?
     @State private var rowToDelete: LibraryRow?
     // PR AP — row whose heavy source the user asked to free; drives
@@ -1957,6 +1960,9 @@ struct LibraryView: View {
     /// the event (whatever Odoo returned in ``related_object``).
     @AppStorage("libraryShowsOdooRelatedColumn") private var showsOdooRelatedColumn = false
     @AppStorage("libraryShowsCloudCostColumn") private var showsCloudCostColumn = false
+    // On by default: knowing which model produced a transcript is
+    // central while comparing engines, and useful long after.
+    @AppStorage("libraryShowsModelColumn") private var showsModelColumn = true
     /// Sort order driving the table — defaults to most-recently
     /// updated first, mirroring what the engine returns from
     /// ``library_list``. Columns toggle between ascending and
@@ -2011,6 +2017,7 @@ struct LibraryView: View {
                 Toggle("Date réunion", isOn: $showsMeetingDateColumn)
                 Toggle("Interlocuteurs", isOn: $showsSpeakersColumn)
                 Toggle("Poids du projet", isOn: $showsProjectSizeColumn)
+                Toggle("Modèle", isOn: $showsModelColumn)
                 Toggle("Coût API", isOn: $showsCloudCostColumn)
                 Divider()
                 Toggle("Réunion Odoo", isOn: $showsOdooMeetingColumn)
@@ -2153,6 +2160,29 @@ struct LibraryView: View {
 
     @TableColumnBuilder<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>>
     private var costAndOdooColumns: some TableColumnContent<LibraryDisplayRow, KeyPathComparator<LibraryDisplayRow>> {
+        if showsModelColumn {
+            TableColumn("Modèle", value: \.sortableModel) { displayRow in
+                if displayRow.isJobRow {
+                    let id = displayRow.job.modelIdUsed
+                    if id.isEmpty {
+                        Text("—").foregroundStyle(.secondary)
+                    } else {
+                        let label = models.models.first { $0.id == id }?.label
+                        HStack(spacing: 5) {
+                            Image(systemName: displayRow.job.ranOnCloud ? "cloud" : "desktopcomputer")
+                                .imageScale(.small)
+                                .foregroundStyle(displayRow.job.ranOnCloud ? .teal : .secondary)
+                            Text(friendlyModelLabel(id, catalogueLabel: label))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        .help(id)
+                    }
+                }
+            }
+            .width(min: 130, ideal: 180, max: 240)
+        }
+
         if showsCloudCostColumn {
             TableColumn("Coût API", value: \.sortableCloudCost) { displayRow in
                 if displayRow.isJobRow {
@@ -2922,244 +2952,286 @@ struct SettingsView: View {
             }
             .padding(22)
             Divider()
-            Form {
-                Section("Mise à jour") {
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text("Version actuelle : \(updater.currentVersion)")
-                            switch updater.state {
-                            case .idle:
-                                Text("Vérifié à l'instant")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            case .checking:
-                                Text("Recherche en cours…")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            case .available(let info):
-                                Text("Version \(info.tag_name) disponible")
-                                    .font(.caption).foregroundStyle(.teal)
-                            case .upToDate:
-                                Text("Vous êtes à jour")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            case .downloading(let pct):
-                                Text("Téléchargement… \(Int(pct * 100))%")
-                                    .font(.caption).foregroundStyle(.teal)
-                            case .readyToInstall:
-                                Text("Prêt à installer")
-                                    .font(.caption).foregroundStyle(.teal)
-                            case .error(let msg):
-                                Text(msg)
-                                    .font(.caption).foregroundStyle(.red)
-                            }
-                        }
-                        Spacer()
-                        if case .readyToInstall(let url, _) = updater.state {
-                            Button("Installer et redémarrer") {
-                                updater.applyUpdate(zipURL: url)
-                            }
-                            .buttonStyle(.borderedProminent)
-                        } else if case .available(let info) = updater.state {
-                            Button("Télécharger") {
-                                Task { await updater.downloadAndPrepare(info: info) }
-                            }
-                        } else {
-                            Button("Vérifier") {
-                                Task { await updater.checkUpdates() }
-                            }
-                            .disabled(updater.state == .checking)
-                        }
-                    }
-                    SecureField("GitHub Token (optionnel)", text: $settings.githubToken)
-                    Text("Requis seulement si le dépôt est privé.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-
-                // PR AT — keep the managed MLX venv fresh. Floors are
-                // enforced automatically at launch; this section shows
-                // the per-package state and offers a manual "upgrade
-                // everything to latest".
-                Section("Moteurs IA (MLX)") {
-                    HStack(alignment: .firstTextBaseline) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            switch deps.phase {
-                            case .checking:
-                                Text("Vérification des versions…")
-                                    .font(.caption).foregroundStyle(.secondary)
-                            case .upgrading:
-                                Text(deps.lastMessage ?? "Mise à jour en cours…")
-                                    .font(.caption).foregroundStyle(.teal)
-                            case .idle:
-                                if let err = deps.errorMessage {
-                                    Text(err).font(.caption).foregroundStyle(.red)
-                                } else if deps.hasOutdated {
-                                    Text("\(deps.outdated.count) paquet(s) à mettre à jour")
-                                        .font(.caption).foregroundStyle(.orange)
-                                } else if deps.status != nil {
-                                    Text("Tous les moteurs sont à jour")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                } else {
-                                    Text("État inconnu — cliquez sur Vérifier")
-                                        .font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        Spacer()
-                        if deps.isBusy {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Button("Vérifier") { Task { await deps.check() } }
-                            Button("Tout mettre à jour") {
-                                Task { await deps.upgradeToLatest() }
-                            }
-                            .buttonStyle(.borderedProminent)
-                        }
-                    }
-                    if let status = deps.status {
-                        ForEach(status.packages) { pkg in
-                            HStack(spacing: 8) {
-                                Image(systemName: pkg.isOK ? "checkmark.circle.fill" : "arrow.up.circle.fill")
-                                    .foregroundStyle(pkg.isOK ? AnyShapeStyle(.green) : AnyShapeStyle(.orange))
-                                    .imageScale(.small)
-                                Text(pkg.pip_name)
-                                    .font(.caption.monospaced())
-                                Spacer()
-                                Text(pkg.installed ?? "absent")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(pkg.isOK ? .secondary : .primary)
-                                if !pkg.isOK {
-                                    Text("→ ≥ \(pkg.minimum)")
-                                        .font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                    }
-                    Text("Les versions minimales sont appliquées automatiquement au démarrage. « Tout mettre à jour » installe la dernière version de chaque moteur (peut prendre plusieurs minutes et télécharger plusieurs centaines de Mo).")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-
-                Section("Sortie") {
-                    TextField("Dossier", text: $settings.outputDir)
-                    Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
-                    Text("L'original est supprimé uniquement après sa copie dans le dossier de travail.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Section("Transcription") {
-                    Picker("Action", selection: $settings.processingMode) {
-                        Text("Compresser + transcrire").tag("compress_transcribe")
-                        Text("Transcrire seulement").tag("transcribe")
-                        Text("Compresser seulement").tag("compress")
-                    }
-                    Picker("Format", selection: $settings.outputFormat) {
-                        Text("Texte").tag("txt")
-                        Text("SRT").tag("srt")
-                        Text("VTT").tag("vtt")
-                        Text("JSON").tag("json")
-                    }
-                    // One picker replaces the previous patchwork of
-                    // VAD/multipass/per-speaker/web toggles. The engine
-                    // maps the preset string to the right combination.
-                    // Power users can still drill down via "Avancé".
-                    Picker("Qualité", selection: $settings.qualityPreset) {
-                        ForEach(TranscriptionQualityPreset.allCases) { preset in
-                            Text(preset.displayName).tag(preset.rawValue)
-                        }
-                    }
-                    .onChange(of: energy.allowsMaxPreset) { _, allowed in
-                        if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
-                            settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
-                        }
-                    }
-                    if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
-                        Text(preset.summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if !energy.allowsMaxPreset {
-                        Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                    }
-                    TextField("Modèle Whisper", text: $settings.whisperModel)
-                }
-                Section("Avancé") {
-                    Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
-                    // PR F shipped the multimodal recheck step in the
-                    // engine. The Toggle is back; PR Z restored it.
-                    // The recheck is opt-in (it loads ``mlx_vlm``
-                    // + Qwen2-Audio ~5 GB on first run) and is also
-                    // turned on by the ``Maximale`` preset.
-                    Toggle(
-                        "Réécoute IA des passages douteux (Qwen2-Audio)",
-                        isOn: $settings.audioRecheckEnabled
-                    )
-                    Text(
-                        "La réécoute multimodale relit chaque passage flaggé « douteux » avec Qwen2-Audio et suggère une transcription dans le rapport de relecture. Première activation : ~5 Go de modèle à télécharger."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    Text(
-                        "La détection des locuteurs nécessite un token Hugging Face. Le nombre d'intervenants attendu se règle au lancement de chaque traitement."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                Section("Identité") {
-                    // Pre-attribution heuristic: the cluster that
-                    // speaks first in any recording gets this name
-                    // before voice matching runs. Fixes the cold
-                    // start where every meeting's SPEAKER_00
-                    // lingered unresolved because voice profiles
-                    // were still empty.
-                    TextField("Vous êtes", text: $settings.currentUserName)
-                    Text(
-                        "Le moteur attribuera votre nom au premier locuteur de chaque enregistrement quand aucune voix mémorisée ne correspond. Laissez vide pour désactiver."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                Section("Transcription Cloud") {
-                    CloudTranscriptionSettingsSection()
-                }
-                Section("Voix mémorisées") {
-                    SpeakerProfilesSection()
-                }
-                Section("Connexion Odoo") {
-                    OdooConnectionSection()
-                }
-                Section("Hugging Face — pyannote") {
-                    HuggingFaceSetupSection()
-                }
-                Section("Vocabulaire conservé") {
-                    Text("\(settings.vocabularyCatalog.count) terme(s) dans le catalogue. L'onglet Vocabulaire permet d'ajouter, supprimer et prioriser les termes selon l'usage.")
-                        .foregroundStyle(.secondary)
-                }
-                Section("Diagnostic") {
-                    // Used to live in the Run Setup form. Moved
-                    // here because exporting logs is a one-off
-                    // troubleshooting action, not something the
-                    // user does on every batch.
-                    Button {
-                        engine.run(arguments: EngineProcess.defaultPythonArguments(["export-logs"]))
-                    } label: {
-                        Label("Exporter les logs", systemImage: "doc.zipper")
-                    }
-                    Text("Une archive ZIP est déposée sur le Bureau pour partage avec le support.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+            // Grouped into a tab bar so the (now sizeable) preferences
+            // stop being one endless scroll. Each tab is its own view
+            // — keeps this body small and the type-checker happy.
+            TabView {
+                GeneralSettingsTab()
+                    .tabItem { Label("Général", systemImage: "gearshape") }
+                TranscriptionSettingsTab()
+                    .tabItem { Label("Transcription", systemImage: "waveform") }
+                CloudSettingsTab()
+                    .tabItem { Label("Cloud", systemImage: "cloud") }
+                EnginesSettingsTab()
+                    .tabItem { Label("Moteurs & accès", systemImage: "shippingbox") }
+                Form { Section("Connexion Odoo") { OdooConnectionSection() } }
+                    .formStyle(.grouped)
+                    .tabItem { Label("Odoo", systemImage: "building.2") }
+                VoiceVocabularySettingsTab()
+                    .tabItem { Label("Voix & vocabulaire", systemImage: "person.wave.2") }
             }
-            .formStyle(.grouped)
             .padding()
         }
-        .frame(minWidth: 620, minHeight: 520)
+        .frame(minWidth: 640, minHeight: 560)
+    }
+}
+
+struct GeneralSettingsTab: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var updater: UpdateStore
+    @EnvironmentObject private var engine: EngineProcess
+
+    var body: some View {
+        Form {
+            Section("Mise à jour") {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text("Version actuelle : \(updater.currentVersion)")
+                        switch updater.state {
+                        case .idle:
+                            Text("Vérifié à l'instant")
+                                .font(.caption).foregroundStyle(.secondary)
+                        case .checking:
+                            Text("Recherche en cours…")
+                                .font(.caption).foregroundStyle(.secondary)
+                        case .available(let info):
+                            Text("Version \(info.tag_name) disponible")
+                                .font(.caption).foregroundStyle(.teal)
+                        case .upToDate:
+                            Text("Vous êtes à jour")
+                                .font(.caption).foregroundStyle(.secondary)
+                        case .downloading(let pct):
+                            Text("Téléchargement… \(Int(pct * 100))%")
+                                .font(.caption).foregroundStyle(.teal)
+                        case .readyToInstall:
+                            Text("Prêt à installer")
+                                .font(.caption).foregroundStyle(.teal)
+                        case .error(let msg):
+                            Text(msg)
+                                .font(.caption).foregroundStyle(.red)
+                        }
+                    }
+                    Spacer()
+                    if case .readyToInstall(let url, _) = updater.state {
+                        Button("Installer et redémarrer") {
+                            updater.applyUpdate(zipURL: url)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else if case .available(let info) = updater.state {
+                        Button("Télécharger") {
+                            Task { await updater.downloadAndPrepare(info: info) }
+                        }
+                    } else {
+                        Button("Vérifier") {
+                            Task { await updater.checkUpdates() }
+                        }
+                        .disabled(updater.state == .checking)
+                    }
+                }
+                SecureField("GitHub Token (optionnel)", text: $settings.githubToken)
+                Text("Requis seulement si le dépôt est privé.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Sortie") {
+                TextField("Dossier", text: $settings.outputDir)
+                Toggle("Supprimer le fichier source après copie", isOn: $settings.deleteSourceAfterCopy)
+                Text("L'original est supprimé uniquement après sa copie dans le dossier de travail.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Diagnostic") {
+                Button {
+                    engine.run(arguments: EngineProcess.defaultPythonArguments(["export-logs"]))
+                } label: {
+                    Label("Exporter les logs", systemImage: "doc.zipper")
+                }
+                Text("Une archive ZIP est déposée sur le Bureau pour partage avec le support.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct TranscriptionSettingsTab: View {
+    @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var energy: EnergyMonitor
+
+    var body: some View {
+        Form {
+            Section("Transcription") {
+                Picker("Action", selection: $settings.processingMode) {
+                    Text("Compresser + transcrire").tag("compress_transcribe")
+                    Text("Transcrire seulement").tag("transcribe")
+                    Text("Compresser seulement").tag("compress")
+                }
+                Picker("Format", selection: $settings.outputFormat) {
+                    Text("Texte").tag("txt")
+                    Text("SRT").tag("srt")
+                    Text("VTT").tag("vtt")
+                    Text("JSON").tag("json")
+                }
+                Picker("Qualité", selection: $settings.qualityPreset) {
+                    ForEach(TranscriptionQualityPreset.allCases) { preset in
+                        Text(preset.displayName).tag(preset.rawValue)
+                    }
+                }
+                .onChange(of: energy.allowsMaxPreset) { _, allowed in
+                    if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                        settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
+                    }
+                }
+                if let preset = TranscriptionQualityPreset(rawValue: settings.qualityPreset) {
+                    Text(preset.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if !energy.allowsMaxPreset {
+                    Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                TextField("Modèle Whisper", text: $settings.whisperModel)
+            }
+            Section("Avancé") {
+                Toggle("Détection des locuteurs", isOn: $settings.diarizationEnabled)
+                Toggle(
+                    "Réécoute IA des passages douteux (Qwen2-Audio)",
+                    isOn: $settings.audioRecheckEnabled
+                )
+                Text(
+                    "La réécoute multimodale relit chaque passage flaggé « douteux » avec Qwen2-Audio et suggère une transcription dans le rapport de relecture. Première activation : ~5 Go de modèle à télécharger."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Text(
+                    "La détection des locuteurs nécessite un token Hugging Face. Le nombre d'intervenants attendu se règle au lancement de chaque traitement."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Section("Identité") {
+                TextField("Vous êtes", text: $settings.currentUserName)
+                Text(
+                    "Le moteur attribuera votre nom au premier locuteur de chaque enregistrement quand aucune voix mémorisée ne correspond. Laissez vide pour désactiver."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct CloudSettingsTab: View {
+    @EnvironmentObject private var cloudUsage: CloudUsageStore
+
+    var body: some View {
+        Form {
+            Section("Transcription Cloud") {
+                CloudTranscriptionSettingsSection()
+            }
+        }
+        .formStyle(.grouped)
         .task {
-            // Refresh the month-to-date spend whenever the sheet
-            // opens — the budget line is only useful if current.
+            // Refresh the month-to-date spend whenever the tab opens —
+            // the budget line is only useful if current.
             await cloudUsage.refresh()
         }
     }
+}
 
+struct EnginesSettingsTab: View {
+    @EnvironmentObject private var deps: DepsStore
+
+    var body: some View {
+        Form {
+            // PR AT — keep the managed MLX venv fresh. Floors are
+            // enforced automatically at launch; this section shows the
+            // per-package state and offers a manual "upgrade to latest".
+            Section("Moteurs IA locaux (MLX)") {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        switch deps.phase {
+                        case .checking:
+                            Text("Vérification des versions…")
+                                .font(.caption).foregroundStyle(.secondary)
+                        case .upgrading:
+                            Text(deps.lastMessage ?? "Mise à jour en cours…")
+                                .font(.caption).foregroundStyle(.teal)
+                        case .idle:
+                            if let err = deps.errorMessage {
+                                Text(err).font(.caption).foregroundStyle(.red)
+                            } else if deps.hasOutdated {
+                                Text("\(deps.outdated.count) paquet(s) à mettre à jour")
+                                    .font(.caption).foregroundStyle(.orange)
+                            } else if deps.status != nil {
+                                Text("Tous les moteurs sont à jour")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text("État inconnu — cliquez sur Vérifier")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    Spacer()
+                    if deps.isBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button("Vérifier") { Task { await deps.check() } }
+                        Button("Tout mettre à jour") {
+                            Task { await deps.upgradeToLatest() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                }
+                if let status = deps.status {
+                    ForEach(status.packages) { pkg in
+                        HStack(spacing: 8) {
+                            Image(systemName: pkg.isOK ? "checkmark.circle.fill" : "arrow.up.circle.fill")
+                                .foregroundStyle(pkg.isOK ? AnyShapeStyle(.green) : AnyShapeStyle(.orange))
+                                .imageScale(.small)
+                            Text(pkg.pip_name)
+                                .font(.caption.monospaced())
+                            Spacer()
+                            Text(pkg.installed ?? "absent")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(pkg.isOK ? .secondary : .primary)
+                            if !pkg.isOK {
+                                Text("→ ≥ \(pkg.minimum)")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                Text("Les versions minimales sont appliquées automatiquement au démarrage. « Tout mettre à jour » installe la dernière version de chaque moteur (peut prendre plusieurs minutes et télécharger plusieurs centaines de Mo).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section("Hugging Face — pyannote") {
+                HuggingFaceSetupSection()
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+struct VoiceVocabularySettingsTab: View {
+    @EnvironmentObject private var settings: SettingsStore
+
+    var body: some View {
+        Form {
+            Section("Voix mémorisées") {
+                SpeakerProfilesSection()
+            }
+            Section("Vocabulaire conservé") {
+                Text("\(settings.vocabularyCatalog.count) terme(s) dans le catalogue. L'onglet Vocabulaire permet d'ajouter, supprimer et prioriser les termes selon l'usage.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
 }
 
 /// Guided setup for the Pyannote / Hugging Face access pipeline.
@@ -3823,6 +3895,12 @@ extension LibraryDisplayRow {
     var displayedTotalBytes: String {
         guard let bytes = job.total_bytes else { return "—" }
         return formatFileBytes(bytes)
+    }
+    /// Sort by model id (empty sorts last under ascending via the
+    /// "zzz" sentinel so "—" rows group together).
+    var sortableModel: String {
+        let id = job.modelIdUsed.lowercased()
+        return id.isEmpty ? "zzz" : id
     }
     /// 0 groups local jobs together on either sort direction without
     /// poisoning the real cloud figures.

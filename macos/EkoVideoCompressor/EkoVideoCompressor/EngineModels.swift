@@ -190,6 +190,27 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     /// Remote model that produced the transcript (e.g.
     /// "gemini-3.5-flash"). NULL on local jobs.
     var cloud_model: String?
+    /// Model + engine that actually produced the transcript, persisted
+    /// at completion. ``transcription_engine`` is "local"/"cloud".
+    /// NULL on jobs that finished before this column existed (cloud
+    /// rows fall back to ``cloud_model``).
+    var transcription_model: String?
+    var transcription_engine: String?
+
+    /// Raw model id used, with the cloud model as a fallback for rows
+    /// written before ``transcription_model`` existed. Empty when
+    /// unknown.
+    var modelIdUsed: String {
+        let id = (transcription_model ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !id.isEmpty { return id }
+        return (cloud_model ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Whether this job ran on the cloud engine (for a badge).
+    var ranOnCloud: Bool {
+        if let engine = transcription_engine { return engine == "cloud" }
+        return !(cloud_model ?? "").isEmpty
+    }
 
     var filename: String {
         URL(fileURLWithPath: source_path ?? "").lastPathComponent
@@ -583,6 +604,19 @@ func estimatedCloudCostUSD(
 
 func formatUSD(_ value: Double) -> String {
     String(format: "%.2f $US", value)
+}
+
+/// Human-readable label for a model id used in the library "Modèle"
+/// column. Prefers the catalogue label (passed in by the caller from
+/// ModelStore); otherwise cleans the raw id (drops the HF org prefix).
+func friendlyModelLabel(_ modelID: String, catalogueLabel: String? = nil) -> String {
+    let id = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+    if id.isEmpty { return "—" }
+    if let label = catalogueLabel, !label.isEmpty { return label }
+    if let slash = id.lastIndex(of: "/") {
+        return String(id[id.index(after: slash)...])
+    }
+    return id
 }
 
 /// Which provider owns a cloud model id. Derived from the id so the

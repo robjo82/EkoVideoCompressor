@@ -532,6 +532,23 @@ class EngineRunner:
                 db.update_job_status(job_id, "FAILED", failed[0].error or "Transcription failed")
                 sink(ErrorEvent(failed[0].error or "Transcription failed", code="transcription_failed"))
                 return 1
+            # Record which model + engine produced this transcript so
+            # the library can show "fait avec X". Cloud step wins when
+            # present; otherwise the Whisper pass model.
+            tx_engine = (
+                request.transcription_settings.transcription_engine or "local"
+            ).strip().lower()
+            tx_model = ""
+            for r in tx_results:
+                if r.name == "cloud_transcription" and r.model:
+                    tx_model = r.model
+                    break
+            if not tx_model:
+                for r in tx_results:
+                    if r.name == "whisper" and r.model:
+                        tx_model = r.model
+                        break
+            db.update_job_transcription_model(job_id, tx_model or None, tx_engine)
             transcript_for_title: str | None = None
             for r in tx_results:
                 if r.artifact_path:

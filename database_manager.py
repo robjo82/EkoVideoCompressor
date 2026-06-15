@@ -189,6 +189,12 @@ class DatabaseManager:
             # jobs — the SwiftUI table renders those as "—".
             "cloud_cost_usd": "REAL",
             "cloud_model": "TEXT",
+            # The model + engine that actually produced the transcript,
+            # persisted at job completion so the library can show "fait
+            # avec X" for every run — local Whisper or any cloud model.
+            # ``transcription_engine`` is "local" or "cloud".
+            "transcription_model": "TEXT",
+            "transcription_engine": "TEXT",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -501,6 +507,18 @@ class DatabaseManager:
                 "UPDATE jobs SET cloud_cost_usd = ?, cloud_model = ?, "
                 "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (float(cost_usd), model or None, job_id),
+            )
+
+    def update_job_transcription_model(
+        self, job_id: int, model: Optional[str], engine: str
+    ) -> None:
+        """Record which model + engine produced the transcript, for the
+        library's "Modèle" column. ``engine`` is "local" or "cloud"."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET transcription_model = ?, transcription_engine = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ((model or "").strip() or None, (engine or "").strip() or None, job_id),
             )
 
     def month_api_spend_usd(self, month: Optional[str] = None) -> float:
