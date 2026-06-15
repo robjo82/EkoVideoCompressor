@@ -4817,15 +4817,16 @@ struct LibraryContextEditor: View {
         dismiss()
         Task {
             if !renameMapping.isEmpty {
-                await library.renameSpeakers(row, mapping: renameMapping)
+                // ``updatedSpeakers`` (label → friendly name) is the
+                // displayed map persisted instantly; ``renameMapping``
+                // drives the engine's background segment/artefact/
+                // enrolment reconcile.
+                await library.renameSpeakers(
+                    row, displayMap: updatedSpeakers, renameMapping: renameMapping
+                )
             }
-            // Persist technical terms only. The rename path already
-            // rewrote ``speaker_map_json`` canonically from the
-            // post-rename segments — passing ``updatedSpeakers`` here
-            // would clobber that with the sheet's id-keyed shape,
-            // which caused the duplicate-row regression (a renamed
-            // cluster lingering as a ghost SPEAKER_NN entry while
-            // segments already used the friendly name).
+            // Technical terms only — the rename path owns the speaker
+            // map. (Passing speakers here too would double-write it.)
             await library.updateContext(row, technicalTerms: terms)
         }
     }
