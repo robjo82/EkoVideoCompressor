@@ -113,6 +113,24 @@ class TranscriptionSettings:
     # 5-minute chunks while still capturing the "name learned in
     # minute 5 helps minute 10" effect. Enabled by ``max`` preset.
     hot_prompt_enrichment: bool = False
+    # Which transcription stack runs the job. "local" is the historic
+    # MLX Whisper pipeline; "cloud" sends the audio to a remote API
+    # (Gemini) that returns transcript + diarisation + title in one
+    # call. The cloud path replaces Whisper/VAD/multipass/diarisation/
+    # LLM-post entirely — mixing both would double the cost for no
+    # quality gain.
+    transcription_engine: str = "local"
+    # Remote model id (e.g. "gemini-3.5-flash"). Empty falls back to
+    # the catalogue default inside the pipeline.
+    cloud_model: str = ""
+    # API key for the cloud provider. Rides on the job request like
+    # the Odoo credentials do; redacted before settings_json hits the
+    # library DB (see database_manager._SENSITIVE_SETTINGS_KEYS).
+    cloud_api_key: str = ""
+    # Hard monthly spending cap in USD. 0 disables the guard. The
+    # engine sums the current month's `api_usage` rows and refuses to
+    # start a cloud job whose *estimate* would cross the cap.
+    cloud_budget_monthly_usd: float = 0.0
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":
@@ -430,6 +448,40 @@ class ContextEvent(EngineEvent):
         self.ts = _now_ts()
         self.speakers = dict(speakers or {})
         self.technical_terms = list(technical_terms or [])
+
+
+@dataclass(slots=True)
+class UsageEvent(EngineEvent):
+    """Token + cost telemetry for one remote API call (or a job
+    aggregate). The SwiftUI app shows it live in the status bar and
+    the runner persists it into ``api_usage`` for the monthly
+    budget guard."""
+
+    provider: str = ""
+    model: str = ""
+    step: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        *,
+        step: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ):
+        self.event = "usage"
+        self.ts = _now_ts()
+        self.provider = provider
+        self.model = model
+        self.step = step
+        self.input_tokens = int(input_tokens)
+        self.output_tokens = int(output_tokens)
+        self.cost_usd = float(cost_usd)
 
 
 @dataclass(slots=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+from cloud_transcription import CLOUD_TRANSCRIPTION_MODELS
 from transcription_utils import (
     AUDIO_LLM_MODELS,
     DIARISATION_MODELS,
@@ -57,6 +58,8 @@ def model_catalog() -> list[dict]:
         rows.append(_build_row(entry, canonical_audio_llm_model_id))
     for entry in DIARISATION_MODELS:
         rows.append(_build_row(entry, lambda x: x))
+    for entry in CLOUD_TRANSCRIPTION_MODELS:
+        rows.append(_build_cloud_row(entry))
     return rows
 
 
@@ -68,6 +71,7 @@ def _build_row(entry: dict, canonicalise) -> dict:
         "label": entry.get("label", repo_id),
         "family": entry.get("family", ""),
         "role": entry.get("role", "transcription"),
+        "kind": "local",
         "size_mb": int(entry.get("size_mb") or 0),
         "tier": entry.get("tier", "balanced"),
         "language": list(entry.get("language") or ["multi"]),
@@ -83,6 +87,32 @@ def _build_row(entry: dict, canonicalise) -> dict:
         # "À venir" in the Models tab and have their Activer button
         # disabled.
         "available": bool(entry.get("available", True)),
+    }
+
+
+def _build_cloud_row(entry: dict) -> dict:
+    """Remote API model: nothing on disk, so ``cached`` is always
+    true (there is nothing to download) and the price tags replace
+    ``size_mb`` as the decision metadata the UI displays."""
+    return {
+        "id": str(entry["id"]),
+        "label": entry.get("label", entry["id"]),
+        "family": entry.get("family", "Gemini"),
+        "role": entry.get("role", "cloud_transcription"),
+        "kind": "cloud",
+        "provider": entry.get("provider", "gemini"),
+        "size_mb": 0,
+        "tier": entry.get("tier", "balanced"),
+        "language": list(entry.get("language") or ["multi"]),
+        "default": bool(entry.get("default") or False),
+        "gated": False,
+        "cached": True,
+        "cache_dir": "",
+        # Cloud rows are always wired: no local dependency can make
+        # them "À venir".
+        "available": True,
+        "price_in_per_1m": float(entry.get("price_in_per_1m") or 0),
+        "price_out_per_1m": float(entry.get("price_out_per_1m") or 0),
     }
 
 

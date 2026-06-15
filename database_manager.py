@@ -9,6 +9,7 @@ _SENSITIVE_SETTINGS_KEYS = {
     "api_key",
     "access_token",
     "client_secret",
+    "cloud_api_key",
     "hf_token",
     "password",
     "refresh_token",
@@ -108,6 +109,29 @@ class DatabaseManager:
             )
             self._ensure_speaker_profile_columns(conn)
 
+            # Remote-API consumption ledger. One row per API call (a
+            # long meeting transcribed in 4 windows writes 4 rows).
+            # ``job_id`` is nullable so non-job calls (key check) can
+            # still be accounted for, and survives job deletion — the
+            # money was spent whether or not the row stays.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS api_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    step TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_api_usage_created_at "
+                "ON api_usage(created_at)"
+            )
+
     def _ensure_jobs_columns(self, conn):
         # The library now exposes each artefact as its own button in the
         # table view, so we track them as distinct columns instead of
@@ -159,6 +183,12 @@ class DatabaseManager:
             # one-click attribution of an SPEAKER_NN cluster to an
             # invitee.
             "odoo_meeting_json": "TEXT",
+            # Aggregate remote-API cost of the job, denormalised from
+            # ``api_usage`` so the library list can show "0,21 $"
+            # without a join on every refresh. NULL on local-only
+            # jobs — the SwiftUI table renders those as "—".
+            "cloud_cost_usd": "REAL",
+            "cloud_model": "TEXT",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -431,6 +461,79 @@ class DatabaseManager:
     def delete_job(self, job_id: int):
         with self._get_connection() as conn:
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+
+    # ------------------------------------------------------------------
+    # Remote-API usage ledger
+    # ------------------------------------------------------------------
+
+    def add_api_usage(
+        self,
+        *,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_usd: float,
+        job_id: Optional[int] = None,
+        step: str = "",
+    ) -> int:
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO api_usage (job_id, provider, model, step, "
+                "input_tokens, output_tokens, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    provider,
+                    model,
+                    step,
+                    int(input_tokens),
+                    int(output_tokens),
+                    float(cost_usd),
+                ),
+            )
+            return cursor.lastrowid
+
+    def update_job_cloud_cost(
+        self, job_id: int, cost_usd: float, model: str = ""
+    ) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET cloud_cost_usd = ?, cloud_model = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (float(cost_usd), model or None, job_id),
+            )
+
+    def month_api_spend_usd(self, month: Optional[str] = None) -> float:
+        """Total spend for one calendar month (``YYYY-MM``, default:
+        current month). Drives the budget guard, so it must stay
+        cheap — a single indexed aggregate."""
+        period = (month or datetime.now().strftime("%Y-%m")).strip()
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM api_usage "
+                "WHERE strftime('%Y-%m', created_at) = ?",
+                (period,),
+            )
+            row = cursor.fetchone()
+            return float(row[0] if row else 0.0)
+
+    def api_usage_summary(self, months: int = 6) -> List[dict]:
+        """Per-month aggregates, most recent first. Surfaced in the
+        SwiftUI Réglages → Transcription Cloud section so the user
+        sees where the money goes before it becomes a surprise."""
+        limit = max(int(months), 1)
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT strftime('%Y-%m', created_at) AS month, "
+                "COUNT(*) AS calls, "
+                "SUM(input_tokens) AS input_tokens, "
+                "SUM(output_tokens) AS output_tokens, "
+                "SUM(cost_usd) AS cost_usd "
+                "FROM api_usage GROUP BY month ORDER BY month DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------
     # Speaker enrollment store

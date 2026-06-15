@@ -68,6 +68,17 @@ from transcription_utils import (
     structured_initial_prompt,
 )
 from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
+from cloud_transcription import (
+    CloudTranscriptionError,
+    GeminiClient,
+    build_cloud_audio_cmd,
+    build_cloud_prompt,
+    canonical_cloud_model_id,
+    estimate_cloud_cost,
+    merge_chunk_results,
+    parse_cloud_response,
+    plan_audio_chunks,
+)
 
 from .events import EventSink
 from .logging import append_app_log, tail_text
@@ -76,6 +87,7 @@ from .models import (
     ContextEvent,
     JobRequest,
     ProgressEvent,
+    UsageEvent,
     WarningEvent,
 )
 from .paths import managed_venv_python_path
@@ -836,6 +848,10 @@ class TranscriptionPipeline:
         # means "not probed yet", True / False are the resolved
         # values.
         self._mlx_vlm_available: bool | None = None
+        # Remote-API consumption of this job, one dict per API call.
+        # The runner persists them into ``api_usage`` (it owns the
+        # job_id) and denormalises the total onto the job row.
+        self.cloud_usage_records: list[dict] = []
 
     def _resolve_managed_python(self) -> None:
         settings = self.request.transcription_settings
@@ -1208,6 +1224,19 @@ class TranscriptionPipeline:
         results: list[StepResult] = []
         workspace = job_workspace_dir(self.request)
         workspace.mkdir(parents=True, exist_ok=True)
+
+        # --- cloud engine -----------------------------------------------
+        # One remote call per 30-min window replaces the whole local
+        # quality stack (Whisper + VAD + multipass + diarisation +
+        # LLM post). Hard failures (budget cap, bad key) abort the
+        # job with an explicit error; transient ones (network, quota)
+        # fall back to the local pipeline below so the user still
+        # gets a transcript.
+        if self._cloud_mode_enabled():
+            cloud_results = self._run_cloud_transcription(source_path, workspace)
+            if cloud_results is not None:
+                return cloud_results
+
         wav_path = workspace / "audio.wav"
         # Pyannote runs on a separate WAV that skips the ASR
         # filtering chain (compressor + loudnorm). Those filters help
@@ -1459,6 +1488,346 @@ class TranscriptionPipeline:
                     technical_terms=self.final_technical_terms,
                 )
             )
+        return results
+
+    # ------------------------------------------------------------------
+    # Cloud engine (Gemini)
+    # ------------------------------------------------------------------
+
+    def _cloud_mode_enabled(self) -> bool:
+        settings = self.request.transcription_settings
+        return (settings.transcription_engine or "local").strip().lower() == "cloud"
+
+    def _probe_duration_seconds(self, source_path: str) -> float:
+        """Media duration via ffprobe — the cloud cost estimate and
+        the chunk plan both key off it. 0.0 on failure (the caller
+        then refuses to run blind rather than uploading unbounded
+        audio against a budget)."""
+        ffprobe = self.request.compression_settings.ffprobe_path or "ffprobe"
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            source_path,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=self._subprocess_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            append_app_log(f"engine_cloud_probe_failed error={exc!r}")
+            return 0.0
+        if proc.returncode != 0:
+            append_app_log(
+                f"engine_cloud_probe_failed rc={proc.returncode} "
+                f"stderr={tail_text(proc.stderr)!r}"
+            )
+            return 0.0
+        try:
+            payload = json.loads(proc.stdout or "{}")
+            return max(float((payload.get("format") or {}).get("duration") or 0), 0.0)
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _cloud_budget_error(self, estimate: dict) -> str | None:
+        """Refuse to upload when the projected cost would cross the
+        monthly cap. Returns the user-facing message, or ``None``
+        when the job may proceed."""
+        budget = float(
+            self.request.transcription_settings.cloud_budget_monthly_usd or 0
+        )
+        if budget <= 0:
+            return None
+        # Lazy import — same rationale as _run_speaker_recognition:
+        # tests of the pipeline shouldn't need a real library DB
+        # unless they exercise this exact path.
+        from .library import database
+
+        try:
+            spent = database().month_api_spend_usd()
+        except Exception as exc:
+            append_app_log(f"engine_cloud_budget_lookup_failed error={exc!r}")
+            spent = 0.0
+        projected = spent + float(estimate.get("cost_usd") or 0)
+        if projected <= budget:
+            return None
+        return (
+            f"Budget cloud mensuel atteint : {spent:.2f} $US déjà consommés "
+            f"sur {budget:.2f} $US, et ce traitement est estimé à "
+            f"{float(estimate.get('cost_usd') or 0):.2f} $US. Augmentez le "
+            "budget dans Réglages → Transcription Cloud, ou repassez sur "
+            "le moteur local."
+        )
+
+    def _encode_cloud_chunk(
+        self,
+        source_path: str,
+        target: Path,
+        start: float,
+        end: float,
+        total: float,
+    ) -> str | None:
+        """Produce the compact MP3 for one upload window. Returns an
+        error string on failure (the caller converts it into a
+        fallback-to-local warning)."""
+        ffmpeg = self.request.compression_settings.ffmpeg_path or "ffmpeg"
+        cmd = build_cloud_audio_cmd(
+            ffmpeg,
+            source_path,
+            str(target),
+            start_seconds=start if start > 0 else None,
+            end_seconds=end if end < total else None,
+        )
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, env=self._subprocess_env()
+        )
+        if proc.returncode != 0 or not target.exists():
+            raw = tail_text(proc.stderr or proc.stdout)
+            append_app_log(
+                f"engine_cloud_encode_failed rc={proc.returncode} error={raw!r}"
+            )
+            return _friendly_ffmpeg_error(raw, cmd[0])
+        return None
+
+    def _run_cloud_transcription(
+        self, source_path: str, workspace: Path
+    ) -> list[StepResult] | None:
+        """Full cloud path. Returns the StepResult list on success or
+        hard failure; ``None`` means "fall back to the local
+        pipeline" (a warning event has already been emitted)."""
+        ts = time.monotonic()
+        settings = self.request.transcription_settings
+        model_id = canonical_cloud_model_id(settings.cloud_model)
+
+        def _fallback(message: str, code: str) -> None:
+            self.sink(
+                WarningEvent(
+                    f"Transcription cloud indisponible ({message}) — bascule "
+                    "sur le moteur local.",
+                    code=code,
+                )
+            )
+
+        duration = self._probe_duration_seconds(source_path)
+        if duration <= 0:
+            _fallback("durée du média indéterminable", "cloud_probe_failed")
+            return None
+
+        estimate = estimate_cloud_cost(duration, model_id)
+        budget_error = self._cloud_budget_error(estimate)
+        if budget_error is not None:
+            append_app_log(
+                "engine_cloud_budget_exceeded "
+                f"estimate={estimate.get('cost_usd')!r}"
+            )
+            return [
+                StepResult(
+                    "cloud_transcription",
+                    False,
+                    model=model_id,
+                    error=budget_error,
+                )
+            ]
+
+        try:
+            client = GeminiClient(settings.cloud_api_key)
+        except CloudTranscriptionError as exc:
+            # No key at all: misconfiguration, not a transient blip.
+            return [
+                StepResult(
+                    "cloud_transcription", False, model=model_id, error=str(exc)
+                )
+            ]
+
+        chunks = plan_audio_chunks(duration)
+        self.sink(
+            ProgressEvent(
+                "cloud_transcription",
+                0,
+                f"Transcription cloud ({model_id}) — coût estimé "
+                f"{estimate['cost_usd']:.2f} $US",
+            )
+        )
+
+        glossary = [*self.request.glossary_terms, *self.request.technical_terms]
+        odoo_context_blob = self._fetch_odoo_context_blob()
+        chunk_results = []
+        known_speakers: dict[str, str] = {}
+        previous_tail = ""
+        for index, (start, end) in enumerate(chunks):
+            base_pct = int(100 * index / len(chunks))
+            self.sink(
+                ProgressEvent(
+                    "cloud_transcription",
+                    base_pct,
+                    f"Envoi de l'audio ({index + 1}/{len(chunks)})",
+                )
+            )
+            chunk_mp3 = workspace / f"cloud_chunk_{index:02d}.mp3"
+            encode_error = self._encode_cloud_chunk(
+                source_path, chunk_mp3, start, end, duration
+            )
+            if encode_error is not None:
+                _fallback(encode_error, "cloud_encode_failed")
+                return None
+            prompt = build_cloud_prompt(
+                language=settings.language,
+                glossary_terms=glossary,
+                expected_speaker_names=self._expected_speaker_names(),
+                meeting_context=self._meeting_context(),
+                odoo_context=odoo_context_blob,
+                known_speakers=known_speakers,
+                chunk_index=index,
+                chunk_count=len(chunks),
+                chunk_offset_seconds=start,
+                previous_tail=previous_tail,
+            )
+            file_info: dict = {}
+            try:
+                file_info = client.upload_audio(
+                    str(chunk_mp3), display_name=f"ekovideo-{index:02d}.mp3"
+                )
+                file_info = client.wait_until_active(file_info)
+                self.sink(
+                    ProgressEvent(
+                        "cloud_transcription",
+                        base_pct + int(30 / len(chunks)),
+                        f"Transcription distante ({index + 1}/{len(chunks)})",
+                    )
+                )
+                raw = client.generate_transcription(
+                    model_id=model_id,
+                    file_uri=str(file_info.get("uri") or ""),
+                    mime_type=str(file_info.get("mimeType") or "audio/mp3"),
+                    prompt=prompt,
+                )
+                chunk_result = parse_cloud_response(
+                    raw, model_id=model_id, chunk_offset_seconds=start
+                )
+            except CloudTranscriptionError as exc:
+                if exc.code == "cloud_auth":
+                    # Bad key: failing loudly beats hours of silent
+                    # local compute the user didn't choose.
+                    return [
+                        StepResult(
+                            "cloud_transcription",
+                            False,
+                            model=model_id,
+                            duration_seconds=time.monotonic() - ts,
+                            error=str(exc),
+                        )
+                    ]
+                append_app_log(
+                    f"engine_cloud_chunk_failed index={index} "
+                    f"code={exc.code!r} error={exc!r}"
+                )
+                _fallback(str(exc), exc.code)
+                return None
+            finally:
+                client.delete_file(file_info)
+                try:
+                    chunk_mp3.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            chunk_results.append(chunk_result)
+            for label, name in chunk_result.speakers.items():
+                if name or label not in known_speakers:
+                    known_speakers[label] = name
+            tail_lines = [
+                f"[{seg.get('speaker') or '—'}] {seg.get('text') or ''}"
+                for seg in chunk_result.segments[-3:]
+            ]
+            previous_tail = "\n".join(tail_lines)
+            usage = chunk_result.usage
+            self.cloud_usage_records.append(
+                {
+                    "provider": "gemini",
+                    "model": usage.model or model_id,
+                    "step": f"chunk_{index + 1}/{len(chunks)}",
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cost_usd": usage.cost_usd,
+                }
+            )
+            self.sink(
+                UsageEvent(
+                    "gemini",
+                    usage.model or model_id,
+                    step=f"chunk_{index + 1}/{len(chunks)}",
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cost_usd=usage.cost_usd,
+                )
+            )
+
+        merged = merge_chunk_results(chunk_results)
+        segments = merged.segments
+        # Apply the label → real-name mapping the model discovered, so
+        # the transcript reads "[Jean Dupont]" instead of
+        # "[Intervenant 1]" wherever a name was identified.
+        named = {k: v for k, v in merged.speakers.items() if v}
+        if named:
+            segments = self._apply_speaker_renames(segments, named)
+
+        # Feed the shared payload the review writer + runner expect.
+        self._llm_payload = {
+            "title": merged.title,
+            "speakers": merged.speakers,
+            "technical_terms": merged.technical_terms,
+            "corrections": [],
+            "uncertain_passages": merged.uncertain,
+        }
+
+        transcript_path = self._write_transcript(segments, workspace)
+        results: list[StepResult] = [
+            StepResult(
+                "cloud_transcription",
+                True,
+                str(transcript_path),
+                model=model_id,
+                duration_seconds=time.monotonic() - ts,
+                metrics={
+                    "chunks": len(chunks),
+                    "audio_seconds": round(duration, 1),
+                    "input_tokens": merged.usage.input_tokens,
+                    "output_tokens": merged.usage.output_tokens,
+                    "cost_usd": merged.usage.cost_usd,
+                },
+            ),
+            StepResult("transcript", True, str(transcript_path)),
+        ]
+        review_path = self._write_review_markdown(transcript_path, segments)
+        if review_path is not None:
+            results.append(StepResult("review", True, str(review_path)))
+
+        self.final_segments = segments
+        self.final_speaker_map = self._build_speaker_map(
+            segments, llm_speakers=merged.speakers
+        )
+        self.final_technical_terms = list(merged.technical_terms)
+        self.final_title = merged.title
+        if self.final_speaker_map or self.final_technical_terms:
+            self.sink(
+                ContextEvent(
+                    speakers=self.final_speaker_map,
+                    technical_terms=self.final_technical_terms,
+                )
+            )
+        total_tokens = f"{merged.usage.input_tokens + merged.usage.output_tokens:,}".replace(",", " ")
+        self.sink(
+            ProgressEvent(
+                "cloud_transcription",
+                100,
+                f"Transcription cloud terminée — {total_tokens} tokens, "
+                f"{merged.usage.cost_usd:.2f} $US",
+            )
+        )
         return results
 
     def _build_speaker_map(

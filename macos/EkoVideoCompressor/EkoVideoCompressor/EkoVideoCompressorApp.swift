@@ -12,6 +12,7 @@ struct EkoVideoCompressorApp: App {
     @StateObject private var energy = EnergyMonitor()
     @StateObject private var pyannote = PyannoteStatusStore()
     @StateObject private var deps = DepsStore()
+    @StateObject private var cloudUsage = CloudUsageStore()
 
     init() {
         let args = CommandLine.arguments
@@ -34,6 +35,7 @@ struct EkoVideoCompressorApp: App {
                 .environmentObject(energy)
                 .environmentObject(pyannote)
                 .environmentObject(deps)
+                .environmentObject(cloudUsage)
                 .frame(minWidth: 1180, minHeight: 760)
                 .onAppear {
                     updater.setSettings(settings)
