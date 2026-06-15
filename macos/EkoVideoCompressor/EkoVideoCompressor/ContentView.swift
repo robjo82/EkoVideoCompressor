@@ -324,6 +324,21 @@ struct ContentView: View {
         let meetingDate = item.meetingDate ?? sourceMeetingDate(for: item.sourceURL)
         let termsForRun = item.selectedGlossaryTerms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        // Cheap cloud text-enrichment for dedicated-STT engines (Gemini
+        // returns its own title/names, so it needs none). Uses the
+        // Gemini key the user already has; empty → engine falls back to
+        // the local LLM or skips.
+        var cloudEnrichModel = ""
+        var cloudEnrichKey = ""
+        if settings.usesCloudTranscription,
+           cloudProviderForModel(settings.cloudModel) != "gemini" {
+            let geminiKey = settings.cloudApiKey(forProvider: "gemini")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !geminiKey.isEmpty {
+                cloudEnrichModel = "gemini-3.1-flash-lite"
+                cloudEnrichKey = geminiKey
+            }
+        }
         let request = JobRequest(
             source_path: item.sourceURL.path,
             workspace_dir: item.workspaceDir,
@@ -354,7 +369,9 @@ struct ContentView: View {
                 transcription_engine: settings.transcriptionEngine,
                 cloud_model: settings.cloudModel,
                 cloud_api_key: settings.usesCloudTranscription ? settings.activeCloudApiKey : "",
-                cloud_budget_monthly_usd: settings.cloudBudgetMonthlyUSD
+                cloud_budget_monthly_usd: settings.cloudBudgetMonthlyUSD,
+                cloud_enrich_model: cloudEnrichModel,
+                cloud_enrich_api_key: cloudEnrichKey
             ),
             glossary_terms: termsForRun,
             speaker_overrides: overrides,
@@ -3379,6 +3396,9 @@ struct CloudTranscriptionSettingsSection: View {
             }
         }
         Text("L'audio est compressé puis envoyé au fournisseur le temps de la transcription, et supprimé de ses serveurs ensuite. Pour des réunions internes, Gladia est hébergé en UE ; avec une offre payante les fournisseurs n'utilisent pas vos données pour l'entraînement.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        Text("Astuce : avec un moteur STT (AssemblyAI, Gladia, Deepgram, OpenAI), une clé Gemini ci-dessus active en plus un enrichissement bon marché (titre, noms d'interlocuteurs, corrections métier) pour quelques centimes par réunion.")
             .font(.caption)
             .foregroundStyle(.secondary)
     }

@@ -731,4 +731,10 @@ struct TranscriptionSettings: Codable {
     /// Hard monthly spending cap in USD enforced engine-side
     /// (0 = no cap). The estimate is checked *before* any upload.
     var cloud_budget_monthly_usd: Double = 0
+    /// Cheap text-LLM enrichment for dedicated-STT jobs (title, speaker
+    /// names, glossary fixes). Gemini text model id + the Gemini key;
+    /// empty when the active engine is Gemini (full bundle) or no
+    /// Gemini key is set (engine then falls back to the local LLM).
+    var cloud_enrich_model: String = ""
+    var cloud_enrich_api_key: String = ""
 }
