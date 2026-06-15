@@ -1066,11 +1066,32 @@ class CloudPromptContext:
     meeting_context: str = ""
     odoo_context: str = ""
     known_speakers: dict[str, str] = field(default_factory=dict)
+    # Expected speaker-count hints (0 = let the model decide). Forwarded
+    # to each STT's native diarisation config so the provider doesn't
+    # under/over-segment — the same signal the local pyannote path uses.
+    expected_min_speakers: int = 0
+    expected_max_speakers: int = 0
     chunk_index: int = 0
     chunk_count: int = 1
     chunk_offset_seconds: float = 0.0
     chunk_duration_seconds: float = 0.0
     previous_tail: str = ""
+
+    def bias_terms(self, limit: int = 200) -> list[str]:
+        """De-duplicated business vocabulary + expected participant
+        names, capped — fed to each provider's native term-boosting
+        mechanism (Gladia custom_vocabulary, Deepgram keyterm, …)."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for term in [*self.glossary_terms, *self.expected_speaker_names]:
+            cleaned = (term or "").strip()
+            key = cleaned.lower()
+            if cleaned and key not in seen:
+                seen.add(key)
+                out.append(cleaned)
+            if len(out) >= limit:
+                break
+        return out
 
 
 def _normalized_speaker(raw: Any, label_map: dict[str, str]) -> str:
@@ -1401,17 +1422,19 @@ class OpenAITranscribeProvider(CloudProvider):
 
         entry = cloud_model_entry(model_id)
         api_model = str(entry.get("api_model") or model_id)
-        prompt_terms = ", ".join(
-            t for t in [*context.glossary_terms, *context.expected_speaker_names]
-            if (t or "").strip()
-        )
+        prompt_terms = ", ".join(context.bias_terms(limit=100))
         fields: dict[str, str] = {"model": api_model, "response_format": "json"}
         if (context.language or "").strip():
             fields["language"] = context.language
+        # The transcription ``prompt`` biases decoding toward our
+        # vocabulary, participants and the meeting topic.
+        prompt_parts: list[str] = []
         if prompt_terms:
-            fields["prompt"] = (
-                "Vocabulaire et participants attendus : " + prompt_terms
-            )
+            prompt_parts.append("Vocabulaire et participants attendus : " + prompt_terms + ".")
+        if (context.meeting_context or "").strip():
+            prompt_parts.append("Sujet de la réunion : " + context.meeting_context.strip() + ".")
+        if prompt_parts:
+            fields["prompt"] = " ".join(prompt_parts)
         body_bytes = _Path(audio_path).read_bytes()
         multipart, content_type = _multipart_body(
             fields,
@@ -1498,9 +1521,21 @@ class AssemblyAIProvider(CloudProvider):
             config["language_code"] = lang
         else:
             config["language_detection"] = True
-        boost = [t for t in context.glossary_terms if (t or "").strip()]
-        if boost:
-            config["word_boost"] = boost[:1000]
+        # Forward the expected speaker count to the diarisation model.
+        lo, hi = context.expected_min_speakers, context.expected_max_speakers
+        if lo > 0 and lo == hi:
+            config["speakers_expected"] = lo
+        elif lo > 0 or hi > 0:
+            opts: dict[str, int] = {}
+            if lo > 0:
+                opts["min_speakers_expected"] = lo
+            if hi > 0:
+                opts["max_speakers_expected"] = hi
+            config["speaker_options"] = opts
+        # NB: ``word_boost`` is intentionally not sent — it's absent from
+        # the current transcript schema and a rejected field would 400
+        # the job (and silently bounce us to the local engine). Business
+        # vocabulary is restored downstream by the LLM enrichment pass.
         created, _ = self._json(
             "POST",
             f"{ASSEMBLYAI_API_BASE}/v2/transcript",
@@ -1564,10 +1599,12 @@ class DeepgramProvider(CloudProvider):
         else:
             params["detect_language"] = "true"
         query = urlencode(params)
-        keyterms = [t for t in context.glossary_terms if (t or "").strip()]
+        # Deepgram caps keyterms at 500 tokens; their docs recommend the
+        # 20-50 most critical terms. Send vocabulary + expected names.
+        keyterms = context.bias_terms(limit=50)
         if keyterms:
             query += "".join(
-                "&keyterm=" + urllib.parse.quote(t) for t in keyterms[:100]
+                "&keyterm=" + urllib.parse.quote(t) for t in keyterms
             )
         raw, _ = self._request(
             "POST",
@@ -1654,9 +1691,22 @@ class GladiaProvider(CloudProvider):
             config["language"] = lang
         else:
             config["detect_language"] = True
-        vocab = [t for t in context.glossary_terms if (t or "").strip()]
+        # Business vocabulary + expected participant names bias the model
+        # toward the right spellings.
+        vocab = context.bias_terms(limit=1000)
         if vocab:
-            config["custom_vocabulary"] = vocab[:1000]
+            config["custom_vocabulary"] = vocab
+        # Expected speaker count → diarisation config.
+        lo, hi = context.expected_min_speakers, context.expected_max_speakers
+        if lo > 0 and lo == hi:
+            config["diarization_config"] = {"number_of_speakers": lo}
+        elif lo > 0 or hi > 0:
+            diar: dict[str, int] = {}
+            if lo > 0:
+                diar["min_speakers"] = lo
+            if hi > 0:
+                diar["max_speakers"] = hi
+            config["diarization_config"] = diar
         created, _ = self._json(
             "POST",
             f"{GLADIA_API_BASE}/v2/pre-recorded",

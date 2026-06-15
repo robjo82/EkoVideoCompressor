@@ -1720,6 +1720,8 @@ class TranscriptionPipeline:
                 meeting_context=self._meeting_context(),
                 odoo_context=odoo_context_blob,
                 known_speakers=known_speakers,
+                expected_min_speakers=max(settings.expected_min_speakers, 0),
+                expected_max_speakers=max(settings.expected_max_speakers, 0),
                 chunk_index=index,
                 chunk_count=len(chunks),
                 chunk_offset_seconds=start,

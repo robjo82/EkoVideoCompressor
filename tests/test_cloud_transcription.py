@@ -495,13 +495,139 @@ def _router(routes):
     return opener
 
 
-def _ctx(duration=600.0):
-    return CloudPromptContext(
+def _ctx(duration=600.0, **overrides):
+    base = dict(
         language="fr",
         glossary_terms=["Odoo"],
         chunk_offset_seconds=0.0,
         chunk_duration_seconds=duration,
     )
+    base.update(overrides)
+    return CloudPromptContext(**base)
+
+
+class _CapturingRouter:
+    """Opener that records each request's parsed JSON body / query so
+    tests can assert what context was forwarded to the provider."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.bodies: list[dict] = []
+        self.urls: list[str] = []
+
+    def __call__(self, request, timeout=None):
+        method = request.get_method()
+        url = request.full_url
+        self.urls.append(url)
+        if request.data:
+            try:
+                self.bodies.append(json.loads(request.data.decode("utf-8")))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.bodies.append({"_raw": True})
+        for want_method, substr, body in self.routes:
+            if method == want_method and substr in url:
+                return _FakeResponse(body)
+        raise AssertionError(f"no route for {method} {url}")
+
+    def body_matching(self, key: str) -> dict | None:
+        for body in self.bodies:
+            if key in body:
+                return body
+        return None
+
+
+class ContextEnrichmentTest(unittest.TestCase):
+    """The signals EVC already has — expected speaker count, names,
+    business vocabulary — must reach each provider's native params."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.audio = Path(self._tmp.name) / "chunk.mp3"
+        self.audio.write_bytes(b"fake-mp3")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_gladia_forwards_vocab_names_and_speaker_count(self):
+        router = _CapturingRouter([
+            ("POST", "/v2/upload", {"audio_url": "https://x/up"}),
+            ("POST", "/v2/pre-recorded", {"result_url": "https://api.gladia.io/v2/pre-recorded/g1"}),
+            ("GET", "/v2/pre-recorded/g1", {
+                "status": "done",
+                "result": {"transcription": {"utterances": [
+                    {"speaker": 0, "start": 0.0, "end": 2.0, "text": "Oui."},
+                ]}},
+            }),
+        ])
+        provider = get_cloud_provider("gladia", "key", opener=router)
+        provider.transcribe(
+            str(self.audio),
+            model_id="gladia-solaria-3",
+            context=_ctx(
+                glossary_terms=["Odoo", "Ekonum"],
+                expected_speaker_names=["Robin Joseph"],
+                expected_min_speakers=3,
+                expected_max_speakers=3,
+            ),
+        )
+        body = router.body_matching("custom_vocabulary")
+        self.assertIsNotNone(body)
+        self.assertIn("Odoo", body["custom_vocabulary"])
+        self.assertIn("Robin Joseph", body["custom_vocabulary"])  # name added
+        self.assertEqual(body["diarization_config"]["number_of_speakers"], 3)
+        self.assertEqual(body["model"], "solaria-3")
+
+    def test_assemblyai_forwards_speaker_range_not_word_boost(self):
+        router = _CapturingRouter([
+            ("POST", "/v2/upload", {"upload_url": "https://x/up"}),
+            ("POST", "/v2/transcript", {"id": "t1"}),
+            ("GET", "/v2/transcript/t1", {
+                "status": "completed",
+                "utterances": [{"speaker": "A", "start": 0, "end": 2000, "text": "Oui."}],
+            }),
+        ])
+        provider = get_cloud_provider("assemblyai", "key", opener=router)
+        provider.transcribe(
+            str(self.audio),
+            model_id="assemblyai-universal-3",
+            context=_ctx(expected_min_speakers=2, expected_max_speakers=4),
+        )
+        body = router.body_matching("speaker_options")
+        self.assertIsNotNone(body)
+        self.assertEqual(body["speaker_options"]["min_speakers_expected"], 2)
+        self.assertEqual(body["speaker_options"]["max_speakers_expected"], 4)
+        # word_boost must not be sent (absent from the current schema).
+        self.assertNotIn("word_boost", body)
+
+    def test_deepgram_keyterms_include_names(self):
+        router = _CapturingRouter([
+            ("POST", "/v1/listen", {"results": {"utterances": [
+                {"speaker": 0, "start": 0.0, "end": 2.0, "transcript": "Oui."},
+            ]}}),
+        ])
+        provider = get_cloud_provider("deepgram", "key", opener=router)
+        provider.transcribe(
+            str(self.audio),
+            model_id="deepgram-nova-3",
+            context=_ctx(glossary_terms=["Ekonum"], expected_speaker_names=["Lùka"]),
+        )
+        from urllib.parse import unquote
+
+        listen_url = next(u for u in router.urls if "/v1/listen" in u)
+        self.assertIn("keyterm=Ekonum", listen_url)
+        # The expected name is added too (URL-encoded in the query).
+        self.assertIn("Lùka", unquote(listen_url))
+
+    def test_bias_terms_dedupes_and_caps(self):
+        ctx = _ctx(
+            glossary_terms=["Odoo", "odoo", "ERP"],
+            expected_speaker_names=["Robin", "ERP"],
+        )
+        terms = ctx.bias_terms(limit=10)
+        # "odoo"/"Odoo" dedup case-insensitively; "ERP" appears once.
+        self.assertEqual(terms.count("Odoo"), 1)
+        self.assertEqual([t.lower() for t in terms].count("erp"), 1)
+        self.assertIn("Robin", terms)
 
 
 class STTProviderParsingTest(unittest.TestCase):

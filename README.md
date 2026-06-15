@@ -103,6 +103,10 @@ Fournisseurs et tarifs indicatifs (par heure d'audio) :
 - L'historique (`Bibliothèque`) indique le modèle utilisé pour chaque
   transcription via la colonne `Modèle` — pratique pour comparer les
   moteurs entre eux.
+- Le contexte déjà connu de l'app est transmis aux API : vocabulaire
+  métier + noms attendus (boosting de termes natif de chaque
+  fournisseur) et nombre d'intervenants attendu (config de diarisation),
+  pour améliorer la qualité sans surcoût.
 - L'audio est compressé (MP3 mono 16 kHz), envoyé par fenêtres de
   30 minutes puis **supprimé des serveurs du fournisseur** sitôt la
   réponse reçue.
