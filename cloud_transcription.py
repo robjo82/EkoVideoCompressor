@@ -44,6 +44,10 @@ except ImportError:  # pragma: no cover - certifi ships with the bundle
 
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+OPENAI_API_BASE = "https://api.openai.com"
+ASSEMBLYAI_API_BASE = "https://api.assemblyai.com"
+DEEPGRAM_API_BASE = "https://api.deepgram.com"
+GLADIA_API_BASE = "https://api.gladia.io"
 
 # Gemini bills audio input at a fixed rate regardless of content.
 AUDIO_TOKENS_PER_SECOND = 32
@@ -68,16 +72,31 @@ _CHUNK_TOLERANCE_SECONDS = 5 * 60
 _CLOUD_ROLE = "cloud_transcription"
 
 # Catalogue surfaced in the SwiftUI Models tab next to the local
-# checkpoints. ``price_in_per_1m`` is the *audio* input price (what a
-# transcription job actually pays), ``price_out_per_1m`` the text
-# output price; both in USD per million tokens, from
-# https://ai.google.dev/gemini-api/docs/pricing (June 2026).
+# checkpoints. Two billing models live side by side:
 #
-# ``thinking`` selects the request knob that caps reasoning tokens —
-# transcription is perception work, extended thinking only burns
-# output budget. "level_low" is the Gemini 3.x dial, "budget_zero"
-# the 2.5 one; the client retries without the knob if the API
-# rejects it, so a model migration can't brick the feature.
+#  * ``billing == "per_token"`` (the multimodal LLMs — Gemini): cost
+#    is metered on the real ``usageMetadata`` counters, so the entry
+#    carries ``price_in_per_1m`` (audio input) and ``price_out_per_1m``
+#    (text output) in USD per million tokens.
+#  * ``billing == "per_hour"`` (dedicated STT — AssemblyAI, Deepgram,
+#    Gladia, OpenAI transcribe): providers bill on audio duration, so
+#    the entry carries ``price_per_hour`` and we derive cost from the
+#    chunk length.
+#
+# ``needs_enrichment`` marks the providers that return only a raw
+# transcript (+ native diarisation) and therefore lean on the LLM
+# post-pass for a title, speaker *names* and business-glossary
+# corrections. The full-bundle providers (Gemini) return all of that
+# in one call and set it to False.
+#
+# ``thinking`` (Gemini only) caps reasoning tokens — transcription is
+# perception work, extended thinking only burns output budget.
+# "level_low" is the Gemini 3.x dial, "budget_zero" the 2.5 one; the
+# client retries without the knob if the API rejects it.
+#
+# Prices are June 2026 list rates from each vendor's pricing page.
+# Per-hour figures pick the *conservative* (higher) tier when a
+# vendor has volume discounts, so the budget guard never under-bills.
 CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
     {
         "id": "gemini-3.5-flash",
@@ -89,8 +108,11 @@ CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
         "tier": "balanced",
         "language": ["multi"],
         "default": True,
+        "billing": "per_token",
         "price_in_per_1m": 1.50,
         "price_out_per_1m": 9.00,
+        "needs_enrichment": False,
+        "diarizes": True,
         "thinking": "level_low",
     },
     {
@@ -102,8 +124,11 @@ CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
         "provider": "gemini",
         "tier": "heavy",
         "language": ["multi"],
+        "billing": "per_token",
         "price_in_per_1m": 4.00,
         "price_out_per_1m": 18.00,
+        "needs_enrichment": False,
+        "diarizes": True,
         "thinking": "level_low",
     },
     {
@@ -115,8 +140,11 @@ CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
         "provider": "gemini",
         "tier": "light",
         "language": ["multi"],
+        "billing": "per_token",
         "price_in_per_1m": 1.00,
         "price_out_per_1m": 2.50,
+        "needs_enrichment": False,
+        "diarizes": True,
         "thinking": "budget_zero",
     },
     {
@@ -128,13 +156,108 @@ CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
         "provider": "gemini",
         "tier": "light",
         "language": ["multi"],
+        "billing": "per_token",
         "price_in_per_1m": 0.50,
         "price_out_per_1m": 1.50,
+        "needs_enrichment": False,
+        "diarizes": True,
         "thinking": "level_low",
+    },
+    # --- Dedicated STT providers (transcript + native diarisation) ---
+    {
+        "id": "assemblyai-universal-3",
+        "label": "AssemblyAI Universal-3",
+        "family": "AssemblyAI",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "assemblyai",
+        "tier": "balanced",
+        "language": ["fr", "en", "multi"],
+        "billing": "per_hour",
+        "price_per_hour": 0.21,
+        "needs_enrichment": True,
+        "diarizes": True,
+    },
+    {
+        "id": "gpt-4o-transcribe-diarize",
+        "label": "OpenAI gpt-4o-transcribe (diarisation)",
+        "family": "OpenAI",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "openai",
+        "tier": "balanced",
+        "language": ["multi"],
+        "billing": "per_hour",
+        "price_per_hour": 0.36,
+        "needs_enrichment": True,
+        "diarizes": True,
+        # OpenAI transcription endpoint model id sent as-is.
+        "api_model": "gpt-4o-transcribe-diarize",
+    },
+    {
+        "id": "gpt-4o-mini-transcribe",
+        "label": "OpenAI gpt-4o-mini-transcribe",
+        "family": "OpenAI",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "openai",
+        "tier": "light",
+        "language": ["multi"],
+        "billing": "per_hour",
+        "price_per_hour": 0.18,
+        "needs_enrichment": True,
+        # No diarisation on the mini transcribe model — single speaker
+        # track. Still useful for 1:1s and dictation at half the price.
+        "diarizes": False,
+        "api_model": "gpt-4o-mini-transcribe",
+    },
+    {
+        "id": "gladia-solaria-1",
+        "label": "Gladia (Solaria-1)",
+        "family": "Gladia",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "gladia",
+        "tier": "balanced",
+        "language": ["multi"],
+        "billing": "per_hour",
+        # Starter async list price; drops to ~0.20 on the Growth plan.
+        # We bill the conservative figure so the guard never under-counts.
+        "price_per_hour": 0.61,
+        "needs_enrichment": True,
+        "diarizes": True,
+    },
+    {
+        "id": "deepgram-nova-3",
+        "label": "Deepgram Nova-3",
+        "family": "Deepgram",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "deepgram",
+        "tier": "light",
+        "language": ["multi"],
+        "billing": "per_hour",
+        # Pay-as-you-go pre-recorded Nova rate (~$0.0043/min).
+        "price_per_hour": 0.26,
+        "needs_enrichment": True,
+        "diarizes": True,
+        "api_model": "nova-3",
     },
 ]
 
 DEFAULT_CLOUD_MODEL = CLOUD_TRANSCRIPTION_MODELS[0]["id"]
+
+# Providers the engine knows how to drive. Surfaced to the SwiftUI
+# settings so it can render one API-key field per provider.
+CLOUD_PROVIDERS: list[str] = ["gemini", "openai", "assemblyai", "gladia", "deepgram"]
+
+
+def cloud_models_for_provider(provider: str) -> list[dict]:
+    return [m for m in CLOUD_TRANSCRIPTION_MODELS if m["provider"] == provider]
+
+
+def provider_for_model(model_id: str) -> str:
+    return cloud_model_entry(model_id).get("provider", "gemini")
 
 
 class CloudTranscriptionError(RuntimeError):
@@ -150,18 +273,31 @@ class CloudTranscriptionError(RuntimeError):
         self.code = code
 
 
+def _entry_hourly_usd(entry: dict) -> float:
+    """Estimated USD for one hour of audio on this model — the common
+    yardstick used to compare per-token and per-hour models (e.g. to
+    pick the most expensive when falling back on an unknown id)."""
+    if entry.get("billing") == "per_hour":
+        return float(entry.get("price_per_hour") or 0)
+    seconds = 3600
+    input_tokens = seconds * AUDIO_TOKENS_PER_SECOND + 400
+    output_tokens = seconds * ESTIMATED_OUTPUT_TOKENS_PER_AUDIO_SECOND + 300
+    return (
+        input_tokens * float(entry.get("price_in_per_1m") or 0)
+        + output_tokens * float(entry.get("price_out_per_1m") or 0)
+    ) / 1_000_000
+
+
 def cloud_model_entry(model_id: str) -> dict:
     raw = (model_id or "").strip() or DEFAULT_CLOUD_MODEL
     for entry in CLOUD_TRANSCRIPTION_MODELS:
         if entry["id"] == raw:
             return entry
     # Unknown id (user typed a fresh model before the catalogue knew
-    # it): keep their choice, bill at the most expensive known rates
-    # so the budget guard stays conservative.
-    fallback = max(
-        CLOUD_TRANSCRIPTION_MODELS,
-        key=lambda e: (e["price_in_per_1m"], e["price_out_per_1m"]),
-    )
+    # it): keep their choice, bill at the most expensive known rate
+    # (compared on a per-hour basis across both billing models) so the
+    # budget guard stays conservative.
+    fallback = max(CLOUD_TRANSCRIPTION_MODELS, key=_entry_hourly_usd)
     return {**fallback, "id": raw, "label": raw, "default": False}
 
 
@@ -170,12 +306,24 @@ def canonical_cloud_model_id(model_id: str) -> str:
 
 
 def compute_cost_usd(model_id: str, input_tokens: int, output_tokens: int) -> float:
+    """Per-token cost from real usage counters (per_token models)."""
     entry = cloud_model_entry(model_id)
     cost = (
-        max(input_tokens, 0) * entry["price_in_per_1m"]
-        + max(output_tokens, 0) * entry["price_out_per_1m"]
+        max(input_tokens, 0) * float(entry.get("price_in_per_1m") or 0)
+        + max(output_tokens, 0) * float(entry.get("price_out_per_1m") or 0)
     ) / 1_000_000
     return round(cost, 6)
+
+
+def cost_for_duration(model_id: str, duration_seconds: float) -> float:
+    """Duration-based cost (per_hour models). For per_token models this
+    returns the *estimate* — handy as a fallback, but real per_token
+    billing should use :func:`compute_cost_usd` on the API counters."""
+    entry = cloud_model_entry(model_id)
+    seconds = max(float(duration_seconds or 0), 0.0)
+    if entry.get("billing") == "per_hour":
+        return round((seconds / 3600.0) * float(entry.get("price_per_hour") or 0), 6)
+    return estimate_cloud_cost(seconds, model_id)["cost_usd"]
 
 
 def estimate_cloud_cost(duration_seconds: float, model_id: str) -> dict[str, Any]:
@@ -188,7 +336,16 @@ def estimate_cloud_cost(duration_seconds: float, model_id: str) -> dict[str, Any
     estimate) — an over-estimate that blocks a borderline job beats
     an under-estimate that overshoots the user's cap.
     """
+    entry = cloud_model_entry(model_id)
     seconds = max(float(duration_seconds or 0), 0.0)
+    if entry.get("billing") == "per_hour":
+        return {
+            "model": canonical_cloud_model_id(model_id),
+            "duration_seconds": seconds,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": round((seconds / 3600.0) * float(entry.get("price_per_hour") or 0), 6),
+        }
     input_tokens = int(seconds * AUDIO_TOKENS_PER_SECOND) + 400  # + prompt
     output_tokens = int(seconds * ESTIMATED_OUTPUT_TOKENS_PER_AUDIO_SECOND) + 300
     return {
@@ -436,6 +593,9 @@ class CloudChunkResult:
     technical_terms: list[str] = field(default_factory=list)
     title: str = ""
     uncertain: list[dict] = field(default_factory=list)
+    # Glossary corrections — empty for the raw STT providers, filled by
+    # the LLM enrichment pass (or by Gemini's full-bundle response).
+    corrections: list[dict] = field(default_factory=list)
     usage: CloudUsage = field(default_factory=CloudUsage)
 
 
@@ -559,6 +719,7 @@ def merge_chunk_results(chunks: list[CloudChunkResult]) -> CloudChunkResult:
                 seen_terms.add(key)
                 merged.technical_terms.append(term)
         merged.uncertain.extend(chunk.uncertain)
+        merged.corrections.extend(chunk.corrections)
         if not merged.title and chunk.title:
             merged.title = chunk.title
         merged.usage.add(chunk.usage)
@@ -577,7 +738,9 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def _friendly_http_error(exc: urllib.error.HTTPError) -> CloudTranscriptionError:
+def _friendly_http_error(
+    exc: urllib.error.HTTPError, provider_label: str = "Gemini"
+) -> CloudTranscriptionError:
     try:
         body = exc.read().decode("utf-8", errors="replace")
     except Exception:
@@ -585,24 +748,35 @@ def _friendly_http_error(exc: urllib.error.HTTPError) -> CloudTranscriptionError
     detail = ""
     try:
         payload = json.loads(body)
-        detail = str(((payload.get("error") or {}).get("message")) or "").strip()
+        # Providers nest the message differently: Gemini/OpenAI use
+        # {"error": {"message": ...}}, AssemblyAI {"error": "..."},
+        # Deepgram {"err_msg": ...}, Gladia {"message": ...}.
+        err = payload.get("error")
+        if isinstance(err, dict):
+            detail = str(err.get("message") or "").strip()
+        elif isinstance(err, str):
+            detail = err.strip()
+        if not detail:
+            detail = str(
+                payload.get("message") or payload.get("err_msg") or ""
+            ).strip()
     except Exception:
         detail = body[:300].strip()
     if exc.code in {401, 403}:
         return CloudTranscriptionError(
-            "Clé API Gemini refusée. Vérifiez la clé dans Réglages → "
+            f"Clé API {provider_label} refusée. Vérifiez la clé dans Réglages → "
             "Transcription Cloud." + (f" (Détail : {detail})" if detail else ""),
             code="cloud_auth",
         )
     if exc.code == 429:
         return CloudTranscriptionError(
-            "Quota Gemini atteint (HTTP 429). Réessayez dans quelques "
+            f"Quota {provider_label} atteint (HTTP 429). Réessayez dans quelques "
             "minutes ou vérifiez votre offre API."
             + (f" (Détail : {detail})" if detail else ""),
             code="cloud_quota",
         )
     return CloudTranscriptionError(
-        f"Erreur API Gemini (HTTP {exc.code})"
+        f"Erreur API {provider_label} (HTTP {exc.code})"
         + (f" : {detail}" if detail else ".")
     )
 
@@ -835,3 +1009,671 @@ class GeminiClient:
             generation_config.pop("thinkingConfig", None)
             body, _ = self._json_request("POST", url, payload=payload)
         return body
+
+
+# ---------------------------------------------------------------------------
+# Provider abstraction
+#
+# Two paradigms behind one interface:
+#
+#  * Multimodal LLM (Gemini): one call returns transcript + diarisation
+#    + title + speaker names + glossary corrections.
+#  * Dedicated STT (OpenAI transcribe, AssemblyAI, Deepgram, Gladia):
+#    returns transcript + native diarisation only. The pipeline then
+#    runs the existing LLM post-pass for title / names / corrections
+#    (``needs_enrichment`` on the catalogue entry).
+#
+# Every provider implements ``transcribe(audio_path, model_id, context)
+# -> CloudChunkResult`` for one audio window, and ``check_access()`` for
+# the Réglages key check. STT providers bill per audio hour, so their
+# usage carries cost derived from the window duration rather than from
+# token counters.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class CloudPromptContext:
+    """Everything a provider needs to transcribe one window with the
+    user's vocabulary, expected participants and cross-window
+    continuity. Mirrors the arguments of :func:`build_cloud_prompt`."""
+
+    language: str = "fr"
+    glossary_terms: list[str] = field(default_factory=list)
+    expected_speaker_names: list[str] = field(default_factory=list)
+    meeting_context: str = ""
+    odoo_context: str = ""
+    known_speakers: dict[str, str] = field(default_factory=dict)
+    chunk_index: int = 0
+    chunk_count: int = 1
+    chunk_offset_seconds: float = 0.0
+    chunk_duration_seconds: float = 0.0
+    previous_tail: str = ""
+
+
+def _normalized_speaker(raw: Any, label_map: dict[str, str]) -> str:
+    """Map a provider's raw speaker tag ("A", 0, "speaker_1") to a
+    stable, user-friendly "Intervenant N" *within one window*. Empty
+    tags (no diarisation) stay empty so the renderer omits the prefix.
+
+    Cross-window identity is intentionally not reconciled here — STT
+    diarisation labels aren't speaker IDs, so window 2's "A" may be a
+    different person than window 1's. The LLM enrichment pass and the
+    rename sheet reconcile names across the full transcript."""
+    key = str(raw).strip()
+    if not key:
+        return ""
+    if key not in label_map:
+        label_map[key] = f"Intervenant {len(label_map) + 1}"
+    return label_map[key]
+
+
+def _segments_from_plain_text(text: str, duration_seconds: float) -> list[dict]:
+    """Fallback segmentation when a provider returns only flat text
+    (e.g. OpenAI transcribe without per-segment timestamps). Splits on
+    sentence boundaries and distributes timestamps proportionally to
+    word count across the window so the transcript stays navigable."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+    pieces = re.split(r"(?<=[.!?…])\s+", cleaned)
+    pieces = [p.strip() for p in pieces if p.strip()]
+    if not pieces:
+        return []
+    total_words = sum(len(p.split()) for p in pieces) or 1
+    span = max(float(duration_seconds or 0), float(len(pieces)))
+    cursor = 0.0
+    out: list[dict] = []
+    for piece in pieces:
+        share = len(piece.split()) / total_words
+        seg_len = max(span * share, 0.5)
+        out.append(
+            {"start": round(cursor, 2), "end": round(cursor + seg_len, 2),
+             "speaker": "", "text": piece}
+        )
+        cursor += seg_len
+    return out
+
+
+def _result_from_utterances(
+    utterances: list[dict],
+    *,
+    model_id: str,
+    context: CloudPromptContext,
+) -> CloudChunkResult:
+    """Build a :class:`CloudChunkResult` from a provider's utterance
+    list. Each utterance is ``{start, end, speaker, text}`` in
+    *chunk-local seconds*; we offset to the source timeline and bill
+    the window by duration (per-hour providers)."""
+    offset = context.chunk_offset_seconds
+    label_map: dict[str, str] = {}
+    result = CloudChunkResult()
+    for utt in utterances:
+        text = str(utt.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start = float(utt.get("start") or 0.0)
+            end = float(utt.get("end") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if end < start:
+            end = start + max(len(text.split()) / 3.0, 1.0)
+        result.segments.append(
+            {
+                "start": round(start + offset, 2),
+                "end": round(end + offset, 2),
+                "speaker": _normalized_speaker(utt.get("speaker"), label_map),
+                "text": text,
+            }
+        )
+    if not result.segments:
+        raise CloudTranscriptionError(
+            "Le fournisseur a répondu mais sans aucun segment exploitable."
+        )
+    result.usage = CloudUsage(
+        model=model_id,
+        input_tokens=0,
+        output_tokens=0,
+        cost_usd=cost_for_duration(model_id, context.chunk_duration_seconds),
+    )
+    return result
+
+
+def _multipart_body(
+    fields: dict[str, str],
+    *,
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    file_content_type: str,
+) -> tuple[bytes, str]:
+    """Hand-rolled multipart/form-data (no third-party deps). The
+    boundary is fixed and improbable — deterministic for tests and not
+    present in audio payloads."""
+    boundary = "----EkoVideoBoundary7MA4YWxkTrZu0gW"
+    crlf = b"\r\n"
+    bb = boundary.encode()
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts += [
+            b"--" + bb,
+            b'Content-Disposition: form-data; name="' + name.encode() + b'"',
+            b"",
+            str(value).encode("utf-8"),
+        ]
+    parts += [
+        b"--" + bb,
+        b'Content-Disposition: form-data; name="' + file_field.encode()
+        + b'"; filename="' + filename.encode() + b'"',
+        b"Content-Type: " + file_content_type.encode(),
+        b"",
+        file_bytes,
+        b"--" + bb + b"--",
+        b"",
+    ]
+    return crlf.join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _audio_mime(path: str) -> str:
+    from pathlib import Path as _Path
+
+    return "audio/mpeg" if _Path(path).suffix.lower() == ".mp3" else "audio/wav"
+
+
+class CloudProvider:
+    """Base class: HTTP plumbing + the two-method contract."""
+
+    provider_id = ""
+    provider_label = ""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        opener: Callable[..., Any] | None = None,
+        timeout: float = 600.0,
+    ):
+        key = (api_key or "").strip()
+        if not key:
+            raise CloudTranscriptionError(
+                f"Aucune clé API {self.provider_label} configurée. Ajoutez-la "
+                "dans Réglages → Transcription Cloud.",
+                code="cloud_auth",
+            )
+        self.api_key = key
+        self.timeout = timeout
+        self._opener = opener
+        self._context = None if opener else _ssl_context()
+
+    # -- HTTP ---------------------------------------------------------
+
+    def _open(self, request: urllib.request.Request) -> Any:
+        try:
+            if self._opener is not None:
+                return self._opener(request, timeout=self.timeout)
+            return urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._context
+            )
+        except urllib.error.HTTPError as exc:
+            raise _friendly_http_error(exc, self.provider_label) from exc
+        except urllib.error.URLError as exc:
+            raise CloudTranscriptionError(
+                f"Impossible de joindre l'API {self.provider_label} : {exc.reason}. "
+                "Vérifiez la connexion internet.",
+                code="cloud_network",
+            ) from exc
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, dict[str, str]]:
+        request = urllib.request.Request(url, data=data, method=method)
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
+        with self._open(request) as response:
+            raw = response.read()
+            resp_headers = {k.lower(): v for k, v in response.headers.items()}
+        return raw, resp_headers
+
+    def _json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[dict, dict[str, str]]:
+        data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+        merged = dict(headers or {})
+        if data is not None:
+            merged.setdefault("Content-Type", "application/json")
+        raw, resp_headers = self._request(method, url, data=data, headers=merged)
+        body: dict = {}
+        text = raw.decode("utf-8", errors="replace") if raw else ""
+        if text.strip():
+            try:
+                body = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise CloudTranscriptionError(
+                    f"Réponse {self.provider_label} illisible : {exc}"
+                ) from exc
+        return body, resp_headers
+
+    def _poll(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str],
+        is_done: Callable[[dict], bool],
+        is_failed: Callable[[dict], bool],
+        poll_seconds: float = 3.0,
+        max_polls: int = 200,
+        sleeper: Callable[[float], None] | None = None,
+    ) -> dict:
+        import time as _time
+
+        sleep = sleeper or _time.sleep
+        polls = 0
+        while True:
+            body, _ = self._json("GET", url, headers=headers)
+            if is_failed(body):
+                raise CloudTranscriptionError(
+                    f"{self.provider_label} a échoué à transcrire l'audio."
+                )
+            if is_done(body):
+                return body
+            if polls >= max_polls:
+                raise CloudTranscriptionError(
+                    f"{self.provider_label} : délai dépassé en attendant la "
+                    "transcription."
+                )
+            polls += 1
+            sleep(poll_seconds)
+
+    # -- contract -----------------------------------------------------
+
+    def check_access(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def transcribe(
+        self, audio_path: str, *, model_id: str, context: CloudPromptContext
+    ) -> CloudChunkResult:
+        raise NotImplementedError
+
+
+class GeminiProvider(CloudProvider):
+    provider_id = "gemini"
+    provider_label = "Gemini"
+
+    def __init__(self, api_key: str, **kwargs):
+        super().__init__(api_key, **kwargs)
+        self._client = GeminiClient(api_key, opener=self._opener, timeout=self.timeout)
+
+    def check_access(self) -> dict[str, Any]:
+        return self._client.check_access()
+
+    def transcribe(
+        self, audio_path: str, *, model_id: str, context: CloudPromptContext
+    ) -> CloudChunkResult:
+        prompt = build_cloud_prompt(
+            language=context.language,
+            glossary_terms=context.glossary_terms,
+            expected_speaker_names=context.expected_speaker_names,
+            meeting_context=context.meeting_context,
+            odoo_context=context.odoo_context,
+            known_speakers=context.known_speakers,
+            chunk_index=context.chunk_index,
+            chunk_count=context.chunk_count,
+            chunk_offset_seconds=context.chunk_offset_seconds,
+            previous_tail=context.previous_tail,
+        )
+        file_info: dict = {}
+        try:
+            file_info = self._client.upload_audio(audio_path)
+            file_info = self._client.wait_until_active(file_info)
+            raw = self._client.generate_transcription(
+                model_id=model_id,
+                file_uri=str(file_info.get("uri") or ""),
+                mime_type=str(file_info.get("mimeType") or "audio/mp3"),
+                prompt=prompt,
+            )
+            return parse_cloud_response(
+                raw, model_id=model_id, chunk_offset_seconds=context.chunk_offset_seconds
+            )
+        finally:
+            self._client.delete_file(file_info)
+
+
+class OpenAITranscribeProvider(CloudProvider):
+    provider_id = "openai"
+    provider_label = "OpenAI"
+
+    def _auth(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def check_access(self) -> dict[str, Any]:
+        body, _ = self._json("GET", f"{OPENAI_API_BASE}/v1/models", headers=self._auth())
+        models = [str(m.get("id") or "") for m in body.get("data") or []]
+        return {"ok": True, "models": [m for m in models if m]}
+
+    def transcribe(
+        self, audio_path: str, *, model_id: str, context: CloudPromptContext
+    ) -> CloudChunkResult:
+        from pathlib import Path as _Path
+
+        entry = cloud_model_entry(model_id)
+        api_model = str(entry.get("api_model") or model_id)
+        prompt_terms = ", ".join(
+            t for t in [*context.glossary_terms, *context.expected_speaker_names]
+            if (t or "").strip()
+        )
+        fields: dict[str, str] = {"model": api_model, "response_format": "json"}
+        if (context.language or "").strip():
+            fields["language"] = context.language
+        if prompt_terms:
+            fields["prompt"] = (
+                "Vocabulaire et participants attendus : " + prompt_terms
+            )
+        body_bytes = _Path(audio_path).read_bytes()
+        multipart, content_type = _multipart_body(
+            fields,
+            file_field="file",
+            filename=_Path(audio_path).name,
+            file_bytes=body_bytes,
+            file_content_type=_audio_mime(audio_path),
+        )
+        raw, _ = self._request(
+            "POST",
+            f"{OPENAI_API_BASE}/v1/audio/transcriptions",
+            data=multipart,
+            headers={**self._auth(), "Content-Type": content_type},
+        )
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError as exc:
+            raise CloudTranscriptionError(
+                f"Réponse OpenAI illisible : {exc}"
+            ) from exc
+        # gpt-4o-transcribe-diarize returns per-speaker segments; the
+        # plain/mini models return flat text. Handle both, plus the
+        # legacy verbose_json "segments" shape, defensively.
+        raw_segments = payload.get("segments") or payload.get("utterances") or []
+        utterances: list[dict] = []
+        for seg in raw_segments:
+            if not isinstance(seg, dict):
+                continue
+            utterances.append(
+                {
+                    "start": parse_cloud_timestamp(seg.get("start")) or 0.0,
+                    "end": parse_cloud_timestamp(seg.get("end")) or 0.0,
+                    "speaker": seg.get("speaker") or seg.get("speaker_id") or "",
+                    "text": seg.get("text") or seg.get("transcript") or "",
+                }
+            )
+        if not utterances:
+            text = str(payload.get("text") or "")
+            utterances = _segments_from_plain_text(text, context.chunk_duration_seconds)
+        return _result_from_utterances(utterances, model_id=model_id, context=context)
+
+
+class AssemblyAIProvider(CloudProvider):
+    provider_id = "assemblyai"
+    provider_label = "AssemblyAI"
+
+    def _auth(self) -> dict[str, str]:
+        return {"authorization": self.api_key}
+
+    def check_access(self) -> dict[str, Any]:
+        # Listing transcripts is the cheapest authenticated GET.
+        self._json(
+            "GET",
+            f"{ASSEMBLYAI_API_BASE}/v2/transcript?limit=1",
+            headers=self._auth(),
+        )
+        return {"ok": True, "models": ["universal-3"]}
+
+    def transcribe(
+        self, audio_path: str, *, model_id: str, context: CloudPromptContext
+    ) -> CloudChunkResult:
+        from pathlib import Path as _Path
+
+        upload_body, _ = self._request(
+            "POST",
+            f"{ASSEMBLYAI_API_BASE}/v2/upload",
+            data=_Path(audio_path).read_bytes(),
+            headers={**self._auth(), "Content-Type": "application/octet-stream"},
+        )
+        try:
+            upload_url = json.loads(upload_body.decode("utf-8")).get("upload_url")
+        except (json.JSONDecodeError, AttributeError):
+            upload_url = None
+        if not upload_url:
+            raise CloudTranscriptionError("Téléversement AssemblyAI sans URL.")
+        config: dict[str, Any] = {
+            "audio_url": upload_url,
+            "speaker_labels": True,
+            "punctuate": True,
+            "format_text": True,
+        }
+        lang = (context.language or "").strip()
+        if lang:
+            config["language_code"] = lang
+        else:
+            config["language_detection"] = True
+        boost = [t for t in context.glossary_terms if (t or "").strip()]
+        if boost:
+            config["word_boost"] = boost[:1000]
+        created, _ = self._json(
+            "POST",
+            f"{ASSEMBLYAI_API_BASE}/v2/transcript",
+            json_body=config,
+            headers=self._auth(),
+        )
+        transcript_id = str(created.get("id") or "")
+        if not transcript_id:
+            raise CloudTranscriptionError("AssemblyAI n'a pas créé de transcription.")
+        done = self._poll(
+            f"{ASSEMBLYAI_API_BASE}/v2/transcript/{transcript_id}",
+            headers=self._auth(),
+            is_done=lambda b: str(b.get("status")) == "completed",
+            is_failed=lambda b: str(b.get("status")) == "error",
+        )
+        utterances = [
+            {
+                "start": float(u.get("start") or 0) / 1000.0,
+                "end": float(u.get("end") or 0) / 1000.0,
+                "speaker": u.get("speaker") or "",
+                "text": u.get("text") or "",
+            }
+            for u in (done.get("utterances") or [])
+            if isinstance(u, dict)
+        ]
+        if not utterances and done.get("text"):
+            utterances = _segments_from_plain_text(
+                str(done.get("text")), context.chunk_duration_seconds
+            )
+        return _result_from_utterances(utterances, model_id=model_id, context=context)
+
+
+class DeepgramProvider(CloudProvider):
+    provider_id = "deepgram"
+    provider_label = "Deepgram"
+
+    def _auth(self) -> dict[str, str]:
+        return {"Authorization": f"Token {self.api_key}"}
+
+    def check_access(self) -> dict[str, Any]:
+        self._json("GET", f"{DEEPGRAM_API_BASE}/v1/projects", headers=self._auth())
+        return {"ok": True, "models": ["nova-3"]}
+
+    def transcribe(
+        self, audio_path: str, *, model_id: str, context: CloudPromptContext
+    ) -> CloudChunkResult:
+        from pathlib import Path as _Path
+        from urllib.parse import urlencode
+
+        entry = cloud_model_entry(model_id)
+        params = {
+            "model": str(entry.get("api_model") or "nova-3"),
+            "diarize": "true",
+            "punctuate": "true",
+            "utterances": "true",
+            "smart_format": "true",
+        }
+        lang = (context.language or "").strip()
+        if lang:
+            params["language"] = lang
+        else:
+            params["detect_language"] = "true"
+        query = urlencode(params)
+        keyterms = [t for t in context.glossary_terms if (t or "").strip()]
+        if keyterms:
+            query += "".join(
+                "&keyterm=" + urllib.parse.quote(t) for t in keyterms[:100]
+            )
+        raw, _ = self._request(
+            "POST",
+            f"{DEEPGRAM_API_BASE}/v1/listen?{query}",
+            data=_Path(audio_path).read_bytes(),
+            headers={**self._auth(), "Content-Type": _audio_mime(audio_path)},
+        )
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+        except json.JSONDecodeError as exc:
+            raise CloudTranscriptionError(f"Réponse Deepgram illisible : {exc}") from exc
+        results = payload.get("results") or {}
+        utterances = [
+            {
+                "start": float(u.get("start") or 0),
+                "end": float(u.get("end") or 0),
+                "speaker": f"spk{u.get('speaker')}" if u.get("speaker") is not None else "",
+                "text": u.get("transcript") or "",
+            }
+            for u in (results.get("utterances") or [])
+            if isinstance(u, dict)
+        ]
+        if not utterances:
+            # Fall back to the channel transcript when utterances are off.
+            channels = results.get("channels") or []
+            if channels:
+                alt = ((channels[0].get("alternatives") or [{}])[0])
+                text = str(alt.get("transcript") or "")
+                utterances = _segments_from_plain_text(
+                    text, context.chunk_duration_seconds
+                )
+        return _result_from_utterances(utterances, model_id=model_id, context=context)
+
+
+class GladiaProvider(CloudProvider):
+    provider_id = "gladia"
+    provider_label = "Gladia"
+
+    def _auth(self) -> dict[str, str]:
+        return {"x-gladia-key": self.api_key}
+
+    def check_access(self) -> dict[str, Any]:
+        self._json(
+            "GET",
+            f"{GLADIA_API_BASE}/v2/pre-recorded?limit=1",
+            headers=self._auth(),
+        )
+        return {"ok": True, "models": ["solaria-1"]}
+
+    def transcribe(
+        self, audio_path: str, *, model_id: str, context: CloudPromptContext
+    ) -> CloudChunkResult:
+        from pathlib import Path as _Path
+
+        multipart, content_type = _multipart_body(
+            {},
+            file_field="audio",
+            filename=_Path(audio_path).name,
+            file_bytes=_Path(audio_path).read_bytes(),
+            file_content_type=_audio_mime(audio_path),
+        )
+        # _json only sends JSON; the multipart upload goes through the
+        # raw _request path.
+        raw, _ = self._request(
+            "POST",
+            f"{GLADIA_API_BASE}/v2/upload",
+            data=multipart,
+            headers={**self._auth(), "Content-Type": content_type},
+        )
+        try:
+            audio_url = json.loads(raw.decode("utf-8")).get("audio_url")
+        except (json.JSONDecodeError, AttributeError):
+            audio_url = None
+        if not audio_url:
+            raise CloudTranscriptionError("Téléversement Gladia sans URL audio.")
+        config: dict[str, Any] = {"audio_url": audio_url, "diarization": True}
+        lang = (context.language or "").strip()
+        if lang:
+            config["language"] = lang
+        else:
+            config["detect_language"] = True
+        vocab = [t for t in context.glossary_terms if (t or "").strip()]
+        if vocab:
+            config["custom_vocabulary"] = vocab[:1000]
+        created, _ = self._json(
+            "POST",
+            f"{GLADIA_API_BASE}/v2/pre-recorded",
+            json_body=config,
+            headers=self._auth(),
+        )
+        result_url = str(created.get("result_url") or "")
+        if not result_url:
+            transcript_id = str(created.get("id") or "")
+            if not transcript_id:
+                raise CloudTranscriptionError("Gladia n'a pas créé de transcription.")
+            result_url = f"{GLADIA_API_BASE}/v2/pre-recorded/{transcript_id}"
+        done = self._poll(
+            result_url,
+            headers=self._auth(),
+            is_done=lambda b: str(b.get("status")) == "done",
+            is_failed=lambda b: str(b.get("status")) == "error",
+        )
+        transcription = (done.get("result") or {}).get("transcription") or {}
+        utterances = [
+            {
+                "start": float(u.get("start") or 0),
+                "end": float(u.get("end") or 0),
+                "speaker": f"spk{u.get('speaker')}" if u.get("speaker") is not None else "",
+                "text": u.get("text") or "",
+            }
+            for u in (transcription.get("utterances") or [])
+            if isinstance(u, dict)
+        ]
+        if not utterances and transcription.get("full_transcript"):
+            utterances = _segments_from_plain_text(
+                str(transcription.get("full_transcript")),
+                context.chunk_duration_seconds,
+            )
+        return _result_from_utterances(utterances, model_id=model_id, context=context)
+
+
+_PROVIDER_CLASSES: dict[str, type[CloudProvider]] = {
+    "gemini": GeminiProvider,
+    "openai": OpenAITranscribeProvider,
+    "assemblyai": AssemblyAIProvider,
+    "deepgram": DeepgramProvider,
+    "gladia": GladiaProvider,
+}
+
+
+def get_cloud_provider(
+    provider_id: str,
+    api_key: str,
+    *,
+    opener: Callable[..., Any] | None = None,
+    timeout: float = 600.0,
+) -> CloudProvider:
+    cls = _PROVIDER_CLASSES.get((provider_id or "").strip().lower())
+    if cls is None:
+        raise CloudTranscriptionError(
+            f"Fournisseur cloud inconnu : {provider_id!r}.", code="cloud_provider"
+        )
+    return cls(api_key, opener=opener, timeout=timeout)

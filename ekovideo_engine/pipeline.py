@@ -69,15 +69,16 @@ from transcription_utils import (
 )
 from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
 from cloud_transcription import (
+    CloudPromptContext,
     CloudTranscriptionError,
-    GeminiClient,
     build_cloud_audio_cmd,
-    build_cloud_prompt,
     canonical_cloud_model_id,
+    cloud_model_entry,
     estimate_cloud_cost,
+    get_cloud_provider,
     merge_chunk_results,
-    parse_cloud_response,
     plan_audio_chunks,
+    provider_for_model,
 )
 
 from .events import EventSink
@@ -1594,6 +1595,40 @@ class TranscriptionPipeline:
             return _friendly_ffmpeg_error(raw, cmd[0])
         return None
 
+    def _enrich_cloud_result(self, merged, segments: list[dict], workspace: Path) -> None:
+        """Best-effort title / speaker-names / glossary corrections for
+        the raw STT providers, reusing the local LLM post-pass.
+
+        No-op when the managed Python env (MLX-LM) isn't installed — the
+        transcript still ships with its native diarisation labels and a
+        filename-derived title (the runner's auto-rename handles that).
+        So a pure-cloud user without the local stack loses only the
+        nice-to-have enrichment, never the transcription itself.
+        """
+        settings = self.request.transcription_settings
+        venv = settings.venv_python_path
+        if not venv or not Path(venv).exists():
+            append_app_log("engine_cloud_enrich_skipped reason='no_venv'")
+            return
+        analysis_path = workspace / "cloud_transcript.txt"
+        try:
+            self._run_llm_post(segments, analysis_path)
+        except Exception as exc:  # never let enrichment sink a good transcript
+            append_app_log(f"engine_cloud_enrich_failed error={exc!r}")
+            return
+        payload = self._llm_payload or {}
+        if not merged.title:
+            merged.title = str(payload.get("title") or "").strip()
+        for label, name in (payload.get("speakers") or {}).items():
+            if name and not (merged.speakers.get(label) or "").strip():
+                merged.speakers[label] = name
+        for term in payload.get("technical_terms") or []:
+            if term not in merged.technical_terms:
+                merged.technical_terms.append(term)
+        if not merged.uncertain:
+            merged.uncertain = list(payload.get("uncertain_passages") or [])
+        merged.corrections = list(payload.get("corrections") or [])
+
     def _run_cloud_transcription(
         self, source_path: str, workspace: Path
     ) -> list[StepResult] | None:
@@ -1603,6 +1638,9 @@ class TranscriptionPipeline:
         ts = time.monotonic()
         settings = self.request.transcription_settings
         model_id = canonical_cloud_model_id(settings.cloud_model)
+        entry = cloud_model_entry(model_id)
+        provider_id = provider_for_model(model_id)
+        provider_label = str(entry.get("family") or provider_id)
 
         def _fallback(message: str, code: str) -> None:
             self.sink(
@@ -1635,9 +1673,9 @@ class TranscriptionPipeline:
             ]
 
         try:
-            client = GeminiClient(settings.cloud_api_key)
+            provider = get_cloud_provider(provider_id, settings.cloud_api_key)
         except CloudTranscriptionError as exc:
-            # No key at all: misconfiguration, not a transient blip.
+            # No key / unknown provider: misconfiguration, not a blip.
             return [
                 StepResult(
                     "cloud_transcription", False, model=model_id, error=str(exc)
@@ -1649,7 +1687,7 @@ class TranscriptionPipeline:
             ProgressEvent(
                 "cloud_transcription",
                 0,
-                f"Transcription cloud ({model_id}) — coût estimé "
+                f"Transcription cloud ({entry.get('label') or model_id}) — coût estimé "
                 f"{estimate['cost_usd']:.2f} $US",
             )
         )
@@ -1675,7 +1713,7 @@ class TranscriptionPipeline:
             if encode_error is not None:
                 _fallback(encode_error, "cloud_encode_failed")
                 return None
-            prompt = build_cloud_prompt(
+            context = CloudPromptContext(
                 language=settings.language,
                 glossary_terms=glossary,
                 expected_speaker_names=self._expected_speaker_names(),
@@ -1685,14 +1723,10 @@ class TranscriptionPipeline:
                 chunk_index=index,
                 chunk_count=len(chunks),
                 chunk_offset_seconds=start,
+                chunk_duration_seconds=max(end - start, 0.0),
                 previous_tail=previous_tail,
             )
-            file_info: dict = {}
             try:
-                file_info = client.upload_audio(
-                    str(chunk_mp3), display_name=f"ekovideo-{index:02d}.mp3"
-                )
-                file_info = client.wait_until_active(file_info)
                 self.sink(
                     ProgressEvent(
                         "cloud_transcription",
@@ -1700,19 +1734,13 @@ class TranscriptionPipeline:
                         f"Transcription distante ({index + 1}/{len(chunks)})",
                     )
                 )
-                raw = client.generate_transcription(
-                    model_id=model_id,
-                    file_uri=str(file_info.get("uri") or ""),
-                    mime_type=str(file_info.get("mimeType") or "audio/mp3"),
-                    prompt=prompt,
-                )
-                chunk_result = parse_cloud_response(
-                    raw, model_id=model_id, chunk_offset_seconds=start
+                chunk_result = provider.transcribe(
+                    str(chunk_mp3), model_id=model_id, context=context
                 )
             except CloudTranscriptionError as exc:
-                if exc.code == "cloud_auth":
-                    # Bad key: failing loudly beats hours of silent
-                    # local compute the user didn't choose.
+                if exc.code in {"cloud_auth", "cloud_provider"}:
+                    # Bad key / misconfig: failing loudly beats hours of
+                    # silent local compute the user didn't choose.
                     return [
                         StepResult(
                             "cloud_transcription",
@@ -1723,13 +1751,12 @@ class TranscriptionPipeline:
                         )
                     ]
                 append_app_log(
-                    f"engine_cloud_chunk_failed index={index} "
-                    f"code={exc.code!r} error={exc!r}"
+                    f"engine_cloud_chunk_failed provider={provider_id!r} "
+                    f"index={index} code={exc.code!r} error={exc!r}"
                 )
                 _fallback(str(exc), exc.code)
                 return None
             finally:
-                client.delete_file(file_info)
                 try:
                     chunk_mp3.unlink(missing_ok=True)
                 except OSError:
@@ -1747,7 +1774,7 @@ class TranscriptionPipeline:
             usage = chunk_result.usage
             self.cloud_usage_records.append(
                 {
-                    "provider": "gemini",
+                    "provider": provider_id,
                     "model": usage.model or model_id,
                     "step": f"chunk_{index + 1}/{len(chunks)}",
                     "input_tokens": usage.input_tokens,
@@ -1757,7 +1784,7 @@ class TranscriptionPipeline:
             )
             self.sink(
                 UsageEvent(
-                    "gemini",
+                    provider_id,
                     usage.model or model_id,
                     step=f"chunk_{index + 1}/{len(chunks)}",
                     input_tokens=usage.input_tokens,
@@ -1768,9 +1795,18 @@ class TranscriptionPipeline:
 
         merged = merge_chunk_results(chunk_results)
         segments = merged.segments
-        # Apply the label → real-name mapping the model discovered, so
-        # the transcript reads "[Jean Dupont]" instead of
-        # "[Intervenant 1]" wherever a name was identified.
+
+        # Dedicated STT providers return only transcript + diarisation.
+        # Run the existing LLM post-pass (best-effort, local venv) for a
+        # title, speaker names and glossary corrections — the same
+        # enrichment the local pipeline applies. Full-bundle providers
+        # (Gemini) already populated all of that.
+        if entry.get("needs_enrichment") and segments:
+            self._enrich_cloud_result(merged, segments, workspace)
+
+        # Apply the label → real-name mapping (model- or LLM-discovered)
+        # so the transcript reads "[Jean Dupont]" instead of
+        # "[Intervenant 1]" wherever a name was resolved.
         named = {k: v for k, v in merged.speakers.items() if v}
         if named:
             segments = self._apply_speaker_renames(segments, named)
@@ -1780,7 +1816,7 @@ class TranscriptionPipeline:
             "title": merged.title,
             "speakers": merged.speakers,
             "technical_terms": merged.technical_terms,
-            "corrections": [],
+            "corrections": list(merged.corrections or []),
             "uncertain_passages": merged.uncertain,
         }
 

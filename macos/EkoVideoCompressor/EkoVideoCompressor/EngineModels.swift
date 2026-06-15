@@ -557,17 +557,25 @@ enum TranscriptionEngineChoice: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// Client-side mirror of the engine's audio cost model: Gemini
-/// tokenises audio at 32 tokens/s and a dense meeting renders to
-/// ~10 output tokens/s of JSON. Used for the pre-launch estimate
-/// only — the engine re-checks against the real budget before any
-/// upload, and bills from the API's actual counters afterwards.
+/// Client-side mirror of the engine's audio cost model, billing-aware:
+///  * per-token (multimodal LLMs): Gemini tokenises audio at 32
+///    tokens/s and a dense meeting renders to ~10 output tokens/s of
+///    JSON;
+///  * per-hour (dedicated STT): a flat duration rate.
+/// Used for the pre-launch estimate only — the engine re-checks
+/// against the real budget before any upload and bills from the API's
+/// actual counters/duration afterwards.
 func estimatedCloudCostUSD(
     durationSeconds: Double,
+    billing: String,
     priceInPer1M: Double,
-    priceOutPer1M: Double
+    priceOutPer1M: Double,
+    pricePerHour: Double
 ) -> Double {
     guard durationSeconds > 0 else { return 0 }
+    if billing == "per_hour" {
+        return (durationSeconds / 3600.0) * pricePerHour
+    }
     let inputTokens = durationSeconds * 32 + 400
     let outputTokens = durationSeconds * 10 + 300
     return (inputTokens * priceInPer1M + outputTokens * priceOutPer1M) / 1_000_000
@@ -575,6 +583,38 @@ func estimatedCloudCostUSD(
 
 func formatUSD(_ value: Double) -> String {
     String(format: "%.2f $US", value)
+}
+
+/// Which provider owns a cloud model id. Derived from the id so the
+/// SwiftUI side picks the right API key without needing the engine
+/// catalogue loaded. Mirrors ``cloud_transcription.provider_for_model``.
+func cloudProviderForModel(_ modelID: String) -> String {
+    let id = modelID.lowercased()
+    if id.hasPrefix("gpt-") || id.contains("openai") { return "openai" }
+    if id.hasPrefix("assemblyai") { return "assemblyai" }
+    if id.hasPrefix("gladia") { return "gladia" }
+    if id.hasPrefix("deepgram") { return "deepgram" }
+    return "gemini"
+}
+
+/// Display label + API-key console URL per provider, for the Réglages
+/// key fields.
+struct CloudProviderInfo: Identifiable {
+    let id: String
+    let label: String
+    let consoleURL: String
+
+    static let all: [CloudProviderInfo] = [
+        .init(id: "gemini", label: "Google Gemini", consoleURL: "https://aistudio.google.com/apikey"),
+        .init(id: "openai", label: "OpenAI", consoleURL: "https://platform.openai.com/api-keys"),
+        .init(id: "assemblyai", label: "AssemblyAI", consoleURL: "https://www.assemblyai.com/app/account"),
+        .init(id: "gladia", label: "Gladia", consoleURL: "https://app.gladia.io/account"),
+        .init(id: "deepgram", label: "Deepgram", consoleURL: "https://console.deepgram.com/"),
+    ]
+
+    static func label(for provider: String) -> String {
+        all.first { $0.id == provider }?.label ?? provider
+    }
 }
 
 /// Decoded payload of the engine's ``usage-summary`` command.

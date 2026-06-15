@@ -111,8 +111,14 @@ def _build_cloud_row(entry: dict) -> dict:
         # Cloud rows are always wired: no local dependency can make
         # them "À venir".
         "available": True,
+        # Billing metadata the SwiftUI Models tab + Run Setup read to
+        # show the right price tag (per-token LLMs vs per-hour STT).
+        "billing": str(entry.get("billing") or "per_token"),
         "price_in_per_1m": float(entry.get("price_in_per_1m") or 0),
         "price_out_per_1m": float(entry.get("price_out_per_1m") or 0),
+        "price_per_hour": float(entry.get("price_per_hour") or 0),
+        "needs_enrichment": bool(entry.get("needs_enrichment") or False),
+        "diarizes": bool(entry.get("diarizes") or False),
     }
 
 

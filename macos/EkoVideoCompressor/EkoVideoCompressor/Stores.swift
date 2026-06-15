@@ -317,18 +317,54 @@ final class SettingsStore: ObservableObject {
     /// derives the real flags from the preset string at job time.
     @AppStorage("qualityPreset") var qualityPreset = TranscriptionQualityPreset.balanced.rawValue
 
-    // Cloud transcription (Gemini). The key lives in @AppStorage like
-    // the other tokens — the Keychain migration is one hardening
-    // pass for all of them. ``cloudBudgetMonthlyUSD`` defaults to a
-    // deliberate non-zero cap: the user opts *out* of the safety
-    // net, never discovers it after a surprise invoice.
+    // Cloud transcription. One API key per provider — the keys live in
+    // @AppStorage like the other tokens (the Keychain migration is one
+    // hardening pass for all of them). The Gemini key keeps the legacy
+    // "cloudApiKey" storage slot so users who set it before the
+    // multi-provider release don't lose it. ``cloudBudgetMonthlyUSD``
+    // defaults to a deliberate non-zero cap: the user opts *out* of the
+    // safety net, never discovers it after a surprise invoice.
     @AppStorage("transcriptionEngine") var transcriptionEngine = TranscriptionEngineChoice.local.rawValue
-    @AppStorage("cloudApiKey") var cloudApiKey = ""
+    @AppStorage("cloudApiKey") var geminiApiKey = ""
+    @AppStorage("openaiApiKey") var openaiApiKey = ""
+    @AppStorage("assemblyaiApiKey") var assemblyaiApiKey = ""
+    @AppStorage("gladiaApiKey") var gladiaApiKey = ""
+    @AppStorage("deepgramApiKey") var deepgramApiKey = ""
     @AppStorage("cloudModel") var cloudModel = "gemini-3.5-flash"
     @AppStorage("cloudBudgetMonthlyUSD") var cloudBudgetMonthlyUSD: Double = 20
 
+    /// Provider owning the currently-selected cloud model.
+    var activeCloudProvider: String { cloudProviderForModel(cloudModel) }
+
+    func cloudApiKey(forProvider provider: String) -> String {
+        switch provider {
+        case "openai": return openaiApiKey
+        case "assemblyai": return assemblyaiApiKey
+        case "gladia": return gladiaApiKey
+        case "deepgram": return deepgramApiKey
+        default: return geminiApiKey
+        }
+    }
+
+    /// SwiftUI binding to a provider's key, so the Réglages SecureFields
+    /// read/write the right @AppStorage slot.
+    func cloudApiKeyBinding(forProvider provider: String) -> Binding<String> {
+        switch provider {
+        case "openai": return Binding(get: { self.openaiApiKey }, set: { self.openaiApiKey = $0 })
+        case "assemblyai": return Binding(get: { self.assemblyaiApiKey }, set: { self.assemblyaiApiKey = $0 })
+        case "gladia": return Binding(get: { self.gladiaApiKey }, set: { self.gladiaApiKey = $0 })
+        case "deepgram": return Binding(get: { self.deepgramApiKey }, set: { self.deepgramApiKey = $0 })
+        default: return Binding(get: { self.geminiApiKey }, set: { self.geminiApiKey = $0 })
+        }
+    }
+
+    /// Key for the active model's provider — what the job request sends.
+    var activeCloudApiKey: String {
+        cloudApiKey(forProvider: activeCloudProvider)
+    }
+
     var cloudConfigured: Bool {
-        !cloudApiKey.trimmingCharacters(in: .whitespaces).isEmpty
+        !activeCloudApiKey.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     var usesCloudTranscription: Bool {
@@ -1829,8 +1865,13 @@ final class CloudUsageStore: ObservableObject {
         summary = payload
     }
 
-    func checkKey(_ apiKey: String) async {
+    /// Which provider the last/in-flight key check targets — lets the
+    /// Réglages UI render the result next to the right field.
+    @Published var keyCheckProvider: String = ""
+
+    func checkKey(_ apiKey: String, provider: String) async {
         let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        keyCheckProvider = provider
         guard !trimmed.isEmpty else {
             keyCheck = .failed("Renseignez d'abord la clé API.")
             return
@@ -1838,7 +1879,7 @@ final class CloudUsageStore: ObservableObject {
         keyCheck = .checking
         let result = await EngineProcess.runCommand(
             arguments: EngineProcess.defaultPythonArguments(
-                ["cloud-check", "--api-key", trimmed]
+                ["cloud-check", "--api-key", trimmed, "--provider", provider]
             )
         )
         struct Payload: Decodable {
@@ -1934,11 +1975,16 @@ struct ModelRow: Codable, Identifiable {
     /// Drives the "À venir" badge in the Models tab.
     var available: Bool
     /// "local" (HF checkpoint on disk) or "cloud" (remote API). Cloud
-    /// rows have no download surface; they carry per-token prices
-    /// instead of a size.
+    /// rows have no download surface; they carry prices instead of a
+    /// size, in one of two billing models.
     var kind: String
+    var provider: String
+    var billing: String
     var price_in_per_1m: Double
     var price_out_per_1m: Double
+    var price_per_hour: Double
+    var needs_enrichment: Bool
+    var diarizes: Bool
 
     var isCloud: Bool { kind == "cloud" }
 
@@ -1950,7 +1996,8 @@ struct ModelRow: Codable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, family, label, role, size_mb, tier, language, cached, cache_dir, gated, available
-        case kind, price_in_per_1m, price_out_per_1m
+        case kind, provider, billing, price_in_per_1m, price_out_per_1m, price_per_hour
+        case needs_enrichment, diarizes
         case isDefault = "default"
     }
 
@@ -1972,8 +2019,13 @@ struct ModelRow: Codable, Identifiable {
         // outputs don't get tagged "À venir" by accident.
         available = try c.decodeIfPresent(Bool.self, forKey: .available) ?? true
         kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "local"
+        provider = try c.decodeIfPresent(String.self, forKey: .provider) ?? ""
+        billing = try c.decodeIfPresent(String.self, forKey: .billing) ?? "per_token"
         price_in_per_1m = try c.decodeIfPresent(Double.self, forKey: .price_in_per_1m) ?? 0
         price_out_per_1m = try c.decodeIfPresent(Double.self, forKey: .price_out_per_1m) ?? 0
+        price_per_hour = try c.decodeIfPresent(Double.self, forKey: .price_per_hour) ?? 0
+        needs_enrichment = try c.decodeIfPresent(Bool.self, forKey: .needs_enrichment) ?? false
+        diarizes = try c.decodeIfPresent(Bool.self, forKey: .diarizes) ?? false
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1991,20 +2043,27 @@ struct ModelRow: Codable, Identifiable {
         try c.encode(cache_dir, forKey: .cache_dir)
         try c.encode(available, forKey: .available)
         try c.encode(kind, forKey: .kind)
+        try c.encode(provider, forKey: .provider)
+        try c.encode(billing, forKey: .billing)
         try c.encode(price_in_per_1m, forKey: .price_in_per_1m)
         try c.encode(price_out_per_1m, forKey: .price_out_per_1m)
+        try c.encode(price_per_hour, forKey: .price_per_hour)
+        try c.encode(needs_enrichment, forKey: .needs_enrichment)
+        try c.encode(diarizes, forKey: .diarizes)
     }
 }
 
 extension ModelRow {
     /// "≈ 0,35 $US / h d'audio" — the figure a user actually
-    /// reasons about, derived from the per-token prices.
+    /// reasons about, billing-aware (per-token LLM vs per-hour STT).
     var estimatedHourlyCostLabel: String {
         guard isCloud else { return "" }
         let hourly = estimatedCloudCostUSD(
             durationSeconds: 3600,
+            billing: billing,
             priceInPer1M: price_in_per_1m,
-            priceOutPer1M: price_out_per_1m
+            priceOutPer1M: price_out_per_1m,
+            pricePerHour: price_per_hour
         )
         return String(format: "≈ %.2f $US / h d'audio", hourly)
     }
