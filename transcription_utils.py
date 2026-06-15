@@ -611,11 +611,16 @@ def default_transcript_path(in_path: str, out_dir: str, suffix: str, output_form
     source = Path(in_path)
     safe_suffix = suffix.strip()
     ext = transcript_output_ext(output_format)
-    base = Path(out_dir) / f"{source.stem}{safe_suffix}.{ext}"
+    # Cap the stem: an over-long source name (or accents, 2 bytes each)
+    # can push the final component past the 255-byte filesystem limit
+    # → ``[Errno 63] File name too long``. ``sanitize_filename_stem``
+    # trims to ≤ 80 chars on a word boundary.
+    stem = sanitize_filename_stem(source.stem)
+    base = Path(out_dir) / f"{stem}{safe_suffix}.{ext}"
     out = base
     i = 1
     while out.exists():
-        out = Path(out_dir) / f"{source.stem}{safe_suffix}_{i}.{ext}"
+        out = Path(out_dir) / f"{stem}{safe_suffix}_{i}.{ext}"
         i += 1
     return str(out)
 

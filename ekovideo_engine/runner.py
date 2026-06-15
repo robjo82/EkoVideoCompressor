@@ -412,7 +412,17 @@ class EngineRunner:
         if request.library_job_id is not None:
             existing_job = db.get_job(job_id)
             if existing_job:
-                snapshot = snapshot_existing_artifacts(workspace, existing_job, sink)
+                # Protect the active source: when the rerun runs on the
+                # compressed file (original freed), it lives among the
+                # snapshot candidates and must stay in place.
+                from .pipeline import _normalized_realpath
+
+                snapshot = snapshot_existing_artifacts(
+                    workspace,
+                    existing_job,
+                    sink,
+                    protected_paths={_normalized_realpath(working_source)},
+                )
                 if snapshot:
                     db.prepend_job_version(job_id, snapshot)
                     # Clear the current artefact paths — the pipeline
