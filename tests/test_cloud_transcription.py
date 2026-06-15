@@ -339,6 +339,20 @@ class UsageLedgerTest(unittest.TestCase):
         self.assertAlmostEqual(row["cloud_cost_usd"], 0.21)
         self.assertEqual(row["cloud_model"], "gemini-3.5-flash")
 
+    def test_transcription_model_persisted_for_history(self):
+        job_id = self.db.create_job("/tmp/a.mp4", "/tmp/ws", {})
+        self.db.update_job_transcription_model(job_id, "assemblyai-universal-3", "cloud")
+        row = self.db.get_job(job_id)
+        self.assertEqual(row["transcription_model"], "assemblyai-universal-3")
+        self.assertEqual(row["transcription_engine"], "cloud")
+        # Local jobs record the Whisper model + "local" engine.
+        local_id = self.db.create_job("/tmp/b.mp4", "/tmp/ws", {})
+        self.db.update_job_transcription_model(
+            local_id, "mlx-community/whisper-large-v3-turbo", "local"
+        )
+        local_row = self.db.get_job(local_id)
+        self.assertEqual(local_row["transcription_engine"], "local")
+
     def test_usage_survives_job_deletion(self):
         job_id = self.db.create_job("/tmp/a.mp4", "/tmp/ws", {})
         self.db.add_api_usage(

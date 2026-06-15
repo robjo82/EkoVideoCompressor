@@ -99,6 +99,9 @@ Fournisseurs et tarifs indicatifs (par heure d'audio) :
   (tokens/durée + coût) est suivie par traitement et par mois.
 - Les modèles distants sont listés dans l'onglet `Modèles` avec leur
   prix (au token ou à l'heure selon le fournisseur).
+- L'historique (`Bibliothèque`) indique le modèle utilisé pour chaque
+  transcription via la colonne `Modèle` — pratique pour comparer les
+  moteurs entre eux.
 - L'audio est compressé (MP3 mono 16 kHz), envoyé par fenêtres de
   30 minutes puis **supprimé des serveurs du fournisseur** sitôt la
   réponse reçue.
