@@ -212,20 +212,43 @@ CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
         "api_model": "gpt-4o-mini-transcribe",
     },
     {
-        "id": "gladia-solaria-1",
-        "label": "Gladia (Solaria-1)",
+        "id": "gladia-solaria-3",
+        "label": "Gladia (Solaria-3)",
         "family": "Gladia",
         "role": _CLOUD_ROLE,
         "kind": "cloud",
         "provider": "gladia",
         "tier": "balanced",
-        "language": ["multi"],
+        # Solaria-3: best accuracy on real EU business audio, single
+        # language (no code-switching), async only. Great for French
+        # meetings. Sent as the ``model`` param — without it Gladia
+        # falls back to Solaria-1.
+        "language": ["fr", "en", "de", "es", "it"],
         "billing": "per_hour",
         # Starter async list price; drops to ~0.20 on the Growth plan.
         # We bill the conservative figure so the guard never under-counts.
         "price_per_hour": 0.61,
         "needs_enrichment": True,
         "diarizes": True,
+        "api_model": "solaria-3",
+    },
+    {
+        "id": "gladia-solaria-1",
+        "label": "Gladia (Solaria-1, multilingue)",
+        "family": "Gladia",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "gladia",
+        "tier": "balanced",
+        # Solaria-1: generalist, 100+ languages with code-switching —
+        # keep it for multilingual recordings where Solaria-3's EU-only
+        # single-language focus doesn't fit.
+        "language": ["multi"],
+        "billing": "per_hour",
+        "price_per_hour": 0.61,
+        "needs_enrichment": True,
+        "diarizes": True,
+        "api_model": "solaria-1",
     },
     {
         "id": "deepgram-nova-3",
@@ -1296,6 +1319,12 @@ class CloudProvider:
 
     # -- contract -----------------------------------------------------
 
+    def _catalogue_models(self) -> list[str]:
+        """Model ids the app actually offers for this provider — what
+        the key-check surfaces, so the count/names stay in sync with
+        the catalogue instead of a stale hardcoded literal."""
+        return [m["id"] for m in cloud_models_for_provider(self.provider_id)]
+
     def check_access(self) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -1314,7 +1343,11 @@ class GeminiProvider(CloudProvider):
         self._client = GeminiClient(api_key, opener=self._opener, timeout=self.timeout)
 
     def check_access(self) -> dict[str, Any]:
-        return self._client.check_access()
+        # The live call validates the key (raises on failure); we then
+        # report the models the app actually offers, not the full raw
+        # API list.
+        self._client.check_access()
+        return {"ok": True, "models": self._catalogue_models()}
 
     def transcribe(
         self, audio_path: str, *, model_id: str, context: CloudPromptContext
@@ -1356,9 +1389,10 @@ class OpenAITranscribeProvider(CloudProvider):
         return {"Authorization": f"Bearer {self.api_key}"}
 
     def check_access(self) -> dict[str, Any]:
-        body, _ = self._json("GET", f"{OPENAI_API_BASE}/v1/models", headers=self._auth())
-        models = [str(m.get("id") or "") for m in body.get("data") or []]
-        return {"ok": True, "models": [m for m in models if m]}
+        # Validate the key against the live endpoint, then report the
+        # transcription models the app offers (not OpenAI's full list).
+        self._json("GET", f"{OPENAI_API_BASE}/v1/models", headers=self._auth())
+        return {"ok": True, "models": self._catalogue_models()}
 
     def transcribe(
         self, audio_path: str, *, model_id: str, context: CloudPromptContext
@@ -1434,7 +1468,7 @@ class AssemblyAIProvider(CloudProvider):
             f"{ASSEMBLYAI_API_BASE}/v2/transcript?limit=1",
             headers=self._auth(),
         )
-        return {"ok": True, "models": ["universal-3"]}
+        return {"ok": True, "models": self._catalogue_models()}
 
     def transcribe(
         self, audio_path: str, *, model_id: str, context: CloudPromptContext
@@ -1508,7 +1542,7 @@ class DeepgramProvider(CloudProvider):
 
     def check_access(self) -> dict[str, Any]:
         self._json("GET", f"{DEEPGRAM_API_BASE}/v1/projects", headers=self._auth())
-        return {"ok": True, "models": ["nova-3"]}
+        return {"ok": True, "models": self._catalogue_models()}
 
     def transcribe(
         self, audio_path: str, *, model_id: str, context: CloudPromptContext
@@ -1581,7 +1615,7 @@ class GladiaProvider(CloudProvider):
             f"{GLADIA_API_BASE}/v2/pre-recorded?limit=1",
             headers=self._auth(),
         )
-        return {"ok": True, "models": ["solaria-1"]}
+        return {"ok": True, "models": self._catalogue_models()}
 
     def transcribe(
         self, audio_path: str, *, model_id: str, context: CloudPromptContext
@@ -1610,6 +1644,11 @@ class GladiaProvider(CloudProvider):
         if not audio_url:
             raise CloudTranscriptionError("Téléversement Gladia sans URL audio.")
         config: dict[str, Any] = {"audio_url": audio_url, "diarization": True}
+        api_model = str(cloud_model_entry(model_id).get("api_model") or "").strip()
+        if api_model:
+            # Without an explicit model Gladia defaults to Solaria-1;
+            # send it so Solaria-3 (and any future model) is honoured.
+            config["model"] = api_model
         lang = (context.language or "").strip()
         if lang:
             config["language"] = lang

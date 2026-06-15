@@ -88,7 +88,8 @@ Fournisseurs et tarifs indicatifs (par heure d'audio) :
 | AssemblyAI Universal-3 | ~0,21 $ | WER FR de pointe |
 | OpenAI gpt-4o-transcribe (diarisation) | ~0,36 $ | pilotable par prompt |
 | OpenAI gpt-4o-mini-transcribe | ~0,18 $ | sans diarisation |
-| Gladia (Solaria-1) | ~0,20–0,61 $ | **hébergé en UE / RGPD** |
+| Gladia Solaria-3 | ~0,20–0,61 $ | **UE / RGPD**, top WER EU |
+| Gladia Solaria-1 | ~0,20–0,61 $ | UE / RGPD, 100+ langues |
 | Deepgram Nova-3 | ~0,26 $ | rapide |
 
 - Choix du moteur (Local / Cloud) et du modèle au lancement de chaque
