@@ -1210,56 +1210,99 @@ final class LibraryStore: ObservableObject {
         return try? JSONDecoder().decode(WorkspaceUsage.self, from: data)
     }
 
-    func renameSpeakers(_ row: LibraryRow, mapping: [String: String]) async {
-        guard let payload = jsonString(mapping) else {
-            errorMessage = "Mapping interlocuteurs invalide."
-            return
-        }
-        isLoading = true
+    /// Rename interlocuteurs.
+    ///
+    /// Structural change (PR: native library edits): the *displayed*
+    /// state — ``speaker_map_json``, what the library row and the rename
+    /// sheet read — is written **directly to SQLite, in-process and
+    /// instantly**. No cold-started Python subprocess on the user's
+    /// click, so the edit sticks immediately. The genuinely-Python work
+    /// (renaming the segment rows, rewriting the on-disk transcript with
+    /// the new labels, and enrolling the voiceprint — which needs the
+    /// original cluster labels, so it must run *before* segments are
+    /// touched) is dispatched to the engine in the **background** and
+    /// reconciled when it finishes.
+    ///
+    /// ``displayMap`` is ``label → friendly name`` (persisted as the
+    /// speaker map). ``renameMapping`` is the source-label → new-name
+    /// pairs the engine applies to segments/artefacts.
+    func renameSpeakers(
+        _ row: LibraryRow,
+        displayMap: [String: String],
+        renameMapping: [String: String]
+    ) async {
         errorMessage = nil
-        // Build the attendee → res.partner lookup the engine uses to
-        // auto-link the resulting voice profile to its Odoo contact.
-        // Keyed lowercase so the engine can match case-insensitively
-        // against the renamed name; entries without a partner id are
-        // dropped because the link target wouldn't be meaningful.
-        var attendeeArgs: [String] = []
-        if let attendees = row.odooMeeting?.attendees, !attendees.isEmpty {
-            var map: [String: [String: Any]] = [:]
-            for attendee in attendees {
-                let nameKey = attendee.name.lowercased()
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !nameKey.isEmpty, attendee.id > 0 else { continue }
-                map[nameKey] = [
-                    "partner_id": attendee.id,
-                    "partner_name": attendee.name,
-                    "company_name": attendee.company,
-                ]
-            }
-            if !map.isEmpty,
-               let data = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]),
-               let raw = String(data: data, encoding: .utf8) {
-                attendeeArgs = ["--attendees", raw]
-            }
+        let displayPayload = jsonString(displayMap)
+
+        // 1. Instant, authoritative write of the displayed map.
+        var wroteDirect = false
+        if let displayPayload {
+            wroteDirect = await LibraryDatabase.shared.applyEdit(
+                jobId: row.id, speakerMapJSON: displayPayload
+            )
         }
-        let result = await EngineProcess.runCommand(
-            arguments: EngineProcess.defaultPythonArguments([
-                "library-rename-speakers",
-                "\(row.id)",
-                "--mapping",
-                payload,
-            ] + attendeeArgs)
-        )
-        if result.status != 0 {
-            errorMessage = result.events.last?.message ?? result.rawOutput
-            isLoading = false
+        if wroteDirect, let index = rows.firstIndex(where: { $0.id == row.id }) {
+            rows[index].speaker_map_json = displayPayload
+        }
+
+        // 2. Background reconcile through the engine (segments, on-disk
+        //    artefacts, voice enrolment, Odoo linking). Fire-and-forget
+        //    so the UI never waits on Python cold start + embeddings.
+        guard let mappingPayload = jsonString(renameMapping), !renameMapping.isEmpty else {
             return
         }
-        // Single-row patch instead of a full library-list reload —
-        // the rename sheet was the worst offender for the post-save
-        // beat (Python startup + 1000-row JSON decode for one edit).
-        await refreshOne(row.id)
-        await refreshSpeakerProfiles(force: true)
-        isLoading = false
+        let attendeeArgs = Self.attendeeLinkArgs(for: row)
+        let jobId = row.id
+        Task { [weak self] in
+            let result = await EngineProcess.runCommand(
+                arguments: EngineProcess.defaultPythonArguments([
+                    "library-rename-speakers",
+                    "\(jobId)",
+                    "--mapping",
+                    mappingPayload,
+                ] + attendeeArgs)
+            )
+            guard let self else { return }
+            if result.status != 0 {
+                // The display map already persisted; surface the
+                // background failure without losing the user's edit.
+                await MainActor.run {
+                    self.errorMessage = result.events.last?.message ?? result.rawOutput
+                }
+            }
+            // Reconcile in-memory to the engine's canonical state
+            // (segments-derived speaker map) — in the background, so the
+            // user already saw the instant optimistic update. Keeps a
+            // rapid second rename working off fresh labels.
+            await self.refreshOne(jobId)
+            await self.refreshSpeakerProfiles(force: true)
+        }
+    }
+
+    /// Build the ``--attendees`` arg that lets the engine auto-link a
+    /// renamed voice profile to its Odoo res.partner. Keyed lowercase
+    /// for case-insensitive matching; entries without a partner id are
+    /// dropped.
+    private static func attendeeLinkArgs(for row: LibraryRow) -> [String] {
+        guard let attendees = row.odooMeeting?.attendees, !attendees.isEmpty else {
+            return []
+        }
+        var map: [String: [String: Any]] = [:]
+        for attendee in attendees {
+            let nameKey = attendee.name.lowercased()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nameKey.isEmpty, attendee.id > 0 else { continue }
+            map[nameKey] = [
+                "partner_id": attendee.id,
+                "partner_name": attendee.name,
+                "company_name": attendee.company,
+            ]
+        }
+        guard !map.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: map, options: [.sortedKeys]),
+              let raw = String(data: data, encoding: .utf8)
+        else { return [] }
+        return ["--attendees", raw]
     }
 
     /// Persist context edits made in the library sheet.
@@ -1280,15 +1323,36 @@ final class LibraryStore: ObservableObject {
             errorMessage = "Contexte invalide."
             return
         }
-        isLoading = true
         errorMessage = nil
+        let speakersPayload = speakers.flatMap { jsonString($0) }
+
+        // Technical terms + (optionally) the speaker map are pure DB
+        // columns — write them directly, in-process and instantly.
+        let ok = await LibraryDatabase.shared.applyEdit(
+            jobId: row.id,
+            technicalTermsJSON: termsPayload,
+            speakerMapJSON: speakersPayload
+        )
+        if ok {
+            if let index = rows.firstIndex(where: { $0.id == row.id }) {
+                rows[index].technical_terms_json = termsPayload
+                if let speakersPayload {
+                    rows[index].speaker_map_json = speakersPayload
+                }
+            }
+            return
+        }
+
+        // Fallback: the direct write couldn't happen (DB missing on a
+        // fresh install, etc.) — go through the engine so the edit
+        // isn't silently lost.
         var args: [String] = [
             "library-update-context",
             "\(row.id)",
             "--technical-terms",
             termsPayload,
         ]
-        if let speakers, let speakersPayload = jsonString(speakers) {
+        if let speakersPayload {
             args.append("--speakers")
             args.append(speakersPayload)
         }
@@ -1297,11 +1361,9 @@ final class LibraryStore: ObservableObject {
         )
         if result.status != 0 {
             errorMessage = result.events.last?.message ?? result.rawOutput
-            isLoading = false
             return
         }
         await refreshOne(row.id)
-        isLoading = false
     }
 
     /// Heals every library row whose ``speaker_map_json`` drifted
