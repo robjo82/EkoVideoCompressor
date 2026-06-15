@@ -578,6 +578,46 @@ class STTProviderParsingTest(unittest.TestCase):
         self.assertEqual(result.segments[0]["text"], "Bonjour.")
         self.assertAlmostEqual(result.usage.cost_usd, 0.305, places=4)
 
+    def test_gladia_sends_solaria_3_model_param(self):
+        # Solaria-3 must be requested explicitly — Gladia defaults to
+        # Solaria-1 otherwise.
+        captured: dict = {}
+
+        def opener(request, timeout=None):
+            url = request.full_url
+            method = request.get_method()
+            if method == "POST" and "/v2/pre-recorded" in url:
+                captured["body"] = json.loads(request.data.decode("utf-8"))
+                return _FakeResponse({"id": "g1", "result_url": "https://api.gladia.io/v2/pre-recorded/g1"})
+            if method == "POST" and "/v2/upload" in url:
+                return _FakeResponse({"audio_url": "https://x/up"})
+            if method == "GET" and "/v2/pre-recorded/g1" in url:
+                return _FakeResponse({
+                    "status": "done",
+                    "result": {"transcription": {"utterances": [
+                        {"speaker": 0, "start": 0.0, "end": 2.0, "text": "Oui."},
+                    ]}},
+                })
+            raise AssertionError(f"no route for {method} {url}")
+
+        provider = get_cloud_provider("gladia", "key", opener=opener)
+        provider.transcribe(
+            str(self.audio), model_id="gladia-solaria-3", context=_ctx(600)
+        )
+        self.assertEqual(captured["body"]["model"], "solaria-3")
+
+    def test_check_access_reports_catalogue_models(self):
+        # The key check must surface the models the app offers for the
+        # provider, not a stale single hardcoded id.
+        from cloud_transcription import cloud_models_for_provider
+
+        opener = _router([("GET", "/v2/pre-recorded", {"items": []})])
+        provider = get_cloud_provider("gladia", "key", opener=opener)
+        payload = provider.check_access()
+        expected = [m["id"] for m in cloud_models_for_provider("gladia")]
+        self.assertEqual(payload["models"], expected)
+        self.assertIn("gladia-solaria-3", payload["models"])
+
     def test_openai_plain_text_is_segmented(self):
         opener = _router([
             ("POST", "/v1/audio/transcriptions", {"text": "Bonjour à tous. On démarre la réunion."}),
