@@ -324,6 +324,16 @@ struct ContentView: View {
         let meetingDate = item.meetingDate ?? sourceMeetingDate(for: item.sourceURL)
         let termsForRun = item.selectedGlossaryTerms.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        // For cloud jobs, the curated vocabulary should bias the
+        // transcription automatically — a dedicated STT (Gladia, etc.)
+        // really needs it to spell "Odoo" right, and the user shouldn't
+        // have to re-pick terms every meeting. When nothing was selected
+        // per-file, fall back to the most-used catalog terms (capped at
+        // 50 — Deepgram's keyterm ceiling; ample for the others).
+        var glossaryForRun = termsForRun
+        if settings.usesCloudTranscription && glossaryForRun.isEmpty {
+            glossaryForRun = Array(settings.vocabularyCatalog.prefix(50))
+        }
         // Cheap cloud text-enrichment for dedicated-STT engines (Gemini
         // returns its own title/names, so it needs none). Uses the
         // Gemini key the user already has; empty → engine falls back to
@@ -373,7 +383,7 @@ struct ContentView: View {
                 cloud_enrich_model: cloudEnrichModel,
                 cloud_enrich_api_key: cloudEnrichKey
             ),
-            glossary_terms: termsForRun,
+            glossary_terms: glossaryForRun,
             speaker_overrides: overrides,
             technical_terms: item.focusNote.map { [$0] } ?? [],
             rerun_steps: [],

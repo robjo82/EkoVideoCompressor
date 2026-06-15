@@ -1772,6 +1772,18 @@ class TranscriptionPipeline:
 
         glossary = [*self.request.glossary_terms, *self.request.technical_terms]
         odoo_context_blob = self._fetch_odoo_context_blob()
+        # Record exactly what context we forward to the provider, so a
+        # "was my vocabulary actually sent?" question is answerable from
+        # the logs (the request bodies themselves aren't logged).
+        glossary_clean = [t for t in glossary if (t or "").strip()]
+        append_app_log(
+            "engine_cloud_context "
+            f"provider={provider_id!r} model={model_id!r} chunks={len(chunks)} "
+            f"vocab_terms={len(glossary_clean)} "
+            f"vocab_sample={glossary_clean[:8]!r} "
+            f"expected_speakers=({settings.expected_min_speakers},{settings.expected_max_speakers}) "
+            f"enrich={'yes' if (settings.cloud_enrich_api_key and settings.cloud_enrich_model) else 'no'}"
+        )
         chunk_results = []
         known_speakers: dict[str, str] = {}
         previous_tail = ""
