@@ -176,6 +176,61 @@ class CompressedFallbackTest(unittest.TestCase):
             self.assertEqual(resolved, compressed)
             self.assertEqual(tier, "compressed")
 
+    def test_recovers_compressed_from_versions_via_previous_versions_json(self):
+        # Regression: a job hit by the pre-fix snapshot bug has its
+        # compressed file stranded in versions/<ts>/ and an empty
+        # compressed_path column. The recorded location in
+        # previous_versions_json must still resolve it (so "Relancer"
+        # works instead of asking the user to pick a source).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "ws"
+            versioned = workspace / "versions" / "20260615-114442"
+            versioned.mkdir(parents=True)
+            compressed = versioned / "meeting_compressed.mp4"
+            compressed.write_bytes(b"compressed")
+            with patch.dict(
+                os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}
+            ):
+                db = database()
+                job_id = db.create_job(
+                    source_path="/nowhere/meeting.mp4",
+                    workspace_dir=str(workspace),
+                    settings={},
+                )
+                db.prepend_job_version(
+                    job_id,
+                    {
+                        "label": "20260615-114442",
+                        "created_at": "2026-06-15T11:44:42Z",
+                        "compressed_path": str(compressed),
+                    },
+                )
+                request = _make_request(
+                    source_path="/nowhere/meeting.mp4",
+                    library_job_id=job_id,
+                )
+                resolved, tier = _resolve_source_path(request)
+            self.assertEqual(resolved, compressed)
+            self.assertEqual(tier, "compressed")
+
+    def test_recovers_compressed_from_versions_via_glob(self):
+        # Belt-and-braces: even without the JSON pointer, the
+        # versions/*/<stem>_compressed.* glob finds it.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "ws"
+            versioned = workspace / "versions" / "20260615-120000"
+            versioned.mkdir(parents=True)
+            compressed = versioned / "meeting_compressed.mp4"
+            compressed.write_bytes(b"compressed")
+            request = _make_request(
+                source_path="/nowhere/meeting.mp4",
+                workspace_dir=str(workspace),
+            )
+            resolved, tier = _resolve_source_path(request)
+            self.assertEqual(resolved, compressed)
+            self.assertEqual(tier, "compressed")
+
     def test_workspace_copy_outranks_compressed(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "ws"

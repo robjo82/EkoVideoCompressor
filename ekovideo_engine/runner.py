@@ -178,11 +178,32 @@ def _resolve_source_path(request: JobRequest) -> tuple[Path | None, str]:
         stored_compressed = (row.get("compressed_path") or "").strip()
         if stored_compressed:
             compressed_candidates.append(Path(stored_compressed).expanduser())
+        # Recovery for jobs hit by the pre-fix snapshot bug: the only
+        # surviving compressed file may sit in ``versions/<ts>/`` and
+        # the live ``compressed_path`` column was cleared. The snapshot
+        # location is recorded in ``previous_versions_json`` (newest
+        # first) — trust it before falling back to a glob.
+        raw_versions = (row.get("previous_versions_json") or "").strip()
+        if raw_versions:
+            try:
+                versions = json.loads(raw_versions)
+            except (json.JSONDecodeError, TypeError):
+                versions = []
+            for entry in versions if isinstance(versions, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                versioned = (entry.get("compressed_path") or "").strip()
+                if versioned:
+                    compressed_candidates.append(Path(versioned).expanduser())
     stem = candidate.stem
     if stem:
         for workspace_dir in workspace_dirs:
+            ws = Path(workspace_dir).expanduser()
+            compressed_candidates.extend(sorted(ws.glob(f"{stem}_compressed.*")))
+            # Snapshotted compressed files live one level down under
+            # versions/<ts>/ — newest timestamp first.
             compressed_candidates.extend(
-                sorted(Path(workspace_dir).expanduser().glob(f"{stem}_compressed.*"))
+                sorted(ws.glob(f"versions/*/{stem}_compressed.*"), reverse=True)
             )
     for compressed in compressed_candidates:
         if compressed.exists() and compressed.is_file():
