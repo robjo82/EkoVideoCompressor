@@ -131,6 +131,15 @@ class TranscriptionSettings:
     # engine sums the current month's `api_usage` rows and refuses to
     # start a cloud job whose *estimate* would cross the cap.
     cloud_budget_monthly_usd: float = 0.0
+    # Post-transcription enrichment for dedicated-STT providers (which
+    # only return transcript + diarisation). A cheap TEXT model run on
+    # the transcript adds the title, speaker names and business-glossary
+    # corrections — pennies, and better than the local 7B. Empty key
+    # falls back to the local LLM pass (if the venv exists), else the
+    # transcript ships without enrichment. ``cloud_enrich_model`` is a
+    # Gemini text model id (default Flash-Lite when a key is set).
+    cloud_enrich_model: str = ""
+    cloud_enrich_api_key: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":

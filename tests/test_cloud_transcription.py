@@ -93,6 +93,39 @@ class TimestampTest(unittest.TestCase):
         self.assertIsNone(parse_cloud_timestamp(""))
 
 
+class PerModelChunkingTest(unittest.TestCase):
+    """Chunking is a per-provider technical ceiling, engine-decided:
+    dedicated STT send the whole meeting (coherent diarisation); the
+    LLMs window at their token/size limit."""
+
+    def test_chunk_seconds_per_provider(self):
+        from cloud_transcription import chunk_seconds_for_model
+
+        self.assertEqual(chunk_seconds_for_model("gemini-3.5-flash"), 30 * 60)
+        self.assertEqual(chunk_seconds_for_model("gpt-4o-transcribe-diarize"), 40 * 60)
+        self.assertEqual(chunk_seconds_for_model("gladia-solaria-3"), 120 * 60)
+        self.assertEqual(chunk_seconds_for_model("assemblyai-universal-3"), 180 * 60)
+        self.assertEqual(chunk_seconds_for_model("deepgram-nova-3"), 120 * 60)
+
+    def test_stt_keeps_normal_meeting_whole(self):
+        from cloud_transcription import chunk_seconds_for_model
+
+        # 90-min meeting on Gladia → a single job (vs 3 windows on Gemini).
+        gladia = plan_audio_chunks(90 * 60, chunk_seconds_for_model("gladia-solaria-3"))
+        self.assertEqual(gladia, [(0.0, 90 * 60)])
+        gemini = plan_audio_chunks(90 * 60, chunk_seconds_for_model("gemini-3.5-flash"))
+        self.assertEqual(len(gemini), 3)
+
+    def test_stt_splits_only_beyond_provider_limit(self):
+        from cloud_transcription import chunk_seconds_for_model
+
+        # 150 min > Gladia's 135-min ceiling → 2 windows, each < limit.
+        chunks = plan_audio_chunks(150 * 60, chunk_seconds_for_model("gladia-solaria-3"))
+        self.assertEqual(len(chunks), 2)
+        for start, end in chunks:
+            self.assertLessEqual(end - start, 135 * 60)
+
+
 class ChunkPlanTest(unittest.TestCase):
     def test_short_meeting_stays_whole(self):
         self.assertEqual(plan_audio_chunks(1200), [(0.0, 1200)])
@@ -253,6 +286,69 @@ class MergeChunksTest(unittest.TestCase):
         self.assertEqual(merged.title, "Titre A")
         self.assertEqual(merged.usage.input_tokens, 300)
         self.assertAlmostEqual(merged.usage.cost_usd, 0.003)
+
+
+class EnrichmentTest(unittest.TestCase):
+    """Cheap cloud text-enrichment of dedicated-STT transcripts."""
+
+    def test_parse_enrich_response(self):
+        from cloud_transcription import parse_enrich_response
+
+        body = {
+            "title": "Comité produit",
+            "speakers": [{"label": "Intervenant 1", "name": "Jean Dupont"}],
+            "technical_terms": ["Odoo"],
+            "corrections": [{"original": "Odo", "replacement": "Odoo"}],
+            "uncertain": [{"timestamp": "00:30", "text": "?", "reason": "bruit"}],
+        }
+        payload = {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(body)}]}}],
+            "usageMetadata": {
+                "promptTokenCount": 9000,
+                "candidatesTokenCount": 300,
+                "thoughtsTokenCount": 100,
+            },
+        }
+        result, usage = parse_enrich_response(payload, model_id="gemini-3.1-flash-lite")
+        self.assertEqual(result["title"], "Comité produit")
+        self.assertEqual(result["speakers"], {"Intervenant 1": "Jean Dupont"})
+        self.assertEqual(result["technical_terms"], ["Odoo"])
+        self.assertEqual(len(result["corrections"]), 1)
+        self.assertEqual(len(result["uncertain_passages"]), 1)
+        # Enrichment is text-only and cheap: 400 output tokens on
+        # Flash-Lite ($1.50/M) ≈ fractions of a cent.
+        self.assertLess(usage.cost_usd, 0.02)
+        self.assertEqual(usage.output_tokens, 400)
+
+    def test_enrich_via_gemini_uses_text_endpoint(self):
+        from cloud_transcription import enrich_transcript_via_gemini
+
+        captured: dict = {}
+
+        def opener(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+
+            class _R:
+                headers = {}
+                def read(self_):
+                    return json.dumps({
+                        "candidates": [{"content": {"parts": [{"text": json.dumps({"title": "T"})}]}}],
+                        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10},
+                    }).encode()
+                def __enter__(self_): return self_
+                def __exit__(self_, *a): return False
+            return _R()
+
+        result, _ = enrich_transcript_via_gemini(
+            "key", "gemini-3.1-flash-lite", "[Intervenant 1] (00:01) Bonjour.",
+            glossary_terms=["Odoo"], opener=opener,
+        )
+        self.assertEqual(result["title"], "T")
+        # Text-only: no audio fileData part, just the prompt text.
+        parts = captured["body"]["contents"][0]["parts"]
+        self.assertTrue(all("fileData" not in p for p in parts))
+        self.assertIn("Bonjour", parts[0]["text"])
 
 
 class GeminiClientTest(unittest.TestCase):

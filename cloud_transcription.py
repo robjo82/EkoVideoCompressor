@@ -59,14 +59,42 @@ AUDIO_TOKENS_PER_SECOND = 32
 # the estimate.
 ESTIMATED_OUTPUT_TOKENS_PER_AUDIO_SECOND = 10
 
-# Window size for long meetings. 30 minutes ≈ 57 600 audio tokens in
-# and ≈ 18 000 JSON tokens out — comfortable for every catalogue model
-# while keeping per-window progress visible in the UI.
+# Default window for the multimodal LLMs (Gemini): 30 minutes ≈ 57 600
+# audio tokens in and ≈ 18 000 JSON tokens out — keeps each response
+# under the output-token ceiling and shows per-window progress.
 CLOUD_CHUNK_SECONDS = 30 * 60
 
-# Don't bother slicing when the overshoot is marginal: a 32-minute
-# meeting is better served by one call than by a 30 + 2 split.
+# Don't bother slicing when the overshoot is marginal.
 _CHUNK_TOLERANCE_SECONDS = 5 * 60
+
+# Per-provider single-request ceiling, in minutes. Chunking is a
+# technical necessity that differs by provider, NOT a quality knob —
+# so the engine decides, never the user:
+#   * gemini  — 30 min: output-token ceiling on long meetings.
+#   * openai  — 40 min: the /v1/audio/transcriptions 25 MB request cap
+#               (~52 min of our 64 kbps mono MP3; 40 leaves margin).
+#   * gladia  — 120 min: 135-min hard limit; staying whole keeps the
+#               native diarisation consistent across the meeting.
+#   * assemblyai / deepgram — long-audio async, effectively whole-file.
+# Dedicated STT (gladia/assemblyai/deepgram) therefore send the WHOLE
+# meeting in one job for typical durations → coherent speaker labels,
+# which per-window chunking would fragment. A model entry may override
+# with its own ``max_chunk_minutes``.
+_PROVIDER_CHUNK_MINUTES: dict[str, int] = {
+    "gemini": 30,
+    "openai": 40,
+    "gladia": 120,
+    "assemblyai": 180,
+    "deepgram": 120,
+}
+
+
+def chunk_seconds_for_model(model_id: str) -> float:
+    entry = cloud_model_entry(model_id)
+    minutes = entry.get("max_chunk_minutes")
+    if not minutes:
+        minutes = _PROVIDER_CHUNK_MINUTES.get(entry.get("provider", ""), 30)
+    return float(minutes) * 60.0
 
 
 _CLOUD_ROLE = "cloud_transcription"
@@ -380,21 +408,27 @@ def estimate_cloud_cost(duration_seconds: float, model_id: str) -> dict[str, Any
     }
 
 
-def plan_audio_chunks(duration_seconds: float) -> list[tuple[float, float]]:
-    """Split a meeting into upload windows.
+def plan_audio_chunks(
+    duration_seconds: float,
+    chunk_seconds: float = CLOUD_CHUNK_SECONDS,
+) -> list[tuple[float, float]]:
+    """Split a meeting into upload windows of at most ``chunk_seconds``.
 
     Returns ``[(start, end), ...]`` in seconds on the source timeline.
-    Short meetings (≤ 35 min) stay whole; longer ones get equal-ish
-    windows of at most :data:`CLOUD_CHUNK_SECONDS`. Equal windows
-    avoid a degenerate last slice (a 61-minute meeting becomes
-    2 × 30.5 min, not 30 + 30 + 1).
+    Meetings within the window (plus a small tolerance) stay whole;
+    longer ones get equal-ish windows so there's no degenerate last
+    slice (a 61-minute meeting at 30-min windows becomes 2 × 30.5,
+    not 30 + 30 + 1). ``chunk_seconds`` is the per-provider ceiling
+    from :func:`chunk_seconds_for_model` — STT providers pass a large
+    value so a normal meeting is a single, diarisation-coherent job.
     """
     total = max(float(duration_seconds or 0), 0.0)
+    window = max(float(chunk_seconds or CLOUD_CHUNK_SECONDS), 60.0)
     if total <= 0:
         return [(0.0, 0.0)]
-    if total <= CLOUD_CHUNK_SECONDS + _CHUNK_TOLERANCE_SECONDS:
+    if total <= window + _CHUNK_TOLERANCE_SECONDS:
         return [(0.0, total)]
-    count = int(total // CLOUD_CHUNK_SECONDS) + (1 if total % CLOUD_CHUNK_SECONDS else 0)
+    count = int(total // window) + (1 if total % window else 0)
     width = total / count
     chunks: list[tuple[float, float]] = []
     for index in range(count):
@@ -727,6 +761,180 @@ def parse_cloud_response(
     return result
 
 
+# Enrichment (post-STT) returns the same metadata Gemini's full-bundle
+# transcription does, minus the segments (the STT already produced
+# those). Text-only call → pennies.
+ENRICH_SCHEMA: dict[str, Any] = {
+    "type": "OBJECT",
+    "properties": {
+        "title": {"type": "STRING"},
+        "speakers": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "label": {"type": "STRING"},
+                    "name": {"type": "STRING"},
+                },
+                "required": ["label"],
+            },
+        },
+        "technical_terms": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "corrections": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "original": {"type": "STRING"},
+                    "replacement": {"type": "STRING"},
+                    "reason": {"type": "STRING"},
+                },
+                "required": ["original", "replacement"],
+            },
+        },
+        "uncertain": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "timestamp": {"type": "STRING"},
+                    "text": {"type": "STRING"},
+                    "reason": {"type": "STRING"},
+                },
+            },
+        },
+    },
+}
+
+
+def build_enrich_prompt(
+    transcript_text: str,
+    *,
+    language: str = "fr",
+    glossary_terms: list[str] | None = None,
+    expected_speaker_names: list[str] | None = None,
+    meeting_context: str = "",
+    odoo_context: str = "",
+) -> str:
+    lang_label = "français" if (language or "fr").startswith("fr") else language
+    lines = [
+        "Voici la transcription d'une réunion, déjà segmentée et "
+        f"diarisée, en {lang_label}. Ne la ré-écris pas. Analyse-la pour "
+        "produire uniquement des métadonnées :",
+        "- `title` : titre court et professionnel résumant le sujet.",
+        "- `speakers` : pour chaque étiquette de locuteur présente "
+        "(« Intervenant 1 », etc.), le nom réel quand le dialogue permet "
+        "de l'identifier (salutations, interpellations) ; sinon laisse "
+        "le nom vide.",
+        "- `technical_terms` : noms propres, clients, produits et termes "
+        "métier entendus.",
+        "- `corrections` : corrections de vocabulaire métier à forte "
+        "confiance uniquement (mot original → correction), sans "
+        "reformuler le style.",
+        "- `uncertain` : passages douteux (mot ambigu/inaudible) avec "
+        "horodatage et raison.",
+    ]
+    names = [n for n in (expected_speaker_names or []) if (n or "").strip()]
+    if names:
+        lines.append(
+            "Participants attendus (orthographes exactes) : "
+            + ", ".join(names) + "."
+        )
+    terms = [t for t in (glossary_terms or []) if (t or "").strip()]
+    if terms:
+        lines.append("Vocabulaire métier attendu : " + ", ".join(terms) + ".")
+    if (meeting_context or "").strip():
+        lines.append(f"Contexte de la réunion : {meeting_context.strip()}")
+    if (odoo_context or "").strip():
+        lines.append("Contexte CRM/projet :\n" + odoo_context.strip())
+    # Cap the transcript fed in: a 2 h meeting is ~120k chars; that's
+    # still cheap, but bound it so a pathological input can't blow up.
+    body = (transcript_text or "").strip()
+    if len(body) > 200_000:
+        body = body[:200_000]
+    lines.append("\nTranscription :\n" + body)
+    return "\n".join(lines)
+
+
+def parse_enrich_response(payload: dict, *, model_id: str) -> tuple[dict, CloudUsage]:
+    """Turn an enrichment ``generateContent`` response into the shared
+    ``_llm_payload`` shape + a usage record."""
+    candidates = payload.get("candidates") or []
+    text = ""
+    if candidates:
+        parts = ((candidates[0].get("content") or {}).get("parts")) or []
+        text = "".join(str(p.get("text") or "") for p in parts).strip()
+    data: dict = {}
+    if text:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = {}
+
+    speakers: dict[str, str] = {}
+    for entry in data.get("speakers") or []:
+        if isinstance(entry, dict):
+            label = str(entry.get("label") or "").strip()
+            if label:
+                speakers[label] = str(entry.get("name") or "").strip()
+    result = {
+        "title": str(data.get("title") or "").strip(),
+        "speakers": speakers,
+        "technical_terms": [
+            str(t).strip() for t in (data.get("technical_terms") or []) if str(t).strip()
+        ],
+        "corrections": [c for c in (data.get("corrections") or []) if isinstance(c, dict)],
+        "uncertain_passages": [
+            u for u in (data.get("uncertain") or []) if isinstance(u, dict)
+        ],
+    }
+
+    meta = payload.get("usageMetadata") or {}
+    input_tokens = int(meta.get("promptTokenCount") or 0)
+    output_tokens = int(meta.get("candidatesTokenCount") or 0) + int(
+        meta.get("thoughtsTokenCount") or 0
+    )
+    usage = CloudUsage(
+        model=model_id,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=compute_cost_usd(model_id, input_tokens, output_tokens),
+    )
+    return result, usage
+
+
+def enrich_transcript_via_gemini(
+    api_key: str,
+    model_id: str,
+    transcript_text: str,
+    *,
+    language: str = "fr",
+    glossary_terms: list[str] | None = None,
+    expected_speaker_names: list[str] | None = None,
+    meeting_context: str = "",
+    odoo_context: str = "",
+    opener: Callable[..., Any] | None = None,
+) -> tuple[dict, CloudUsage]:
+    """Cheap, text-only enrichment of a dedicated-STT transcript via a
+    Gemini text model (default Flash-Lite). Returns the ``_llm_payload``
+    dict + the token usage so the caller can bill it. Raises
+    :class:`CloudTranscriptionError` on failure — the caller treats
+    enrichment as best-effort."""
+    client = GeminiClient(api_key, opener=opener)
+    prompt = build_enrich_prompt(
+        transcript_text,
+        language=language,
+        glossary_terms=glossary_terms,
+        expected_speaker_names=expected_speaker_names,
+        meeting_context=meeting_context,
+        odoo_context=odoo_context,
+    )
+    raw = client.generate_text_json(
+        model_id=model_id, prompt=prompt, schema=ENRICH_SCHEMA
+    )
+    return parse_enrich_response(raw, model_id=model_id)
+
+
 def merge_chunk_results(chunks: list[CloudChunkResult]) -> CloudChunkResult:
     """Stitch per-window results into one meeting-level result."""
     merged = CloudChunkResult()
@@ -1027,6 +1235,40 @@ class GeminiClient:
             # The thinking knob is the most model-version-sensitive part
             # of the request; if a future model rejects it, retry plain
             # rather than failing the meeting.
+            if "thinking" not in str(exc).lower() or "thinkingConfig" not in str(payload):
+                raise
+            generation_config.pop("thinkingConfig", None)
+            body, _ = self._json_request("POST", url, payload=payload)
+        return body
+
+    def generate_text_json(
+        self, *, model_id: str, prompt: str, schema: dict
+    ) -> dict:
+        """Text-only ``generateContent`` returning JSON against
+        ``schema``. Used for the cheap post-transcription enrichment of
+        dedicated-STT output (title, speaker names, glossary fixes)."""
+        entry = cloud_model_entry(model_id)
+        generation_config: dict[str, Any] = {
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            "temperature": 0.2,
+        }
+        thinking = entry.get("thinking")
+        if thinking == "level_low":
+            generation_config["thinkingConfig"] = {"thinkingLevel": "low"}
+        elif thinking == "budget_zero":
+            generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": generation_config,
+        }
+        url = (
+            f"{GEMINI_API_BASE}/v1beta/models/"
+            f"{canonical_cloud_model_id(model_id)}:generateContent"
+        )
+        try:
+            body, _ = self._json_request("POST", url, payload=payload)
+        except CloudTranscriptionError as exc:
             if "thinking" not in str(exc).lower() or "thinkingConfig" not in str(payload):
                 raise
             generation_config.pop("thinkingConfig", None)

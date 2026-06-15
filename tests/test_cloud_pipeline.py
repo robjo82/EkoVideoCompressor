@@ -289,6 +289,65 @@ class CloudPipelineTest(unittest.TestCase):
         # No venv in the test env → enrichment skipped, transcript intact.
         self.assertTrue(pipeline.final_segments)
 
+    def test_stt_cloud_enrichment_adds_title_and_records_usage(self):
+        # STT provider + a configured enrich key → the cheap cloud text
+        # pass fills title/speakers and its (small) cost is tracked as a
+        # separate "enrich" usage record.
+        from cloud_transcription import CloudChunkResult, CloudUsage, cost_for_duration
+
+        model = "assemblyai-universal-3"
+
+        class _STTProvider:
+            def __init__(self, *a, **k):
+                pass
+
+            def transcribe(self, audio_path, *, model_id, context):
+                return CloudChunkResult(
+                    segments=[{"start": 1.0, "end": 4.0, "speaker": "Intervenant 1", "text": "Bonjour."}],
+                    usage=CloudUsage(
+                        model=model_id,
+                        cost_usd=cost_for_duration(model_id, context.chunk_duration_seconds),
+                    ),
+                )
+
+        def fake_enrich(api_key, model_id, transcript_text, **kwargs):
+            payload = {
+                "title": "Comité produit",
+                "speakers": {"Intervenant 1": "Jean Dupont"},
+                "technical_terms": ["Odoo"],
+                "corrections": [],
+                "uncertain_passages": [],
+            }
+            return payload, CloudUsage(model=model_id, input_tokens=8000, output_tokens=300, cost_usd=0.0045)
+
+        request = _make_cloud_request(
+            self.workspace, self.source,
+            cloud_model=model,
+            cloud_enrich_model="gemini-3.1-flash-lite",
+            cloud_enrich_api_key="gem-key",
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace, duration_seconds=600.0),
+        ), patch(
+            "ekovideo_engine.pipeline.get_cloud_provider", lambda *a, **k: _STTProvider()
+        ), patch(
+            "ekovideo_engine.pipeline.enrich_transcript_via_gemini", side_effect=fake_enrich
+        ):
+            results = pipeline.run(str(self.source))
+
+        by_name = {r.name: r for r in results}
+        self.assertTrue(by_name["cloud_transcription"].ok)
+        self.assertEqual(pipeline.final_title, "Comité produit")
+        self.assertIn("Jean Dupont", pipeline.final_speaker_map)
+        # Two usage records: the STT chunk + the enrichment.
+        steps = {r["step"] for r in pipeline.cloud_usage_records}
+        self.assertIn("enrich", steps)
+        transcript = Path(by_name["transcript"].artifact_path).read_text(encoding="utf-8")
+        self.assertIn("Jean Dupont", transcript)
+
     def test_auth_failure_is_fatal_not_fallback(self):
         _FakeProvider.fail_with = CloudTranscriptionError(
             "clé refusée", code="cloud_auth"

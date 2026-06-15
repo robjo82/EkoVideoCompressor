@@ -73,7 +73,9 @@ from cloud_transcription import (
     CloudTranscriptionError,
     build_cloud_audio_cmd,
     canonical_cloud_model_id,
+    chunk_seconds_for_model,
     cloud_model_entry,
+    enrich_transcript_via_gemini,
     estimate_cloud_cost,
     get_cloud_provider,
     merge_chunk_results,
@@ -1618,27 +1620,78 @@ class TranscriptionPipeline:
         return None
 
     def _enrich_cloud_result(self, merged, segments: list[dict], workspace: Path) -> None:
-        """Best-effort title / speaker-names / glossary corrections for
-        the raw STT providers, reusing the local LLM post-pass.
+        """Add title / speaker-names / glossary corrections to a raw-STT
+        transcript. Priority, best-effort:
 
-        No-op when the managed Python env (MLX-LM) isn't installed — the
-        transcript still ships with its native diarisation labels and a
-        filename-derived title (the runner's auto-rename handles that).
-        So a pure-cloud user without the local stack loses only the
-        nice-to-have enrichment, never the transcription itself.
+        1. **Cloud text LLM** (Gemini Flash-Lite by default) on the
+           transcript text — pennies, no local dependency, better than
+           the local 7B. Used when ``cloud_enrich_api_key`` is set.
+        2. **Local LLM** post-pass (MLX-LM) when the managed venv exists.
+        3. **Skip** — the transcript still ships with native diarisation
+           and a filename-derived title (runner auto-rename).
+
+        Enrichment never sinks a good transcript: any failure is logged
+        and swallowed.
         """
+        payload: dict | None = None
         settings = self.request.transcription_settings
-        venv = settings.venv_python_path
-        if not venv or not Path(venv).exists():
-            append_app_log("engine_cloud_enrich_skipped reason='no_venv'")
-            return
-        analysis_path = workspace / "cloud_transcript.txt"
-        try:
-            self._run_llm_post(segments, analysis_path)
-        except Exception as exc:  # never let enrichment sink a good transcript
-            append_app_log(f"engine_cloud_enrich_failed error={exc!r}")
-            return
-        payload = self._llm_payload or {}
+
+        enrich_key = (settings.cloud_enrich_api_key or "").strip()
+        enrich_model = (settings.cloud_enrich_model or "").strip()
+        if enrich_key and enrich_model:
+            try:
+                analysis_text = render_segments_with_speakers(segments, "txt")
+                self.sink(
+                    ProgressEvent("cloud_enrich", 0, "Enrichissement (titre, noms, termes)")
+                )
+                payload, usage = enrich_transcript_via_gemini(
+                    enrich_key,
+                    enrich_model,
+                    analysis_text,
+                    language=settings.language,
+                    glossary_terms=[*self.request.glossary_terms, *self.request.technical_terms],
+                    expected_speaker_names=self._expected_speaker_names(),
+                    meeting_context=self._meeting_context(),
+                    odoo_context=self._fetch_odoo_context_blob(),
+                )
+                self.cloud_usage_records.append(
+                    {
+                        "provider": "gemini",
+                        "model": usage.model or enrich_model,
+                        "step": "enrich",
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cost_usd": usage.cost_usd,
+                    }
+                )
+                self.sink(
+                    UsageEvent(
+                        "gemini",
+                        usage.model or enrich_model,
+                        step="enrich",
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cost_usd=usage.cost_usd,
+                    )
+                )
+                self.sink(ProgressEvent("cloud_enrich", 100, "Enrichissement terminé"))
+            except Exception as exc:  # best-effort
+                append_app_log(f"engine_cloud_enrich_cloud_failed error={exc!r}")
+                payload = None
+
+        if payload is None:
+            venv = settings.venv_python_path
+            if not venv or not Path(venv).exists():
+                append_app_log("engine_cloud_enrich_skipped reason='no_cloud_key_no_venv'")
+                return
+            analysis_path = workspace / "cloud_transcript.txt"
+            try:
+                self._run_llm_post(segments, analysis_path)
+            except Exception as exc:
+                append_app_log(f"engine_cloud_enrich_local_failed error={exc!r}")
+                return
+            payload = self._llm_payload or {}
+
         if not merged.title:
             merged.title = str(payload.get("title") or "").strip()
         for label, name in (payload.get("speakers") or {}).items():
@@ -1704,7 +1757,10 @@ class TranscriptionPipeline:
                 )
             ]
 
-        chunks = plan_audio_chunks(duration)
+        # Chunking is per-provider (engine-decided): dedicated STT send
+        # the whole meeting in one job (coherent diarisation), the LLMs
+        # window at their token/size ceiling.
+        chunks = plan_audio_chunks(duration, chunk_seconds_for_model(model_id))
         self.sink(
             ProgressEvent(
                 "cloud_transcription",

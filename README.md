@@ -107,9 +107,16 @@ Fournisseurs et tarifs indicatifs (par heure d'audio) :
   métier + noms attendus (boosting de termes natif de chaque
   fournisseur) et nombre d'intervenants attendu (config de diarisation),
   pour améliorer la qualité sans surcoût.
-- L'audio est compressé (MP3 mono 16 kHz), envoyé par fenêtres de
-  30 minutes puis **supprimé des serveurs du fournisseur** sitôt la
-  réponse reçue.
+- L'audio est compressé (MP3 mono 16 kHz) puis **supprimé des serveurs
+  du fournisseur** sitôt la réponse reçue. Le **découpage est adapté à
+  chaque fournisseur** : les STT dédiés (Gladia jusqu'à 2 h, AssemblyAI,
+  Deepgram) traitent la réunion **en un seul appel** — diarisation
+  cohérente sur toute la durée ; seuls les LLM (Gemini ~30 min, OpenAI
+  ~40 min) découpent en fenêtres, par contrainte technique.
+- Pour les moteurs **STT**, un **enrichissement texte bon marché**
+  (Gemini Flash-Lite, quelques centimes) ajoute titre, noms
+  d'interlocuteurs et corrections métier à partir de la transcription —
+  dès qu'une clé Gemini est renseignée (sinon repli sur le LLM local).
 - En cas d'erreur réseau ou de quota, le traitement bascule
   automatiquement sur le moteur local avec un avertissement ; une clé
   refusée ou un budget atteint échoue explicitement.
