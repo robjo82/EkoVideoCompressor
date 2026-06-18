@@ -895,6 +895,37 @@ class SpeakerEnrollmentTest(unittest.TestCase):
             self.assertEqual(final_map["Sophie"], "Sophie")
             self.assertEqual(final_map["Robin"], "Robin")
 
+    def test_rename_matches_across_unicode_normalization(self):
+        # Regression: renaming an accented label ("Mickaël") reverted
+        # after a few seconds — the mapping key (NFD) didn't match the
+        # segment column (NFC), so the segment rename no-op'd and the
+        # canonical rebuild restored the old name. Both sides are now
+        # NFC-normalised before comparison.
+        import unicodedata
+
+        nfc = "Mickaël"  # composed ë (U+00EB)
+        nfd = unicodedata.normalize("NFD", nfc)  # e + combining diaeresis
+        self.assertNotEqual(nfc, nfd)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(str(root / "x.mov"), str(root / "ws"), {})
+                # Segment stored NFC; rename request arrives NFD-keyed.
+                db.add_segments(job_id, [
+                    {"start": 0, "end": 3, "speaker": nfc, "text": "bonjour"},
+                    {"start": 3, "end": 6, "speaker": "Elsa", "text": "oui"},
+                ])
+                db.update_job_context(job_id, speakers={nfc: nfc, "Elsa": "Elsa"})
+                library_rename_speakers(
+                    job_id, {nfd: "Robin", "Elsa": "Elsa"}, enroll=False
+                )
+                speakers = {s["speaker"] for s in db.get_segments(job_id)}
+                final_map = json.loads(db.get_job(job_id).get("speaker_map_json") or "{}")
+            self.assertIn("Robin", speakers)
+            self.assertNotIn(nfc, speakers)
+            self.assertEqual(set(final_map.keys()), {"Robin", "Elsa"})
+
     def test_rename_with_enroll_disabled_skips_pyannote(self):
         # The CLI / Swift caller can opt out of enrollment when
         # they're just doing a string-only rename (e.g. fixing a
