@@ -5,9 +5,19 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+def _nfc(value: object) -> str:
+    """NFC-normalise a speaker label for comparison. macOS / Whisper
+    can emit accented names decomposed (NFD: e + ◌̈) while another code
+    path holds them composed (NFC: ë). A naive ``==`` then fails, so a
+    rename of "Mickaël" silently matched no segment and reverted on the
+    next refresh. Normalising both sides before comparing fixes it."""
+    return unicodedata.normalize("NFC", str(value or "").strip())
 
 from database_manager import DatabaseManager
 from speaker_recognition import (
@@ -840,9 +850,11 @@ def _job_artifact_paths(job: dict[str, Any]) -> list[Path]:
 
 def _replace_speaker_labels(text: str, mapping: dict[str, str]) -> tuple[str, int]:
     changed = 0
-    output = text
+    # Normalise the file text so accented labels match the (NFC) mapping
+    # keys — same NFC/NFD pitfall as the segment rename.
+    output = unicodedata.normalize("NFC", text)
     for old, new in mapping.items():
-        old = old.strip()
+        old = _nfc(old)
         new = new.strip()
         if not old or not new or old == new:
             continue
@@ -905,6 +917,12 @@ def library_rename_speakers(
     job = db.get_job(job_id)
     if not job:
         raise ValueError(f"job not found: {job_id}")
+
+    # NFC-normalise the mapping keys up front so accented labels
+    # ("Mickaël") match the segment column regardless of how either
+    # side was normalised. Without this the rename no-ops on the
+    # accented cluster and the UI reverts on the next refresh.
+    mapping = {_nfc(source): name for source, name in mapping.items()}
 
     # Enrollment runs *before* the DB segments get renamed —
     # otherwise the labels we want to look up are already gone
@@ -984,8 +1002,9 @@ def library_rename_speakers(
     for segment in segments:
         segment = dict(segment)
         speaker = segment.get("speaker")
-        if speaker in mapping:
-            segment["speaker"] = mapping[speaker]
+        nfc_speaker = _nfc(speaker)
+        if nfc_speaker in mapping:
+            segment["speaker"] = mapping[nfc_speaker]
             segments_changed += 1
         segment["start"] = segment.get("start", segment.get("start_time"))
         segment["end"] = segment.get("end", segment.get("end_time"))
@@ -1238,13 +1257,15 @@ def _segments_per_cluster(
       still dropped as before so back-channels don't poison the
       centroid.
     """
-    # Build per-label turn lists with their numeric bounds.
-    by_label_raw: dict[str, list[dict]] = {label: [] for label in labels}
+    # Build per-label turn lists with their numeric bounds. Keys are
+    # NFC-normalised so accented cluster labels match the segment column
+    # (NFC/NFD) — otherwise enrolment silently finds no audio.
+    by_label_raw: dict[str, list[dict]] = {_nfc(label): [] for label in labels}
     # Plus a flat list of ``(start, end, owner_label)`` for the
     # overlap check across all labels (NOT just the enrolment ones).
     flat_segments: list[tuple[float, float, str]] = []
     for segment in segments:
-        label = (segment.get("speaker") or "").strip()
+        label = _nfc(segment.get("speaker"))
         try:
             start = float(segment.get("start_time") or segment.get("start") or 0)
             end = float(segment.get("end_time") or segment.get("end") or 0)
