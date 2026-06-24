@@ -469,18 +469,27 @@ final class SettingsStore: ObservableObject {
         }
         guard !cooccurringWith.isEmpty else { return candidates }
         let usage = vocabularyUsage
-        // PR AJ — re-sort by (co-occurrence score with the
-        // selected terms) DESC, then by raw usage DESC, then
-        // alphabetical. Without overlap, behaviour matches the
-        // legacy frequency-only sort because cooccurrence_score=0
-        // for everything.
+        // PERF: decode the co-occurrence matrix ONCE and fold the rows
+        // of the selected terms into a single candidate→score map.
+        // The previous code called ``vocabularyCooccurrenceScore`` from
+        // inside the sort comparator — each call re-decoded the whole
+        // co-occurrence JSON, so a single keystroke triggered
+        // O(N·log N) full JSON decodes + nested scans. On a grown
+        // vocabulary that froze the Run Setup picker. Now it's one
+        // decode + O(matrix) to build the map + cheap dict lookups.
+        let matrix = vocabularyCooccurrence
+        let selectedKeys = Set(cooccurringWith.map { $0.lowercased() })
+        var scoreByKey: [String: Int] = [:]
+        for (storedKey, inner) in matrix where selectedKeys.contains(storedKey.lowercased()) {
+            for (innerKey, count) in inner {
+                scoreByKey[innerKey.lowercased(), default: 0] += count
+            }
+        }
+        // Sort by co-occurrence score DESC, then raw usage DESC, then
+        // alphabetical — identical ordering to before, just cheap.
         return candidates.sorted { left, right in
-            let leftScore = vocabularyCooccurrenceScore(
-                for: left, with: cooccurringWith
-            )
-            let rightScore = vocabularyCooccurrenceScore(
-                for: right, with: cooccurringWith
-            )
+            let leftScore = scoreByKey[left.lowercased()] ?? 0
+            let rightScore = scoreByKey[right.lowercased()] ?? 0
             if leftScore != rightScore { return leftScore > rightScore }
             let leftUsage = usage[left] ?? 0
             let rightUsage = usage[right] ?? 0
