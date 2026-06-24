@@ -31,8 +31,24 @@ cd "$ROOT_DIR"
 mkdir -p bin
 
 FORCE="${FORCE:-0}"
-EVERMEET_FFMPEG_URL="${EVERMEET_FFMPEG_URL:-https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip}"
-EVERMEET_FFPROBE_URL="${EVERMEET_FFPROBE_URL:-https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip}"
+# Apple-Silicon (arm64) static builds. evermeet.cx — used previously —
+# only ships x86_64, so the bundle ran ffmpeg/ffprobe under Rosetta and
+# macOS warned the app "contains Intel components". martin-riedl.de
+# publishes statically-linked arm64 builds depending only on system
+# frameworks, behind stable "latest" redirect URLs.
+FFMPEG_URL="${FFMPEG_URL:-https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip}"
+FFPROBE_URL="${FFPROBE_URL:-https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffprobe.zip}"
+REQUIRED_ARCH="${REQUIRED_ARCH:-arm64}"
+
+# Reject a binary not built for the architecture we ship. This is the
+# guard that would have caught the Intel-binary regression: the
+# `-version` smoke test passes on Apple Silicon via Rosetta, so it
+# never noticed a wrong-arch binary.
+is_required_arch() {
+  local path="$1"
+  [[ -x "$path" ]] || return 1
+  lipo -archs "$path" 2>/dev/null | tr ' ' '\n' | grep -qx "$REQUIRED_ARCH"
+}
 
 # A binary is "self-contained" when otool -L returns only system
 # frameworks. Anything pointing at /opt/homebrew, /usr/local/Cellar,
@@ -75,6 +91,11 @@ needs_download() {
   if ! is_self_contained "$path" 2>/dev/null; then
     return 0
   fi
+  # Re-download an existing binary of the wrong architecture (e.g. a
+  # leftover x86_64 from the old evermeet source).
+  if ! is_required_arch "$path"; then
+    return 0
+  fi
   return 1
 }
 
@@ -110,8 +131,17 @@ verify_self_contained() {
     otool -L "$path" >&2 || true
     return 1
   fi
+  # Hard arch gate — refuse to ship anything that isn't $REQUIRED_ARCH.
+  # (A universal binary with the slice present also passes.) Without
+  # this, an x86_64 binary slips through and triggers macOS's "contains
+  # Intel components" warning on Apple Silicon.
+  if ! is_required_arch "$path"; then
+    echo "$path is not built for $REQUIRED_ARCH (archs: $(lipo -archs "$path" 2>/dev/null)); refusing to ship" >&2
+    return 1
+  fi
   # `--version` is a cheap end-to-end check — confirms the binary
-  # actually runs on this machine (right arch, not corrupt).
+  # actually runs (not corrupt). Note it passes under Rosetta, so it's
+  # NOT an arch check; that's what is_required_arch is for.
   if ! "$path" -version >/dev/null 2>&1; then
     echo "$path failed --version smoke test" >&2
     return 1
@@ -119,16 +149,16 @@ verify_self_contained() {
 }
 
 if needs_download "bin/ffmpeg"; then
-  download_and_extract "$EVERMEET_FFMPEG_URL" "bin/ffmpeg"
+  download_and_extract "$FFMPEG_URL" "bin/ffmpeg"
 else
-  echo "bin/ffmpeg already statically linked, skipping download (set FORCE=1 to override)"
+  echo "bin/ffmpeg already statically linked ($REQUIRED_ARCH), skipping download (set FORCE=1 to override)"
 fi
 verify_self_contained "bin/ffmpeg"
 
 if needs_download "bin/ffprobe"; then
-  download_and_extract "$EVERMEET_FFPROBE_URL" "bin/ffprobe"
+  download_and_extract "$FFPROBE_URL" "bin/ffprobe"
 else
-  echo "bin/ffprobe already statically linked, skipping download (set FORCE=1 to override)"
+  echo "bin/ffprobe already statically linked ($REQUIRED_ARCH), skipping download (set FORCE=1 to override)"
 fi
 verify_self_contained "bin/ffprobe"
 
