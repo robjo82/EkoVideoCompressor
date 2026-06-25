@@ -621,12 +621,39 @@ def _normalized_realpath(path: str | Path) -> str:
     return unicodedata.normalize("NFC", resolved)
 
 
+# Which artefact columns each mode (re)produces — so a rerun only
+# archives what it's about to overwrite. Running "compress only" after
+# "transcribe only" must leave the transcript active (fill the empty
+# grid cell), not push it to history; history is for *redoing the same
+# operation*.
+_MODE_PRODUCED_ARTEFACTS: dict[str, set[str]] = {
+    "compress": {"compressed_path"},
+    "transcribe": {"transcript_path", "enhanced_transcript_path", "review_path"},
+    "compress_transcribe": {
+        "compressed_path",
+        "transcript_path",
+        "enhanced_transcript_path",
+        "review_path",
+    },
+}
+
+
+def produced_artifact_columns(mode: str) -> set[str]:
+    return _MODE_PRODUCED_ARTEFACTS.get(
+        mode,
+        # enhance / review and any future mode touch the transcript
+        # outputs; default there rather than archiving everything.
+        {"transcript_path", "enhanced_transcript_path", "review_path"},
+    )
+
+
 def snapshot_existing_artifacts(
     workspace: Path,
     job: dict[str, Any],
     sink: EventSink,
     *,
     protected_paths: set[str] | None = None,
+    kinds: set[str] | None = None,
 ) -> dict[str, Any]:
     """Move the user-facing outputs of the previous run into a dated
     ``versions/`` subfolder so the rerun about to start can't clobber
@@ -669,6 +696,7 @@ def snapshot_existing_artifacts(
         column: path
         for column, path in candidates.items()
         if path
+        and (kinds is None or column in kinds)
         and Path(path).exists()
         and _normalized_realpath(path) not in protected
     }
