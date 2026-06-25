@@ -26,6 +26,7 @@ from .library import (
     library_list_speaker_profiles,
     library_recognize_speakers,
     library_rename_speakers,
+    library_replace_term,
     library_repair_all_speaker_maps,
     library_speaker_samples,
     library_unlink_speaker_profile_from_odoo,
@@ -118,6 +119,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="JSON object or JSON file with the meeting's attendee partner map",
     )
+
+    # Correct a misheard term everywhere (transcript files + segments +
+    # technical-terms list). One-click "WeDo" → "Ouidoo" from the editor.
+    replace_term = sub.add_parser("library-replace-term")
+    replace_term.add_argument("job_id", type=int)
+    replace_term.add_argument("--from", dest="old_term", required=True)
+    replace_term.add_argument("--to", dest="new_term", required=True)
 
     samples = sub.add_parser("library-speaker-samples")
     samples.add_argument("job_id", type=int)
@@ -351,6 +359,11 @@ def main(argv: list[str] | None = None) -> int:
                 {str(k): str(v) for k, v in mapping.items()},
                 attendee_partner_map=attendee_payload,
             )
+            _print_json({"job_id": args.job_id, **result})
+            return 0
+
+        if args.command == "library-replace-term":
+            result = library_replace_term(args.job_id, args.old_term, args.new_term)
             _print_json({"job_id": args.job_id, **result})
             return 0
 

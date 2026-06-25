@@ -567,6 +567,32 @@ final class SettingsStore: ObservableObject {
               let text = String(data: data, encoding: .utf8) else { return }
         glossaryCooccurrenceJSON = text
     }
+
+    /// Learn a "rides with" link the instant the user pairs terms in a
+    /// meeting's vocabulary — without waiting for the run to complete.
+    /// This is what makes adding "Acritec" immediately float
+    /// "CVR Contrôle" to the top of the suggestions next time, even
+    /// though CVR is globally rarer than Robin / Ekonum / Odoo (the
+    /// suggestion sort puts co-occurrence ahead of raw usage). Bumps
+    /// the new term against each already-selected term, symmetrically.
+    func recordVocabularyPairing(_ term: String, with existing: [String]) {
+        let newTerm = term.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newTerm.isEmpty, !existing.isEmpty else { return }
+        let newKey = newTerm.lowercased()
+        var matrix = vocabularyCooccurrence
+        var changed = false
+        for other in existing {
+            let peer = other.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !peer.isEmpty, peer.lowercased() != newKey else { continue }
+            matrix[newTerm, default: [:]][peer, default: 0] += 1
+            matrix[peer, default: [:]][newTerm, default: 0] += 1
+            changed = true
+        }
+        guard changed,
+              let data = try? JSONEncoder().encode(matrix),
+              let text = String(data: data, encoding: .utf8) else { return }
+        glossaryCooccurrenceJSON = text
+    }
 }
 
 struct ReleaseInfo: Codable, Equatable {
@@ -1285,6 +1311,49 @@ final class LibraryStore: ObservableObject {
             // rapid second rename working off fresh labels.
             await self.refreshOne(jobId)
             await self.refreshSpeakerProfiles(force: true)
+        }
+    }
+
+    /// Correct a misheard technical term everywhere: the stored term
+    /// list (instant, in-process), then the transcript files + segment
+    /// text via the engine in the background. "WeDo" → "Ouidoo",
+    /// "Acritek" → "Acritec", in one click.
+    func replaceTerm(_ row: LibraryRow, from old: String, to new: String) async {
+        let oldTerm = old.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newTerm = new.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !oldTerm.isEmpty, !newTerm.isEmpty,
+              oldTerm.caseInsensitiveCompare(newTerm) != .orderedSame else { return }
+        errorMessage = nil
+
+        // 1. Instant: patch the stored term list (replace + de-dupe).
+        if let index = rows.firstIndex(where: { $0.id == row.id }) {
+            var seen = Set<String>()
+            let replaced = rows[index].technicalTerms
+                .map { $0.caseInsensitiveCompare(oldTerm) == .orderedSame ? newTerm : $0 }
+                .filter { seen.insert($0.lowercased()).inserted }
+            if let json = jsonString(replaced) {
+                _ = await LibraryDatabase.shared.applyEdit(jobId: row.id, technicalTermsJSON: json)
+                rows[index].technical_terms_json = json
+            }
+        }
+
+        // 2. Background: the engine rewrites the transcript files + the
+        //    segment text authoritatively, then we reconcile.
+        let jobId = row.id
+        Task { [weak self] in
+            let result = await EngineProcess.runCommand(
+                arguments: EngineProcess.defaultPythonArguments([
+                    "library-replace-term", "\(jobId)",
+                    "--from", oldTerm, "--to", newTerm,
+                ])
+            )
+            guard let self else { return }
+            if result.status != 0 {
+                await MainActor.run {
+                    self.errorMessage = result.events.last?.message ?? result.rawOutput
+                }
+            }
+            await self.refreshOne(jobId)
         }
     }
 

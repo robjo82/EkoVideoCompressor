@@ -1035,6 +1035,91 @@ def library_rename_speakers(
     }
 
 
+def library_replace_term(job_id: int, old: str, new: str) -> dict[str, int]:
+    """Correct a misheard term everywhere in a job: the transcript /
+    enhanced / review files on disk, the segment text in the DB, and
+    the stored technical-terms list. Lets the user fix "WeDo" → "Ouidoo"
+    or "Acritek" → "Acritec" in one click from the library editor.
+
+    Matching is whole-word (``\\b``), case-insensitive, NFC-normalised
+    (same accent pitfall as the speaker rename). No-op when old/new are
+    blank or identical. Returns occurrence counts for the UI.
+    """
+    db = database()
+    job = db.get_job(job_id)
+    if not job:
+        raise ValueError(f"job not found: {job_id}")
+
+    old_n = _nfc(old)
+    new_n = unicodedata.normalize("NFC", str(new or "").strip())
+    if not old_n or not new_n or old_n.lower() == new_n.lower():
+        return {"occurrences": 0, "files_changed": 0, "segments_changed": 0}
+
+    pattern = re.compile(r"\b" + re.escape(old_n) + r"\b", re.IGNORECASE)
+
+    # 1. Transcript / enhanced / review files on disk.
+    occurrences = 0
+    files_changed = 0
+    for path in _job_artifact_paths(job):
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        new_text, count = pattern.subn(new_n, unicodedata.normalize("NFC", text))
+        if count:
+            try:
+                path.write_text(new_text, encoding="utf-8")
+            except OSError:
+                continue
+            occurrences += count
+            files_changed += 1
+
+    # 2. Segment text in the DB (drives search + future re-renders).
+    segments = db.get_segments(job_id)
+    segments_changed = 0
+    updated: list[dict] = []
+    for segment in segments:
+        segment = dict(segment)
+        text = str(segment.get("text") or "")
+        new_text, count = pattern.subn(new_n, unicodedata.normalize("NFC", text))
+        if count:
+            segment["text"] = new_text
+            segments_changed += count
+        segment["start"] = segment.get("start", segment.get("start_time"))
+        segment["end"] = segment.get("end", segment.get("end_time"))
+        updated.append(segment)
+    if segments_changed:
+        db.add_segments(job_id, updated)
+
+    # 3. The stored technical-terms list — replace + de-dupe.
+    try:
+        terms = json.loads(job.get("technical_terms_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        terms = []
+    out: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        replacement = new_n if _nfc(term).lower() == old_n.lower() else str(term)
+        key = _nfc(replacement).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(replacement)
+    db.update_job_context(job_id, technical_terms=out)
+
+    append_app_log(
+        f"engine_replace_term job_id={job_id} old={old_n!r} new={new_n!r} "
+        f"occurrences={occurrences} files={files_changed} segments={segments_changed}"
+    )
+    return {
+        "occurrences": occurrences,
+        "files_changed": files_changed,
+        "segments_changed": segments_changed,
+    }
+
+
 def library_repair_all_speaker_maps() -> dict[str, int]:
     """Heal every library job's ``speaker_map_json`` from segments.
 
