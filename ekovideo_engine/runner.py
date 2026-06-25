@@ -436,13 +436,18 @@ class EngineRunner:
                 # Protect the active source: when the rerun runs on the
                 # compressed file (original freed), it lives among the
                 # snapshot candidates and must stay in place.
-                from .pipeline import _normalized_realpath
+                from .pipeline import _normalized_realpath, produced_artifact_columns
 
+                # Only archive what THIS run will overwrite — so a
+                # "compress only" rerun after a "transcribe only" fills
+                # the empty compressed slot and leaves the transcript
+                # active, instead of pushing it to history.
                 snapshot = snapshot_existing_artifacts(
                     workspace,
                     existing_job,
                     sink,
                     protected_paths={_normalized_realpath(working_source)},
+                    kinds=produced_artifact_columns(request.mode),
                 )
                 if snapshot:
                     db.prepend_job_version(job_id, snapshot)

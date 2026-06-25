@@ -672,7 +672,10 @@ struct RunBatchSettingsForm: View {
     var body: some View {
         Form {
             // Mode is now per-file (set in each file's panel / its queue
-            // row), so only the transcript Format stays batch-wide here.
+            // row). The transcript Format + engine settings are
+            // batch-wide but only matter when something transcribes, so
+            // they vanish when every queued file is compress-only.
+            if anyItemTranscribes {
             Section("Format de sortie") {
                 Picker("Format", selection: $settings.outputFormat) {
                     Text("Texte").tag("txt")
@@ -682,7 +685,6 @@ struct RunBatchSettingsForm: View {
                 }
             }
 
-            if anyItemTranscribes {
             Section("Moteur de transcription") {
                 Picker("Moteur", selection: $settings.transcriptionEngine) {
                     ForEach(TranscriptionEngineChoice.allCases) { choice in

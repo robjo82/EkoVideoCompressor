@@ -1255,6 +1255,36 @@ class SnapshotExistingArtifactsTest(unittest.TestCase):
             self.assertEqual(summary, {})
             self.assertFalse((workspace / "versions").exists())
 
+    def test_kinds_only_archives_what_the_run_produces(self):
+        # "compress only" rerun (kinds={compressed_path}) must archive
+        # only the compressed file and leave the transcript active —
+        # filling the grid, not pushing the existing transcription to
+        # history.
+        from ekovideo_engine.pipeline import (
+            produced_artifact_columns,
+            snapshot_existing_artifacts,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace, job = self._seed_workspace(root)
+            transcript = job["transcript_path"]
+            compressed = job["compressed_path"]
+            summary = snapshot_existing_artifacts(
+                workspace, job, lambda _: None,
+                kinds=produced_artifact_columns("compress"),
+            )
+            self.assertIn("compressed_path", summary)
+            self.assertNotIn("transcript_path", summary)
+            self.assertFalse(Path(compressed).exists())
+            self.assertTrue(Path(transcript).exists())
+
+    def test_produced_artifact_columns_per_mode(self):
+        from ekovideo_engine.pipeline import produced_artifact_columns
+
+        self.assertEqual(produced_artifact_columns("compress"), {"compressed_path"})
+        self.assertNotIn("compressed_path", produced_artifact_columns("transcribe"))
+        self.assertEqual(len(produced_artifact_columns("compress_transcribe")), 4)
+
     def test_protected_source_is_not_moved(self):
         # Regression: after "Libérer la source", the rerun's source IS
         # the compressed file. Snapshotting must leave it in place,
