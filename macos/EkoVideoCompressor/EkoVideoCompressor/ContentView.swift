@@ -1475,8 +1475,13 @@ struct VocabularyTokenPicker: View {
             draft = ""
             return
         }
+        // Capture the prior selection so we can learn the pairing
+        // (e.g. Acritec → CVR Contrôle) the moment the user groups them
+        // for this meeting — surfaces the related term sooner next time.
+        let priorSelection = selected
         selected.append(value)
         settings.addVocabularyTerm(value)
+        settings.recordVocabularyPairing(value, with: priorSelection)
         draft = ""
     }
 }
@@ -4384,7 +4389,9 @@ struct LibraryContextEditor: View {
     @State private var playingSampleID: String?
     @State private var playbackTimerTask: Task<Void, Never>?
     @State private var reviewNotice: String?
-    @State private var termsText: String
+    @State private var terms: [TermEditRow]
+    @State private var newTermDraft = ""
+    @State private var termNotice: String?
     @State private var isRecognizing = false
     @State private var recognitionSummary: String?
 
@@ -4397,7 +4404,7 @@ struct LibraryContextEditor: View {
             .sorted { $0.key < $1.key }
             .map { SpeakerEditRow(id: $0.key, name: $0.value) }
         _speakers = State(initialValue: initialSpeakers)
-        _termsText = State(initialValue: row.technicalTerms.joined(separator: "\n"))
+        _terms = State(initialValue: row.technicalTerms.map { TermEditRow(original: $0, text: $0) })
     }
 
     var body: some View {
@@ -4499,12 +4506,49 @@ struct LibraryContextEditor: View {
                     }
                 }
                 Section("Termes techniques") {
-                    TextEditor(text: $termsText)
-                        .font(.body.monospaced())
-                        .frame(minHeight: 140)
-                    Text("Un terme par ligne. Conservé avec cette transcription et réutilisable lors d'une relance.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    ForEach($terms) { $term in
+                        HStack(spacing: 8) {
+                            TextField("Terme", text: $term.text)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit { commitTerm(term) }
+                            if term.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                != term.original.trimmingCharacters(in: .whitespacesAndNewlines) {
+                                Button {
+                                    commitTerm(term)
+                                } label: {
+                                    Label("Corriger partout", systemImage: "arrow.triangle.2.circlepath")
+                                        .labelStyle(.iconOnly)
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Remplacer « \(term.original) » par « \(term.text) » dans toute la transcription")
+                            }
+                            Button(role: .destructive) {
+                                terms.removeAll { $0.id == term.id }
+                            } label: {
+                                Label("Retirer", systemImage: "xmark.circle")
+                                    .labelStyle(.iconOnly)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        TextField("Ajouter un terme", text: $newTermDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { addTerm() }
+                        Button { addTerm() } label: {
+                            Label("Ajouter", systemImage: "plus")
+                        }
+                        .disabled(newTermDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if let termNotice {
+                        Text(termNotice)
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    } else {
+                        Text("Modifiez un terme puis « Corriger partout » (ou Entrée) pour le remplacer dans toute la transcription — utile pour « WeDo » → « Ouidoo », « Acritek » → « Acritec ».")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 odooLinkSection
             }
@@ -4867,10 +4911,20 @@ struct LibraryContextEditor: View {
                 renameMapping[oldValue] = newValue
             }
         }
-        let terms = termsText
-            .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        // Any term edited but not yet committed (the user typed a fix
+        // and clicked Enregistrer instead of Entrée): replace it
+        // throughout the transcription too, not just in the list.
+        let pendingReplacements = terms.compactMap { term -> (String, String)? in
+            let old = term.original.trimmingCharacters(in: .whitespacesAndNewlines)
+            let new = term.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !old.isEmpty, !new.isEmpty,
+                  old.caseInsensitiveCompare(new) != .orderedSame else { return nil }
+            return (old, new)
+        }
+        let finalTerms = terms
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        let theRow = row
         dismiss()
         Task {
             if !renameMapping.isEmpty {
@@ -4879,13 +4933,44 @@ struct LibraryContextEditor: View {
                 // drives the engine's background segment/artefact/
                 // enrolment reconcile.
                 await library.renameSpeakers(
-                    row, displayMap: updatedSpeakers, renameMapping: renameMapping
+                    theRow, displayMap: updatedSpeakers, renameMapping: renameMapping
                 )
             }
-            // Technical terms only — the rename path owns the speaker
-            // map. (Passing speakers here too would double-write it.)
-            await library.updateContext(row, technicalTerms: terms)
+            for (old, new) in pendingReplacements {
+                await library.replaceTerm(theRow, from: old, to: new)
+            }
+            // Persist the final term list (additions/removals). The
+            // replace path above already corrected the body text.
+            await library.updateContext(theRow, technicalTerms: finalTerms)
         }
+    }
+
+    private func commitTerm(_ term: TermEditRow) {
+        let old = term.original.trimmingCharacters(in: .whitespacesAndNewlines)
+        let new = term.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !new.isEmpty, !old.isEmpty, old.caseInsensitiveCompare(new) != .orderedSame else { return }
+        if let index = terms.firstIndex(where: { $0.id == term.id }) {
+            terms[index].original = new
+            terms[index].text = new
+        }
+        let theRow = row
+        withAnimation { termNotice = "« \(old) » remplacé par « \(new) » dans la transcription." }
+        Task {
+            await library.replaceTerm(theRow, from: old, to: new)
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            await MainActor.run { withAnimation { if termNotice?.contains(new) == true { termNotice = nil } } }
+        }
+    }
+
+    private func addTerm() {
+        let value = newTermDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        guard !terms.contains(where: { $0.text.caseInsensitiveCompare(value) == .orderedSame }) else {
+            newTermDraft = ""
+            return
+        }
+        terms.append(TermEditRow(original: value, text: value))
+        newTermDraft = ""
     }
 
     private func loadSamples() async {
@@ -5158,6 +5243,16 @@ struct LibraryContextEditor: View {
 struct SpeakerEditRow: Identifiable, Equatable {
     var id: String
     var name: String
+}
+
+/// One editable technical-term row. ``original`` is the value last
+/// persisted (or last corrected); ``text`` is the live edit. When they
+/// differ, committing replaces ``original`` with ``text`` throughout
+/// the transcription (files + segments + the stored list).
+struct TermEditRow: Identifiable, Equatable {
+    let id = UUID()
+    var original: String
+    var text: String
 }
 
 /// PR AR — accent-insensitive fuzzy matching for speaker names at

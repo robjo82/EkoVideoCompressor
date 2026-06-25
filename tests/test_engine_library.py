@@ -895,6 +895,56 @@ class SpeakerEnrollmentTest(unittest.TestCase):
             self.assertEqual(final_map["Sophie"], "Sophie")
             self.assertEqual(final_map["Robin"], "Robin")
 
+    def test_replace_term_corrects_files_segments_and_list(self):
+        # One-click "WeDo" → "Ouidoo": whole-word, case-insensitive,
+        # across the transcript file, the segment text, and the stored
+        # technical-terms list — without touching "Wedophone".
+        from ekovideo_engine.library import library_replace_term
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                ws = root / "ws"
+                ws.mkdir()
+                transcript = ws / "t.txt"
+                transcript.write_text(
+                    "[Robin] On parle de WeDo et de wedo, pas de Wedophone.\n",
+                    encoding="utf-8",
+                )
+                job_id = db.create_job(str(root / "x.mov"), str(ws), {})
+                db.update_job_artefact(job_id, "transcript", str(transcript))
+                db.add_segments(job_id, [
+                    {"start": 0, "end": 3, "speaker": "Robin", "text": "On parle de WeDo."},
+                ])
+                db.update_job_context(job_id, technical_terms=["WeDo", "Odoo"])
+
+                result = library_replace_term(job_id, "WeDo", "Ouidoo")
+                file_text = transcript.read_text(encoding="utf-8")
+                seg_text = db.get_segments(job_id)[0]["text"]
+                terms = json.loads(db.get_job(job_id).get("technical_terms_json") or "[]")
+
+            self.assertEqual(result["occurrences"], 2)  # WeDo + wedo
+            self.assertIn("Ouidoo et de Ouidoo", file_text)
+            self.assertIn("Wedophone", file_text)  # word-boundary spared it
+            self.assertEqual(seg_text, "On parle de Ouidoo.")
+            self.assertEqual(terms, ["Ouidoo", "Odoo"])
+
+    def test_replace_term_noop_when_blank_or_identical(self):
+        from ekovideo_engine.library import library_replace_term
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"EKO_APP_SUPPORT_DIR": str(root / "support")}):
+                db = database()
+                job_id = db.create_job(str(root / "x.mov"), str(root / "ws"), {})
+                self.assertEqual(
+                    library_replace_term(job_id, "Odoo", "odoo")["occurrences"], 0
+                )
+                self.assertEqual(
+                    library_replace_term(job_id, "", "X")["occurrences"], 0
+                )
+
     def test_rename_matches_across_unicode_normalization(self):
         # Regression: renaming an accented label ("Mickaël") reverted
         # after a few seconds — the mapping key (NFD) didn't match the
