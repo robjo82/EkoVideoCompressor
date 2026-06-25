@@ -662,14 +662,18 @@ struct RunBatchSettingsForm: View {
         queue.items.contains { !$0.isLibraryRerun }
     }
 
+    /// At least one queued file actually transcribes — gates the
+    /// (batch-wide) transcription engine settings so they vanish when
+    /// every file is compress-only.
+    private var anyItemTranscribes: Bool {
+        queue.items.contains { $0.mode != "compress" }
+    }
+
     var body: some View {
         Form {
-            Section("Action") {
-                Picker("Mode", selection: $settings.processingMode) {
-                    Text("Compresser + transcrire").tag("compress_transcribe")
-                    Text("Transcrire seulement").tag("transcribe")
-                    Text("Compresser seulement").tag("compress")
-                }
+            // Mode is now per-file (set in each file's panel / its queue
+            // row), so only the transcript Format stays batch-wide here.
+            Section("Format de sortie") {
                 Picker("Format", selection: $settings.outputFormat) {
                     Text("Texte").tag("txt")
                     Text("SRT").tag("srt")
@@ -678,6 +682,7 @@ struct RunBatchSettingsForm: View {
                 }
             }
 
+            if anyItemTranscribes {
             Section("Moteur de transcription") {
                 Picker("Moteur", selection: $settings.transcriptionEngine) {
                     ForEach(TranscriptionEngineChoice.allCases) { choice in
@@ -737,6 +742,7 @@ struct RunBatchSettingsForm: View {
                     pyannotePreflightBanner
                 }
             }
+            }  // anyItemTranscribes
 
             if canDeleteOriginalSources {
                 Section("Fichiers") {
@@ -995,33 +1001,50 @@ struct PerFileSetupPanel: View {
             }
             audioScrubber
 
-            meetingDatePicker
-
-            if settings.odooConfigured {
-                OdooMeetingSuggestionsSection(
-                    item: $item,
-                    suggestions: suggestions,
-                    loading: suggestionsLoading
-                )
-            }
-
-            Picker("Nombre d'intervenants attendu", selection: $item.expectedSpeakerCount) {
-                Text("Auto").tag(0)
-                ForEach(1...12, id: \.self) { count in
-                    Text("\(count)").tag(count)
-                }
+            // Per-file action. Each queue item carries its own mode
+            // (default snapshotted from Réglages at add time); editing
+            // one file never changes another's. The transcription
+            // controls below collapse when this file is compress-only.
+            Picker("Action pour ce fichier", selection: $item.mode) {
+                Text("Compresser + transcrire").tag("compress_transcribe")
+                Text("Transcrire seulement").tag("transcribe")
+                Text("Compresser seulement").tag("compress")
             }
             .pickerStyle(.menu)
 
-            TokenListPicker(
-                title: "Interlocuteurs attendus",
-                placeholder: "Ajouter un nom",
-                selected: $item.expectedSpeakerNames,
-                suggestions: speakerSuggestions
-            )
+            meetingDatePicker
 
-            VocabularyTokenPicker(selected: $item.selectedGlossaryTerms)
-                .environmentObject(settings)
+            if itemTranscribes {
+                if settings.odooConfigured {
+                    OdooMeetingSuggestionsSection(
+                        item: $item,
+                        suggestions: suggestions,
+                        loading: suggestionsLoading
+                    )
+                }
+
+                Picker("Nombre d'intervenants attendu", selection: $item.expectedSpeakerCount) {
+                    Text("Auto").tag(0)
+                    ForEach(1...12, id: \.self) { count in
+                        Text("\(count)").tag(count)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                TokenListPicker(
+                    title: "Interlocuteurs attendus",
+                    placeholder: "Ajouter un nom",
+                    selected: $item.expectedSpeakerNames,
+                    suggestions: speakerSuggestions
+                )
+
+                VocabularyTokenPicker(selected: $item.selectedGlossaryTerms)
+                    .environmentObject(settings)
+            } else {
+                Label("Compression seule — pas de transcription pour ce fichier.", systemImage: "rectangle.compress.vertical")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Notes pour ce fichier (optionnel)")
@@ -1050,6 +1073,10 @@ struct PerFileSetupPanel: View {
             item.mediaDurationSeconds = duration
         }
         .onDisappear { player.stop() }
+    }
+
+    private var itemTranscribes: Bool {
+        item.mode != "compress"
     }
 
     private var detectedMeetingDate: Date {
