@@ -114,11 +114,19 @@ class _FakeProvider:
 
     response: dict = {}
     fail_with: CloudTranscriptionError | None = None
+    fail_times: int = 0  # transient (retryable) failures before succeeding
+    calls: int = 0
 
     def __init__(self, *args, **kwargs):
         pass
 
     def transcribe(self, audio_path, *, model_id, context):
+        type(self).calls += 1
+        if type(self).fail_times > 0:
+            type(self).fail_times -= 1
+            raise CloudTranscriptionError(
+                "Erreur API Gemini (HTTP 503) : high demand", status=503
+            )
         if self.fail_with is not None:
             raise self.fail_with
         from cloud_transcription import parse_cloud_response
@@ -142,6 +150,8 @@ class CloudPipelineTest(unittest.TestCase):
         self.source.write_bytes(b"fake video")
         _FakeProvider.response = _gemini_payload()
         _FakeProvider.fail_with = None
+        _FakeProvider.fail_times = 0
+        _FakeProvider.calls = 0
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -218,6 +228,8 @@ class CloudPipelineTest(unittest.TestCase):
         self.assertEqual(pipeline.cloud_usage_records, [])
 
     def test_transient_cloud_failure_falls_back_to_local(self):
+        # A *persistent* retryable failure exhausts the retries, then
+        # falls back to local so the user still gets a transcript.
         _FakeProvider.fail_with = CloudTranscriptionError(
             "réseau coupé", code="cloud_network"
         )
@@ -227,16 +239,68 @@ class CloudPipelineTest(unittest.TestCase):
         with patch(
             "ekovideo_engine.pipeline.subprocess.run",
             side_effect=_fake_subprocess_run(self.workspace),
-        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory):
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ) as sleeper:
             fallback = pipeline._run_cloud_transcription(
                 str(self.source), self.workspace
             )
         self.assertIsNone(fallback)
+        # It retried (with backoff) before giving up.
+        self.assertEqual(sleeper.call_count, 3)
         warnings = [e for e in events if e["event"] == "warning"]
         self.assertTrue(
             any("bascule" in (w.get("message") or "") for w in warnings),
             [w.get("message") for w in warnings],
         )
+
+    def test_retryable_failure_retries_then_succeeds_on_cloud(self):
+        # The reported bug: a momentary HTTP 503 must NOT drop the whole
+        # meeting to local. Two transient failures, then success — stays
+        # on cloud, no fallback.
+        _FakeProvider.fail_times = 2
+        request = _make_cloud_request(self.workspace, self.source)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ) as sleeper:
+            results = pipeline._run_cloud_transcription(
+                str(self.source), self.workspace
+            )
+        self.assertIsNotNone(results)  # stayed on cloud
+        self.assertEqual(_FakeProvider.calls, 3)  # 2 failures + 1 success
+        self.assertEqual(sleeper.call_count, 2)
+        retries = [e for e in events if e.get("code") == "cloud_retry"]
+        self.assertEqual(len(retries), 2)
+        # No "bascule sur le moteur local" warning was emitted.
+        self.assertFalse(
+            any("bascule" in (e.get("message") or "") for e in events)
+        )
+
+    def test_non_retryable_failure_falls_back_without_retrying(self):
+        # A 4xx (e.g. bad request) is not transient — fall back at once,
+        # don't waste time retrying.
+        _FakeProvider.fail_with = CloudTranscriptionError(
+            "Erreur API Gemini (HTTP 400)", status=400
+        )
+        request = _make_cloud_request(self.workspace, self.source)
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ) as sleeper:
+            fallback = pipeline._run_cloud_transcription(
+                str(self.source), self.workspace
+            )
+        self.assertIsNone(fallback)
+        sleeper.assert_not_called()
 
     def test_stt_provider_records_per_hour_usage(self):
         # A dedicated STT provider (per-hour billing, no full bundle):
