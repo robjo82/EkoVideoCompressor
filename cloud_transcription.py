@@ -319,9 +319,27 @@ class CloudTranscriptionError(RuntimeError):
     ``cloud_api`` falls back to the local pipeline).
     """
 
-    def __init__(self, message: str, code: str = "cloud_api"):
+    # Transient server-side conditions worth retrying before we give up
+    # and fall back to the (slower, lower-quality) local pipeline. 503 is
+    # Gemini's "experiencing high demand, try again later".
+    RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "cloud_api",
+        *,
+        status: int | None = None,
+        retryable: bool | None = None,
+    ):
         super().__init__(message)
         self.code = code
+        self.status = status
+        if retryable is None:
+            retryable = (
+                status in self.RETRYABLE_STATUSES or code == "cloud_network"
+            )
+        self.retryable = bool(retryable)
 
 
 def _entry_hourly_usd(entry: dict) -> float:
@@ -1008,7 +1026,8 @@ def _friendly_http_error(
         )
     return CloudTranscriptionError(
         f"Erreur API {provider_label} (HTTP {exc.code})"
-        + (f" : {detail}" if detail else ".")
+        + (f" : {detail}" if detail else "."),
+        status=exc.code,
     )
 
 

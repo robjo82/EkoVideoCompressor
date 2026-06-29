@@ -96,6 +96,12 @@ from .models import (
 from .paths import managed_venv_python_path
 
 
+# Backoff (seconds) between retries of a cloud transcription chunk that
+# failed with a transient/retryable error (HTTP 503 "high demand", other
+# 5xx, network blips). After this many attempts we fall back to local.
+# Kept short so a persistent outage doesn't stall the queue for long.
+_CLOUD_RETRY_BACKOFF_SECONDS = (5, 15, 30)
+
 # Tqdm progress lines that ``huggingface_hub`` writes to stderr while
 # downloading model weights. They're not errors, but they end up in
 # the same stderr buffer the engine surfaces to the UI when the
@@ -1846,36 +1852,67 @@ class TranscriptionPipeline:
                 chunk_duration_seconds=max(end - start, 0.0),
                 previous_tail=previous_tail,
             )
+            # Retry transient server-side failures (HTTP 503 "high
+            # demand", 5xx, network blips) with backoff before giving up.
+            # The user chose cloud for quality — a momentary Gemini spike
+            # shouldn't silently drop the whole meeting to local Whisper.
+            chunk_result = None
             try:
-                self.sink(
-                    ProgressEvent(
-                        "cloud_transcription",
-                        base_pct + int(30 / len(chunks)),
-                        f"Transcription distante ({index + 1}/{len(chunks)})",
-                    )
-                )
-                chunk_result = provider.transcribe(
-                    str(chunk_mp3), model_id=model_id, context=context
-                )
-            except CloudTranscriptionError as exc:
-                if exc.code in {"cloud_auth", "cloud_provider"}:
-                    # Bad key / misconfig: failing loudly beats hours of
-                    # silent local compute the user didn't choose.
-                    return [
-                        StepResult(
-                            "cloud_transcription",
-                            False,
-                            model=model_id,
-                            duration_seconds=time.monotonic() - ts,
-                            error=str(exc),
+                attempt = 0
+                while True:
+                    try:
+                        self.sink(
+                            ProgressEvent(
+                                "cloud_transcription",
+                                base_pct + int(30 / len(chunks)),
+                                f"Transcription distante ({index + 1}/{len(chunks)})",
+                            )
                         )
-                    ]
-                append_app_log(
-                    f"engine_cloud_chunk_failed provider={provider_id!r} "
-                    f"index={index} code={exc.code!r} error={exc!r}"
-                )
-                _fallback(str(exc), exc.code)
-                return None
+                        chunk_result = provider.transcribe(
+                            str(chunk_mp3), model_id=model_id, context=context
+                        )
+                        break
+                    except CloudTranscriptionError as exc:
+                        if exc.code in {"cloud_auth", "cloud_provider"}:
+                            # Bad key / misconfig: failing loudly beats
+                            # hours of silent local compute the user
+                            # didn't choose.
+                            return [
+                                StepResult(
+                                    "cloud_transcription",
+                                    False,
+                                    model=model_id,
+                                    duration_seconds=time.monotonic() - ts,
+                                    error=str(exc),
+                                )
+                            ]
+                        if getattr(exc, "retryable", False) and attempt < len(
+                            _CLOUD_RETRY_BACKOFF_SECONDS
+                        ):
+                            wait = _CLOUD_RETRY_BACKOFF_SECONDS[attempt]
+                            attempt += 1
+                            append_app_log(
+                                f"engine_cloud_chunk_retry provider={provider_id!r} "
+                                f"index={index} attempt={attempt}/"
+                                f"{len(_CLOUD_RETRY_BACKOFF_SECONDS)} "
+                                f"code={exc.code!r} wait={wait}s error={exc!r}"
+                            )
+                            self.sink(
+                                WarningEvent(
+                                    "Service cloud momentanément saturé — nouvelle "
+                                    f"tentative dans {wait}s "
+                                    f"({attempt}/{len(_CLOUD_RETRY_BACKOFF_SECONDS)})…",
+                                    code="cloud_retry",
+                                )
+                            )
+                            time.sleep(wait)
+                            continue
+                        append_app_log(
+                            f"engine_cloud_chunk_failed provider={provider_id!r} "
+                            f"index={index} code={exc.code!r} error={exc!r}"
+                        )
+                        _fallback(str(exc), exc.code)
+                        return None
             finally:
                 try:
                     chunk_mp3.unlink(missing_ok=True)
