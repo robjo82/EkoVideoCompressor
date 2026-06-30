@@ -74,6 +74,7 @@ from cloud_transcription import (
     build_cloud_audio_cmd,
     canonical_cloud_model_id,
     chunk_seconds_for_model,
+    cloud_fallback_models,
     cloud_model_entry,
     enrich_transcript_via_gemini,
     estimate_cloud_cost,
@@ -1746,10 +1747,7 @@ class TranscriptionPipeline:
         pipeline" (a warning event has already been emitted)."""
         ts = time.monotonic()
         settings = self.request.transcription_settings
-        model_id = canonical_cloud_model_id(settings.cloud_model)
-        entry = cloud_model_entry(model_id)
-        provider_id = provider_for_model(model_id)
-        provider_label = str(entry.get("family") or provider_id)
+        primary_model = canonical_cloud_model_id(settings.cloud_model)
 
         def _fallback(message: str, code: str) -> None:
             self.sink(
@@ -1765,263 +1763,333 @@ class TranscriptionPipeline:
             _fallback("durée du média indéterminable", "cloud_probe_failed")
             return None
 
-        estimate = estimate_cloud_cost(duration, model_id)
-        budget_error = self._cloud_budget_error(estimate)
-        if budget_error is not None:
-            append_app_log(
-                "engine_cloud_budget_exceeded "
-                f"estimate={estimate.get('cost_usd')!r}"
-            )
-            return [
-                StepResult(
-                    "cloud_transcription",
-                    False,
-                    model=model_id,
-                    error=budget_error,
+        # Try the chosen model first; on a *persistent* retryable outage
+        # (e.g. a preview model like Gemini 3.5 Flash being capacity-
+        # rationed — a 503 that outlasts our backoff) fall over to a more
+        # available GA model BEFORE dropping to the local pipeline, so the
+        # user keeps cloud-grade quality. cloud_fallback_models() yields
+        # that chain (empty for already-stable models → retry-then-local
+        # as before).
+        candidate_models = [primary_model, *cloud_fallback_models(primary_model)]
+        last_error_msg: str | None = None
+
+        def _attempt_cloud_model(model_id: str, is_fallback: bool):
+            """One full attempt on a single model. Returns a tagged
+            outcome: ``("ok", results)`` on success, ``("abort",
+            results)`` on a hard failure to surface (auth/budget),
+            ``("local", None)`` when the caller should drop to local
+            (a warning was already emitted), or ``("retry_next", None)``
+            to try the next candidate model."""
+            nonlocal last_error_msg
+            entry = cloud_model_entry(model_id)
+            provider_id = provider_for_model(model_id)
+
+            estimate = estimate_cloud_cost(duration, model_id)
+            budget_error = self._cloud_budget_error(estimate)
+            if budget_error is not None:
+                if is_fallback:
+                    # Can't afford this fallback — skip to the next / local.
+                    last_error_msg = budget_error
+                    return ("retry_next", None)
+                append_app_log(
+                    "engine_cloud_budget_exceeded "
+                    f"estimate={estimate.get('cost_usd')!r}"
                 )
-            ]
-
-        try:
-            provider = get_cloud_provider(provider_id, settings.cloud_api_key)
-        except CloudTranscriptionError as exc:
-            # No key / unknown provider: misconfiguration, not a blip.
-            return [
-                StepResult(
-                    "cloud_transcription", False, model=model_id, error=str(exc)
+                return (
+                    "abort",
+                    [
+                        StepResult(
+                            "cloud_transcription",
+                            False,
+                            model=model_id,
+                            error=budget_error,
+                        )
+                    ],
                 )
-            ]
 
-        # Chunking is per-provider (engine-decided): dedicated STT send
-        # the whole meeting in one job (coherent diarisation), the LLMs
-        # window at their token/size ceiling.
-        chunks = plan_audio_chunks(duration, chunk_seconds_for_model(model_id))
-        self.sink(
-            ProgressEvent(
-                "cloud_transcription",
-                0,
-                f"Transcription cloud ({entry.get('label') or model_id}) — coût estimé "
-                f"{estimate['cost_usd']:.2f} $US",
-            )
-        )
+            try:
+                provider = get_cloud_provider(provider_id, settings.cloud_api_key)
+            except CloudTranscriptionError as exc:
+                # No key / unknown provider: misconfiguration, not a blip.
+                if is_fallback:
+                    last_error_msg = str(exc)
+                    return ("retry_next", None)
+                return (
+                    "abort",
+                    [
+                        StepResult(
+                            "cloud_transcription", False, model=model_id, error=str(exc)
+                        )
+                    ],
+                )
 
-        glossary = [*self.request.glossary_terms, *self.request.technical_terms]
-        odoo_context_blob = self._fetch_odoo_context_blob()
-        # Record exactly what context we forward to the provider, so a
-        # "was my vocabulary actually sent?" question is answerable from
-        # the logs (the request bodies themselves aren't logged).
-        glossary_clean = [t for t in glossary if (t or "").strip()]
-        append_app_log(
-            "engine_cloud_context "
-            f"provider={provider_id!r} model={model_id!r} chunks={len(chunks)} "
-            f"vocab_terms={len(glossary_clean)} "
-            f"vocab_sample={glossary_clean[:8]!r} "
-            f"expected_speakers=({settings.expected_min_speakers},{settings.expected_max_speakers}) "
-            f"enrich={'yes' if (settings.cloud_enrich_api_key and settings.cloud_enrich_model) else 'no'}"
-        )
-        chunk_results = []
-        known_speakers: dict[str, str] = {}
-        previous_tail = ""
-        for index, (start, end) in enumerate(chunks):
-            base_pct = int(100 * index / len(chunks))
+            if is_fallback:
+                append_app_log(
+                    f"engine_cloud_model_fallback from={primary_model!r} "
+                    f"to={model_id!r}"
+                )
+                self.sink(
+                    WarningEvent(
+                        "Modèle cloud précédent saturé — bascule sur "
+                        f"{entry.get('label') or model_id}…",
+                        code="cloud_model_fallback",
+                    )
+                )
+
+            # Chunking is per-provider (engine-decided): dedicated STT send
+            # the whole meeting in one job (coherent diarisation), the LLMs
+            # window at their token/size ceiling.
+            chunks = plan_audio_chunks(duration, chunk_seconds_for_model(model_id))
             self.sink(
                 ProgressEvent(
                     "cloud_transcription",
-                    base_pct,
-                    f"Envoi de l'audio ({index + 1}/{len(chunks)})",
+                    0,
+                    f"Transcription cloud ({entry.get('label') or model_id}) — coût estimé "
+                    f"{estimate['cost_usd']:.2f} $US",
                 )
             )
-            chunk_mp3 = workspace / f"cloud_chunk_{index:02d}.mp3"
-            encode_error = self._encode_cloud_chunk(
-                source_path, chunk_mp3, start, end, duration
+
+            glossary = [*self.request.glossary_terms, *self.request.technical_terms]
+            odoo_context_blob = self._fetch_odoo_context_blob()
+            # Record exactly what context we forward to the provider, so a
+            # "was my vocabulary actually sent?" question is answerable from
+            # the logs (the request bodies themselves aren't logged).
+            glossary_clean = [t for t in glossary if (t or "").strip()]
+            append_app_log(
+                "engine_cloud_context "
+                f"provider={provider_id!r} model={model_id!r} chunks={len(chunks)} "
+                f"vocab_terms={len(glossary_clean)} "
+                f"vocab_sample={glossary_clean[:8]!r} "
+                f"expected_speakers=({settings.expected_min_speakers},{settings.expected_max_speakers}) "
+                f"enrich={'yes' if (settings.cloud_enrich_api_key and settings.cloud_enrich_model) else 'no'}"
             )
-            if encode_error is not None:
-                _fallback(encode_error, "cloud_encode_failed")
-                return None
-            context = CloudPromptContext(
-                language=settings.language,
-                glossary_terms=glossary,
-                expected_speaker_names=self._expected_speaker_names(),
-                meeting_context=self._meeting_context(),
-                odoo_context=odoo_context_blob,
-                known_speakers=known_speakers,
-                expected_min_speakers=max(settings.expected_min_speakers, 0),
-                expected_max_speakers=max(settings.expected_max_speakers, 0),
-                chunk_index=index,
-                chunk_count=len(chunks),
-                chunk_offset_seconds=start,
-                chunk_duration_seconds=max(end - start, 0.0),
-                previous_tail=previous_tail,
-            )
-            # Retry transient server-side failures (HTTP 503 "high
-            # demand", 5xx, network blips) with backoff before giving up.
-            # The user chose cloud for quality — a momentary Gemini spike
-            # shouldn't silently drop the whole meeting to local Whisper.
-            chunk_result = None
-            try:
-                attempt = 0
-                while True:
-                    try:
-                        self.sink(
-                            ProgressEvent(
-                                "cloud_transcription",
-                                base_pct + int(30 / len(chunks)),
-                                f"Transcription distante ({index + 1}/{len(chunks)})",
-                            )
-                        )
-                        chunk_result = provider.transcribe(
-                            str(chunk_mp3), model_id=model_id, context=context
-                        )
-                        break
-                    except CloudTranscriptionError as exc:
-                        if exc.code in {"cloud_auth", "cloud_provider"}:
-                            # Bad key / misconfig: failing loudly beats
-                            # hours of silent local compute the user
-                            # didn't choose.
-                            return [
-                                StepResult(
-                                    "cloud_transcription",
-                                    False,
-                                    model=model_id,
-                                    duration_seconds=time.monotonic() - ts,
-                                    error=str(exc),
-                                )
-                            ]
-                        if getattr(exc, "retryable", False) and attempt < len(
-                            _CLOUD_RETRY_BACKOFF_SECONDS
-                        ):
-                            wait = _CLOUD_RETRY_BACKOFF_SECONDS[attempt]
-                            attempt += 1
-                            append_app_log(
-                                f"engine_cloud_chunk_retry provider={provider_id!r} "
-                                f"index={index} attempt={attempt}/"
-                                f"{len(_CLOUD_RETRY_BACKOFF_SECONDS)} "
-                                f"code={exc.code!r} wait={wait}s error={exc!r}"
-                            )
-                            self.sink(
-                                WarningEvent(
-                                    "Service cloud momentanément saturé — nouvelle "
-                                    f"tentative dans {wait}s "
-                                    f"({attempt}/{len(_CLOUD_RETRY_BACKOFF_SECONDS)})…",
-                                    code="cloud_retry",
-                                )
-                            )
-                            time.sleep(wait)
-                            continue
-                        append_app_log(
-                            f"engine_cloud_chunk_failed provider={provider_id!r} "
-                            f"index={index} code={exc.code!r} error={exc!r}"
-                        )
-                        _fallback(str(exc), exc.code)
-                        return None
-            finally:
+            chunk_results = []
+            known_speakers: dict[str, str] = {}
+            previous_tail = ""
+            for index, (start, end) in enumerate(chunks):
+                base_pct = int(100 * index / len(chunks))
+                self.sink(
+                    ProgressEvent(
+                        "cloud_transcription",
+                        base_pct,
+                        f"Envoi de l'audio ({index + 1}/{len(chunks)})",
+                    )
+                )
+                chunk_mp3 = workspace / f"cloud_chunk_{index:02d}.mp3"
+                encode_error = self._encode_cloud_chunk(
+                    source_path, chunk_mp3, start, end, duration
+                )
+                if encode_error is not None:
+                    _fallback(encode_error, "cloud_encode_failed")
+                    return ("local", None)
+                context = CloudPromptContext(
+                    language=settings.language,
+                    glossary_terms=glossary,
+                    expected_speaker_names=self._expected_speaker_names(),
+                    meeting_context=self._meeting_context(),
+                    odoo_context=odoo_context_blob,
+                    known_speakers=known_speakers,
+                    expected_min_speakers=max(settings.expected_min_speakers, 0),
+                    expected_max_speakers=max(settings.expected_max_speakers, 0),
+                    chunk_index=index,
+                    chunk_count=len(chunks),
+                    chunk_offset_seconds=start,
+                    chunk_duration_seconds=max(end - start, 0.0),
+                    previous_tail=previous_tail,
+                )
+                # Retry transient server-side failures (HTTP 503 "high
+                # demand", 5xx, network blips) with backoff. If they
+                # persist, the caller fails this model over to the next
+                # candidate (then local) rather than burning hours of
+                # unwanted local compute.
+                chunk_result = None
                 try:
-                    chunk_mp3.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                    attempt = 0
+                    while True:
+                        try:
+                            self.sink(
+                                ProgressEvent(
+                                    "cloud_transcription",
+                                    base_pct + int(30 / len(chunks)),
+                                    f"Transcription distante ({index + 1}/{len(chunks)})",
+                                )
+                            )
+                            chunk_result = provider.transcribe(
+                                str(chunk_mp3), model_id=model_id, context=context
+                            )
+                            break
+                        except CloudTranscriptionError as exc:
+                            if exc.code in {"cloud_auth", "cloud_provider"}:
+                                # Bad key / misconfig: failing loudly beats
+                                # hours of silent local compute the user
+                                # didn't choose. Same key for every
+                                # candidate, so abort outright.
+                                return (
+                                    "abort",
+                                    [
+                                        StepResult(
+                                            "cloud_transcription",
+                                            False,
+                                            model=model_id,
+                                            duration_seconds=time.monotonic() - ts,
+                                            error=str(exc),
+                                        )
+                                    ],
+                                )
+                            if getattr(exc, "retryable", False) and attempt < len(
+                                _CLOUD_RETRY_BACKOFF_SECONDS
+                            ):
+                                wait = _CLOUD_RETRY_BACKOFF_SECONDS[attempt]
+                                attempt += 1
+                                append_app_log(
+                                    f"engine_cloud_chunk_retry provider={provider_id!r} "
+                                    f"index={index} attempt={attempt}/"
+                                    f"{len(_CLOUD_RETRY_BACKOFF_SECONDS)} "
+                                    f"code={exc.code!r} wait={wait}s error={exc!r}"
+                                )
+                                self.sink(
+                                    WarningEvent(
+                                        "Service cloud momentanément saturé — nouvelle "
+                                        f"tentative dans {wait}s "
+                                        f"({attempt}/{len(_CLOUD_RETRY_BACKOFF_SECONDS)})…",
+                                        code="cloud_retry",
+                                    )
+                                )
+                                time.sleep(wait)
+                                continue
+                            append_app_log(
+                                f"engine_cloud_chunk_failed provider={provider_id!r} "
+                                f"index={index} code={exc.code!r} error={exc!r}"
+                            )
+                            last_error_msg = str(exc)
+                            return ("retry_next", None)
+                finally:
+                    try:
+                        chunk_mp3.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
-            chunk_results.append(chunk_result)
-            for label, name in chunk_result.speakers.items():
-                if name or label not in known_speakers:
-                    known_speakers[label] = name
-            tail_lines = [
-                f"[{seg.get('speaker') or '—'}] {seg.get('text') or ''}"
-                for seg in chunk_result.segments[-3:]
+                chunk_results.append(chunk_result)
+                for label, name in chunk_result.speakers.items():
+                    if name or label not in known_speakers:
+                        known_speakers[label] = name
+                tail_lines = [
+                    f"[{seg.get('speaker') or '—'}] {seg.get('text') or ''}"
+                    for seg in chunk_result.segments[-3:]
+                ]
+                previous_tail = "\n".join(tail_lines)
+                usage = chunk_result.usage
+                # Every successful chunk billed real money at the API,
+                # even if a later chunk fails and we fail over — so it
+                # stays on the record (no discarding on fail-over).
+                self.cloud_usage_records.append(
+                    {
+                        "provider": provider_id,
+                        "model": usage.model or model_id,
+                        "step": f"chunk_{index + 1}/{len(chunks)}",
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cost_usd": usage.cost_usd,
+                    }
+                )
+                self.sink(
+                    UsageEvent(
+                        provider_id,
+                        usage.model or model_id,
+                        step=f"chunk_{index + 1}/{len(chunks)}",
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cost_usd=usage.cost_usd,
+                    )
+                )
+
+            merged = merge_chunk_results(chunk_results)
+            segments = merged.segments
+
+            # Dedicated STT providers return only transcript + diarisation.
+            # Run the existing LLM post-pass (best-effort, local venv) for a
+            # title, speaker names and glossary corrections — the same
+            # enrichment the local pipeline applies. Full-bundle providers
+            # (Gemini) already populated all of that.
+            if entry.get("needs_enrichment") and segments:
+                self._enrich_cloud_result(merged, segments, workspace)
+
+            # Apply the label → real-name mapping (model- or LLM-discovered)
+            # so the transcript reads "[Jean Dupont]" instead of
+            # "[Intervenant 1]" wherever a name was resolved.
+            named = {k: v for k, v in merged.speakers.items() if v}
+            if named:
+                segments = self._apply_speaker_renames(segments, named)
+
+            # Feed the shared payload the review writer + runner expect.
+            self._llm_payload = {
+                "title": merged.title,
+                "speakers": merged.speakers,
+                "technical_terms": merged.technical_terms,
+                "corrections": list(merged.corrections or []),
+                "uncertain_passages": merged.uncertain,
+            }
+
+            transcript_path = self._write_transcript(segments, workspace)
+            results: list[StepResult] = [
+                StepResult(
+                    "cloud_transcription",
+                    True,
+                    str(transcript_path),
+                    model=model_id,
+                    duration_seconds=time.monotonic() - ts,
+                    metrics={
+                        "chunks": len(chunks),
+                        "audio_seconds": round(duration, 1),
+                        "input_tokens": merged.usage.input_tokens,
+                        "output_tokens": merged.usage.output_tokens,
+                        "cost_usd": merged.usage.cost_usd,
+                    },
+                ),
+                StepResult("transcript", True, str(transcript_path)),
             ]
-            previous_tail = "\n".join(tail_lines)
-            usage = chunk_result.usage
-            self.cloud_usage_records.append(
-                {
-                    "provider": provider_id,
-                    "model": usage.model or model_id,
-                    "step": f"chunk_{index + 1}/{len(chunks)}",
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "cost_usd": usage.cost_usd,
-                }
+            review_path = self._write_review_markdown(transcript_path, segments)
+            if review_path is not None:
+                results.append(StepResult("review", True, str(review_path)))
+
+            self.final_segments = segments
+            self.final_speaker_map = self._build_speaker_map(
+                segments, llm_speakers=merged.speakers
             )
+            self.final_technical_terms = list(merged.technical_terms)
+            self.final_title = merged.title
+            if self.final_speaker_map or self.final_technical_terms:
+                self.sink(
+                    ContextEvent(
+                        speakers=self.final_speaker_map,
+                        technical_terms=self.final_technical_terms,
+                    )
+                )
+            total_tokens = f"{merged.usage.input_tokens + merged.usage.output_tokens:,}".replace(",", " ")
             self.sink(
-                UsageEvent(
-                    provider_id,
-                    usage.model or model_id,
-                    step=f"chunk_{index + 1}/{len(chunks)}",
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cost_usd=usage.cost_usd,
+                ProgressEvent(
+                    "cloud_transcription",
+                    100,
+                    f"Transcription cloud terminée — {total_tokens} tokens, "
+                    f"{merged.usage.cost_usd:.2f} $US",
                 )
             )
+            return ("ok", results)
 
-        merged = merge_chunk_results(chunk_results)
-        segments = merged.segments
-
-        # Dedicated STT providers return only transcript + diarisation.
-        # Run the existing LLM post-pass (best-effort, local venv) for a
-        # title, speaker names and glossary corrections — the same
-        # enrichment the local pipeline applies. Full-bundle providers
-        # (Gemini) already populated all of that.
-        if entry.get("needs_enrichment") and segments:
-            self._enrich_cloud_result(merged, segments, workspace)
-
-        # Apply the label → real-name mapping (model- or LLM-discovered)
-        # so the transcript reads "[Jean Dupont]" instead of
-        # "[Intervenant 1]" wherever a name was resolved.
-        named = {k: v for k, v in merged.speakers.items() if v}
-        if named:
-            segments = self._apply_speaker_renames(segments, named)
-
-        # Feed the shared payload the review writer + runner expect.
-        self._llm_payload = {
-            "title": merged.title,
-            "speakers": merged.speakers,
-            "technical_terms": merged.technical_terms,
-            "corrections": list(merged.corrections or []),
-            "uncertain_passages": merged.uncertain,
-        }
-
-        transcript_path = self._write_transcript(segments, workspace)
-        results: list[StepResult] = [
-            StepResult(
-                "cloud_transcription",
-                True,
-                str(transcript_path),
-                model=model_id,
-                duration_seconds=time.monotonic() - ts,
-                metrics={
-                    "chunks": len(chunks),
-                    "audio_seconds": round(duration, 1),
-                    "input_tokens": merged.usage.input_tokens,
-                    "output_tokens": merged.usage.output_tokens,
-                    "cost_usd": merged.usage.cost_usd,
-                },
-            ),
-            StepResult("transcript", True, str(transcript_path)),
-        ]
-        review_path = self._write_review_markdown(transcript_path, segments)
-        if review_path is not None:
-            results.append(StepResult("review", True, str(review_path)))
-
-        self.final_segments = segments
-        self.final_speaker_map = self._build_speaker_map(
-            segments, llm_speakers=merged.speakers
-        )
-        self.final_technical_terms = list(merged.technical_terms)
-        self.final_title = merged.title
-        if self.final_speaker_map or self.final_technical_terms:
-            self.sink(
-                ContextEvent(
-                    speakers=self.final_speaker_map,
-                    technical_terms=self.final_technical_terms,
-                )
+        for position, model_id in enumerate(candidate_models):
+            outcome, payload = _attempt_cloud_model(
+                model_id, is_fallback=position > 0
             )
-        total_tokens = f"{merged.usage.input_tokens + merged.usage.output_tokens:,}".replace(",", " ")
-        self.sink(
-            ProgressEvent(
-                "cloud_transcription",
-                100,
-                f"Transcription cloud terminée — {total_tokens} tokens, "
-                f"{merged.usage.cost_usd:.2f} $US",
-            )
-        )
-        return results
+            if outcome in ("ok", "abort"):
+                return payload
+            if outcome == "local":
+                return None  # encode failure — warning already emitted
+            # "retry_next": this model is capacity-rationed; try the next.
+
+        # Every cloud candidate exhausted its retries — drop to local so
+        # the user still gets a transcript.
+        _fallback(last_error_msg or "service cloud saturé", "cloud_api")
+        return None
 
     def _build_speaker_map(
         self,

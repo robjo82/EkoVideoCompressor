@@ -115,6 +115,8 @@ class _FakeProvider:
     response: dict = {}
     fail_with: CloudTranscriptionError | None = None
     fail_times: int = 0  # transient (retryable) failures before succeeding
+    fail_for_model: str | None = None  # always 503 for this model id
+    models_seen: list[str] = []
     calls: int = 0
 
     def __init__(self, *args, **kwargs):
@@ -122,6 +124,11 @@ class _FakeProvider:
 
     def transcribe(self, audio_path, *, model_id, context):
         type(self).calls += 1
+        type(self).models_seen.append(model_id)
+        if type(self).fail_for_model and model_id == type(self).fail_for_model:
+            raise CloudTranscriptionError(
+                "Erreur API Gemini (HTTP 503) : high demand", status=503
+            )
         if type(self).fail_times > 0:
             type(self).fail_times -= 1
             raise CloudTranscriptionError(
@@ -151,6 +158,8 @@ class CloudPipelineTest(unittest.TestCase):
         _FakeProvider.response = _gemini_payload()
         _FakeProvider.fail_with = None
         _FakeProvider.fail_times = 0
+        _FakeProvider.fail_for_model = None
+        _FakeProvider.models_seen = []
         _FakeProvider.calls = 0
 
     def tearDown(self):
@@ -279,6 +288,65 @@ class CloudPipelineTest(unittest.TestCase):
         # No "bascule sur le moteur local" warning was emitted.
         self.assertFalse(
             any("bascule" in (e.get("message") or "") for e in events)
+        )
+
+    def test_capacity_rationed_model_fails_over_to_ga_model(self):
+        # The reported case: Gemini 3.5 Flash (preview) is persistently
+        # 503'd. Instead of dropping to local, the engine fails over to a
+        # GA model (2.5 Flash) and stays on cloud.
+        _FakeProvider.fail_for_model = "gemini-3.5-flash"
+        request = _make_cloud_request(
+            self.workspace, self.source, cloud_model="gemini-3.5-flash"
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ):
+            results = pipeline._run_cloud_transcription(
+                str(self.source), self.workspace
+            )
+        self.assertIsNotNone(results)  # stayed on cloud, no local fallback
+        # The GA fallback model actually ran.
+        self.assertIn("gemini-2.5-flash", _FakeProvider.models_seen)
+        cloud_step = next(r for r in results if r.name == "cloud_transcription")
+        self.assertEqual(cloud_step.model, "gemini-2.5-flash")
+        self.assertTrue(
+            any(e.get("code") == "cloud_model_fallback" for e in events)
+        )
+        self.assertFalse(
+            any("bascule sur le moteur local" in (e.get("message") or "") for e in events)
+        )
+
+    def test_all_cloud_models_down_falls_back_to_local(self):
+        # Both the chosen preview model and its GA fallback are 503'd →
+        # only then do we drop to local.
+        _FakeProvider.fail_with = CloudTranscriptionError(
+            "Erreur API Gemini (HTTP 503)", status=503
+        )
+        request = _make_cloud_request(
+            self.workspace, self.source, cloud_model="gemini-3.5-flash"
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ):
+            fallback = pipeline._run_cloud_transcription(
+                str(self.source), self.workspace
+            )
+        self.assertIsNone(fallback)
+        # Both models were attempted before giving up.
+        self.assertIn("gemini-3.5-flash", _FakeProvider.models_seen)
+        self.assertIn("gemini-2.5-flash", _FakeProvider.models_seen)
+        self.assertTrue(
+            any("bascule sur le moteur local" in (e.get("message") or "") for e in events)
         )
 
     def test_non_retryable_failure_falls_back_without_retrying(self):

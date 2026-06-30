@@ -374,6 +374,39 @@ def canonical_cloud_model_id(model_id: str) -> str:
     return cloud_model_entry(model_id)["id"]
 
 
+# Stable, high-capacity GA models to fall over to when the *chosen* model
+# is being capacity-rationed (a persistent 503 that outlasts retry
+# backoff — typical of preview models like Gemini 3.5 Flash, where Google
+# prioritises its consumer products over the API). Keyed by provider
+# family so a Gemini choice degrades to a GA Gemini — same full-bundle
+# output (speakers, title, terms) — rather than to a bare STT provider.
+_CLOUD_FALLBACK_BY_FAMILY: dict[str, list[str]] = {
+    "Gemini": ["gemini-2.5-flash"],
+}
+
+
+def cloud_fallback_models(primary_model_id: str) -> list[str]:
+    """Ordered, de-duplicated fallback model ids for a primary choice.
+
+    Excludes the primary itself and any id the catalogue doesn't know.
+    Empty when the chosen model is already the stable GA option (or no
+    alternative is configured) — in which case the engine just retries
+    then drops to local as before.
+    """
+    primary = canonical_cloud_model_id(primary_model_id)
+    family = str(cloud_model_entry(primary).get("family") or "")
+    known = {m["id"] for m in CLOUD_TRANSCRIPTION_MODELS}
+    out: list[str] = []
+    seen = {primary}
+    for candidate in _CLOUD_FALLBACK_BY_FAMILY.get(family, []):
+        cid = canonical_cloud_model_id(candidate)
+        if cid in seen or cid not in known:
+            continue
+        out.append(cid)
+        seen.add(cid)
+    return out
+
+
 def compute_cost_usd(model_id: str, input_tokens: int, output_tokens: int) -> float:
     """Per-token cost from real usage counters (per_token models)."""
     entry = cloud_model_entry(model_id)
