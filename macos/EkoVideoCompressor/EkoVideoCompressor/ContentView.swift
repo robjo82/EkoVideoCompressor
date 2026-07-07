@@ -381,7 +381,8 @@ struct ContentView: View {
                 cloud_api_key: settings.usesCloudTranscription ? settings.activeCloudApiKey : "",
                 cloud_budget_monthly_usd: settings.cloudBudgetMonthlyUSD,
                 cloud_enrich_model: cloudEnrichModel,
-                cloud_enrich_api_key: cloudEnrichKey
+                cloud_enrich_api_key: cloudEnrichKey,
+                cloud_unavailable_policy: settings.cloudUnavailablePolicy
             ),
             glossary_terms: glossaryForRun,
             speaker_overrides: overrides,
@@ -894,6 +895,16 @@ struct CloudEngineRunOptions: View {
                 }
             }
         }
+
+        Picker("Si le cloud est indisponible", selection: $settings.cloudUnavailablePolicy) {
+            Text("Basculer en local").tag("local_fallback")
+            Text("Rester en cloud (réessais prolongés)").tag("stay_cloud")
+        }
+        Text(settings.cloudUnavailablePolicy == "stay_cloud"
+             ? "Réessaie le modèle choisi avec des intervalles croissants (10s, 20s, 40s…) sans jamais changer de modèle ni passer en local. Si le service reste indisponible, le traitement échoue — tu le relances plus tard sur le même modèle."
+             : "Réessaie brièvement, bascule vers un modèle cloud plus disponible, puis en local en dernier recours pour toujours produire un transcript.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
 
         let estimate = queueEstimate
         if estimate.knownCost > 0 || estimate.unknownCount > 0 {

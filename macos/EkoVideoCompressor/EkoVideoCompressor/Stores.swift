@@ -332,6 +332,10 @@ final class SettingsStore: ObservableObject {
     @AppStorage("deepgramApiKey") var deepgramApiKey = ""
     @AppStorage("cloudModel") var cloudModel = "gemini-3.5-flash"
     @AppStorage("cloudBudgetMonthlyUSD") var cloudBudgetMonthlyUSD: Double = 20
+    // Cloud outage policy: "local_fallback" (retry → GA model → local)
+    // or "stay_cloud" (long expanding backoff on the chosen model, never
+    // switch or drop to local; fail if still down).
+    @AppStorage("cloudUnavailablePolicy") var cloudUnavailablePolicy = "local_fallback"
 
     /// Provider owning the currently-selected cloud model.
     var activeCloudProvider: String { cloudProviderForModel(cloudModel) }

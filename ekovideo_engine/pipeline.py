@@ -103,6 +103,12 @@ from .paths import managed_venv_python_path
 # Kept short so a persistent outage doesn't stall the queue for long.
 _CLOUD_RETRY_BACKOFF_SECONDS = (5, 15, 30)
 
+# Longer, expanding backoff used by the "stay_cloud" policy — when the
+# user would rather wait out a capacity spike than lose their chosen
+# model (or drop to local). ~33 min of total patience, capped at 5 min
+# per wait; on exhaustion the job fails rather than falling back.
+_CLOUD_STAY_BACKOFF_SECONDS = (10, 20, 40, 80, 160, 300, 300, 300, 300, 300)
+
 # Tqdm progress lines that ``huggingface_hub`` writes to stderr while
 # downloading model weights. They're not errors, but they end up in
 # the same stderr buffer the engine surfaces to the UI when the
@@ -1763,14 +1769,21 @@ class TranscriptionPipeline:
             _fallback("durée du média indéterminable", "cloud_probe_failed")
             return None
 
-        # Try the chosen model first; on a *persistent* retryable outage
-        # (e.g. a preview model like Gemini 3.5 Flash being capacity-
-        # rationed — a 503 that outlasts our backoff) fall over to a more
-        # available GA model BEFORE dropping to the local pipeline, so the
-        # user keeps cloud-grade quality. cloud_fallback_models() yields
-        # that chain (empty for already-stable models → retry-then-local
-        # as before).
-        candidate_models = [primary_model, *cloud_fallback_models(primary_model)]
+        # Retry/outage policy (user-chosen, per transcription):
+        #   local_fallback → short backoff, fail over to a GA cloud model,
+        #     then local Whisper (a transcript always ships).
+        #   stay_cloud → long expanding backoff on the *chosen* model
+        #     only, never switch models or drop to local; fail the job if
+        #     it's still down so the user reruns later on the exact model.
+        stay_cloud = (
+            settings.cloud_unavailable_policy or "local_fallback"
+        ).strip() == "stay_cloud"
+        backoff = _CLOUD_STAY_BACKOFF_SECONDS if stay_cloud else _CLOUD_RETRY_BACKOFF_SECONDS
+        candidate_models = (
+            [primary_model]
+            if stay_cloud
+            else [primary_model, *cloud_fallback_models(primary_model)]
+        )
         last_error_msg: str | None = None
 
         def _attempt_cloud_model(model_id: str, is_fallback: bool):
@@ -1942,21 +1955,21 @@ class TranscriptionPipeline:
                                     ],
                                 )
                             if getattr(exc, "retryable", False) and attempt < len(
-                                _CLOUD_RETRY_BACKOFF_SECONDS
+                                backoff
                             ):
-                                wait = _CLOUD_RETRY_BACKOFF_SECONDS[attempt]
+                                wait = backoff[attempt]
                                 attempt += 1
                                 append_app_log(
                                     f"engine_cloud_chunk_retry provider={provider_id!r} "
-                                    f"index={index} attempt={attempt}/"
-                                    f"{len(_CLOUD_RETRY_BACKOFF_SECONDS)} "
+                                    f"index={index} attempt={attempt}/{len(backoff)} "
+                                    f"policy={'stay_cloud' if stay_cloud else 'local_fallback'} "
                                     f"code={exc.code!r} wait={wait}s error={exc!r}"
                                 )
                                 self.sink(
                                     WarningEvent(
                                         "Service cloud momentanément saturé — nouvelle "
                                         f"tentative dans {wait}s "
-                                        f"({attempt}/{len(_CLOUD_RETRY_BACKOFF_SECONDS)})…",
+                                        f"({attempt}/{len(backoff)})…",
                                         code="cloud_retry",
                                     )
                                 )
@@ -1967,6 +1980,28 @@ class TranscriptionPipeline:
                                 f"index={index} code={exc.code!r} error={exc!r}"
                             )
                             last_error_msg = str(exc)
+                            if stay_cloud:
+                                # User demanded this exact model — fail the
+                                # job (no fail-over, no local) so they can
+                                # rerun later rather than get a worse
+                                # transcript they didn't ask for.
+                                return (
+                                    "abort",
+                                    [
+                                        StepResult(
+                                            "cloud_transcription",
+                                            False,
+                                            model=model_id,
+                                            duration_seconds=time.monotonic() - ts,
+                                            error=(
+                                                f"Service cloud indisponible après "
+                                                f"{len(backoff)} tentatives prolongées "
+                                                f"({str(exc)}). Mode « rester en cloud » : "
+                                                "aucune bascule locale — réessayez plus tard."
+                                            ),
+                                        )
+                                    ],
+                                )
                             return ("retry_next", None)
                 finally:
                     try:
