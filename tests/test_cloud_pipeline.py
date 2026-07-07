@@ -56,9 +56,9 @@ def _make_cloud_request(workspace: Path, source: Path, **tx_overrides) -> JobReq
     )
 
 
-def _gemini_payload() -> dict:
+def _gemini_payload(title: str = "Comité produit") -> dict:
     body = {
-        "title": "Comité produit",
+        "title": title,
         "speakers": [{"label": "Intervenant 1", "name": "Jean Dupont"}],
         "technical_terms": ["Odoo"],
         "segments": [
@@ -348,6 +348,27 @@ class CloudPipelineTest(unittest.TestCase):
         self.assertTrue(
             any("bascule sur le moteur local" in (e.get("message") or "") for e in events)
         )
+
+    def test_cloud_title_uses_client_company_not_ekonum(self):
+        # Gemini titled the meeting after our own company; the pipeline
+        # rewrites it to "Client - Sujet" using the calendar partner.
+        _FakeProvider.response = _gemini_payload("Ekonum - Présentation des modules RH")
+        request = _make_cloud_request(self.workspace, self.source)
+        request.odoo_meeting_metadata = {
+            "partners": [{"name": "Ekonum"}, {"name": "Acritec"}]
+        }
+        pipeline, _results, _events = self._run(request)
+        self.assertEqual(
+            pipeline.final_title, "Acritec - Présentation des modules RH"
+        )
+
+    def test_cloud_title_strips_ekonum_when_no_client_resolved(self):
+        # No client resolvable → at least drop the useless "Ekonum -"
+        # self-prefix instead of shipping it.
+        _FakeProvider.response = _gemini_payload("Ekonum - Audit ERP")
+        request = _make_cloud_request(self.workspace, self.source)
+        pipeline, _results, _events = self._run(request)
+        self.assertEqual(pipeline.final_title, "Audit ERP")
 
     def test_non_retryable_failure_falls_back_without_retrying(self):
         # A 4xx (e.g. bad request) is not transient — fall back at once,

@@ -1851,6 +1851,10 @@ class TranscriptionPipeline:
 
             glossary = [*self.request.glossary_terms, *self.request.technical_terms]
             odoo_context_blob = self._fetch_odoo_context_blob()
+            # External client company for the "Client - Sujet" title —
+            # resolved once and forwarded so the model uses the exact
+            # spelling (and never prefixes with our own "Ekonum").
+            client_company = self._resolve_company_name_for_title()
             # Record exactly what context we forward to the provider, so a
             # "was my vocabulary actually sent?" question is answerable from
             # the logs (the request bodies themselves aren't logged).
@@ -1889,6 +1893,7 @@ class TranscriptionPipeline:
                     meeting_context=self._meeting_context(),
                     odoo_context=odoo_context_blob,
                     known_speakers=known_speakers,
+                    client_company=client_company,
                     expected_min_speakers=max(settings.expected_min_speakers, 0),
                     expected_max_speakers=max(settings.expected_max_speakers, 0),
                     chunk_index=index,
@@ -2005,6 +2010,12 @@ class TranscriptionPipeline:
 
             merged = merge_chunk_results(chunk_results)
             segments = merged.segments
+
+            # Code-side safety net: even with the prompt rule, the model
+            # sometimes still titles the meeting after the host ("Ekonum
+            # - …"). Strip that and apply the resolved client prefix —
+            # the same normalisation the local pipeline runs.
+            merged.title = self._apply_title_company_prefix(merged.title)
 
             # Dedicated STT providers return only transcript + diarisation.
             # Run the existing LLM post-pass (best-effort, local venv) for a

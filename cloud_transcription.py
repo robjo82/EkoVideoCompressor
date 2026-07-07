@@ -579,6 +579,7 @@ def build_cloud_prompt(
     meeting_context: str = "",
     odoo_context: str = "",
     known_speakers: dict[str, str] | None = None,
+    client_company: str = "",
     chunk_index: int = 0,
     chunk_count: int = 1,
     chunk_offset_seconds: float = 0.0,
@@ -609,8 +610,25 @@ def build_cloud_prompt(
         "produits et termes métier entendus.",
         "- Renseigne `uncertain` avec les passages dont tu doutes "
         "(mot inaudible, terme ambigu) et la raison.",
-        "- Propose dans `title` un titre court et professionnel de la réunion.",
     ]
+    # Title rule: prefix with the *external* stakeholder company (client
+    # or prospect), never « Ekonum » — that's the host's own company and
+    # naming every meeting after itself is useless. Mirrors the code-side
+    # veto in the pipeline (`_strip_ekonum_prefix` / company prefix).
+    title_rule = (
+        "- Propose dans `title` un titre court au format « Client - Sujet », "
+        "où Client est la société de la partie prenante externe (client ou "
+        "prospect) de la réunion. N'utilise JAMAIS « Ekonum » comme préfixe : "
+        "c'est notre propre société, celle qui reçoit. Si aucune société "
+        "cliente n'est identifiable, donne seulement le sujet, sans préfixe."
+    )
+    if (client_company or "").strip():
+        company = client_company.strip()
+        title_rule += (
+            f" Ici, la société cliente est « {company} » : titre attendu "
+            f"« {company} - <sujet> »."
+        )
+    lines.append(title_rule)
     names = [n for n in (expected_speaker_names or []) if (n or "").strip()]
     if names:
         lines.append(
@@ -1360,6 +1378,9 @@ class CloudPromptContext:
     meeting_context: str = ""
     odoo_context: str = ""
     known_speakers: dict[str, str] = field(default_factory=dict)
+    # External stakeholder company (client/prospect) for the title
+    # prefix — "Acritec - Sujet". Never the host's own company (Ekonum).
+    client_company: str = ""
     # Expected speaker-count hints (0 = let the model decide). Forwarded
     # to each STT's native diarisation config so the provider doesn't
     # under/over-segment — the same signal the local pyannote path uses.
@@ -1674,6 +1695,7 @@ class GeminiProvider(CloudProvider):
             meeting_context=context.meeting_context,
             odoo_context=context.odoo_context,
             known_speakers=context.known_speakers,
+            client_company=context.client_company,
             chunk_index=context.chunk_index,
             chunk_count=context.chunk_count,
             chunk_offset_seconds=context.chunk_offset_seconds,
