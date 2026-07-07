@@ -751,13 +751,19 @@ def parse_cloud_response(
         raise CloudTranscriptionError(
             "Réponse Gemini vide"
             + (f" (finishReason : {finish})" if finish else "")
-            + "."
+            + ".",
+            # A blank / truncated generation is a transient model hiccup,
+            # not a config error — worth another attempt.
+            retryable=True,
         )
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise CloudTranscriptionError(
-            f"Réponse Gemini illisible (JSON invalide) : {exc}"
+            f"Réponse Gemini illisible (JSON invalide) : {exc}",
+            # Truncated/garbled JSON ("Unterminated string") is transient
+            # too — retrying usually returns a clean payload.
+            retryable=True,
         ) from exc
 
     result = CloudChunkResult()

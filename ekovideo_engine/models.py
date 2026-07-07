@@ -140,6 +140,16 @@ class TranscriptionSettings:
     # Gemini text model id (default Flash-Lite when a key is set).
     cloud_enrich_model: str = ""
     cloud_enrich_api_key: str = ""
+    # What to do when the chosen cloud model stays unavailable after
+    # retries:
+    #   "local_fallback" (default) — retry with short backoff, fail over
+    #     to a more available GA cloud model, then drop to local Whisper
+    #     so a transcript always ships.
+    #   "stay_cloud" — keep retrying the *chosen* model with a longer,
+    #     expanding backoff (10/20/40/… s) and never switch models or
+    #     drop to local; if it's still down after the extended attempts,
+    #     the job fails so the user can rerun later on the exact model.
+    cloud_unavailable_policy: str = "local_fallback"
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "TranscriptionSettings":

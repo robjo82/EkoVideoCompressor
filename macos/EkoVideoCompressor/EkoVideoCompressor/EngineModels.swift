@@ -737,4 +737,9 @@ struct TranscriptionSettings: Codable {
     /// Gemini key is set (engine then falls back to the local LLM).
     var cloud_enrich_model: String = ""
     var cloud_enrich_api_key: String = ""
+    /// What the engine does when the chosen cloud model stays down after
+    /// retries: "local_fallback" (retry → GA model → local) or
+    /// "stay_cloud" (long expanding backoff on the chosen model, never
+    /// switch or drop to local; fail if still down).
+    var cloud_unavailable_policy: String = "local_fallback"
 }

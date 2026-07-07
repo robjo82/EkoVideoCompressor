@@ -370,6 +370,75 @@ class CloudPipelineTest(unittest.TestCase):
         pipeline, _results, _events = self._run(request)
         self.assertEqual(pipeline.final_title, "Audit ERP")
 
+    def test_stay_cloud_policy_never_leaves_the_chosen_model(self):
+        # "stay_cloud": a persistent 503 must NOT fail over to another
+        # model nor drop to local — the job fails on the chosen model.
+        _FakeProvider.fail_for_model = "gemini-3.5-flash"
+        request = _make_cloud_request(
+            self.workspace,
+            self.source,
+            cloud_model="gemini-3.5-flash",
+            cloud_unavailable_policy="stay_cloud",
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ):
+            results = pipeline._run_cloud_transcription(
+                str(self.source), self.workspace
+            )
+        # Hard failure (not None → no local), and only the chosen model
+        # was ever contacted (no fail-over to 2.5-flash).
+        self.assertIsNotNone(results)
+        cloud_step = next(r for r in results if r.name == "cloud_transcription")
+        self.assertFalse(cloud_step.ok)
+        self.assertEqual(set(_FakeProvider.models_seen), {"gemini-3.5-flash"})
+        self.assertNotIn("gemini-2.5-flash", _FakeProvider.models_seen)
+        self.assertFalse(
+            any("bascule sur le moteur local" in (e.get("message") or "") for e in events)
+        )
+
+    def test_stay_cloud_uses_the_expanding_backoff(self):
+        _FakeProvider.fail_for_model = "gemini-3.5-flash"
+        request = _make_cloud_request(
+            self.workspace,
+            self.source,
+            cloud_model="gemini-3.5-flash",
+            cloud_unavailable_policy="stay_cloud",
+        )
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ) as sleeper:
+            pipeline._run_cloud_transcription(str(self.source), self.workspace)
+        from ekovideo_engine.pipeline import _CLOUD_STAY_BACKOFF_SECONDS
+
+        waits = [c.args[0] for c in sleeper.call_args_list]
+        self.assertEqual(waits, list(_CLOUD_STAY_BACKOFF_SECONDS))
+        self.assertEqual(waits[:3], [10, 20, 40])  # expanding, as asked
+
+    def test_truncated_json_response_is_retryable(self):
+        # The real 2.5-flash failure: Gemini returned a truncated JSON
+        # payload ("Unterminated string"). That error is now retryable so
+        # the engine gives it another go instead of bailing to local.
+        from cloud_transcription import CloudTranscriptionError, parse_cloud_response
+
+        with self.assertRaises(CloudTranscriptionError) as ctx:
+            parse_cloud_response(
+                {"candidates": [{"content": {"parts": [{"text": '{"segments": ['}]}}]},
+                model_id="gemini-2.5-flash",
+                chunk_offset_seconds=0,
+            )
+        self.assertTrue(ctx.exception.retryable)
+
     def test_non_retryable_failure_falls_back_without_retrying(self):
         # A 4xx (e.g. bad request) is not transient — fall back at once,
         # don't waste time retrying.
