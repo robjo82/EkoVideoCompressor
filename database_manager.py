@@ -195,6 +195,11 @@ class DatabaseManager:
             # ``transcription_engine`` is "local" or "cloud".
             "transcription_model": "TEXT",
             "transcription_engine": "TEXT",
+            # Per-chunk state of the last cloud attempt on long meetings:
+            # a JSON list of {index, start, end, ok}. Lets the library
+            # show which windows failed and offer to relaunch just those.
+            # NULL on local / single-shot jobs.
+            "cloud_chunks_json": "TEXT",
         }
         for name, definition in columns.items():
             if name not in existing:
@@ -519,6 +524,20 @@ class DatabaseManager:
                 "UPDATE jobs SET transcription_model = ?, transcription_engine = ?, "
                 "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 ((model or "").strip() or None, (engine or "").strip() or None, job_id),
+            )
+
+    def update_job_cloud_chunks(
+        self, job_id: int, chunks: Optional[list]
+    ) -> None:
+        """Persist the per-chunk state of a cloud run ({index,start,end,ok}
+        list) so the library can offer to relaunch the failed windows.
+        Passing an empty list clears it (local / single-shot jobs)."""
+        payload = json.dumps(chunks) if chunks else None
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE jobs SET cloud_chunks_json = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (payload, job_id),
             )
 
     def month_api_spend_usd(self, month: Optional[str] = None) -> float:

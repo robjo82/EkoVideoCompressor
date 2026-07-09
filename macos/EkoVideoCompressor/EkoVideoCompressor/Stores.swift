@@ -54,6 +54,11 @@ struct QueueItem: Identifiable, Equatable {
     /// once a drop is in the queue, its mode is locked unless the
     /// user explicitly edits it from the row picker.
     var mode: String = "compress_transcribe"
+    /// Cloud chunk indices to force re-transcribing on this rerun,
+    /// bypassing the resume cache. Empty = normal auto-resume (only
+    /// missing/failed windows are redone). Set from the library's
+    /// "relancer les chunks" panel.
+    var cloudRedoChunks: [Int] = []
     /// Per-file vocabulary explicitly selected for this run. The global
     /// vocabulary catalog suggests entries, but nothing is sent to
     /// Whisper unless the user chose it here.
@@ -131,7 +136,10 @@ final class QueueStore: ObservableObject {
         /// current global picker value; the item locks it. Defaults
         /// to ``compress_transcribe`` for the rare programmatic
         /// caller that doesn't go through the UI.
-        mode: String = "compress_transcribe"
+        mode: String = "compress_transcribe",
+        /// Cloud chunk indices to force-redo on a rerun (from the
+        /// "relancer les chunks" panel). Empty = normal auto-resume.
+        cloudRedoChunks: [Int] = []
     ) {
         for url in urls {
             if let index = items.firstIndex(where: { $0.sourceURL == url && $0.libraryJobId == libraryJobId }) {
@@ -166,6 +174,7 @@ final class QueueStore: ObservableObject {
                 // the mode to whatever the current picker says. The
                 // user just re-asked, so respect their current intent.
                 items[index].mode = mode
+                items[index].cloudRedoChunks = cloudRedoChunks
                 if prioritize && index > 0 {
                     let item = items.remove(at: index)
                     items.insert(item, at: 0)
@@ -184,6 +193,7 @@ final class QueueStore: ObservableObject {
             item.meetingDate = meetingDate
             item.meetingDateManuallyEdited = meetingDateManuallyEdited
             item.mode = mode
+            item.cloudRedoChunks = cloudRedoChunks
             if prioritize {
                 items.insert(item, at: 0)
             } else {
@@ -208,7 +218,9 @@ final class QueueStore: ObservableObject {
         /// ``compress_transcribe`` ; callers typically pass the
         /// current ``settings.processingMode`` so the rerun matches
         /// the user's current intent.
-        mode: String = "compress_transcribe"
+        mode: String = "compress_transcribe",
+        /// Cloud chunk indices to force-redo (from the chunk panel).
+        cloudRedoChunks: [Int] = []
     ) {
         let path = sourcePath
             ?? (pathExists(row.copiedSourcePath) ? row.copiedSourcePath : row.source_path)
@@ -232,7 +244,8 @@ final class QueueStore: ObservableObject {
             },
             meetingDate: existingMeetingDate,
             meetingDateManuallyEdited: existingMeetingDate != nil,
-            mode: mode
+            mode: mode,
+            cloudRedoChunks: cloudRedoChunks
         )
     }
 
