@@ -485,6 +485,31 @@ class CloudPipelineTest(unittest.TestCase):
         self.assertEqual(_FakeProvider.calls, 1)
         self.assertFalse(cache.exists())  # cleared on full success
 
+    def test_partial_run_persists_speakers_terms_and_status(self):
+        # Even when a later chunk fails, the speakers, vocabulary and
+        # per-chunk status from the successful windows are saved to the
+        # job — not lost until the (never-reached) final merge.
+        from ekovideo_engine.library import database
+        db = database()
+        job_id = db.create_job(str(self.source), str(self.workspace), {})
+        request = _make_cloud_request(self.workspace, self.source)
+        request.library_job_id = job_id
+        _FakeProvider.fail_indices = {2}
+        self._run_cloud(request, duration_seconds=5400)
+
+        row = db.get_job(job_id)
+        speakers = json.loads(row.get("speaker_map_json") or "{}")
+        terms = json.loads(row.get("technical_terms_json") or "[]")
+        chunks = json.loads(row.get("cloud_chunks_json") or "[]")
+        self.assertTrue(
+            any("Jean Dupont" in k or "Jean Dupont" in v for k, v in speakers.items()),
+            speakers,
+        )
+        self.assertIn("Odoo", terms)
+        self.assertEqual([c["ok"] for c in chunks], [True, True, False])
+        # A partial transcript was written too.
+        self.assertTrue(row.get("transcript_path"))
+
     def test_cloud_chunk_status_records_failed_windows(self):
         # After a partial run the pipeline exposes per-chunk state so the
         # library can list which windows failed.
