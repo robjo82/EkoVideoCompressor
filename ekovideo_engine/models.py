@@ -345,6 +345,11 @@ class JobRequest:
     rerun_steps: list[str] = field(default_factory=list)
     library_job_id: int | None = None
     delete_source_after_copy: bool = False
+    # Cloud chunk indices to force re-transcribing on a rerun, ignoring
+    # the per-chunk disk cache. Empty = normal resume (reuse every cached
+    # chunk, only redo the missing/failed ones). Used by the "relancer
+    # certains chunks" advanced control on long meetings.
+    cloud_redo_chunks: list[int] = field(default_factory=list)
     # ISO-8601 timestamp of the actual meeting. Defaults to the
     # source file's metadata on the SwiftUI side, but can be corrected
     # manually when a recording was copied or exported later than the
@@ -395,6 +400,9 @@ class JobRequest:
             rerun_steps=[str(x) for x in data.get("rerun_steps") or []],
             library_job_id=data.get("library_job_id"),
             delete_source_after_copy=bool(data.get("delete_source_after_copy") or False),
+            cloud_redo_chunks=[
+                int(x) for x in (data.get("cloud_redo_chunks") or []) if str(x).lstrip("-").isdigit()
+            ],
             meeting_date=str(data.get("meeting_date") or ""),
             odoo_context_ref=OdooContextRef.from_dict(data.get("odoo_context_ref")),
             odoo_meeting_metadata=dict(data.get("odoo_meeting_metadata") or {}),

@@ -69,6 +69,7 @@ from transcription_utils import (
 )
 from vad_silero import build_vad_cmd, parse_vad_manifest, remap_segments_to_source
 from cloud_transcription import (
+    CloudChunkResult,
     CloudPromptContext,
     CloudTranscriptionError,
     build_cloud_audio_cmd,
@@ -108,6 +109,86 @@ _CLOUD_RETRY_BACKOFF_SECONDS = (5, 15, 30)
 # model (or drop to local). ~33 min of total patience, capped at 5 min
 # per wait; on exhaustion the job fails rather than falling back.
 _CLOUD_STAY_BACKOFF_SECONDS = (10, 20, 40, 80, 160, 300, 300, 300, 300, 300)
+
+
+def _cloud_chunk_cache_path(cache_dir: Path, index: int) -> Path:
+    return cache_dir / f"chunk_{index:02d}.json"
+
+
+def _load_cached_cloud_chunk(
+    cache_dir: Path, index: int, start: float, end: float, chunk_count: int
+) -> "CloudChunkResult | None":
+    """Return a previously-transcribed chunk from disk when it matches the
+    current chunk plan, else ``None``. This is what lets a rerun of a long
+    meeting resume — reusing the windows that already succeeded instead of
+    re-uploading and re-paying. Stale caches (edited media / different
+    chunking → shifted window or count) are ignored."""
+    path = _cloud_chunk_cache_path(cache_dir, index)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if int(data.get("chunk_count") or -1) != int(chunk_count):
+        return None
+    # Explicit None checks — a chunk-0 window legitimately starts at 0.0,
+    # which `x or -1` would wrongly treat as missing.
+    cached_start = data.get("start")
+    cached_end = data.get("end")
+    if cached_start is None or cached_end is None:
+        return None
+    if abs(float(cached_start) - float(start)) > 0.5:
+        return None
+    if abs(float(cached_end) - float(end)) > 0.5:
+        return None
+    result_raw = data.get("result")
+    if not isinstance(result_raw, dict):
+        return None
+    result = CloudChunkResult.from_dict(result_raw)
+    # A cached chunk with no segments is worthless — force a redo.
+    return result if result.segments else None
+
+
+def _save_cached_cloud_chunk(
+    cache_dir: Path,
+    index: int,
+    start: float,
+    end: float,
+    chunk_count: int,
+    model_id: str,
+    result: "CloudChunkResult",
+) -> None:
+    """Persist a freshly-transcribed chunk for resume. Best-effort — a
+    write failure just means that chunk won't be resumable."""
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "index": int(index),
+            "start": float(start),
+            "end": float(end),
+            "chunk_count": int(chunk_count),
+            "model": model_id,
+            "result": result.to_dict(),
+        }
+        _cloud_chunk_cache_path(cache_dir, index).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _clear_cloud_chunk_cache(cache_dir: Path) -> None:
+    """Drop the whole resume cache once a cloud run completes — so the
+    NEXT rerun (e.g. to apply new vocabulary) starts fresh rather than
+    silently reusing the old windows. Only an *incomplete* run leaves a
+    cache behind for the resume path to pick up."""
+    try:
+        for path in cache_dir.glob("chunk_*.json"):
+            path.unlink(missing_ok=True)
+        cache_dir.rmdir()
+    except OSError:
+        pass
 
 # Tqdm progress lines that ``huggingface_hub`` writes to stderr while
 # downloading model weights. They're not errors, but they end up in
@@ -1880,11 +1961,55 @@ class TranscriptionPipeline:
                 f"expected_speakers=({settings.expected_min_speakers},{settings.expected_max_speakers}) "
                 f"enrich={'yes' if (settings.cloud_enrich_api_key and settings.cloud_enrich_model) else 'no'}"
             )
+            cache_dir = workspace / "cloud_chunks"
+            redo_set = {int(i) for i in (self.request.cloud_redo_chunks or [])}
             chunk_results = []
             known_speakers: dict[str, str] = {}
             previous_tail = ""
+
+            def _absorb_chunk(result: CloudChunkResult) -> None:
+                # Thread the speaker map + transcript tail forward for
+                # cross-window continuity — whether the chunk was freshly
+                # transcribed or restored from the resume cache.
+                nonlocal previous_tail
+                for label, name in result.speakers.items():
+                    if name or label not in known_speakers:
+                        known_speakers[label] = name
+                previous_tail = "\n".join(
+                    f"[{seg.get('speaker') or '—'}] {seg.get('text') or ''}"
+                    for seg in result.segments[-3:]
+                )
+
             for index, (start, end) in enumerate(chunks):
                 base_pct = int(100 * index / len(chunks))
+
+                # Resume: reuse a previously-transcribed chunk from disk
+                # unless the user force-redoes this index — a rerun of a
+                # long meeting then only redoes the chunks that failed (no
+                # re-upload, no re-billing).
+                cached = (
+                    None
+                    if index in redo_set
+                    else _load_cached_cloud_chunk(
+                        cache_dir, index, start, end, len(chunks)
+                    )
+                )
+                if cached is not None:
+                    append_app_log(
+                        f"engine_cloud_chunk_cached index={index} "
+                        f"model={cached.usage.model!r}"
+                    )
+                    self.sink(
+                        ProgressEvent(
+                            "cloud_transcription",
+                            base_pct + int(30 / len(chunks)),
+                            f"Chunk {index + 1}/{len(chunks)} déjà transcrit — repris",
+                        )
+                    )
+                    chunk_results.append(cached)
+                    _absorb_chunk(cached)
+                    continue
+
                 self.sink(
                     ProgressEvent(
                         "cloud_transcription",
@@ -2009,19 +2134,18 @@ class TranscriptionPipeline:
                     except OSError:
                         pass
 
+                # Persist the freshly-transcribed chunk so a later rerun
+                # can resume from it instead of re-uploading + re-paying.
+                _save_cached_cloud_chunk(
+                    cache_dir, index, start, end, len(chunks), model_id, chunk_result
+                )
                 chunk_results.append(chunk_result)
-                for label, name in chunk_result.speakers.items():
-                    if name or label not in known_speakers:
-                        known_speakers[label] = name
-                tail_lines = [
-                    f"[{seg.get('speaker') or '—'}] {seg.get('text') or ''}"
-                    for seg in chunk_result.segments[-3:]
-                ]
-                previous_tail = "\n".join(tail_lines)
+                _absorb_chunk(chunk_result)
                 usage = chunk_result.usage
-                # Every successful chunk billed real money at the API,
-                # even if a later chunk fails and we fail over — so it
-                # stays on the record (no discarding on fail-over).
+                # Every freshly-transcribed chunk billed real money at the
+                # API, even if a later chunk fails and we fail over — so it
+                # stays on the record (no discarding on fail-over). Cached
+                # chunks `continue`d above, so they're never re-billed.
                 self.cloud_usage_records.append(
                     {
                         "provider": provider_id,
@@ -2120,6 +2244,10 @@ class TranscriptionPipeline:
                     f"{merged.usage.cost_usd:.2f} $US",
                 )
             )
+            # Full success — drop the resume cache so the next rerun (e.g.
+            # to apply new vocabulary) starts clean. Only an incomplete
+            # run leaves its cached chunks behind to resume from.
+            _clear_cloud_chunk_cache(cache_dir)
             return ("ok", results)
 
         for position, model_id in enumerate(candidate_models):
