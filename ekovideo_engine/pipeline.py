@@ -2173,6 +2173,14 @@ class TranscriptionPipeline:
                         cost_usd=usage.cost_usd,
                     )
                 )
+                # Save progress after every completed window: the partial
+                # transcript, speakers, vocabulary and chunk status land on
+                # the job now — so an interrupted or killed run keeps what
+                # it transcribed instead of losing it because the final
+                # merge never ran.
+                self._persist_partial_cloud_progress(
+                    workspace, chunk_results, chunks, cache_dir
+                )
 
             merged = merge_chunk_results(chunk_results)
             segments = merged.segments
@@ -2302,6 +2310,60 @@ class TranscriptionPipeline:
         _record_chunk_status_from_cache()
         _fallback(last_error_msg or "service cloud saturé", "cloud_api")
         return None
+
+    def _persist_partial_cloud_progress(
+        self,
+        workspace: Path,
+        chunk_results: list,
+        chunk_plan: list,
+        cache_dir: Path,
+    ) -> None:
+        """Best-effort incremental persistence during a cloud run. After
+        each completed window we write the partial transcript, speaker
+        map, technical terms and per-chunk status onto the job row — so an
+        interrupted or killed run keeps everything transcribed so far
+        (speakers + vocabulary included) and surfaces the relaunch panel,
+        instead of losing it all because the final merge never ran. The
+        runner overwrites with the authoritative version on full success.
+        """
+        job_id = self.request.library_job_id
+        if not job_id or not chunk_results:
+            return
+        try:
+            from .library import database
+
+            db = database()
+            merged = merge_chunk_results(chunk_results)
+            segments = merged.segments
+            named = {k: v for k, v in merged.speakers.items() if v}
+            if named:
+                segments = self._apply_speaker_renames(segments, named)
+            transcript_path = self._write_transcript(segments, workspace)
+            db.update_job_artefact(job_id, "transcript", str(transcript_path))
+            db.update_job_output(job_id, str(transcript_path))
+            if segments:
+                db.add_segments(job_id, segments)
+            speaker_map = self._build_speaker_map(
+                segments, llm_speakers=merged.speakers
+            )
+            db.update_job_context(
+                job_id,
+                speakers=speaker_map or None,
+                technical_terms=list(merged.technical_terms) or None,
+            )
+            status = [
+                {
+                    "index": i,
+                    "start": float(s),
+                    "end": float(e),
+                    "ok": _load_cached_cloud_chunk(cache_dir, i, s, e, len(chunk_plan))
+                    is not None,
+                }
+                for i, (s, e) in enumerate(chunk_plan)
+            ]
+            db.update_job_cloud_chunks(job_id, status)
+        except Exception as exc:  # pragma: no cover — best-effort safety net
+            append_app_log(f"engine_cloud_partial_persist_failed error={exc!r}")
 
     def _build_speaker_map(
         self,
