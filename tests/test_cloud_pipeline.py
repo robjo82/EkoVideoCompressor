@@ -116,7 +116,9 @@ class _FakeProvider:
     fail_with: CloudTranscriptionError | None = None
     fail_times: int = 0  # transient (retryable) failures before succeeding
     fail_for_model: str | None = None  # always 503 for this model id
+    fail_indices: set = set()  # always 503 for these chunk indices
     models_seen: list[str] = []
+    indices_seen: list[int] = []
     calls: int = 0
 
     def __init__(self, *args, **kwargs):
@@ -125,6 +127,11 @@ class _FakeProvider:
     def transcribe(self, audio_path, *, model_id, context):
         type(self).calls += 1
         type(self).models_seen.append(model_id)
+        type(self).indices_seen.append(context.chunk_index)
+        if context.chunk_index in type(self).fail_indices:
+            raise CloudTranscriptionError(
+                "Erreur API Gemini (HTTP 503) : high demand", status=503
+            )
         if type(self).fail_for_model and model_id == type(self).fail_for_model:
             raise CloudTranscriptionError(
                 "Erreur API Gemini (HTTP 503) : high demand", status=503
@@ -159,11 +166,29 @@ class CloudPipelineTest(unittest.TestCase):
         _FakeProvider.fail_with = None
         _FakeProvider.fail_times = 0
         _FakeProvider.fail_for_model = None
+        _FakeProvider.fail_indices = set()
         _FakeProvider.models_seen = []
+        _FakeProvider.indices_seen = []
         _FakeProvider.calls = 0
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def _run_cloud(self, request: JobRequest, duration_seconds: float = 600.0):
+        """Drive just the cloud path with a chosen media duration (to
+        control the chunk count). Returns (pipeline, results, events)."""
+        events, sink = collect_events()
+        pipeline = TranscriptionPipeline(request, sink)
+        with patch(
+            "ekovideo_engine.pipeline.subprocess.run",
+            side_effect=_fake_subprocess_run(self.workspace, duration_seconds),
+        ), patch("ekovideo_engine.pipeline.get_cloud_provider", _fake_factory), patch(
+            "ekovideo_engine.pipeline.time.sleep"
+        ):
+            results = pipeline._run_cloud_transcription(
+                str(self.source), self.workspace
+            )
+        return pipeline, results, events
 
     def _run(self, request: JobRequest):
         events, sink = collect_events()
@@ -438,6 +463,53 @@ class CloudPipelineTest(unittest.TestCase):
                 chunk_offset_seconds=0,
             )
         self.assertTrue(ctx.exception.retryable)
+
+    def test_failed_chunks_resume_from_cache_on_rerun(self):
+        # 3-chunk meeting, chunk 2 fails → chunks 0/1 cached, run drops to
+        # local. Rerun reuses 0/1 and only redoes chunk 2.
+        request = _make_cloud_request(self.workspace, self.source)
+        _FakeProvider.fail_indices = {2}
+        _p1, r1, _e1 = self._run_cloud(request, duration_seconds=5400)
+        self.assertIsNone(r1)  # chunk 2 failed → local fallback
+        cache = self.workspace / "cloud_chunks"
+        self.assertTrue((cache / "chunk_00.json").exists())
+        self.assertTrue((cache / "chunk_01.json").exists())
+        self.assertFalse((cache / "chunk_02.json").exists())
+
+        _FakeProvider.fail_indices = set()
+        _FakeProvider.indices_seen = []
+        _FakeProvider.calls = 0
+        _p2, r2, _e2 = self._run_cloud(request, duration_seconds=5400)
+        self.assertIsNotNone(r2)  # completed on resume
+        self.assertEqual(_FakeProvider.indices_seen, [2])  # only the failed one
+        self.assertEqual(_FakeProvider.calls, 1)
+        self.assertFalse(cache.exists())  # cleared on full success
+
+    def test_cloud_redo_chunks_forces_retranscription(self):
+        # Seed cache for chunks 0/1 (chunk 2 fails), then rerun forcing
+        # chunk 0 to redo — chunk 1 stays cached, chunks 0 and 2 run.
+        request = _make_cloud_request(self.workspace, self.source)
+        _FakeProvider.fail_indices = {2}
+        self._run_cloud(request, duration_seconds=5400)
+
+        _FakeProvider.fail_indices = set()
+        _FakeProvider.indices_seen = []
+        request.cloud_redo_chunks = [0]
+        _p, r, _e = self._run_cloud(request, duration_seconds=5400)
+        self.assertIsNotNone(r)
+        self.assertEqual(sorted(_FakeProvider.indices_seen), [0, 2])
+
+    def test_cache_cleared_after_full_success_so_rerun_is_fresh(self):
+        # A fully successful run leaves no cache — a later rerun (e.g. to
+        # apply new vocabulary) re-transcribes everything.
+        request = _make_cloud_request(self.workspace, self.source)
+        _p, r, _e = self._run_cloud(request, duration_seconds=5400)
+        self.assertIsNotNone(r)
+        self.assertFalse((self.workspace / "cloud_chunks").exists())
+
+        _FakeProvider.indices_seen = []
+        self._run_cloud(request, duration_seconds=5400)
+        self.assertEqual(sorted(_FakeProvider.indices_seen), [0, 1, 2])
 
     def test_non_retryable_failure_falls_back_without_retrying(self):
         # A 4xx (e.g. bad request) is not transient — fall back at once,

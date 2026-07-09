@@ -711,6 +711,24 @@ class CloudUsage:
         self.output_tokens += other.output_tokens
         self.cost_usd = round(self.cost_usd + other.cost_usd, 6)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cost_usd": self.cost_usd,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "CloudUsage":
+        data = dict(raw or {})
+        return cls(
+            model=str(data.get("model") or ""),
+            input_tokens=int(data.get("input_tokens") or 0),
+            output_tokens=int(data.get("output_tokens") or 0),
+            cost_usd=float(data.get("cost_usd") or 0.0),
+        )
+
 
 @dataclass(slots=True)
 class CloudChunkResult:
@@ -723,6 +741,33 @@ class CloudChunkResult:
     # the LLM enrichment pass (or by Gemini's full-bundle response).
     corrections: list[dict] = field(default_factory=list)
     usage: CloudUsage = field(default_factory=CloudUsage)
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serialisable form for the per-chunk disk cache that lets
+        a rerun resume long meetings without re-transcribing (and
+        re-paying for) the chunks that already succeeded."""
+        return {
+            "segments": self.segments,
+            "speakers": self.speakers,
+            "technical_terms": self.technical_terms,
+            "title": self.title,
+            "uncertain": self.uncertain,
+            "corrections": self.corrections,
+            "usage": self.usage.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "CloudChunkResult":
+        data = dict(raw or {})
+        return cls(
+            segments=list(data.get("segments") or []),
+            speakers=dict(data.get("speakers") or {}),
+            technical_terms=list(data.get("technical_terms") or []),
+            title=str(data.get("title") or ""),
+            uncertain=list(data.get("uncertain") or []),
+            corrections=list(data.get("corrections") or []),
+            usage=CloudUsage.from_dict(data.get("usage")),
+        )
 
 
 def parse_cloud_response(
