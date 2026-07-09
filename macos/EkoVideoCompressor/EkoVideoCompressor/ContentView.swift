@@ -53,6 +53,10 @@ struct ContentView: View {
     /// decide whether the user is at risk (Max on battery = bad)
     /// without rummaging through QueueStore on every event.
     @State private var runningPreset: String = ""
+    /// Engine choice (local/cloud) snapshotted at queue start, for the
+    /// same reason: a cloud run doesn't saturate the SoC, so the
+    /// unplug guard must leave it alone whatever the preset says.
+    @State private var runningEngine: String = ""
     @State private var unplugInterruptTask: Task<Void, Never>?
 
     var body: some View {
@@ -187,6 +191,13 @@ struct ContentView: View {
                     // refuses to start a fresh one below 40 %.
                     continue
                 }
+                guard runningEngine != TranscriptionEngineChoice.cloud.rawValue else {
+                    // Cloud transcription offloads the heavy pass to
+                    // the API — the SoC stays cool and the battery
+                    // drain is nowhere near the local large-v3 case
+                    // this guard exists for. Let the run finish.
+                    continue
+                }
                 engine.cancel()
                 queue.cancellationReason = "max_on_battery"
             }
@@ -214,7 +225,11 @@ struct ContentView: View {
         // whether an interrupt is warranted. Every item in a batch
         // inherits the same preset today, so a single field suffices.
         runningPreset = settings.qualityPreset
-        defer { runningPreset = "" }
+        runningEngine = settings.transcriptionEngine
+        defer {
+            runningPreset = ""
+            runningEngine = ""
+        }
         let itemIDs = queue.items.map(\.id)
 
         for itemID in itemIDs {
@@ -3161,8 +3176,12 @@ struct TranscriptionSettingsTab: View {
                         Text(preset.displayName).tag(preset.rawValue)
                     }
                 }
+                // The Max-needs-AC constraint only concerns the local
+                // Whisper engine — a cloud run leaves the SoC idle, so
+                // neither the auto-downgrade nor the warning apply.
                 .onChange(of: energy.allowsMaxPreset) { _, allowed in
-                    if !allowed && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
+                    if !allowed && !settings.usesCloudTranscription
+                        && settings.qualityPreset == TranscriptionQualityPreset.max.rawValue {
                         settings.qualityPreset = TranscriptionQualityPreset.balanced.rawValue
                     }
                 }
@@ -3171,7 +3190,7 @@ struct TranscriptionSettingsTab: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if !energy.allowsMaxPreset {
+                if !energy.allowsMaxPreset && !settings.usesCloudTranscription {
                     Label(energy.maxPresetBlockedReason, systemImage: "bolt.slash.fill")
                         .font(.caption)
                         .foregroundStyle(.orange)
