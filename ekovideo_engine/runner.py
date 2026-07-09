@@ -547,6 +547,11 @@ class EngineRunner:
                     cloud_total += float(record.get("cost_usd") or 0)
                     cloud_model = record.get("model") or cloud_model
                 db.update_job_cloud_cost(job_id, round(cloud_total, 6), cloud_model)
+            # Per-chunk state for the library's "relancer les chunks
+            # échoués" panel. Persisted on any cloud attempt (success or
+            # partial) so the UI can list which windows failed.
+            if pipeline.cloud_chunk_status:
+                db.update_job_cloud_chunks(job_id, pipeline.cloud_chunk_status)
             failed = [
                 r
                 for r in tx_results

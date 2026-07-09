@@ -390,6 +390,7 @@ struct ContentView: View {
             rerun_steps: [],
             library_job_id: item.libraryJobId,
             delete_source_after_copy: settings.deleteSourceAfterCopy && !item.isLibraryRerun,
+            cloud_redo_chunks: item.cloudRedoChunks,
             meeting_date: engineMeetingDateString(meetingDate),
             odoo_context_ref: contextRef,
             odoo_meeting_metadata: item.odooMeeting
@@ -2008,6 +2009,7 @@ struct LibraryView: View {
     @EnvironmentObject private var models: ModelStore
     @State private var editingRow: LibraryRow?
     @State private var rowToDelete: LibraryRow?
+    @State private var chunkPanelRow: LibraryRow?
     // PR AP — row whose heavy source the user asked to free; drives
     // the confirmation dialog.
     @State private var rowToFreeSource: LibraryRow?
@@ -2350,6 +2352,7 @@ struct LibraryView: View {
                                     onInspect: { toggleExpanded(displayRow.job) },
                                     onRerun: { enqueue(displayRow.job, label: "Relance ajoutée à la file d'attente") },
                                     onEditContext: { editingRow = displayRow.job },
+                                    onRelaunchChunks: { chunkPanelRow = displayRow.job },
                                     onDelete: { rowToDelete = displayRow.job }
                                 )
                             }
@@ -2381,6 +2384,15 @@ struct LibraryView: View {
             LibraryContextEditor(row: row)
                 .environmentObject(library)
                 .environmentObject(queue)
+        }
+        .sheet(item: $chunkPanelRow) { row in
+            CloudChunkRelaunchPanel(row: row) { indices in
+                queue.addRerun(row: row, mode: "transcribe", cloudRedoChunks: indices)
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    queueNotice = "Relance des chunks ajoutée à la file d'attente"
+                }
+            }
+            .environmentObject(queue)
         }
         .sheet(item: $rowToDelete) { row in
             LibraryDeletionSheet(row: row)
@@ -4024,11 +4036,87 @@ func frenchOdooModelLabel(_ model: String) -> String {
     }
 }
 
+/// Advanced panel to relaunch only the chosen cloud chunks of a long
+/// meeting. Failed windows are pre-selected (the common intent); the
+/// user can also tick a "successful" window to force-redo it. Reused
+/// windows aren't re-uploaded or re-billed.
+struct CloudChunkRelaunchPanel: View {
+    let row: LibraryRow
+    let onRelaunch: ([Int]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var selected: Set<Int>
+
+    init(row: LibraryRow, onRelaunch: @escaping ([Int]) -> Void) {
+        self.row = row
+        self.onRelaunch = onRelaunch
+        _selected = State(
+            initialValue: Set(row.cloudChunks.filter { !$0.ok }.map(\.index))
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Relancer des chunks cloud")
+                    .font(.headline)
+                Text("Coche les fenêtres à retranscrire. Les chunks réussis non cochés sont réutilisés tels quels — pas de ré-upload ni de re-facturation.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding()
+            Divider()
+            List {
+                ForEach(row.cloudChunks) { chunk in
+                    Toggle(isOn: Binding(
+                        get: { selected.contains(chunk.index) },
+                        set: { on in
+                            if on { selected.insert(chunk.index) }
+                            else { selected.remove(chunk.index) }
+                        }
+                    )) {
+                        HStack(spacing: 8) {
+                            Image(systemName: chunk.ok ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                .foregroundStyle(chunk.ok ? .green : .orange)
+                            Text("Chunk \(chunk.index + 1)")
+                                .font(.body.weight(.medium))
+                            Text(chunk.windowLabel)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Text(chunk.ok ? "Réussi" : "Échoué")
+                                .font(.caption)
+                                .foregroundStyle(chunk.ok ? Color.secondary : Color.orange)
+                        }
+                    }
+                }
+            }
+            Divider()
+            HStack {
+                Button("Annuler") { dismiss() }
+                Spacer()
+                Text("\(selected.count) chunk(s) à relancer")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Relancer les chunks sélectionnés") {
+                    onRelaunch(selected.sorted())
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(selected.isEmpty)
+            }
+            .padding()
+        }
+        .frame(minWidth: 480, minHeight: 400)
+    }
+}
+
 struct LibraryTableActionsView: View {
     var row: LibraryRow
     var onInspect: () -> Void
     var onRerun: () -> Void
     var onEditContext: () -> Void
+    var onRelaunchChunks: () -> Void
     var onDelete: () -> Void
 
     var body: some View {
@@ -4046,6 +4134,15 @@ struct LibraryTableActionsView: View {
             }
             .labelStyle(.iconOnly)
             .help("Ajouter la source copiée à la file")
+
+            if row.hasFailedCloudChunks {
+                Button(action: onRelaunchChunks) {
+                    Label("Chunks échoués", systemImage: "square.stack.3d.up.trianglebadge.exclamationmark")
+                }
+                .labelStyle(.iconOnly)
+                .tint(.orange)
+                .help("Relancer les chunks cloud qui ont échoué")
+            }
 
             Button(action: onEditContext) {
                 Label("Contexte", systemImage: "person.2.badge.gearshape")

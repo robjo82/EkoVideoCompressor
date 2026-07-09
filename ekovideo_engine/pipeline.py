@@ -999,6 +999,11 @@ class TranscriptionPipeline:
         # The runner persists them into ``api_usage`` (it owns the
         # job_id) and denormalises the total onto the job row.
         self.cloud_usage_records: list[dict] = []
+        # Per-chunk state of the last cloud attempt, one dict per window
+        # ({index, start, end, ok}). The runner persists it so the
+        # library can show which chunks failed and offer to relaunch
+        # them. Empty for local jobs.
+        self.cloud_chunk_status: list[dict] = []
 
     def _resolve_managed_python(self) -> None:
         settings = self.request.transcription_settings
@@ -1866,6 +1871,10 @@ class TranscriptionPipeline:
             else [primary_model, *cloud_fallback_models(primary_model)]
         )
         last_error_msg: str | None = None
+        # Resume cache dir + force-redo set live at this scope so both the
+        # per-model attempt and the final chunk-status recorder see them.
+        cache_dir = workspace / "cloud_chunks"
+        redo_set = {int(i) for i in (self.request.cloud_redo_chunks or [])}
 
         def _attempt_cloud_model(model_id: str, is_fallback: bool):
             """One full attempt on a single model. Returns a tagged
@@ -1961,8 +1970,6 @@ class TranscriptionPipeline:
                 f"expected_speakers=({settings.expected_min_speakers},{settings.expected_max_speakers}) "
                 f"enrich={'yes' if (settings.cloud_enrich_api_key and settings.cloud_enrich_model) else 'no'}"
             )
-            cache_dir = workspace / "cloud_chunks"
-            redo_set = {int(i) for i in (self.request.cloud_redo_chunks or [])}
             chunk_results = []
             known_speakers: dict[str, str] = {}
             previous_tail = ""
@@ -2244,24 +2251,55 @@ class TranscriptionPipeline:
                     f"{merged.usage.cost_usd:.2f} $US",
                 )
             )
-            # Full success — drop the resume cache so the next rerun (e.g.
-            # to apply new vocabulary) starts clean. Only an incomplete
-            # run leaves its cached chunks behind to resume from.
+            # Record every window as done for the library, THEN drop the
+            # resume cache — a full run means the next rerun (e.g. to apply
+            # new vocabulary) starts clean; only an incomplete run leaves
+            # its cached chunks behind to resume from.
+            self.cloud_chunk_status = [
+                {"index": i, "start": float(s), "end": float(e), "ok": True}
+                for i, (s, e) in enumerate(chunks)
+            ]
             _clear_cloud_chunk_cache(cache_dir)
             return ("ok", results)
 
+        def _record_chunk_status_from_cache() -> None:
+            # Derive per-chunk done/failed state from the resume cache for
+            # the library's "relaunch failed chunks" panel. Only for the
+            # ok path is it set directly (cache is cleared there).
+            if self.cloud_chunk_status:
+                return
+            plan = plan_audio_chunks(
+                duration, chunk_seconds_for_model(primary_model)
+            )
+            self.cloud_chunk_status = [
+                {
+                    "index": i,
+                    "start": float(s),
+                    "end": float(e),
+                    "ok": _load_cached_cloud_chunk(cache_dir, i, s, e, len(plan))
+                    is not None,
+                }
+                for i, (s, e) in enumerate(plan)
+            ]
+
+        result: list[StepResult] | None = None
         for position, model_id in enumerate(candidate_models):
             outcome, payload = _attempt_cloud_model(
                 model_id, is_fallback=position > 0
             )
-            if outcome in ("ok", "abort"):
+            if outcome == "ok":
+                return payload
+            if outcome == "abort":
+                _record_chunk_status_from_cache()
                 return payload
             if outcome == "local":
+                _record_chunk_status_from_cache()
                 return None  # encode failure — warning already emitted
             # "retry_next": this model is capacity-rationed; try the next.
 
         # Every cloud candidate exhausted its retries — drop to local so
         # the user still gets a transcript.
+        _record_chunk_status_from_cache()
         _fallback(last_error_msg or "service cloud saturé", "cloud_api")
         return None
 

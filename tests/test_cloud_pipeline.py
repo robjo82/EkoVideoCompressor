@@ -485,6 +485,24 @@ class CloudPipelineTest(unittest.TestCase):
         self.assertEqual(_FakeProvider.calls, 1)
         self.assertFalse(cache.exists())  # cleared on full success
 
+    def test_cloud_chunk_status_records_failed_windows(self):
+        # After a partial run the pipeline exposes per-chunk state so the
+        # library can list which windows failed.
+        request = _make_cloud_request(self.workspace, self.source)
+        _FakeProvider.fail_indices = {2}
+        pipeline, r, _e = self._run_cloud(request, duration_seconds=5400)
+        self.assertIsNone(r)
+        status = pipeline.cloud_chunk_status
+        self.assertEqual([c["index"] for c in status], [0, 1, 2])
+        self.assertEqual([c["ok"] for c in status], [True, True, False])
+
+    def test_cloud_chunk_status_all_ok_on_full_success(self):
+        request = _make_cloud_request(self.workspace, self.source)
+        pipeline, r, _e = self._run_cloud(request, duration_seconds=5400)
+        self.assertIsNotNone(r)
+        self.assertTrue(all(c["ok"] for c in pipeline.cloud_chunk_status))
+        self.assertEqual(len(pipeline.cloud_chunk_status), 3)
+
     def test_cloud_redo_chunks_forces_retranscription(self):
         # Seed cache for chunks 0/1 (chunk 2 fails), then rerun forcing
         # chunk 0 to redo — chunk 1 stays cached, chunks 0 and 2 run.

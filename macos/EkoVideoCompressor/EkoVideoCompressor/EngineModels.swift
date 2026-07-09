@@ -112,6 +112,9 @@ struct JobRequest: Codable {
     var rerun_steps: [String]
     var library_job_id: Int?
     var delete_source_after_copy: Bool
+    /// Cloud chunk indices to force re-transcribing on a rerun, ignoring
+    /// the resume cache. Empty = normal auto-resume (only failed windows).
+    var cloud_redo_chunks: [Int] = []
     /// Actual meeting date used for Odoo matching and generated
     /// artefact metadata. ISO-8601 string; defaults to source file
     /// metadata in the SwiftUI setup screen.
@@ -143,6 +146,29 @@ struct OdooMeetingMetadata: Codable, Equatable {
     var event_name: String
     var attendees: [OdooMeetingAttendee]
     var related: OdooRelatedObject?
+}
+
+/// One cloud chunk's state, decoded from a job's ``cloud_chunks_json``.
+/// ``start``/``end`` are seconds on the source timeline.
+struct CloudChunkState: Codable, Equatable, Identifiable {
+    var index: Int
+    var start: Double
+    var end: Double
+    var ok: Bool
+
+    var id: Int { index }
+
+    /// "12:00 – 42:00" window label for the panel row.
+    var windowLabel: String {
+        func hms(_ s: Double) -> String {
+            let total = Int(s.rounded())
+            let h = total / 3600, m = (total % 3600) / 60, sec = total % 60
+            return h > 0
+                ? String(format: "%d:%02d:%02d", h, m, sec)
+                : String(format: "%d:%02d", m, sec)
+        }
+        return "\(hms(start)) – \(hms(end))"
+    }
 }
 
 struct LibraryRow: Codable, Identifiable, Equatable {
@@ -196,6 +222,26 @@ struct LibraryRow: Codable, Identifiable, Equatable {
     /// rows fall back to ``cloud_model``).
     var transcription_model: String?
     var transcription_engine: String?
+    /// Per-chunk state of the last cloud attempt on a long meeting:
+    /// JSON `[{index,start,end,ok}]`. NULL on local / single-shot jobs.
+    /// Drives the "relancer les chunks échoués" panel.
+    var cloud_chunks_json: String?
+
+    /// Parsed cloud chunk states, ordered by index. Empty when the job
+    /// wasn't a chunked cloud run.
+    var cloudChunks: [CloudChunkState] {
+        guard let raw = cloud_chunks_json,
+              let data = raw.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([CloudChunkState].self, from: data)
+        else { return [] }
+        return decoded.sorted { $0.index < $1.index }
+    }
+
+    /// True when at least one cloud window failed — the panel is only
+    /// worth showing (and resumable) then.
+    var hasFailedCloudChunks: Bool {
+        cloudChunks.contains { !$0.ok }
+    }
 
     /// Raw model id used, with the cloud model as a fallback for rows
     /// written before ``transcription_model`` existed. Empty when
