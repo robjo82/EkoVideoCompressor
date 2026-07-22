@@ -343,7 +343,7 @@ final class SettingsStore: ObservableObject {
     @AppStorage("assemblyaiApiKey") var assemblyaiApiKey = ""
     @AppStorage("gladiaApiKey") var gladiaApiKey = ""
     @AppStorage("deepgramApiKey") var deepgramApiKey = ""
-    @AppStorage("cloudModel") var cloudModel = "gemini-3.5-flash"
+    @AppStorage("cloudModel") var cloudModel = "gemini-3.6-flash"
     @AppStorage("cloudBudgetMonthlyUSD") var cloudBudgetMonthlyUSD: Double = 20
     // Cloud outage policy: "local_fallback" (retry → GA model → local)
     // or "stay_cloud" (long expanding backoff on the chosen model, never

@@ -127,6 +127,30 @@ _CLOUD_ROLE = "cloud_transcription"
 # vendor has volume discounts, so the budget guard never under-bills.
 CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
     {
+        # Released 2026-07-21. Google's official pitch: same 1M-token
+        # context, frontier-level intelligence, lower cost than 3.5 Flash
+        # (17% fewer output tokens on Artificial Analysis Index). Chosen
+        # as the new default per user's explicit call — a launch-day
+        # model can still hit early capacity limits, but the cloud
+        # retry/fail-over machinery (backoff, cloud_fallback_models,
+        # stay_cloud policy) already covers that.
+        "id": "gemini-3.6-flash",
+        "label": "Gemini 3.6 Flash",
+        "family": "Gemini",
+        "role": _CLOUD_ROLE,
+        "kind": "cloud",
+        "provider": "gemini",
+        "tier": "balanced",
+        "language": ["multi"],
+        "default": True,
+        "billing": "per_token",
+        "price_in_per_1m": 1.50,
+        "price_out_per_1m": 7.50,
+        "needs_enrichment": False,
+        "diarizes": True,
+        "thinking": "level_low",
+    },
+    {
         "id": "gemini-3.5-flash",
         "label": "Gemini 3.5 Flash",
         "family": "Gemini",
@@ -135,7 +159,6 @@ CLOUD_TRANSCRIPTION_MODELS: list[dict] = [
         "provider": "gemini",
         "tier": "balanced",
         "language": ["multi"],
-        "default": True,
         "billing": "per_token",
         "price_in_per_1m": 1.50,
         "price_out_per_1m": 9.00,
