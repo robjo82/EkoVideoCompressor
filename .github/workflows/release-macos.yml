@@ -11,6 +11,7 @@ on:
       - 'ekonum.yaml'
       - '.github/workflows/deploy-web.yml'
       - '.github/workflows/build-web.yml'
+      - 'scripts/fetch-ekonum-ui.sh'
   workflow_dispatch:
 
 concurrency:

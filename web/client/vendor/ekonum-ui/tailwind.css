@@ -1,0 +1,89 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   GENERATED from src/tokens.json by scripts/tokens.py — do not edit by hand.
+
+   ekonum-ui Tailwind v4 theme. Prefixed `ekn-`: it adds utilities
+   (bg-ekn-dark-green, text-ekn-sm, p-ekn-4, rounded-ekn-card…) without
+   redefining any. Also load ekonum-ui.css, which holds the values:
+
+     @import "tailwindcss";
+     @import "./ekonum-ui/ekonum-ui.css";
+     @import "./ekonum-ui/fonts/fonts.css";
+     @import "./ekonum-ui/tailwind.css";
+
+   Gradients: no Tailwind namespace, use bg-(image:--ekn-gradient-light).
+   ────────────────────────────────────────────────────────────────────────── */
+
+@theme inline {
+  --color-ekn-dark-green: var(--ekn-dark-green);
+  --color-ekn-off-white: var(--ekn-off-white);
+  --color-ekn-turquoise: var(--ekn-turquoise);
+  --color-ekn-violet: var(--ekn-violet);
+  --color-ekn-surface: var(--ekn-surface);
+  --color-ekn-background: var(--ekn-background);
+  --color-ekn-border: var(--ekn-border);
+  --color-ekn-border-strong: var(--ekn-border-strong);
+  --color-ekn-hover-dark: var(--ekn-hover-dark);
+  --color-ekn-border-control: var(--ekn-border-control);
+  --color-ekn-text: var(--ekn-text);
+  --color-ekn-text-muted: var(--ekn-text-muted);
+  --color-ekn-text-inverse: var(--ekn-text-inverse);
+  --color-ekn-text-inverse-muted: var(--ekn-text-inverse-muted);
+  --color-ekn-border-inverse: var(--ekn-border-inverse);
+  --color-ekn-hover-inverse: var(--ekn-hover-inverse);
+  --color-ekn-overlay: var(--ekn-overlay);
+  --color-ekn-highlight: var(--ekn-highlight);
+  --color-ekn-success: var(--ekn-success);
+  --color-ekn-success-dark: var(--ekn-success-dark);
+  --color-ekn-warning: var(--ekn-warning);
+  --color-ekn-warning-dark: var(--ekn-warning-dark);
+  --color-ekn-error: var(--ekn-error);
+  --color-ekn-error-dark: var(--ekn-error-dark);
+  --color-ekn-error-light: var(--ekn-error-light);
+  --color-ekn-unknown: var(--ekn-unknown);
+  --color-ekn-unknown-dark: var(--ekn-unknown-dark);
+  --color-ekn-field: var(--ekn-field);
+  --color-ekn-hover: var(--ekn-hover);
+  --color-ekn-action: var(--ekn-action);
+  --color-ekn-on-action: var(--ekn-on-action);
+  --color-ekn-action-hover: var(--ekn-action-hover);
+  --color-ekn-focus: var(--ekn-focus);
+  --color-ekn-danger: var(--ekn-danger);
+  --color-ekn-on-danger: var(--ekn-on-danger);
+  --color-ekn-tone-success: var(--ekn-tone-success);
+  --color-ekn-tone-warning: var(--ekn-tone-warning);
+  --color-ekn-tone-error: var(--ekn-tone-error);
+  --color-ekn-tone-unknown: var(--ekn-tone-unknown);
+  --color-ekn-tile: var(--ekn-tile);
+  --color-ekn-on-tile: var(--ekn-on-tile);
+  --color-ekn-halo: var(--ekn-halo);
+  --font-ekn-heading: var(--ekn-font-heading);
+  --font-ekn-body: var(--ekn-font-body);
+  --text-ekn-xs: var(--ekn-text-xs);
+  --text-ekn-sm: var(--ekn-text-sm);
+  --text-ekn-md: var(--ekn-text-md);
+  --text-ekn-lg: var(--ekn-text-lg);
+  --text-ekn-xl: var(--ekn-text-xl);
+  --text-ekn-2xl: var(--ekn-text-2xl);
+  --text-ekn-3xl: var(--ekn-text-3xl);
+  --tracking-ekn: var(--ekn-tracking);
+  --leading-ekn-heading: var(--ekn-leading-heading);
+  --leading-ekn-body: var(--ekn-leading-body);
+  --spacing-ekn-1: var(--ekn-space-1);
+  --spacing-ekn-2: var(--ekn-space-2);
+  --spacing-ekn-3: var(--ekn-space-3);
+  --spacing-ekn-4: var(--ekn-space-4);
+  --spacing-ekn-5: var(--ekn-space-5);
+  --spacing-ekn-6: var(--ekn-space-6);
+  --spacing-ekn-7: var(--ekn-space-7);
+  --spacing-ekn-8: var(--ekn-space-8);
+  --spacing-ekn-target: var(--ekn-target);
+  --spacing-ekn-target-min: var(--ekn-target-min);
+  --spacing-ekn-gutter: var(--ekn-gutter);
+  --container-ekn-page: var(--ekn-page-width);
+  --radius-ekn-tile: var(--ekn-radius-tile);
+  --radius-ekn-card: var(--ekn-radius-card);
+  --radius-ekn-field: var(--ekn-radius-field);
+  --radius-ekn-pill: var(--ekn-radius-pill);
+  --shadow-ekn-1: var(--ekn-shadow-1);
+  --shadow-ekn-2: var(--ekn-shadow-2);
+}
