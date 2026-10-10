@@ -128,7 +128,7 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
       <Erreur>{erreur}</Erreur>
       {note ? <p className="mt-4 text-ekn-sm text-ekn-success-dark">{note}</p> : null}
 
-      <div className="mt-8 grid gap-10 lg:grid-cols-[minmax(0,1fr)_20rem]">
+      <div className="mt-8 grid grid-cols-1 gap-10 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <div>
           <div className="flex items-center justify-between gap-3">
             <h2 className="titre text-[1.0625rem] font-medium">Transcription</h2>
