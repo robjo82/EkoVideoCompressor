@@ -138,7 +138,7 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
                   type="button"
                   onClick={ouvrirTrouver}
                   title={`Chercher dans la transcription (${MOD} F)`}
-                  className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce"
+                  className="ekn-button ekn-button--subtle ekn-button--compact"
                 >
                   Chercher
                 </button>
@@ -398,7 +398,7 @@ function Video({ jobId, video, filename, surMaj, lecteur, surTemps }) {
             <button
               type="button"
               onClick={() => setEtape('repos')}
-              className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/60 hover:text-fonce"
+              className="ekn-button ekn-button--subtle"
             >
               Pas maintenant
             </button>
@@ -413,7 +413,7 @@ function Video({ jobId, video, filename, surMaj, lecteur, surTemps }) {
           <button
             type="button"
             onClick={() => setEtape('question')}
-            className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
+            className="ekn-button ekn-button--subtle ekn-button--compact"
           >
             {audio ? 'Écouter' : 'Regarder'}
           </button>
@@ -444,7 +444,7 @@ function Copier({ texte, libelle = 'Copier la transcription' }) {
         }
         setTimeout(() => setEtat('repos'), 2000);
       }}
-      className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce"
+      className="ekn-button ekn-button--subtle ekn-button--compact"
     >
       {etat === 'copie'
         ? 'Copiée ✓'
@@ -565,7 +565,7 @@ function Relecture({ fiche, jobId, surMaj, surNote, surErreur }) {
         } catch (e) { surErreur(e.message); }
         finally { setOccupe(false); }
       }}
-      className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce disabled:opacity-50"
+      className="ekn-button ekn-button--subtle ekn-button--compact"
     >
       {occupe ? 'Relecture…' : 'Refaire titre et noms'}
     </button>
@@ -793,7 +793,7 @@ function Versions({ versions, jobId, surMaj, surNote, surErreur }) {
                     Remettre cette version en place ? La version actuelle sera gardée dans l'historique.
                   </span>
                   <button type="button" disabled={occupe} onClick={() => revenir(rang)}
-                          className="rounded-md bg-fonce px-3 py-1 text-clair hover:bg-fonce-doux disabled:opacity-50">
+                          className="ekn-button ekn-button--compact">
                     {occupe ? 'Restauration…' : 'Y revenir'}
                   </button>
                   <button type="button" onClick={() => setAConfirmer(null)}

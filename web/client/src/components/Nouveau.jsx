@@ -710,7 +710,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                   if (suivant) charger(suivant);
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                 }}
-                className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord hover:bg-white/60"
+                className="ekn-button ekn-button--subtle"
               >
                 {enAttente.length
                   ? `Passer à la suivante (${enAttente.length} en attente)`
@@ -725,7 +725,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                       + 'et la réunion part à la corbeille.',
                     )) interrompre(pipeline.cle);
                   }}
-                  className="ml-auto rounded-md px-3 py-1.5 text-ekn-sm text-[#8c1d18] ring-1 ring-[#b3261e]/30 hover:bg-[#b3261e]/5"
+                  className="ekn-button ekn-button--danger ml-auto"
                 >
                   Interrompre
                 </button>

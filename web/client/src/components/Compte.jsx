@@ -33,7 +33,7 @@ export function Compte() {
         </p>
         <a
           href={DECONNEXION}
-          className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
+          className="ekn-button ekn-button--subtle ekn-button--compact"
         >
           Se déconnecter
         </a>
@@ -104,7 +104,7 @@ function FormulaireOdoo({ possible, surPose }) {
 
   if (!possible) {
     return (
-      <p className="mt-4 rounded-lg bg-[#b3261e]/6 px-3 py-2 text-ekn-sm text-[#8c1d18]">
+      <p role="alert" className="ekn-alert ekn-alert--error mt-4">
         Le serveur n'a pas de clé de chiffrement configurée, et refuse donc
         d'enregistrer une clé API en clair. À régler côté déploiement.
       </p>

@@ -97,7 +97,7 @@ function Step({ done, optional = false, title, text, action = null }) {
         <button
           type="button"
           onClick={action[1]}
-          className="shrink-0 rounded-md bg-fonce px-3 py-1.5 text-ekn-sm text-clair hover:bg-fonce-doux"
+          className="ekn-button ekn-button--compact shrink-0"
         >
           {action[0]}
         </button>
