@@ -1,0 +1,22 @@
+/*! ekonum-ui 3.7.0 — brand fonts. Ekonum internal use only: do not serve them
+    from a public URL or pass them on (FFL licence, LICENCE-FFL.txt). */
+/* Brand fonts, self-hosted. Official Fontshare WOFF2 files, copied unmodified —
+   the licence forbids any change (see fonts/PROVENANCE.md in the repository).
+   Variable weight axis 200–700.
+
+   Built as fonts/fonts.css, APART from ekonum-ui.css: the CSS may be public,
+   the fonts may not (FFL licence, internal use). Each application serves this
+   file and the WOFF2 from its own domain, behind Cloudflare Access.
+   URLs are relative to the fonts/ folder. */
+@font-face {
+  font-family: 'Chillax';
+  src: url('Chillax-Variable.woff2') format('woff2-variations'),
+       url('Chillax-Variable.woff2') format('woff2');
+  font-weight: 200 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'Synonym';
+  src: url('Synonym-Variable.woff2') format('woff2-variations'),
+       url('Synonym-Variable.woff2') format('woff2');
+  font-weight: 200 700; font-style: normal; font-display: swap;
+}

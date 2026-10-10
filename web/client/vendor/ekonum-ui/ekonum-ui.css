@@ -1,0 +1,1233 @@
+/*! ekonum-ui 3.7.0 — Ekonum brand (Brand Guidelines, BolimDesign 2025) */
+/*  Fonts are separate: fonts/fonts.css, to be served by the application. */
+:root { --ekn-version: "3.7.0"; }
+
+/* ── src/tokens.css ── */
+/* ──────────────────────────────────────────────────────────────────────────
+   GENERATED from src/tokens.json by scripts/tokens.py — do not edit by
+   hand: edit tokens.json, then run the script again.
+
+   Ekonum tokens — the brand guidelines (Brand Guidelines, BolimDesign 2025)
+   translated for application interfaces. src/tokens.json is the single token
+   source; src/tokens.css is generated from it. Brand guidelines are written
+   for posters, posts and slides. An interface departs from them on three
+   points, documented here rather than endured: typographic density, semantic
+   states, and the share of dark.
+   ────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Official brand palette. */
+  --ekn-dark-green: #021A1A;   /* brand ink: primary button on light, text, headers and dark areas */
+  --ekn-off-white:  #EAEAEA;   /* brand light: page base, text and primary button label on dark green */
+  --ekn-turquoise:  #2AD39F;   /* brand signal: primary button and current link on dark green, continuity; never under light text */
+  --ekn-violet:     #9645D6;   /* occasional accent: badge and hero button, with pure white text; one or two per screen */
+
+  /* Interface shades, for surfaces and borders. The guidelines provide no
+     grey scale; an interface needs one (separators, hovers, disabled fields).
+     Derived from dark green by opacity, so never neutral grey — they keep the
+     hue. Those that change in the dark theme carry their dark value in
+     $extensions["fr.ekonum"].dark: off-white by opacity over dark green, the
+     mirror of the light shades. */
+  --ekn-surface:            #F4F4F2;   /* card background, lighter than the base; dark: off-white at 8 % over dark green */
+  --ekn-background:         var(--ekn-off-white);   /* page base; dark: off-white at 4 % over dark green, so the header and dark areas stay a shade deeper */
+  --ekn-border:             rgba(2, 26, 26, .12);   /* hairline separators, card borders, row hover */
+  --ekn-border-strong:      rgba(2, 26, 26, .24);   /* subtle button outline, table header rule, choice card border */
+  --ekn-hover-dark:         #0B3C34;   /* hover of a dark-green button; hue of the brand's dark gradient */
+  --ekn-border-control:     rgba(2, 26, 26, .5);   /* field border: ≥ 3:1 against the field and around it, in both themes */
+  --ekn-text:               var(--ekn-dark-green);   /* body text on background and surface */
+  --ekn-text-muted:         rgba(2, 26, 26, .64);   /* secondary text, help, placeholders: ≥ 5:1 in both themes */
+  --ekn-text-inverse:       var(--ekn-off-white);   /* text on dark green */
+  --ekn-text-inverse-muted: rgba(234, 234, 234, .7);   /* secondary text and navigation links on dark green */
+  --ekn-border-inverse:     rgba(234, 234, 234, .32);   /* border on a dark background */
+  --ekn-hover-inverse:      rgba(234, 234, 234, .08);   /* hover on a dark background */
+  --ekn-overlay:            rgba(2, 26, 26, .48);   /* backdrop behind a modal dialog: the page stays visible, dimmed */
+  --ekn-highlight:          rgba(42, 211, 159, .24);   /* highlighted passage, selected row: turquoise, translucent, under dark text */
+
+  /* Semantic states — an extension of the guidelines, APPROVED by the brand
+     on 24/09/2026. The guidelines have no warning or error colour; a
+     monitoring tool needs them: "compliant / to check / failing / unknown"
+     cannot be told with four shades of turquoise. Each state has two shades:
+     the hue, for dots on dark backgrounds, and its dark shade, for text and
+     dots on light backgrounds — on #EAEAEA the hues fell to 1.60–3.26:1, the
+     dark shades reach 4.5:1. One single error red for the whole fleet. */
+  --ekn-success:      var(--ekn-turquoise);   /* dot on a dark background */
+  --ekn-success-dark: #18785A;   /* text and dot on a light background */
+  --ekn-warning:      #D9A441;   /* dot on a dark background */
+  --ekn-warning-dark: #89631B;   /* text and dot on a light background */
+  --ekn-error:        #D6584A;   /* dot on a dark background */
+  --ekn-error-dark:   #BF3A2B;   /* text and dot on a light background; the note's #C03A2B rounded to 4.497:1 */
+  --ekn-error-light:  #DE776B;   /* text on a dark surface (dark theme): the hue lightened until it reaches 4.5:1 in a card; #D6584A only reaches 3.8:1 */
+  --ekn-unknown:      rgba(234, 234, 234, .5);   /* dot on a dark background; dark green at 38 % until 1.2, invisible on dark */
+  --ekn-unknown-dark: rgba(2, 26, 26, .5);   /* dot on a light background */
+
+  /* Roles — what the components paint with. A component never names a palette
+     colour for something that changes with the background: it asks for the
+     action, the focus ring, the tone of a state. The dark theme redefines the
+     roles (and the shades above); .ekn-dark, .ekn-selection-bar and [data-
+     ekn-theme] apply it — a dark area and a dark page are the same mechanism. */
+  --ekn-field:        #FFFFFF;   /* inside of a field, track of a switch: white on light, dark green (a shade below the card) on dark */
+  --ekn-hover:        rgba(2, 26, 26, .12);   /* background of a hovered row, menu item, subtle button or day */
+  --ekn-action:       var(--ekn-dark-green);   /* primary button, checked control, selected day: the colour with the most contrast against its background */
+  --ekn-on-action:    var(--ekn-off-white);   /* label and pictogram on the action colour */
+  --ekn-action-hover: var(--ekn-hover-dark);   /* hovered primary button; dark: turquoise at 94 % brightness */
+  --ekn-focus:        var(--ekn-dark-green);   /* focus ring: 2 px, ≥ 3:1 on every background of its theme */
+  --ekn-danger:       var(--ekn-error-dark);   /* destructive button */
+  --ekn-on-danger:    #FFFFFF;   /* label on the destructive button */
+  --ekn-tone-success: var(--ekn-success-dark);   /* « success » state on the current background: dot, alert stripe */
+  --ekn-tone-warning: var(--ekn-warning-dark);   /* « warning » state on the current background: dot, alert stripe */
+  --ekn-tone-error:   var(--ekn-error-dark);   /* « error » state on the current background: dot, alert stripe, error message and invalid field border */
+  --ekn-tone-unknown: var(--ekn-unknown-dark);   /* « unknown » state on the current background: dot, alert stripe */
+  --ekn-tile:         var(--ekn-dark-green);   /* icon tile: dark plaque on light, light plaque on dark — as the guidelines ask */
+  --ekn-on-tile:      var(--ekn-turquoise);   /* pictogram on the icon tile */
+  --ekn-halo:         rgba(2, 26, 26, 0);   /* hairline that detaches a thin mark from the bright colour it crosses (the audio playhead over the kept part): none on light, dark green on dark */
+
+  /* Typography: Chillax (headings) and Synonym (body), as in the guidelines. */
+  --ekn-font-heading: 'Chillax', system-ui, sans-serif;   /* headings, buttons, labels of states and badges */
+  --ekn-font-body:    'Synonym', system-ui, sans-serif;   /* running text, fields, tables */
+
+  /* Sizes. DELIBERATE DEPARTURE: the guidelines give a 1.6 ratio between
+     paragraph, subtitle and title. That is a poster scale — applied to a 16
+     px body it only yields three steps (16 / 26 / 41) and skips the sizes a
+     dense interface needs. We keep the font, the hierarchy and the tracking;
+     we tighten the scale. The three large headings are fluid: a 44 px hero
+     title takes three lines on a phone. `$value` gives the desktop size,
+     `$extensions` the formula and the minimum size. The rem part preserves
+     the user's text zoom. */
+  --ekn-text-xs:  .75rem;   /* 12 — meta, labels */
+  --ekn-text-sm:  .875rem;   /* 14 — secondary text */
+  --ekn-text-md:  1rem;   /* 16 — body */
+  --ekn-text-lg:  1.25rem;   /* 20 — card title */
+  --ekn-text-xl:  clamp(1.375rem, 1.24rem + .57vw, 1.625rem);   /* 26 — section title (≈16×1.6); fluid from 375 to 1080 px wide, 22 → 26 px */
+  --ekn-text-2xl: clamp(1.75rem, 1.55rem + .85vw, 2.125rem);   /* 34 — page title; fluid from 375 to 1080 px wide, 28 → 34 px */
+  --ekn-text-3xl: clamp(2rem, 1.6rem + 1.7vw, 2.75rem);   /* 44 — hero title; fluid from 375 to 1080 px wide, 32 → 44 px */
+
+  /* Tracking and line heights. The guidelines ask for -10 units of tracking
+     on every text. */
+  --ekn-tracking:        -.01em;   /* em, i.e. the guidelines' -10 units */
+  --ekn-leading-heading: 1.15;   /* the guidelines use ≈1.12 on large headings */
+  --ekn-leading-body:    1.55;   /* > the guidelines' 1.36: reading on screen, not projection */
+
+  /* Spacing: the vertical and horizontal rhythm. */
+  --ekn-space-1: .25rem;   /* 4 px: inside dense controls */
+  --ekn-space-2: .5rem;   /* 8 px: gap between a label and its field, small clusters */
+  --ekn-space-3: .75rem;   /* 12 px: gap between buttons, field padding */
+  --ekn-space-4: 1rem;   /* 16 px: grid gap, card inner blocks */
+  --ekn-space-5: 1.5rem;   /* 24 px: card padding, button side padding */
+  --ekn-space-6: 2rem;   /* 32 px: dialog padding, large blocks */
+  --ekn-space-7: 3rem;   /* 48 px: between page sections */
+  --ekn-space-8: 4rem;   /* 64 px: page top, anchor margin */
+
+  /* Layout, mobile first: components adapt to the room they have (intrinsic
+     grids, wrapping) rather than to global breakpoints. A custom property
+     cannot be used in a media query: the reference widths are the test's
+     (375, 768, 1280 px). */
+  --ekn-target:     2.75rem;   /* 44 px: minimum height of a button or a field */
+  --ekn-target-min: 1.5rem;   /* 24 px: WCAG 2.5.8 minimum for any active element */
+  --ekn-gutter:     clamp(1rem, 4vw, 2rem);   /* page side margin, 16 → 32 px */
+  --ekn-page-width: 70rem;   /* 1120 px: maximum content width */
+
+  /* Radii. The guidelines give none, but their icon tiles and CTA are clearly
+     rounded. We reuse that vocabulary — ~22 % for tiles, full pill for
+     buttons. */
+  --ekn-radius-tile:  22%;   /* fraction of the tile's side; DTCG cannot express a percentage */
+  --ekn-radius-card:  14px;   /* cards, tables, menus, dialogs */
+  --ekn-radius-field: 10px;   /* fields, alerts, choice cards */
+  --ekn-radius-pill:  999px;   /* buttons, statuses, badges, tabs */
+
+  /* Shadows: short and tinted, like the brand's icons. */
+  --ekn-shadow-1: 0 1px 2px rgba(2, 26, 26, .06);   /* cards at rest */
+  --ekn-shadow-2: 0 4px 16px rgba(2, 26, 26, .08);   /* menus, dialogs, selection bar, accent card */
+
+  /* Gradients. The brand's are diffuse, turquoise ↔ dark green ↔ off-white,
+     with grain. Violet never appears in them: it remains an occasional
+     accent. DTCG only describes linear gradients without geometry: verbatim
+     CSS value. */
+  --ekn-gradient-dark:  radial-gradient(120% 140% at 12% 8%, #0B3C34 0%, var(--ekn-dark-green) 58%),
+    radial-gradient(90% 120% at 88% 92%, rgba(42, 211, 159, .55) 0%, transparent 62%);
+  --ekn-gradient-light: radial-gradient(100% 130% at 8% 100%, rgba(42, 211, 159, .55) 0%, transparent 58%),
+    linear-gradient(140deg, #DCEFE8 0%, var(--ekn-off-white) 60%);
+}
+
+/* Dark theme: a dark area (.ekn-dark, the selection bar) or a whole page
+   (data-ekn-theme="dark" on <html>, or "auto" to follow the system). Opt-in:
+   without the attribute, the page stays light. */
+.ekn-dark, .ekn-selection-bar, [data-ekn-theme="dark"] {
+  color-scheme: dark;
+  --ekn-color-scheme: dark;
+  --ekn-surface:        #152B2B;
+  --ekn-background:     #0B2222;
+  --ekn-border:         rgba(234, 234, 234, .12);
+  --ekn-border-strong:  rgba(234, 234, 234, .32);
+  --ekn-border-control: rgba(234, 234, 234, .5);
+  --ekn-text:           var(--ekn-off-white);
+  --ekn-text-muted:     rgba(234, 234, 234, .72);
+  --ekn-overlay:        rgba(2, 26, 26, .72);
+  --ekn-field:          var(--ekn-dark-green);
+  --ekn-hover:          rgba(234, 234, 234, .08);
+  --ekn-action:         var(--ekn-turquoise);
+  --ekn-on-action:      var(--ekn-dark-green);
+  --ekn-action-hover:   #27C695;
+  --ekn-focus:          var(--ekn-turquoise);
+  --ekn-danger:         var(--ekn-error);
+  --ekn-on-danger:      var(--ekn-dark-green);
+  --ekn-tone-success:   var(--ekn-success);
+  --ekn-tone-warning:   var(--ekn-warning);
+  --ekn-tone-error:     var(--ekn-error-light);
+  --ekn-tone-unknown:   var(--ekn-unknown);
+  --ekn-tile:           var(--ekn-off-white);
+  --ekn-on-tile:        var(--ekn-dark-green);
+  --ekn-halo:           var(--ekn-dark-green);
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-ekn-theme="auto"] {
+    color-scheme: dark;
+    --ekn-color-scheme: dark;
+    --ekn-surface:        #152B2B;
+    --ekn-background:     #0B2222;
+    --ekn-border:         rgba(234, 234, 234, .12);
+    --ekn-border-strong:  rgba(234, 234, 234, .32);
+    --ekn-border-control: rgba(234, 234, 234, .5);
+    --ekn-text:           var(--ekn-off-white);
+    --ekn-text-muted:     rgba(234, 234, 234, .72);
+    --ekn-overlay:        rgba(2, 26, 26, .72);
+    --ekn-field:          var(--ekn-dark-green);
+    --ekn-hover:          rgba(234, 234, 234, .08);
+    --ekn-action:         var(--ekn-turquoise);
+    --ekn-on-action:      var(--ekn-dark-green);
+    --ekn-action-hover:   #27C695;
+    --ekn-focus:          var(--ekn-turquoise);
+    --ekn-danger:         var(--ekn-error);
+    --ekn-on-danger:      var(--ekn-dark-green);
+    --ekn-tone-success:   var(--ekn-success);
+    --ekn-tone-warning:   var(--ekn-warning);
+    --ekn-tone-error:     var(--ekn-error-light);
+    --ekn-tone-unknown:   var(--ekn-unknown);
+    --ekn-tile:           var(--ekn-off-white);
+    --ekn-on-tile:        var(--ekn-dark-green);
+    --ekn-halo:           var(--ekn-dark-green);
+  }
+}
+
+/* A light island in a dark page. */
+[data-ekn-theme="light"] {
+  color-scheme: light;
+  --ekn-color-scheme: light;
+  --ekn-surface:        #F4F4F2;
+  --ekn-background:     var(--ekn-off-white);
+  --ekn-border:         rgba(2, 26, 26, .12);
+  --ekn-border-strong:  rgba(2, 26, 26, .24);
+  --ekn-border-control: rgba(2, 26, 26, .5);
+  --ekn-text:           var(--ekn-dark-green);
+  --ekn-text-muted:     rgba(2, 26, 26, .64);
+  --ekn-overlay:        rgba(2, 26, 26, .48);
+  --ekn-field:          #FFFFFF;
+  --ekn-hover:          rgba(2, 26, 26, .12);
+  --ekn-action:         var(--ekn-dark-green);
+  --ekn-on-action:      var(--ekn-off-white);
+  --ekn-action-hover:   var(--ekn-hover-dark);
+  --ekn-focus:          var(--ekn-dark-green);
+  --ekn-danger:         var(--ekn-error-dark);
+  --ekn-on-danger:      #FFFFFF;
+  --ekn-tone-success:   var(--ekn-success-dark);
+  --ekn-tone-warning:   var(--ekn-warning-dark);
+  --ekn-tone-error:     var(--ekn-error-dark);
+  --ekn-tone-unknown:   var(--ekn-unknown-dark);
+  --ekn-tile:           var(--ekn-dark-green);
+  --ekn-on-tile:        var(--ekn-turquoise);
+  --ekn-halo:           rgba(2, 26, 26, 0);
+}
+
+/* ── src/base.css ── */
+/* ──────────────────────────────────────────────────────────────────────────
+   Typographic base — OPT-IN.
+
+   Everything hangs on the `.ekn` class, set on a screen's root element (or on
+   <body> for a fully migrated application). A package that restyled `body`
+   globally would break every application the moment it is imported; this one
+   can be adopted screen by screen.
+   ────────────────────────────────────────────────────────────────────────── */
+
+.ekn {
+  font-family: var(--ekn-font-body);
+  font-weight: 500;                         /* Synonym Medium, as in the guidelines */
+  font-size: var(--ekn-text-md);
+  line-height: var(--ekn-leading-body);
+  letter-spacing: var(--ekn-tracking);
+  color: var(--ekn-text);
+  background: var(--ekn-background);
+  -webkit-font-smoothing: antialiased;
+  /* Mobile first. iOS enlarges text in landscape without asking: keep the
+     intended size; the zoom chosen by the user remains possible. */
+  -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+  /* An e-mail address, a URL or a file identifier never breaks the page on a
+     phone: it wraps rather than overflows. */
+  overflow-wrap: break-word;
+}
+/* A media element never exceeds its container. */
+.ekn :where(img, video, canvas) { max-width: 100%; height: auto; }
+
+.ekn :where(h1, h2, h3, h4) {
+  font-family: var(--ekn-font-heading);
+  line-height: var(--ekn-leading-heading);
+  letter-spacing: var(--ekn-tracking);
+  margin: 0;
+}
+/* Chillax Bold reserved for the first-level heading: on an interface full of
+   headings, the same weight everywhere becomes heavy (see the ekonum-design skill). */
+.ekn :where(h1) { font-weight: 700; font-size: var(--ekn-text-2xl); }
+.ekn :where(h2) { font-weight: 600; font-size: var(--ekn-text-xl); }
+.ekn :where(h3) { font-weight: 600; font-size: var(--ekn-text-lg); }
+.ekn :where(h4) { font-weight: 600; font-size: var(--ekn-text-md); }
+
+.ekn :where(p) { margin: 0; }
+.ekn :where(a) { color: inherit; text-decoration-color: var(--ekn-turquoise); text-underline-offset: .2em; }
+
+/* Visible focus: the guidelines do not mention it, accessibility requires it.
+   Dark green on light, turquoise on dark — primary combinations. */
+.ekn :where(:focus-visible) {
+  outline: 2px solid var(--ekn-focus);
+  outline-offset: 2px;
+}
+
+/* Dark variant of an area (navigation, banner). Preferably one per screen:
+   the guidelines warn against a succession of dark areas. It applies the dark
+   theme (tokens.css): every component inside takes its dark values. */
+.ekn-dark {
+  background: var(--ekn-dark-green);
+  color: var(--ekn-text-inverse);
+}
+
+/* ── src/components.css ── */
+/* ──────────────────────────────────────────────────────────────────────────
+   Components. Each one is a standalone `.ekn-*` class: usable without the base,
+   without clashing with an application's existing CSS.
+
+   Contrast rule from the brand guidelines, which governs this whole file: below
+   18 pt of text or 30 px of element, only the "primary combinations" are
+   allowed — dark green / off-white both ways, turquoise on dark green, dark
+   green on turquoise, and PURE white on violet (5.10:1, promoted by the brand
+   on 24/09/2026). Light text on turquoise: forbidden at any size (1.60 to
+   1.92:1), decorative shapes only.
+   Every pair is declared in src/contrast.json and measured in CI, in both themes.
+
+   Themes: a colour that changes with the background is a ROLE (--ekn-action,
+   --ekn-focus, --ekn-tone-error…), never a palette colour. The dark theme
+   redefines the roles — in a .ekn-dark area as on a page with data-ekn-theme —
+   so no component needs a dark variant of its own.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* ── Button ─────────────────────────────────────────────────────────────────
+   The primary button takes the colour with the most contrast against its
+   background: dark green on light (border 14.98:1), turquoise on dark (9.37:1).
+   Decided on a side-by-side rendering on 23/09/2026: in turquoise on light
+   (border 1.60:1), a small button was mistaken for a status dot; in dark green on
+   dark, it vanished. v1 used turquoise everywhere. Height 44 px (--ekn-target),
+   except for the compact variant. */
+.ekn-button {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--ekn-space-2);
+  font-family: var(--ekn-font-heading); font-weight: 600;
+  font-size: var(--ekn-text-sm); letter-spacing: var(--ekn-tracking); line-height: 1.2;
+  white-space: nowrap; text-decoration: none; cursor: pointer;
+  background: var(--ekn-action); color: var(--ekn-on-action);
+  border: 1px solid transparent; border-radius: var(--ekn-radius-pill);
+  padding: var(--ekn-space-3) var(--ekn-space-5);
+  min-height: var(--ekn-target);   /* 44 px: touch target, on desktop as on phone */
+  box-sizing: border-box;
+  transition: background-color .15s ease, filter .15s ease;
+}
+.ekn-button:hover  { background: var(--ekn-action-hover); }
+.ekn-button:disabled, .ekn-button[aria-disabled="true"] { opacity: .45; cursor: not-allowed; filter: none; }
+
+/* Subtle: outline, no fill. Its label is enough to identify it as a button,
+   so the outline does not need to reach 3:1. */
+.ekn-button--subtle { background: transparent; color: var(--ekn-text); border-color: var(--ekn-border-strong); }
+.ekn-button--subtle:hover { background: var(--ekn-hover); }
+
+/* Danger: a destructive or irreversible action (delete, cut everything).
+   Dark error red and pure white on light (5.45:1), bright red and dark green
+   on dark (4.59:1). Always preceded by a confirmation. */
+.ekn-button--danger { background: var(--ekn-danger); color: var(--ekn-on-danger); }
+.ekn-button--danger:hover { background: var(--ekn-danger); filter: brightness(.9); }
+
+/* Compact: in a list row or a dense toolbar. 32 px, above the WCAG 2.5.8
+   minimum (24 px); avoid it as the primary button of a phone screen. */
+.ekn-button--compact {
+  min-height: 2rem; padding: var(--ekn-space-1) var(--ekn-space-4); font-size: var(--ekn-text-xs);
+}
+
+/* Icon only: square, 44 px. An aria-label is mandatory — without it, the
+   button has no name for a screen reader. */
+.ekn-button--icon { width: var(--ekn-target); padding: 0; }
+.ekn-button--icon.ekn-button--compact { width: 2rem; }
+.ekn-button > svg { width: 1.25em; height: 1.25em; flex: none; }
+
+/* Loading: aria-busy="true" during the call. The label stays (you know what
+   is happening), a ring spins in front of it, and the button can no longer be
+   clicked. Replaces the home-made indicators of sync-hub (16) and transcript. */
+.ekn-button[aria-busy="true"] { cursor: progress; pointer-events: none; }
+.ekn-button[aria-busy="true"]::before {
+  content: ""; width: 1em; height: 1em; flex: none; box-sizing: border-box;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: ekn-spin .8s linear infinite;
+}
+@keyframes ekn-spin { to { transform: rotate(1turn); } }
+@media (prefers-reduced-motion: reduce) {
+  .ekn-button[aria-busy="true"]::before { animation-duration: 2.4s; }
+}
+
+/* Hero button — violet carries PURE white (5.10:1, a primary combination
+   since 24/09/2026). Keep it for landing pages and final decisions, not for
+   toolbars. */
+.ekn-button--brand {
+  background: var(--ekn-violet); color: #fff;
+  font-size: 1.5rem; padding: var(--ekn-space-4) var(--ekn-space-6);
+}
+.ekn-button--brand:hover { background: var(--ekn-violet); filter: brightness(.94); }
+
+/* ── Icon tile ──────────────────────────────────────────────────────────────
+   SOLID dark-green or off-white background, never a gradient or glass: the
+   guidelines require it for the pictogram to stay legible. The pictogram must fill
+   its tile — no tiny symbol lost in a large square. */
+.ekn-tile {
+  width: 44px; height: 44px; flex: none;
+  display: grid; place-items: center;
+  border-radius: var(--ekn-radius-tile);
+  background: var(--ekn-tile); color: var(--ekn-on-tile);
+}
+.ekn-tile > svg { width: 55%; height: 55%; }
+/* Light tile: ONLY on a dark background — which the tile does by itself in a
+   dark area or theme. On a light card, off-white (#EAEAEA) blends into the
+   surface (#F4F4F2) and the tile disappears — seen on the demo, invisible from
+   reading the code alone. */
+.ekn-tile--light { background: var(--ekn-off-white); color: var(--ekn-dark-green); }
+.ekn-tile--small { width: 32px; height: 32px; }
+
+/* ── Card ───────────────────────────────────────────────────────────────────
+   For real, distinct objects: an application, an offer, a state.
+   Not to frame a heading and its paragraph that the grid already separates. */
+.ekn-card {
+  background: var(--ekn-surface);
+  border: 1px solid var(--ekn-border);
+  border-radius: var(--ekn-radius-card);
+  padding: var(--ekn-space-5);
+  box-shadow: var(--ekn-shadow-1);
+}
+
+/* ── Status ─────────────────────────────────────────────────────────────────
+   Coloured dot + label. Colour is NEVER the only carrier of the information:
+   the label states the status, the dot confirms it.
+   Status colours approved by the brand on 24/09/2026. On a light background, the
+   dot takes each status's dark shade (≥ 3.3:1): the bright hues only reached 1.60
+   to 2.40:1 there. On a dark background, the bright hue.
+   "Running" keeps the "success" hue but changes shape — a ring — rather than
+   adding a colour. */
+.ekn-status {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2);
+  font-family: var(--ekn-font-heading); font-weight: 600;
+  font-size: var(--ekn-text-xs); letter-spacing: var(--ekn-tracking); line-height: 1.3;
+  white-space: nowrap;
+  padding: var(--ekn-space-1) var(--ekn-space-3);
+  border: 1px solid var(--ekn-border-strong); border-radius: var(--ekn-radius-pill);
+  color: var(--ekn-text);
+}
+.ekn-status::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%; flex: none; box-sizing: border-box;
+  background: var(--ekn-tone-unknown);
+}
+.ekn-status--success::before { background: var(--ekn-tone-success); }
+.ekn-status--warning::before { background: var(--ekn-tone-warning); }
+.ekn-status--error::before   { background: var(--ekn-tone-error); }
+.ekn-status--running::before { background: transparent; border: 2px solid var(--ekn-tone-success); }
+
+/* ── Badge ──────────────────────────────────────────────────────────────────
+   Violet as an accent: a landmark, not decoration. One or two per screen. */
+.ekn-badge {
+  display: inline-flex; align-items: center;
+  font-family: var(--ekn-font-heading); font-weight: 600;
+  font-size: var(--ekn-text-xs); letter-spacing: var(--ekn-tracking); line-height: 1.3;
+  white-space: nowrap;
+  padding: var(--ekn-space-1) var(--ekn-space-3); border-radius: var(--ekn-radius-pill);
+  background: var(--ekn-violet); color: #fff;
+}
+/* PURE white on violet measures 5.10:1 — WCAG AA even for small text; the
+   brand promoted it to a primary combination on 24/09/2026. The badge uses it
+   at 12 px. Do not replace #fff with off-white: #EAEAEA on violet drops to
+   4.24:1, not enough. Measurements: README, "Contrastes mesurés". */
+
+/* ── Input ──────────────────────────────────────────────────────────────────
+   A white field on a light background only stands out by its border: white
+   against #EAEAEA is only 1.2:1. The border therefore identifies the field and must
+   reach 3:1 (WCAG 1.4.11) — `--ekn-border-control` holds it on white, surface and
+   background. In v1, `--ekn-border-strong` fell to 1.7:1.
+   Focus follows the base rule: dark green on light (14.98:1). v1's turquoise only
+   reached 1.92:1 against the field's white. */
+.ekn-input {
+  font: inherit; color: var(--ekn-text);
+  background: var(--ekn-field); border: 1px solid var(--ekn-border-control);
+  border-radius: var(--ekn-radius-field);
+  padding: var(--ekn-space-3) var(--ekn-space-4); width: 100%;
+  box-sizing: border-box;   /* without it, width: 100% + padding overflows the container (seen in v1) */
+  min-height: var(--ekn-target);
+  /* Below 16 px, iOS Safari zooms into the field on focus and shifts the page. */
+  font-size: max(1em, 16px);
+}
+.ekn-input:focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+.ekn-input::placeholder { color: var(--ekn-text-muted); }
+
+/* ── Forms ──────────────────────────────────────────────────────────────────
+   Everything stays native — <label>, <select>, <input type="date">, checkboxes —
+   because native is accessible, opens the right keyboard and calendar on a phone,
+   and needs no JavaScript. Seen in the fleet: sync-hub and partners-dashboard both
+   filter by a "From / To" period in <input type="date">, surrounded by selects. */
+
+/* Label: the text above, the field below, the whole block clickable. */
+.ekn-label {
+  display: flex; flex-direction: column; gap: var(--ekn-space-1);
+  font-size: var(--ekn-text-sm); font-weight: 600; color: var(--ekn-text);
+}
+.ekn-help   { font-size: var(--ekn-text-sm); font-weight: 500; color: var(--ekn-text-muted); }
+/* The error is told in words, under the field; the red border only flags it.
+   Link the message to the field: aria-invalid="true" and aria-describedby. */
+.ekn-error { font-size: var(--ekn-text-sm); font-weight: 600; color: var(--ekn-tone-error); }
+.ekn-input[aria-invalid="true"] { border-color: var(--ekn-tone-error); box-shadow: inset 0 0 0 1px var(--ekn-tone-error); }
+.ekn-input:disabled { background: var(--ekn-background); color: var(--ekn-text-muted); cursor: not-allowed; }
+
+textarea.ekn-input { min-height: 6rem; resize: vertical; line-height: var(--ekn-leading-body); }
+
+/* Select: arrow redrawn in currentColor (two gradients) — no hard-coded colour,
+   and the same arrow in every browser. */
+select.ekn-input {
+  appearance: none; -webkit-appearance: none; cursor: pointer;
+  padding-right: var(--ekn-space-7);
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: right 1.3rem center, right .95rem center;
+  background-size: .35rem .35rem;
+  background-repeat: no-repeat;
+}
+
+/* Date: the native calendar — the phone's own on mobile. Without these
+   settings, iOS Safari centres the value and ignores the height. */
+input.ekn-input[type="date"], input.ekn-input[type="month"], input.ekn-input[type="time"],
+input.ekn-input[type="datetime-local"] {
+  -webkit-appearance: none; appearance: none; color-scheme: var(--ekn-color-scheme, light); min-width: 0;
+}
+input.ekn-input::-webkit-date-and-time-value { text-align: left; }
+input.ekn-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: .75; }
+
+/* Date range: "From" and "To" side by side, even on a phone. */
+.ekn-date-range {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--ekn-space-3);
+  border: 0; margin: 0; padding: 0; min-width: 0;
+}
+.ekn-date-range > legend { padding: 0; margin-bottom: var(--ekn-space-1); font-size: var(--ekn-text-sm); font-weight: 600; }
+
+/* Filter bar: fields wrap and align on their bottom edge. */
+.ekn-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--ekn-space-3) var(--ekn-space-4); }
+.ekn-filters > * { flex: 1 1 10rem; min-width: 0; }
+.ekn-filters > .ekn-date-range { flex-basis: 18rem; }
+.ekn-filters > .ekn-button { flex: 0 0 auto; }
+
+/* Checkboxes and radio buttons: native, 24 px (WCAG 2.5.8 minimum). */
+.ekn-option {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2);
+  min-height: var(--ekn-target-min); font-size: var(--ekn-text-sm); cursor: pointer;
+}
+/* :not(.ekn-switch): without it, this rule forced 24 × 24 px on the switch,
+   which became a circle whose knob covered the label (seen on a screenshot). */
+.ekn-option > input[type="checkbox"]:not(.ekn-switch), .ekn-option > input[type="radio"] {
+  width: var(--ekn-target-min); height: var(--ekn-target-min); margin: 0; flex: none;
+  accent-color: var(--ekn-action); cursor: pointer;
+}
+
+/* Switch: a setting that applies at once (on / off), not a choice to confirm.
+   <input type="checkbox" role="switch" class="ekn-switch">. */
+.ekn-switch {
+  appearance: none; -webkit-appearance: none; flex: none; cursor: pointer; margin: 0;
+  position: relative; width: 2.75rem; height: var(--ekn-target-min); box-sizing: border-box;
+  border: 1px solid var(--ekn-border-control); border-radius: var(--ekn-radius-pill); background: var(--ekn-field);
+  transition: background-color .15s ease, border-color .15s ease;
+}
+.ekn-switch::before {
+  content: ""; position: absolute; top: 3px; left: 3px;
+  width: calc(var(--ekn-target-min) - 8px); height: calc(var(--ekn-target-min) - 8px);
+  border-radius: 50%; background: var(--ekn-text-muted);
+  transition: transform .15s ease, background-color .15s ease;
+}
+.ekn-switch:checked { background: var(--ekn-action); border-color: var(--ekn-action); }
+.ekn-switch:checked::before { transform: translateX(1.25rem); background: var(--ekn-on-action); }
+.ekn-switch:focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+.ekn-switch:disabled { opacity: .45; cursor: not-allowed; }
+@media (prefers-reduced-motion: reduce) {
+  .ekn-switch, .ekn-switch::before { transition: none; }
+}
+
+/* ── Table ──────────────────────────────────────────────────────────────────
+   Reinvented by 4 applications out of 5 (a dozen tables in sync-hub). Dense,
+   aligned figures. The container carries the horizontal scroll: on a phone, the
+   table scrolls, never the page.
+     <div class="ekn-table" role="region" aria-label="Applications" tabindex="0">
+       <table>…</table>
+     </div>
+   role + aria-label + tabindex: the scrolling container stays reachable and
+   scrollable with the keyboard. Inner shadows show that more columns remain
+   ("local" / "scroll" gradients: not a single line of JavaScript). */
+.ekn-table {
+  max-width: 100%; overflow-x: auto; box-sizing: border-box;
+  border: 1px solid var(--ekn-border); border-radius: var(--ekn-radius-card);
+  background:
+    linear-gradient(to right, var(--ekn-surface) 30%, transparent) left center / 2.5rem 100% no-repeat local,
+    linear-gradient(to left, var(--ekn-surface) 30%, transparent) right center / 2.5rem 100% no-repeat local,
+    linear-gradient(to right, var(--ekn-border-strong), transparent) left center / .75rem 100% no-repeat scroll,
+    linear-gradient(to left, var(--ekn-border-strong), transparent) right center / .75rem 100% no-repeat scroll,
+    var(--ekn-surface);
+}
+.ekn-table:focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+.ekn-table > table { width: 100%; border-collapse: collapse; font-size: var(--ekn-text-sm); }
+.ekn-table caption { text-align: left; padding: var(--ekn-space-3) var(--ekn-space-4) 0; font-weight: 600; }
+/* One line per cell: otherwise the browser squeezes the columns before
+   scrolling, and "ekonum-secret-broker" broke over three lines (seen on a
+   screenshot). .ekn-wrap on a long-text cell that should wrap. */
+.ekn-table :is(th, td) {
+  padding: var(--ekn-space-2) var(--ekn-space-4); text-align: left; vertical-align: middle;
+  border-bottom: 1px solid var(--ekn-border); white-space: nowrap;
+}
+.ekn-table :is(th, td).ekn-wrap { white-space: normal; min-width: 14rem; }
+.ekn-table thead th {
+  font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-xs);
+  color: var(--ekn-text-muted); white-space: nowrap;
+}
+.ekn-table tbody tr:last-child > * { border-bottom: 0; }
+.ekn-table tbody tr:hover { background: var(--ekn-hover); }
+/* Numbers: right-aligned, tabular figures — columns read at a glance. */
+.ekn-table :is(th, td).ekn-numeric { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Long text on one line, cut cleanly; put the full text in title. */
+/* inline-block: on a <span>, a max-width is ignored inline, and the text was
+   cut off by the table's edge instead of showing an ellipsis. */
+.ekn-truncate {
+  display: inline-block; vertical-align: bottom;
+  max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Stacked variant: when room runs out, each row becomes a record.
+   Each cell carries its label: <td data-label="Version">. */
+.ekn-table--stacked { container-type: inline-size; }
+@container (max-width: 34rem) {
+  .ekn-table--stacked thead {
+    position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+  }
+  .ekn-table--stacked :is(table, tbody, tr, td) { display: block; }
+  .ekn-table--stacked tr { padding: var(--ekn-space-3) var(--ekn-space-4); border-bottom: 1px solid var(--ekn-border); }
+  .ekn-table--stacked tbody tr:last-child { border-bottom: 0; }
+  .ekn-table--stacked td {
+    display: flex; justify-content: space-between; align-items: center; gap: var(--ekn-space-3);
+    padding: var(--ekn-space-1) 0; border-bottom: 0; text-align: right;
+  }
+  .ekn-table--stacked td::before {
+    content: attr(data-label); flex: none; text-align: left;
+    font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-xs); color: var(--ekn-text-muted);
+  }
+  .ekn-table--stacked td:first-child { font-weight: 600; font-size: var(--ekn-text-md); justify-content: flex-start; text-align: left; }
+  .ekn-table--stacked td:first-child::before { content: none; }
+  .ekn-table--stacked .ekn-truncate { max-width: 60%; }
+}
+
+/* ── Messages and screen states ─────────────────────────────────────────────
+   Reinvented by 4 applications out of 5: transcript's Empty and Error, sync-hub's
+   16 loading indicators, the portal's alert stripe.
+   
+   Alert: a message within the page. The stripe carries the tone (the status's dark
+   shade, ≥ 3.3:1), the text carries the meaning — start with what is happening,
+   then what to do. role="status" for incoming information, role="alert" for an
+   error that calls for action. */
+.ekn-alert {
+  display: flex; flex-direction: column; gap: var(--ekn-space-1);
+  padding: var(--ekn-space-3) var(--ekn-space-4); box-sizing: border-box;
+  background: var(--ekn-surface); color: var(--ekn-text); font-size: var(--ekn-text-sm);
+  border: 1px solid var(--ekn-border); border-left: 4px solid var(--ekn-tone-unknown);
+  border-radius: var(--ekn-radius-field);
+}
+.ekn-alert > strong { font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-md); }
+.ekn-alert--success { border-left-color: var(--ekn-tone-success); }
+.ekn-alert--warning { border-left-color: var(--ekn-tone-warning); }
+.ekn-alert--error   { border-left-color: var(--ekn-tone-error); }
+
+/* Empty: what is missing, and how to fix it. Never a blank page. */
+.ekn-empty {
+  display: flex; flex-direction: column; align-items: center; gap: var(--ekn-space-2);
+  padding: var(--ekn-space-7) var(--ekn-space-4); text-align: center;
+}
+.ekn-empty > strong { font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-lg); }
+.ekn-empty > p { max-width: 42ch; color: var(--ekn-text-muted); }
+.ekn-empty > .ekn-button, .ekn-empty > .ekn-cluster { margin-top: var(--ekn-space-3); }
+
+/* Loading: a ring and what is loading. role="status": announced without
+   stealing focus. Same ring as the busy button (aria-busy). */
+.ekn-loading {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2);
+  font-size: var(--ekn-text-sm); color: var(--ekn-text-muted);
+}
+.ekn-loading::before {
+  content: ""; width: 1.1em; height: 1.1em; flex: none; box-sizing: border-box;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: ekn-spin .8s linear infinite;
+}
+.ekn-loading--block { display: flex; justify-content: center; padding: var(--ekn-space-7) var(--ekn-space-4); }
+
+/* Skeleton: the shape of the content on its way, for a list or a card. Calmer
+   than a ring when several blocks load together. aria-hidden="true" on the
+   skeleton, and an .ekn-loading (or hidden text) to announce it. */
+.ekn-skeleton {
+  display: block; height: 1em; border-radius: var(--ekn-radius-field);
+  background: var(--ekn-border); animation: ekn-pulse 1.4s ease-in-out infinite;
+}
+@keyframes ekn-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) {
+  .ekn-loading::before { animation-duration: 2.4s; }
+  .ekn-skeleton { animation: none; }
+}
+
+/* ── Navigation ─────────────────────────────────────────────────────────────
+   The screen's dark band. Current link in turquoise on dark green (primary
+   combination). */
+.ekn-nav {
+  background: var(--ekn-dark-green); color: var(--ekn-text-inverse);
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--ekn-space-2) var(--ekn-space-5);
+  padding: var(--ekn-space-3) var(--ekn-gutter);
+}
+/* On a phone, links wrap rather than leave the screen (v1: 14 px of
+   overflow at 375 px). This bar never overflows; .ekn-header scrolls instead. */
+.ekn-nav a {
+  color: var(--ekn-text-inverse-muted); text-decoration: none; font-size: var(--ekn-text-sm);
+  display: inline-flex; align-items: center; min-height: var(--ekn-target-min);
+  padding-block: var(--ekn-space-2);
+}
+.ekn-nav a:hover { color: var(--ekn-text-inverse); }
+.ekn-nav a[aria-current] { color: var(--ekn-turquoise); }
+
+/* ── Layout ─────────────────────────────────────────────────────────────────
+   Mobile first, without breakpoints: each primitive adapts to the room it has.
+   An application can use them without setting `.ekn`. */
+
+/* Page: bounded width, gutter going from 16 px (phone) to 32 px. */
+.ekn-page {
+  box-sizing: border-box; width: 100%;
+  max-width: var(--ekn-page-width); margin-inline: auto;
+  padding-inline: var(--ekn-gutter);
+}
+
+/* Intrinsic grid: as many columns as fit, a single one on a phone.
+   `min(100%, …)` prevents a column wider than the screen — v1's
+   `minmax(280px, 1fr)` overflowed in a narrow container.
+   Adjustable minimum column width: style="--ekn-grid-column: 20rem". */
+.ekn-grid {
+  display: grid; gap: var(--ekn-space-4);
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--ekn-grid-column, 17.5rem)), 1fr));
+}
+
+/* Cluster: side-by-side items that wrap (buttons, dots). */
+.ekn-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ekn-space-3); }
+
+/* Stack: items stacked with even spacing. */
+.ekn-stack { display: flex; flex-direction: column; gap: var(--ekn-stack-gap, var(--ekn-space-4)); }
+
+/* Row: a label followed by secondary items (status, button). The label takes
+   the room; when it runs out, the secondary items move below instead of
+   squeezing the label onto three lines — seen at 375 px on a library row.
+   16rem: at 12rem, a dot stayed alongside and still cut the label in two (seen
+   on a screenshot). Adjustable: style="--ekn-row-label: 20rem". */
+.ekn-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ekn-space-2) var(--ekn-space-3); }
+.ekn-row > :first-child { flex: 1 1 var(--ekn-row-label, 16rem); min-width: 0; }
+
+/* ── Page structure ─────────────────────────────────────────────────────────
+   Rebuilt in transcript, the portal, sync-hub and partners. The header is the
+   screen's dark band — only one, the guidelines warn against stacked dark areas:
+     <header class="ekn-header"><div class="ekn-page">
+       <a class="ekn-header__brand" href="/"><img src="…/brand/logo-on-dark.svg" alt="Ekonum"></a>
+       <nav class="ekn-header__nav" aria-label="Principale">…links…</nav>
+       <a class="ekn-account" href="/compte">…</a>
+     </div></header>
+   On a phone, the navigation moves below the brand and scrolls horizontally: no
+   menu to open, so no JavaScript, and every link stays visible. */
+.ekn-header { background: var(--ekn-dark-green); color: var(--ekn-text-inverse); container-type: inline-size; }
+.ekn-header > .ekn-page {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--ekn-space-2) var(--ekn-space-5);
+  padding-block: var(--ekn-space-2);
+}
+/* Logo: 28 px high, above the guidelines' 20 px minimum; never recoloured. */
+.ekn-header__brand {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2); flex: none;
+  min-height: var(--ekn-target); color: inherit; text-decoration: none;
+  font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-sm);
+}
+.ekn-header__brand > img { height: 28px; width: auto; display: block; }
+.ekn-header__nav {
+  display: flex; gap: var(--ekn-space-1); flex: 1 1 auto; min-width: 0;
+  overflow-x: auto; scrollbar-width: none;
+}
+.ekn-header__nav > a {
+  display: inline-flex; align-items: center; flex: none; min-height: var(--ekn-target);
+  padding: 0 var(--ekn-space-3); border-radius: var(--ekn-radius-pill);
+  color: var(--ekn-text-inverse-muted); text-decoration: none; font-size: var(--ekn-text-sm); white-space: nowrap;
+}
+.ekn-header__nav > a:hover { color: var(--ekn-text-inverse); background: var(--ekn-hover-inverse); }
+/* Current link: turquoise on dark green (9.37:1), a continuity landmark. */
+.ekn-header__nav > a[aria-current] { color: var(--ekn-dark-green); background: var(--ekn-turquoise); font-weight: 600; }
+.ekn-header :focus-visible { outline: 2px solid var(--ekn-turquoise); outline-offset: 2px; }
+.ekn-header > .ekn-page > .ekn-account { margin-left: auto; }
+@container (max-width: 40rem) {
+  /* Brand and account on the first line, full-width navigation below. */
+  .ekn-header__nav { order: 3; flex-basis: 100%; }
+}
+
+/* Account: who is signed in, the first thing people look for in a team tool.
+   Dark-green initials on turquoise (9.37:1). The name disappears on a phone,
+   not the initials; the link keeps a full aria-label. */
+.ekn-account {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2); flex: none;
+  min-height: var(--ekn-target); padding: 0 var(--ekn-space-1) 0 var(--ekn-space-3); border-radius: var(--ekn-radius-pill);
+  color: var(--ekn-text-inverse-muted); text-decoration: none; font-size: var(--ekn-text-sm);
+}
+.ekn-account:hover { background: var(--ekn-hover-inverse); color: var(--ekn-text-inverse); }
+/* A <button> that opens the account menu (popovertarget) looks like the link. */
+button.ekn-account { font: inherit; font-size: var(--ekn-text-sm); border: 0; background: none; cursor: pointer; }
+button.ekn-account:hover { background: var(--ekn-hover-inverse); }
+.ekn-account__initials {
+  display: grid; place-items: center; width: 2rem; height: 2rem; flex: none; border-radius: 50%;
+  background: var(--ekn-turquoise); color: var(--ekn-dark-green);
+  font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-xs);
+}
+@container (max-width: 40rem) {
+  .ekn-account__name { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .ekn-account { padding-left: var(--ekn-space-1); }
+}
+
+/* Tabs: the sections of one screen (partners: Synthèse, PartnerStack…).
+   Links or buttons with aria-current; on a light background, the current tab
+   is underlined in dark green (14.98:1). They scroll horizontally on a phone. */
+.ekn-tabs {
+  display: flex; gap: var(--ekn-space-1); overflow-x: auto; scrollbar-width: none;
+  border-bottom: 1px solid var(--ekn-border-strong);
+}
+.ekn-tabs > :is(a, button) {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2); flex: none;
+  min-height: var(--ekn-target); padding: 0 var(--ekn-space-3); margin-bottom: -1px;
+  font: inherit; font-size: var(--ekn-text-sm); color: var(--ekn-text-muted); white-space: nowrap;
+  background: none; border: 0; border-bottom: 3px solid transparent; cursor: pointer; text-decoration: none;
+}
+.ekn-tabs > :is(a, button):hover { color: var(--ekn-text); }
+.ekn-tabs > [aria-current], .ekn-tabs > [aria-selected="true"] {
+  color: var(--ekn-text); font-weight: 600; border-bottom-color: var(--ekn-action);
+}
+
+/* ── Menu ───────────────────────────────────────────────────────────────────
+   A short list of links and buttons that opens over the page: the account menu
+   (settings, keyboard shortcuts, sign out), a row's actions. Asked for on
+   transcript, where signing out was missing and the shortcut help cluttered the
+   page. No JavaScript: the popover attribute opens, closes on Escape or on a
+   click outside, and gives the button aria-expanded.
+     <button class="ekn-account" popovertarget="account-menu">…</button>
+     <div class="ekn-menu" id="account-menu" popover>
+       <div class="ekn-menu__header"><strong>Camille Martin</strong><span>camille.martin@ekonum.fr</span></div>
+       <a href="/reglages">Réglages</a>
+       <button type="button" command="show-modal" commandfor="shortcuts">Raccourcis clavier <kbd class="ekn-key">?</kbd></button>
+       <hr>
+       <a href="/cdn-cgi/access/logout">Se déconnecter</a>
+     </div>
+   Plain links and buttons, not role="menu": that role promises arrow-key
+   navigation, which would need JavaScript. Tab and Enter work as everywhere. */
+.ekn-menu {
+  /* Placed under the button that opened it, aligned on its right edge, and
+     flipped when the screen edge is near. */
+  position: fixed; inset: auto; margin: var(--ekn-space-1) 0 0;
+  position-area: bottom span-left; position-try-fallbacks: flip-block, flip-inline;
+  box-sizing: border-box; min-width: 15rem; max-width: calc(100vw - 2 * var(--ekn-gutter));
+  padding: var(--ekn-space-2); border: 1px solid var(--ekn-border); border-radius: var(--ekn-radius-card);
+  background: var(--ekn-surface); color: var(--ekn-text); box-shadow: var(--ekn-shadow-2);
+  font-family: var(--ekn-font-body); font-size: var(--ekn-text-sm); font-weight: 500;
+  letter-spacing: var(--ekn-tracking); line-height: var(--ekn-leading-body);
+}
+.ekn-menu:popover-open { display: flex; flex-direction: column; }
+/* Without anchor positioning: pinned under the header, on the right. */
+@supports not (position-area: bottom) {
+  .ekn-menu { top: 3.75rem; right: var(--ekn-gutter); }
+}
+.ekn-menu > :is(a, button) {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--ekn-space-4);
+  min-height: var(--ekn-target); padding: 0 var(--ekn-space-3); box-sizing: border-box; width: 100%;
+  border: 0; border-radius: var(--ekn-radius-field); background: none;
+  font: inherit; color: inherit; text-align: left; text-decoration: none; cursor: pointer;
+}
+.ekn-menu > :is(a, button):hover { background: var(--ekn-hover); }
+.ekn-menu > :is(a, button):focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: -2px; }
+.ekn-menu > hr { width: 100%; margin: var(--ekn-space-1) 0; border: 0; border-top: 1px solid var(--ekn-border); }
+.ekn-menu__header {
+  display: flex; flex-direction: column; padding: var(--ekn-space-2) var(--ekn-space-3) var(--ekn-space-3);
+  margin-bottom: var(--ekn-space-1); border-bottom: 1px solid var(--ekn-border);
+}
+.ekn-menu__header > strong { font-family: var(--ekn-font-heading); font-weight: 600; }
+.ekn-menu__header > span { color: var(--ekn-text-muted); overflow-wrap: anywhere; }
+
+/* ── Dialog ─────────────────────────────────────────────────────────────────
+   A native <dialog>, opened as a modal: the browser traps focus, closes on
+   Escape and gives focus back to the button that opened it. It replaces the
+   browser's confirm() (six of them in sync-hub and transcript) and holds the
+   keyboard-shortcut help.
+     <button class="ekn-button ekn-button--danger" command="show-modal" commandfor="delete">Supprimer</button>
+     <dialog class="ekn-dialog" id="delete" aria-labelledby="delete-title">
+       <form method="dialog">
+         <h2 id="delete-title">Supprimer ces 3 réunions ?</h2>
+         <p>Elles partent à la corbeille pendant 30 jours.</p>
+         <div class="ekn-dialog__actions">
+           <button class="ekn-button ekn-button--subtle" value="cancel">Annuler</button>
+           <button class="ekn-button ekn-button--danger" value="confirm">Supprimer</button>
+         </div>
+       </form>
+     </dialog>
+   A confirmation names the action in its title and on its button ("Supprimer",
+   not "OK"), and the safe choice comes first. command / commandfor open it
+   without JavaScript; older browsers need dialog.showModal(). On a phone, it
+   becomes a sheet at the bottom of the screen, within reach of the thumb;
+   --full takes the whole screen for long content. */
+.ekn-dialog {
+  box-sizing: border-box; width: min(100% - 2 * var(--ekn-gutter), var(--ekn-dialog-width, 32rem));
+  max-height: calc(100dvh - 2 * var(--ekn-space-6)); overflow: auto;
+  padding: var(--ekn-space-6); border: 1px solid var(--ekn-border); border-radius: var(--ekn-radius-card);
+  background: var(--ekn-surface); color: var(--ekn-text); box-shadow: var(--ekn-shadow-2);
+  font-family: var(--ekn-font-body); font-size: var(--ekn-text-md); font-weight: 500;
+  letter-spacing: var(--ekn-tracking); line-height: var(--ekn-leading-body);
+}
+.ekn-dialog::backdrop { background: var(--ekn-overlay); }
+.ekn-dialog > form { display: contents; }
+.ekn-dialog :where(h2) {
+  margin: 0 0 var(--ekn-space-2); font-family: var(--ekn-font-heading); font-weight: 600;
+  font-size: var(--ekn-text-lg); line-height: var(--ekn-leading-heading);
+}
+.ekn-dialog :where(p) { margin: 0 0 var(--ekn-space-3); color: var(--ekn-text-muted); }
+.ekn-dialog__actions {
+  display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--ekn-space-3);
+  margin-top: var(--ekn-space-5);
+}
+.ekn-dialog--wide { --ekn-dialog-width: 48rem; }
+@media (max-width: 40rem) {
+  .ekn-dialog {
+    width: 100%; max-width: 100%; margin: auto 0 0; max-height: 90dvh;
+    border-radius: var(--ekn-radius-card) var(--ekn-radius-card) 0 0; border-bottom: 0;
+    padding: var(--ekn-space-5) var(--ekn-gutter) calc(var(--ekn-space-5) + env(safe-area-inset-bottom));
+  }
+  /* Buttons full width; the first in the markup (the safe choice) lands at the
+     bottom, nearest the thumb, as in iOS action sheets. */
+  .ekn-dialog__actions { flex-direction: column-reverse; align-items: stretch; }
+  .ekn-dialog--full { max-height: 100dvh; height: 100dvh; border-radius: 0; }
+}
+
+/* ── Keyboard keys ──────────────────────────────────────────────────────────
+   <kbd class="ekn-key">⌘</kbd><kbd class="ekn-key">F</kbd>. For the shortcut
+   help and menu hints, never as a permanent hint written into the page. */
+.ekn-key {
+  display: inline-grid; place-items: center; box-sizing: border-box;
+  min-width: 1.5rem; height: 1.5rem; padding: 0 var(--ekn-space-1);
+  font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-xs); line-height: 1;
+  color: var(--ekn-text); background: var(--ekn-background);
+  border: 1px solid var(--ekn-border-strong); border-bottom-width: 2px; border-radius: calc(var(--ekn-radius-field) * .6);
+}
+.ekn-key + .ekn-key { margin-left: var(--ekn-space-1); }
+/* Shortcut list: what it does on the left, the keys on the right.
+     <dl class="ekn-shortcuts"><div><dt>Rechercher</dt><dd><kbd class="ekn-key">⌘</kbd><kbd class="ekn-key">F</kbd></dd></div></dl> */
+.ekn-shortcuts { margin: 0; display: flex; flex-direction: column; }
+.ekn-shortcuts > div {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--ekn-space-4);
+  min-height: var(--ekn-target); border-bottom: 1px solid var(--ekn-border);
+}
+.ekn-shortcuts > div:last-child { border-bottom: 0; }
+.ekn-shortcuts dt { font-size: var(--ekn-text-sm); }
+.ekn-shortcuts dd { margin: 0; flex: none; white-space: nowrap; }
+
+/* ── Replacement ────────────────────────────────────────────────────────────
+   What was there, and what replaces it — a word corrected in a transcript,
+   a renamed field. On transcript, "Écrit Acritek · À la place Acritec" left
+   the reader guessing which replaced which: the old value struck through, an
+   arrow, the new value in bold.
+     <span class="ekn-replace"><del>Acritek</del><ins>Acritec</ins></span>
+   <del> and <ins> carry the meaning for screen readers; the arrow is
+   decoration and has an empty alternative text. */
+.ekn-replace { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--ekn-space-2); }
+.ekn-replace > del { color: var(--ekn-text-muted); text-decoration-thickness: 1px; }
+/* Declared twice: a browser that ignores the empty alternative still draws the arrow. */
+.ekn-replace > del::after { content: "→"; content: "→" / ""; display: inline-block; margin-left: var(--ekn-space-2); color: var(--ekn-text-muted); text-decoration: none; }
+.ekn-replace > ins { text-decoration: none; font-weight: 600; color: var(--ekn-text); }
+
+/* ── Disclosure ─────────────────────────────────────────────────────────────
+   Something available but secondary, shown on request just under what it
+   relates to: previous versions of a transcript, technical details. On
+   transcript, "versions précédentes" looked like a button without saying what
+   it would do: the summary states its content and its count.
+     <details class="ekn-disclosure"><summary>Versions précédentes (3)</summary>…</details>
+   Native <details>: keyboard, screen readers and the open state for free. */
+.ekn-disclosure > summary {
+  display: inline-flex; align-items: center; gap: var(--ekn-space-2);
+  min-height: var(--ekn-target-min); cursor: pointer; list-style: none;
+  font-size: var(--ekn-text-sm); color: var(--ekn-text-muted);
+}
+.ekn-disclosure > summary::-webkit-details-marker { display: none; }
+.ekn-disclosure > summary::before {
+  content: ""; width: .45em; height: .45em; flex: none; margin-inline: .1em .15em;
+  border: solid currentColor; border-width: 0 2px 2px 0; transform: rotate(-45deg);
+  transition: transform .15s ease;
+}
+.ekn-disclosure[open] > summary::before { transform: rotate(45deg); }
+.ekn-disclosure > summary:hover { color: var(--ekn-text); }
+.ekn-disclosure[open] > summary { margin-bottom: var(--ekn-space-2); }
+@media (prefers-reduced-motion: reduce) { .ekn-disclosure > summary::before { transition: none; } }
+
+/* ── Choice cards ───────────────────────────────────────────────────────────
+   A few rich options, one of which is chosen: the Odoo record a meeting
+   belongs to, among three proposals. The whole card is the label; the checked
+   one gets a dark-green frame (≥ 3:1) and a heavier weight.
+     <fieldset class="ekn-choices"><legend>Dossier Odoo de cette réunion</legend>
+       <label class="ekn-choice"><input type="radio" name="record" value="42">
+         <span><strong>Refonte API Visiotec</strong><span>Tâche · Acritec</span></span></label>
+       …
+       <label class="ekn-choice"><input type="radio" name="record" value="">
+         <span><strong>Aucun de ces dossiers</strong></span></label>
+     </fieldset>
+   To choose none, offer it as the last choice: a radio button cannot be
+   unchecked without JavaScript, and "none" is a decision worth saying. */
+.ekn-choices { display: flex; flex-direction: column; gap: var(--ekn-space-2); border: 0; margin: 0; padding: 0; min-width: 0; }
+.ekn-choices > legend { padding: 0; margin-bottom: var(--ekn-space-2); font-size: var(--ekn-text-sm); font-weight: 600; }
+.ekn-choice {
+  display: flex; align-items: flex-start; gap: var(--ekn-space-3); cursor: pointer;
+  padding: var(--ekn-space-3) var(--ekn-space-4); min-height: var(--ekn-target); box-sizing: border-box;
+  background: var(--ekn-surface); border: 1px solid var(--ekn-border-strong); border-radius: var(--ekn-radius-field);
+}
+.ekn-choice:hover { border-color: var(--ekn-border-control); }
+.ekn-choice > input {
+  width: var(--ekn-target-min); height: var(--ekn-target-min); margin: 0; flex: none;
+  accent-color: var(--ekn-action); cursor: pointer;
+}
+.ekn-choice > span { display: flex; flex-direction: column; min-width: 0; font-size: var(--ekn-text-sm); }
+.ekn-choice > span > strong { font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-md); }
+.ekn-choice > span > span { color: var(--ekn-text-muted); }
+.ekn-choice:has(input:checked) { border-color: var(--ekn-action); box-shadow: inset 0 0 0 1px var(--ekn-action); }
+.ekn-choice:has(input:focus-visible) { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+
+/* ── Selection ──────────────────────────────────────────────────────────────
+   Several rows chosen at once, and what to do with them: archive, move to the
+   bin, listen again. Each row has a visible checkbox — a phone has no Option
+   or Shift key, so modifier clicks can only be a desktop shortcut on top.
+   A selected row takes the highlight (text 13:1 and more); the bar appears at
+   the bottom of the screen as long as something is selected.
+     <tr aria-selected="true">…</tr>   or   <div class="ekn-row" aria-selected="true">…</div>
+     <div class="ekn-selection-bar" role="region" aria-label="Sélection">
+       <strong>3 réunions sélectionnées</strong>
+       <div class="ekn-cluster"><button class="ekn-button ekn-button--compact">Archiver</button>…</div>
+     </div>
+   Hide the bar with the hidden attribute when nothing is selected. */
+/* The row's checkbox: 24 px, like every other checkbox, in a column no wider
+   than itself (the table otherwise shares its width out evenly). */
+.ekn-table :is(th, td):has(> input[type="checkbox"]:only-child) { width: 1%; padding-right: 0; }
+.ekn-table :is(th, td) > input[type="checkbox"] {
+  width: var(--ekn-target-min); height: var(--ekn-target-min); margin: 0; vertical-align: middle;
+  accent-color: var(--ekn-action); cursor: pointer;
+}
+.ekn-table tbody tr[aria-selected="true"],
+.ekn-table tbody tr[aria-selected="true"]:hover,
+.ekn-row[aria-selected="true"] { background: var(--ekn-highlight); }
+.ekn-selection-bar {
+  position: sticky; bottom: var(--ekn-space-4); z-index: 1;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: var(--ekn-space-2) var(--ekn-space-4); box-sizing: border-box;
+  margin-top: var(--ekn-space-4); padding: var(--ekn-space-3) var(--ekn-space-4);
+  border-radius: var(--ekn-radius-card); box-shadow: var(--ekn-shadow-2);
+  background: var(--ekn-dark-green); color: var(--ekn-text-inverse); font-size: var(--ekn-text-sm);
+}
+.ekn-selection-bar[hidden] { display: none; }
+/* The bar is a dark area (tokens.css): its buttons and focus take their dark
+   values. */
+.ekn-selection-bar > strong { font-family: var(--ekn-font-heading); font-weight: 600; color: var(--ekn-turquoise); }
+.ekn-selection-bar :focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+
+/* ── Emphasis and targeted passage ──────────────────────────────────────────
+   Accent card: the one block that asks for attention now (the Odoo record
+   still to confirm). On transcript, that block "did not stand out enough to
+   be understood". One per screen, or it stops meaning anything. */
+.ekn-card--accent { border-color: var(--ekn-turquoise); box-shadow: 0 0 0 1px var(--ekn-turquoise), var(--ekn-shadow-2); }
+
+/* A passage reached from elsewhere — a "to check" item that scrolls the
+   transcript to its sentence. The anchor lands clear of a sticky header, and
+   the passage lights up. <mark class="ekn-mark"> for words highlighted in text.
+     <p class="ekn-passage" id="t-17h29">…</p>   reached by   <a href="#t-17h29">17 h 29</a> */
+.ekn-passage { scroll-margin-block: var(--ekn-space-8); border-radius: var(--ekn-radius-field); }
+.ekn-passage:target { background: var(--ekn-highlight); box-shadow: 0 0 0 var(--ekn-space-2) var(--ekn-highlight); }
+.ekn-mark { background: var(--ekn-highlight); color: inherit; border-radius: calc(var(--ekn-radius-field) * .3); padding: 0 .15em; }
+@media (prefers-reduced-motion: no-preference) {
+  html:has(.ekn-passage) { scroll-behavior: smooth; }
+}
+
+/* ── Date picker (optional JavaScript: ekonum-ui.js) ────────────────────────
+   <ekn-date-picker> adds a calendar to a native date field, on desktop only;
+   on a phone the phone's own calendar stays. Without the script, nothing here
+   applies and the native field works as before. Day buttons are 40 px; the
+   chosen day is dark green (14.98:1), today is underlined. */
+ekn-date-picker { display: block; position: relative; min-width: 0; }
+ekn-date-picker[data-enhanced] > input { padding-right: calc(var(--ekn-target) + var(--ekn-space-1)); }
+ekn-date-picker[data-enhanced] > input::-webkit-calendar-picker-indicator { display: none; }
+.ekn-date-picker__toggle {
+  position: absolute; top: 50%; right: var(--ekn-space-1); transform: translateY(-50%);
+  display: grid; place-items: center; width: 2.25rem; height: 2.25rem; padding: 0;
+  border: 0; border-radius: var(--ekn-radius-field); background: none; color: var(--ekn-text); cursor: pointer;
+}
+.ekn-date-picker__toggle:hover { background: var(--ekn-hover); }
+.ekn-date-picker__toggle:focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 0; }
+.ekn-date-picker__toggle > svg { width: 1.25rem; height: 1.25rem; }
+
+.ekn-calendar {
+  position: fixed; inset: auto; margin: 0; box-sizing: border-box;
+  padding: var(--ekn-space-3); border: 1px solid var(--ekn-border); border-radius: var(--ekn-radius-card);
+  background: var(--ekn-surface); color: var(--ekn-text); box-shadow: var(--ekn-shadow-2);
+  font-family: var(--ekn-font-body); font-size: var(--ekn-text-sm); font-weight: 500; letter-spacing: var(--ekn-tracking);
+}
+.ekn-calendar__head { display: flex; align-items: center; justify-content: space-between; gap: var(--ekn-space-2); margin-bottom: var(--ekn-space-2); }
+.ekn-calendar__head > strong { font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-md); }
+.ekn-calendar__head > strong::first-letter { text-transform: uppercase; }
+.ekn-calendar__nav, .ekn-calendar__day, .ekn-calendar__today {
+  font: inherit; color: inherit; background: none; border: 1px solid transparent; cursor: pointer;
+  border-radius: var(--ekn-radius-pill);
+}
+.ekn-calendar__nav { width: 2.5rem; height: 2.5rem; font-size: var(--ekn-text-lg); line-height: 1; }
+.ekn-calendar__nav:disabled { opacity: .35; cursor: not-allowed; }
+.ekn-calendar__grid { border-collapse: collapse; }
+.ekn-calendar__grid th { width: 2.5rem; padding-bottom: var(--ekn-space-1); font-size: var(--ekn-text-xs); font-weight: 600; color: var(--ekn-text-muted); text-align: center; }
+.ekn-calendar__grid td { padding: 1px; text-align: center; }
+.ekn-calendar__day { width: 2.5rem; height: 2.5rem; font-variant-numeric: tabular-nums; }
+:is(.ekn-calendar__nav, .ekn-calendar__day, .ekn-calendar__today):hover { background: var(--ekn-hover); }
+:is(.ekn-calendar__nav, .ekn-calendar__day, .ekn-calendar__today):focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 1px; }
+/* Today is underlined, not ringed: a ring is what keyboard focus looks like. */
+.ekn-calendar__day[aria-current="date"] { font-weight: 600; text-decoration: underline 2px var(--ekn-action); text-underline-offset: 4px; }
+.ekn-calendar__day[aria-pressed="true"],
+.ekn-calendar__day[aria-pressed="true"]:hover { background: var(--ekn-action); color: var(--ekn-on-action); font-weight: 600; }
+.ekn-calendar__day[aria-disabled="true"] { color: var(--ekn-text-muted); text-decoration: line-through; cursor: not-allowed; }
+.ekn-calendar__day[aria-disabled="true"]:hover { background: none; }
+.ekn-calendar__foot { display: flex; justify-content: center; margin-top: var(--ekn-space-2); padding-top: var(--ekn-space-2); border-top: 1px solid var(--ekn-border); }
+.ekn-calendar__today { min-height: var(--ekn-target-min); padding: var(--ekn-space-1) var(--ekn-space-4); font-weight: 600; }
+
+/* ── Audio player (optional JavaScript: ekonum-ui.js) ───────────────────────
+   <ekn-audio> replaces the browser's player with compact controls. Without
+   `trim`: play, time, position, speed. With `trim`, "listen and trim" as in
+   transcript: one timeline holds the kept part (turquoise), a hairline playhead and
+   two handles; start and end can also be typed. Without the script the native player
+   stays. Every handle is a native range input with a 44 px touch area. The timeline
+   is turquoise in both themes, as in transcript: what has been heard, what is kept. */
+ekn-audio { display: block; min-width: 0; }
+ekn-audio[data-enhanced] {
+  padding: var(--ekn-space-3) var(--ekn-space-4); box-sizing: border-box;
+  border: 1px solid var(--ekn-border); border-radius: var(--ekn-radius-card); background: var(--ekn-surface);
+  font-size: var(--ekn-text-sm); color: var(--ekn-text);
+}
+ekn-audio > audio { display: block; width: 100%; }
+/* A video shows its picture above the controls; a <video> without a picture (an
+   audio file) reserves no space. */
+ekn-audio > video:not([hidden]) {
+  display: block; width: 100%; aspect-ratio: 16 / 9; margin-bottom: var(--ekn-space-3);
+  border-radius: var(--ekn-radius-field); background: var(--ekn-dark-green);
+}
+.ekn-audio__bar { display: flex; align-items: center; gap: var(--ekn-space-2) var(--ekn-space-3); min-width: 0; }
+.ekn-audio__play {
+  display: grid; place-items: center; flex: none; width: var(--ekn-target); height: var(--ekn-target); padding: 0;
+  border: 0; border-radius: 50%; background: var(--ekn-action); color: var(--ekn-on-action); cursor: pointer;
+}
+.ekn-audio__play:hover:not(:disabled) { background: var(--ekn-action-hover); }
+.ekn-audio__play:disabled { opacity: .45; cursor: not-allowed; }
+.ekn-audio__error { margin: var(--ekn-space-2) 0 0; color: var(--ekn-text-muted); }
+.ekn-audio__play > svg { width: 1.25rem; height: 1.25rem; }
+.ekn-audio__time, .ekn-audio__now, .ekn-audio__status { font-variant-numeric: tabular-nums; color: var(--ekn-text-muted); white-space: nowrap; }
+.ekn-audio__time { flex: none; }
+.ekn-audio__speed {
+  flex: none; min-width: 3rem; min-height: var(--ekn-target-min); padding: var(--ekn-space-1) var(--ekn-space-2);
+  font: inherit; font-weight: 600; font-variant-numeric: tabular-nums; color: inherit; cursor: pointer;
+  background: none; border: 1px solid var(--ekn-border-strong); border-radius: var(--ekn-radius-pill);
+}
+.ekn-audio__speed:hover { background: var(--ekn-hover); }
+ekn-audio :is(.ekn-audio__play, .ekn-audio__speed, .ekn-audio__reset):focus-visible { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+
+/* Range inputs: a light 6 px track, a 16 px thumb detached by a ring of the card's
+   colour, a 44 px hit area. */
+.ekn-audio__range {
+  -webkit-appearance: none; appearance: none; flex: 1 1 8rem; min-width: 0; height: var(--ekn-target); margin: 0;
+  background: transparent; cursor: pointer;
+}
+.ekn-audio__range::-webkit-slider-runnable-track { height: 6px; border-radius: var(--ekn-radius-pill); background: var(--ekn-track, var(--ekn-border)); }
+.ekn-audio__range::-moz-range-track { height: 6px; border-radius: var(--ekn-radius-pill); background: var(--ekn-track, var(--ekn-border)); }
+.ekn-audio__range::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 16px; height: 16px; margin-top: -5px; border-radius: 50%;
+  background: var(--ekn-action); border: 2px solid var(--ekn-surface); box-sizing: border-box; box-shadow: var(--ekn-shadow-1);
+}
+.ekn-audio__range::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--ekn-action); border: 2px solid var(--ekn-surface); box-sizing: border-box; box-shadow: var(--ekn-shadow-1); }
+.ekn-audio__range:focus-visible { outline: none; }
+.ekn-audio__range:focus-visible::-webkit-slider-thumb { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+.ekn-audio__range:focus-visible::-moz-range-thumb { outline: 2px solid var(--ekn-focus); outline-offset: 2px; }
+/* Position: the part already heard is turquoise, like the kept part of a trim. */
+.ekn-audio__seek { --ekn-track: linear-gradient(to right, var(--ekn-turquoise) var(--ekn-progress, 0%), var(--ekn-border) var(--ekn-progress, 0%)); }
+
+/* Listen and trim. The header states what is kept; "Tout reprendre" undoes the cut. */
+.ekn-audio__head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: var(--ekn-space-1) var(--ekn-space-3); margin-bottom: var(--ekn-space-2); }
+.ekn-audio__title { font-family: var(--ekn-font-heading); font-weight: 600; font-size: var(--ekn-text-md); }
+.ekn-audio__status { white-space: normal; }
+.ekn-audio__reset {
+  min-height: var(--ekn-target-min); margin-left: var(--ekn-space-2); padding: 0;
+  font: inherit; color: var(--ekn-text); background: none; border: 0; cursor: pointer;
+  text-decoration: underline; text-decoration-color: var(--ekn-turquoise); text-underline-offset: .2em;
+}
+.ekn-audio__body { display: flex; flex-wrap: wrap; align-items: center; gap: var(--ekn-space-4); }
+/* A video shows its picture; an audio file reserves no space. */
+.ekn-audio__picture:empty { display: none; }
+.ekn-audio__picture > video { display: block; width: 12rem; max-width: 100%; aspect-ratio: 16 / 9; border-radius: var(--ekn-radius-field); background: var(--ekn-dark-green); }
+.ekn-audio__main { flex: 1 1 16rem; min-width: 0; }
+.ekn-audio__timeline { position: relative; flex: 1 1 auto; min-width: 0; height: var(--ekn-target); cursor: pointer; touch-action: none; }
+.ekn-audio__timeline::before {
+  content: ""; position: absolute; left: 8px; right: 8px; top: 50%; height: 8px; transform: translateY(-50%);
+  border-radius: var(--ekn-radius-pill); background: var(--ekn-border);
+}
+.ekn-audio__kept {
+  position: absolute; top: 50%; height: 8px; transform: translateY(-50%);
+  border-radius: var(--ekn-radius-pill); background: var(--ekn-turquoise); pointer-events: none;
+}
+.ekn-audio__playhead {
+  position: absolute; top: 6px; bottom: 6px; width: 1px; margin-left: -.5px;
+  background: var(--ekn-text); pointer-events: none;
+  /* A hairline, as in transcript. Off-white on turquoise would fade (1.6:1): on dark,
+     a dark-green halo keeps it visible over the kept part (contrast.json). */
+  box-shadow: 0 0 0 1px var(--ekn-halo);
+}
+.ekn-audio__timeline > .ekn-audio__handle { position: absolute; inset: 0; width: 100%; pointer-events: none; --ekn-track: transparent; }
+/* Handles: 16 × 28, detached from the timeline by a ring of the card's colour and a
+   short shadow; held, they grow a little. */
+.ekn-audio__handle::-webkit-slider-thumb {
+  pointer-events: auto; cursor: ew-resize; width: 16px; height: 28px; margin-top: -11px; border-radius: 6px;
+  background: var(--ekn-tone-success); border: 2px solid var(--ekn-surface); box-sizing: border-box; box-shadow: var(--ekn-shadow-1);
+}
+.ekn-audio__handle::-moz-range-thumb {
+  pointer-events: auto; cursor: ew-resize; width: 16px; height: 28px; border-radius: 6px;
+  background: var(--ekn-tone-success); border: 2px solid var(--ekn-surface); box-sizing: border-box; box-shadow: var(--ekn-shadow-1);
+}
+.ekn-audio__handle:active::-webkit-slider-thumb { transform: scale(1.1); }
+.ekn-audio__handle:active::-moz-range-thumb { transform: scale(1.1); }
+/* The handle touched last — the one play starts from — takes the text colour:
+   dark green on light, off-white on dark. */
+.ekn-audio__handle[data-last]::-webkit-slider-thumb { background: var(--ekn-text); }
+.ekn-audio__handle[data-last]::-moz-range-thumb { background: var(--ekn-text); }
+.ekn-audio__fields {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--ekn-space-2) var(--ekn-space-3);
+  margin-top: var(--ekn-space-2); padding-left: calc(var(--ekn-target) + var(--ekn-space-3));
+}
+.ekn-audio__field { display: inline-flex; align-items: center; gap: var(--ekn-space-2); color: var(--ekn-text-muted); }
+.ekn-audio__clock { width: 5.25rem; text-align: center; font-variant-numeric: tabular-nums; padding-inline: var(--ekn-space-2); }
+/* On a phone: Début and Fin side by side, the current time after them. */
+@media (max-width: 30rem) {
+  .ekn-audio__fields { padding-left: 0; justify-content: flex-start; }
+  .ekn-audio__now { order: 3; }
+}
+
+

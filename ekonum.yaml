@@ -38,12 +38,14 @@ consumes:
     - discuss.channel
     - ir.model
   ekonum_apps:
+    - ekonum-ui                   # CSS et polices, versionnés dans web/client/vendor à la version ci-dessous
     - secret-broker               # clé Gemini (web/app/secrets.py)
   external:
     - gemini                      # transcription, sonde et enquête
     - cloudflare-access           # vérification de l'identité
 
 release_notes: https://github.com/Ekonum/EkoVideoCompressor/releases
+design_system: 3.7.0              # épinglé ; scripts/fetch-ekonum-ui.sh lit cette valeur
 
 environments:
   production:

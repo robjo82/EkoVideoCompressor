@@ -1,0 +1,53 @@
+{
+  "$description": "ekonum-ui 2.x → 3.0.0: every public name moves to English. Read by scripts/migrate_v3.py; also the reference table of the README.",
+  "groups": {
+    "couleur": "color", "palette": "palette", "interface": "ui", "etat": "status",
+    "typographie": "typography", "police": "font", "taille": "size", "rythme": "rhythm",
+    "espace": "space", "mise-en-page": "layout", "rayon": "radius", "ombre": "shadow", "degrade": "gradient"
+  },
+  "tokens": {
+    "vert-fonce": "dark-green", "blanc-casse": "off-white", "turquoise": "turquoise", "violet": "violet",
+    "surface": "surface", "fond": "background", "trait": "border", "trait-fort": "border-strong",
+    "survol-fonce": "hover-dark", "trait-controle": "border-control", "texte": "text", "texte-doux": "text-muted",
+    "texte-inverse": "text-inverse", "texte-inverse-doux": "text-inverse-muted", "trait-inverse": "border-inverse",
+    "survol-inverse": "hover-inverse",
+    "ok": "success", "ok-fonce": "success-dark", "attention": "warning", "attention-fonce": "warning-dark",
+    "echec": "error", "echec-fonce": "error-dark", "inconnu": "unknown", "inconnu-fonce": "unknown-dark",
+    "police-titre": "font-heading", "police-texte": "font-body",
+    "t-xs": "text-xs", "t-sm": "text-sm", "t-md": "text-md", "t-lg": "text-lg", "t-xl": "text-xl", "t-2xl": "text-2xl", "t-3xl": "text-3xl",
+    "interlettrage": "tracking", "interligne-titre": "leading-heading", "interligne-texte": "leading-body",
+    "e-1": "space-1", "e-2": "space-2", "e-3": "space-3", "e-4": "space-4", "e-5": "space-5", "e-6": "space-6", "e-7": "space-7", "e-8": "space-8",
+    "cible": "target", "cible-min": "target-min", "gouttiere": "gutter", "largeur-page": "page-width",
+    "r-plaque": "radius-tile", "r-carte": "radius-card", "r-champ": "radius-field", "r-pilule": "radius-pill",
+    "ombre-1": "shadow-1", "ombre-2": "shadow-2", "degrade-sombre": "gradient-dark", "degrade-clair": "gradient-light"
+  },
+  "properties": {
+    "colonne": "grid-column", "ligne-libelle": "row-label", "pile": "stack-gap"
+  },
+  "classes": {
+    "ekn-action--compacte": "ekn-button--compact", "ekn-action--danger": "ekn-button--danger",
+    "ekn-action--discrete": "ekn-button--subtle", "ekn-action--icone": "ekn-button--icon",
+    "ekn-action--marque": "ekn-button--brand", "ekn-action": "ekn-button",
+    "ekn-aide": "ekn-help", "ekn-avis--attention": "ekn-alert--warning", "ekn-avis--echec": "ekn-alert--error",
+    "ekn-avis--ok": "ekn-alert--success", "ekn-avis": "ekn-alert", "ekn-bascule": "ekn-switch", "ekn-carte": "ekn-card",
+    "ekn-champ": "ekn-input", "ekn-chargement--bloc": "ekn-loading--block", "ekn-chargement": "ekn-loading",
+    "ekn-compte__initiales": "ekn-account__initials", "ekn-compte__nom": "ekn-account__name", "ekn-compte": "ekn-account",
+    "ekn-entete__marque": "ekn-header__brand", "ekn-entete__nav": "ekn-header__nav", "ekn-entete": "ekn-header",
+    "ekn-erreur": "ekn-error", "ekn-etiquette": "ekn-label", "ekn-filtres": "ekn-filters", "ekn-grappe": "ekn-cluster",
+    "ekn-grille": "ekn-grid", "ekn-libre": "ekn-wrap", "ekn-ligne": "ekn-row", "ekn-marqueur": "ekn-badge",
+    "ekn-nav": "ekn-nav", "ekn-niveau--attention": "ekn-status--warning", "ekn-niveau--echec": "ekn-status--error",
+    "ekn-niveau--en-cours": "ekn-status--running", "ekn-niveau--ok": "ekn-status--success", "ekn-niveau": "ekn-status",
+    "ekn-nombre": "ekn-numeric", "ekn-onglets": "ekn-tabs", "ekn-option": "ekn-option", "ekn-page": "ekn-page",
+    "ekn-periode": "ekn-date-range", "ekn-pile": "ekn-stack", "ekn-plaque--claire": "ekn-tile--light",
+    "ekn-plaque--petite": "ekn-tile--small", "ekn-plaque": "ekn-tile", "ekn-sombre": "ekn-dark",
+    "ekn-squelette": "ekn-skeleton", "ekn-tableau--empile": "ekn-table--stacked", "ekn-tableau": "ekn-table",
+    "ekn-tronque": "ekn-truncate", "ekn-vide": "ekn-empty"
+  },
+  "attributes": { "data-libelle": "data-label" },
+  "files": {
+    "polices/polices.css": "fonts/fonts.css", "polices/": "fonts/", "marque/": "brand/",
+    "logo-sur-clair.svg": "logo-on-light.svg", "logo-sur-sombre.svg": "logo-on-dark.svg",
+    "icone-sur-clair.svg": "icon-on-light.svg", "icone-sur-sombre.svg": "icon-on-dark.svg", "icone.svg": "icon.svg",
+    "recuperer.sh": "fetch.sh"
+  }
+}

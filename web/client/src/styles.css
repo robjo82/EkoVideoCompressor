@@ -1,20 +1,11 @@
 @import "tailwindcss";
 
-/* Fontes officielles Ekonum. Variables : un fichier couvre toutes les
-   graisses, ce qui évite six requêtes pour une interface qui en utilise
-   trois. Servies par le conteneur, jamais par un CDN. */
-@font-face {
-  font-family: "Chillax";
-  src: url("/fonts/Chillax-Variable.woff2") format("woff2-variations");
-  font-weight: 200 700;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Synonym";
-  src: url("/fonts/Synonym-Variable.woff2") format("woff2-variations");
-  font-weight: 200 700;
-  font-display: swap;
-}
+/* Design system Ekonum, à la version épinglée dans ekonum.yaml
+   (scripts/fetch-ekonum-ui.sh). Les fontes viennent de l'archive, servies par
+   le conteneur derrière Access — jamais par un CDN ni une URL publique. */
+@import "../vendor/ekonum-ui/ekonum-ui.css";
+@import "../vendor/ekonum-ui/fonts/fonts.css";
+@import "../vendor/ekonum-ui/tailwind.css";
 
 @theme {
   /* Palette officielle, telle quelle. Les nuances dérivées ne servent
