@@ -105,16 +105,16 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
   useEffect(() => { recharger(); }, [jobId]);
 
   if (erreur && !fiche) return <div className="mx-auto max-w-4xl px-6 py-10"><Erreur>{erreur}</Erreur></div>;
-  if (!fiche) return <p className="py-16 text-center text-fonce/50">Chargement…</p>;
+  if (!fiche) return <p className="py-16 text-center text-ekn-text-muted">Chargement…</p>;
 
   return (
     <section className="mx-auto max-w-6xl px-6 py-10">
-      <button onClick={surRetour} className="text-[0.875rem] text-fonce/55 hover:text-fonce">
+      <button onClick={surRetour} className="text-ekn-sm text-ekn-text-muted hover:text-fonce">
         ← Bibliothèque
       </button>
 
       <h1 className="titre mt-3 text-[1.5rem] font-semibold">{fiche.title || fiche.filename}</h1>
-      <p className="mt-1 text-[0.875rem] text-fonce/55">
+      <p className="mt-1 text-ekn-sm text-ekn-text-muted">
         {fiche.filename} · {fiche.model} · {usd(fiche.cost_usd)}
       </p>
       <DateReunion
@@ -126,7 +126,7 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
       />
 
       <Erreur>{erreur}</Erreur>
-      {note ? <p className="mt-4 text-[0.875rem] text-turquoise-sombre">{note}</p> : null}
+      {note ? <p className="mt-4 text-ekn-sm text-ekn-success-dark">{note}</p> : null}
 
       <div className="mt-8 grid gap-10 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <div>
@@ -138,7 +138,7 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
                   type="button"
                   onClick={ouvrirTrouver}
                   title={`Chercher dans la transcription (${MOD} F)`}
-                  className="rounded-md px-3 py-1.5 text-[0.8125rem] text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce"
+                  className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce"
                 >
                   Chercher
                 </button>
@@ -161,22 +161,22 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
                 }}
                 placeholder="Chercher dans la transcription"
                 aria-label="Chercher dans la transcription"
-                className="min-w-0 flex-1 bg-transparent text-[0.875rem] outline-none placeholder:text-fonce/35"
+                className="min-w-0 flex-1 bg-transparent text-ekn-sm outline-none placeholder:text-ekn-text-muted"
               />
-              <span className="shrink-0 text-[0.8125rem] tabular-nums text-fonce/50">
+              <span className="shrink-0 text-ekn-sm tabular-nums text-ekn-text-muted">
                 {trouver.terme.trim()
                   ? occurrences.length ? `${(trouver.courant % occurrences.length) + 1} / ${occurrences.length}` : 'aucune'
                   : ''}
               </span>
               <button type="button" onClick={() => avancer(-1)} disabled={!occurrences.length}
                       aria-label="Occurrence précédente" title="Précédente (Maj+Entrée)"
-                      className="rounded px-1.5 text-fonce/55 hover:bg-papier hover:text-fonce disabled:opacity-30">↑</button>
+                      className="rounded px-1.5 text-ekn-text-muted hover:bg-papier hover:text-fonce disabled:opacity-30">↑</button>
               <button type="button" onClick={() => avancer(1)} disabled={!occurrences.length}
                       aria-label="Occurrence suivante" title="Suivante (Entrée)"
-                      className="rounded px-1.5 text-fonce/55 hover:bg-papier hover:text-fonce disabled:opacity-30">↓</button>
+                      className="rounded px-1.5 text-ekn-text-muted hover:bg-papier hover:text-fonce disabled:opacity-30">↓</button>
               <button type="button" onClick={() => setTrouver(null)} aria-label="Fermer la recherche"
                       title="Fermer (Échap)"
-                      className="rounded px-1.5 text-[1.125rem] leading-none text-fonce/45 hover:bg-papier hover:text-fonce">×</button>
+                      className="rounded px-1.5 text-[1.125rem] leading-none text-ekn-text-muted hover:bg-papier hover:text-fonce">×</button>
             </div>
           ) : null}
           <div className="verre mt-3 max-h-[34rem] overflow-y-auto rounded-xl">
@@ -184,7 +184,7 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
               fiche.reprocessable && fiche.video?.presente ? (
                 <Retraiter fiche={fiche} jobId={jobId} surRetraiter={surRetraiter} />
               ) : (
-                <p className="px-4 py-6 text-fonce/50">Pas encore de segment.</p>
+                <p className="px-4 py-6 text-ekn-text-muted">Pas encore de segment.</p>
               )
             ) : (
               <ol>
@@ -195,7 +195,7 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
                     className={`flex gap-4 px-4 py-2 transition-colors duration-700 ${
                       surlignee === rang
                         ? 'bg-turquoise/25'
-                        : enCours(fiche.segments, rang, ecoute) ? 'bg-turquoise/10 shadow-[inset_3px_0_0_#2AD39F]' : ''
+                        : enCours(fiche.segments, rang, ecoute) ? 'bg-turquoise/10 shadow-[inset_3px_0_0_var(--color-turquoise)]' : ''
                     }`}
                   >
                     {ecoute !== null ? (
@@ -204,18 +204,18 @@ export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
                         type="button"
                         onClick={() => lecteur.current?.seek(s.start_second)}
                         title="Écouter à partir d’ici"
-                        className="w-12 shrink-0 pt-0.5 text-left text-[0.8125rem] tabular-nums text-turquoise-sombre hover:underline"
+                        className="w-12 shrink-0 pt-0.5 text-left text-ekn-sm tabular-nums text-ekn-text hover:underline"
                       >
                         {horodatage(s.start_second)}
                       </button>
                     ) : (
-                      <span className="w-12 shrink-0 pt-0.5 text-[0.8125rem] tabular-nums text-fonce/40">
+                      <span className="w-12 shrink-0 pt-0.5 text-ekn-sm tabular-nums text-ekn-text-muted">
                         {horodatage(s.start_second)}
                       </span>
                     )}
                     <span>
                       {s.speaker ? (
-                        <span className="titre mr-2 font-medium text-turquoise-sombre">{s.speaker}</span>
+                        <span className="titre mr-2 font-medium text-ekn-text">{s.speaker}</span>
                       ) : null}
                       {trouver?.terme.trim()
                         ? surligner(s.text, trouver.terme, actuelle?.rang === rang ? actuelle.k : -1)
@@ -273,7 +273,7 @@ function Retraiter({ fiche, jobId, surRetraiter }) {
           cancelled: 'Transcription interrompue : la vidéo est toujours stockée.',
         }[fiche.status] || 'La transcription a échoué, mais la vidéo est stockée.'}
       </p>
-      <p className="mt-1 text-[0.8125rem] text-fonce/55">
+      <p className="mt-1 text-ekn-sm text-ekn-text-muted">
         Le traitement relit la vidéo stockée, sans rien déposer dans Odoo
         d'office ; une vidéo lourde peut être allégée au passage.
       </p>
@@ -294,9 +294,9 @@ function DateReunion({ jobId, valeur, deduite, surMaj, surErreur }) {
 
   if (!edition) {
     return (
-      <p className="mt-1 text-[0.875rem] text-fonce/70">
+      <p className="mt-1 text-ekn-sm text-fonce/70">
         Réunion du {lisible}
-        {deduite ? <span className="text-fonce/45"> (date du dépôt)</span> : null}
+        {deduite ? <span className="text-ekn-text-muted"> (date du dépôt)</span> : null}
         <button
           type="button"
           onClick={() => {
@@ -305,7 +305,7 @@ function DateReunion({ jobId, valeur, deduite, surMaj, surErreur }) {
             setSaisie(local.toISOString().slice(0, 16));
             setEdition(true);
           }}
-          className="ml-2 text-[0.8125rem] text-turquoise-sombre underline-offset-2 hover:underline"
+          className="ml-2 text-ekn-sm text-ekn-text underline underline-offset-2"
         >
           modifier
         </button>
@@ -314,7 +314,7 @@ function DateReunion({ jobId, valeur, deduite, surMaj, surErreur }) {
   }
   return (
     <form
-      className="mt-1 flex flex-wrap items-center gap-2 text-[0.875rem]"
+      className="mt-1 flex flex-wrap items-center gap-2 text-ekn-sm"
       onSubmit={async (e) => {
         e.preventDefault();
         try {
@@ -327,7 +327,7 @@ function DateReunion({ jobId, valeur, deduite, surMaj, surErreur }) {
       <DateHeure valeur={saisie} surChange={setSaisie} />
       <Bouton type="submit">Enregistrer</Bouton>
       <button type="button" onClick={() => setEdition(false)}
-              className="text-[0.8125rem] text-fonce/55 hover:text-fonce">
+              className="text-ekn-sm text-ekn-text-muted hover:text-fonce">
         Annuler
       </button>
     </form>
@@ -365,7 +365,7 @@ function Video({ jobId, video, filename, surMaj, lecteur, surTemps }) {
   }
   if (!video?.presente) {
     return video?.en_cours ? (
-      <p className="mt-3 text-[0.8125rem] text-fonce/55">
+      <p className="mt-3 text-ekn-sm text-ekn-text-muted">
         L'envoi de la vidéo a été interrompu (onglet fermé ?). La transcription,
         elle, est complète.
       </p>
@@ -388,7 +388,7 @@ function Video({ jobId, video, filename, surMaj, lecteur, surTemps }) {
       {etape === 'question' ? (
         <>
           <p className="titre text-[0.9375rem] font-medium">{audio ? 'Réécouter l’enregistrement ?' : 'Relire la vidéo ?'}</p>
-          <p className="mt-1 text-[0.875rem] text-fonce/70">
+          <p className="mt-1 text-ekn-sm text-fonce/70">
             {audio ? 'Il' : 'Elle'} est en <strong>stockage froid</strong> : {audio ? 'le' : 'la'} conserver
             ne coûte presque rien, {audio ? 'le réécouter' : 'la relire'} coûte davantage. On ne{' '}
             {audio ? 'le' : 'la'} charge que si tu en as besoin.
@@ -398,7 +398,7 @@ function Video({ jobId, video, filename, surMaj, lecteur, surTemps }) {
             <button
               type="button"
               onClick={() => setEtape('repos')}
-              className="rounded-md px-3 py-1.5 text-[0.875rem] text-fonce/60 hover:text-fonce"
+              className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/60 hover:text-fonce"
             >
               Pas maintenant
             </button>
@@ -406,14 +406,14 @@ function Video({ jobId, video, filename, surMaj, lecteur, surTemps }) {
         </>
       ) : (
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-[0.875rem] text-fonce/70">
+          <p className="text-ekn-sm text-fonce/70">
             {audio ? 'Enregistrement archivé' : 'Vidéo archivée'}{video.octets ? ` — ${mo(video.octets)}` : ''}, en
             stockage froid.
           </p>
           <button
             type="button"
             onClick={() => setEtape('question')}
-            className="rounded-md px-3 py-1.5 text-[0.8125rem] text-fonce/70 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
+            className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
           >
             {audio ? 'Écouter' : 'Regarder'}
           </button>
@@ -444,7 +444,7 @@ function Copier({ texte, libelle = 'Copier la transcription' }) {
         }
         setTimeout(() => setEtat('repos'), 2000);
       }}
-      className="rounded-md px-3 py-1.5 text-[0.8125rem] text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce"
+      className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce"
     >
       {etat === 'copie'
         ? 'Copiée ✓'
@@ -505,7 +505,7 @@ function AVerifier({ fiche, surAller, surCorriger }) {
   return (
     <div>
       <h2 className="titre text-[1.0625rem] font-medium">À vérifier</h2>
-      <p className="mt-1 text-[0.8125rem] text-fonce/55">
+      <p className="mt-1 text-ekn-sm text-ekn-text-muted">
         {passages.length} passage{passages.length > 1 ? 's' : ''} dont le modèle
         doute — un clic montre le mot dans la transcription et le propose à la
         correction.
@@ -525,12 +525,12 @@ function AVerifier({ fiche, surAller, surCorriger }) {
                 }}
                 className="w-full rounded-lg bg-papier p-2.5 text-left transition-colors hover:bg-turquoise/15 disabled:cursor-default disabled:hover:bg-papier"
               >
-                <span className="block text-[0.75rem] tabular-nums text-turquoise-sombre">
+                <span className="block text-ekn-xs tabular-nums text-ekn-text-muted">
                   {p.timestamp || '—'}
                 </span>
-                <span className="block text-[0.875rem]">{p.text}</span>
+                <span className="block text-ekn-sm">{p.text}</span>
                 {p.reason ? (
-                  <span className="block text-[0.8125rem] text-fonce/55">{p.reason}</span>
+                  <span className="block text-ekn-sm text-ekn-text-muted">{p.reason}</span>
                 ) : null}
               </button>
             </li>
@@ -565,7 +565,7 @@ function Relecture({ fiche, jobId, surMaj, surNote, surErreur }) {
         } catch (e) { surErreur(e.message); }
         finally { setOccupe(false); }
       }}
-      className="rounded-md px-3 py-1.5 text-[0.8125rem] text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce disabled:opacity-50"
+      className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 hover:text-fonce disabled:opacity-50"
     >
       {occupe ? 'Relecture…' : 'Refaire titre et noms'}
     </button>
@@ -627,11 +627,11 @@ function Termes({ fiche, jobId, surMaj, surNote, surErreur, aCorriger }) {
     <div>
       <h2 className="titre text-[1.0625rem] font-medium">Vocabulaire</h2>
       {fiche.technical_terms.length ? (
-        <p className="mt-2 text-[0.875rem] leading-relaxed text-fonce/70">
+        <p className="mt-2 text-ekn-sm leading-relaxed text-fonce/70">
           {fiche.technical_terms.join(' · ')}
         </p>
       ) : (
-        <p className="mt-2 text-[0.875rem] text-fonce/50">Aucun terme relevé.</p>
+        <p className="mt-2 text-ekn-sm text-ekn-text-muted">Aucun terme relevé.</p>
       )}
 
       <h3 className="titre mt-5 text-[0.9375rem] font-medium">Corriger un mot mal entendu</h3>
@@ -644,7 +644,7 @@ function Termes({ fiche, jobId, surMaj, surNote, surErreur, aCorriger }) {
           value={ancien}
           onChange={(e) => setAncien(e.target.value)}
         />
-        <span aria-hidden className="pb-2 text-fonce/40">→</span>
+        <span aria-hidden className="pb-2 text-ekn-text-muted">→</span>
         <Champ
           ref={champNouveau}
           label="Bonne orthographe"
@@ -653,7 +653,7 @@ function Termes({ fiche, jobId, surMaj, surNote, surErreur, aCorriger }) {
           onChange={(e) => setNouveau(e.target.value)}
         />
       </div>
-      <p className="mt-2 text-[0.8125rem] text-fonce/55">
+      <p className="mt-2 text-ekn-sm text-ekn-text-muted">
         {ancien.trim() && nouveau.trim()
           ? <>« {ancien.trim()} » deviendra « {nouveau.trim()} » partout : transcription, segments et vocabulaire.</>
           : 'Le remplacement s’applique à toute la réunion, et le bon mot rejoint le vocabulaire de l’équipe.'}
@@ -696,13 +696,13 @@ function Fenetres({ jobId, surNote, surErreur }) {
       <h2 className="titre text-[1.0625rem] font-medium">Fenêtres</h2>
       <ul className="verre mt-3 divide-y divide-bord/60 rounded-xl">
         {vue.chunks.map((c) => (
-          <li key={c.index} className="flex items-center gap-3 px-3 py-2 text-[0.875rem]">
-            <span className="w-12 shrink-0 tabular-nums text-fonce/45">{horodatage(c.start)}</span>
-            <span className={`flex-1 ${c.status === 'erreur' ? 'text-[#8c1d18]' : 'text-fonce/70'}`}>
+          <li key={c.index} className="flex items-center gap-3 px-3 py-2 text-ekn-sm">
+            <span className="w-12 shrink-0 tabular-nums text-ekn-text-muted">{horodatage(c.start)}</span>
+            <span className={`flex-1 ${c.status === 'erreur' ? 'text-ekn-error-dark' : 'text-fonce/70'}`}>
               {c.status === 'termine' ? 'terminée' : c.status === 'erreur' ? 'erreur' : c.status}
             </span>
             <button
-              className="text-turquoise-sombre hover:underline"
+              className="text-ekn-text underline underline-offset-2"
               onClick={async () => {
                 try {
                   await api.resetChunk(jobId, c.index);
@@ -758,7 +758,7 @@ function Versions({ versions, jobId, surMaj, surNote, surErreur }) {
         type="button"
         onClick={() => setOuvert((o) => !o)}
         aria-expanded={ouvert}
-        className="text-[0.8125rem] text-fonce/50 hover:text-fonce"
+        className="text-ekn-sm text-ekn-text-muted hover:text-fonce"
       >
         {ouvert ? '▾' : '▸'} {versions.length} version{versions.length > 1 ? 's' : ''} antérieure{versions.length > 1 ? 's' : ''}
       </button>
@@ -767,9 +767,9 @@ function Versions({ versions, jobId, surMaj, surNote, surErreur }) {
           {versions.map((v, rang) => (
             <li key={v.archived_at + rang} className="rounded-lg bg-white/50 px-3 py-2">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <span className="text-[0.75rem] tabular-nums text-fonce/50">{jour(v.archived_at)}</span>
-                <span className="min-w-0 flex-1 truncate text-[0.875rem]">{v.title || 'Sans titre'}</span>
-                <span className="flex shrink-0 gap-3 text-[0.8125rem]">
+                <span className="text-ekn-xs tabular-nums text-ekn-text-muted">{jour(v.archived_at)}</span>
+                <span className="min-w-0 flex-1 truncate text-ekn-sm">{v.title || 'Sans titre'}</span>
+                <span className="flex shrink-0 gap-3 text-ekn-sm">
                   <button type="button" onClick={() => setLue(lue === rang ? null : rang)}
                           className="text-violet hover:underline">
                     {lue === rang ? 'replier' : 'lire'}
@@ -788,7 +788,7 @@ function Versions({ versions, jobId, surMaj, surNote, surErreur }) {
                 </span>
               </div>
               {aConfirmer === rang ? (
-                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-papier px-3 py-2 text-[0.8125rem]">
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-papier px-3 py-2 text-ekn-sm">
                   <span className="flex-1 text-fonce/70">
                     Remettre cette version en place ? La version actuelle sera gardée dans l'historique.
                   </span>
@@ -797,14 +797,14 @@ function Versions({ versions, jobId, surMaj, surNote, surErreur }) {
                     {occupe ? 'Restauration…' : 'Y revenir'}
                   </button>
                   <button type="button" onClick={() => setAConfirmer(null)}
-                          className="px-2 py-1 text-fonce/55 hover:text-fonce">
+                          className="px-2 py-1 text-ekn-text-muted hover:text-fonce">
                     Annuler
                   </button>
                 </div>
               ) : null}
               {lue === rang ? (
                 <>
-                  <div className="mt-2 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-md bg-white/80 p-2 text-[0.8125rem] leading-relaxed text-fonce/80">
+                  <div className="mt-2 max-h-72 overflow-y-auto whitespace-pre-wrap rounded-md bg-white/80 p-2 text-ekn-sm leading-relaxed text-fonce/80">
                     {v.transcript || 'Texte non conservé pour cette version.'}
                   </div>
                   <div className="mt-2 flex justify-end">
@@ -848,10 +848,10 @@ function Odoo({ fiche, jobId, surMaj, surNote, surErreur }) {
     return (
       <div>
         <h2 className="titre text-[1.0625rem] font-medium">Odoo</h2>
-        <p className="mt-2 text-[0.875rem] text-turquoise-sombre">
+        <p className="mt-2 text-ekn-sm text-ekn-success-dark">
           Déposée dans le chatter le {jour(lien.published_at)}.
         </p>
-        <p className="mt-0.5 text-[0.8125rem] text-fonce/50">
+        <p className="mt-0.5 text-ekn-sm text-ekn-text-muted">
           {lien.model} #{lien.record_id}
         </p>
       </div>
@@ -865,7 +865,7 @@ function Odoo({ fiche, jobId, surMaj, surNote, surErreur }) {
       <h2 className="titre text-[1.0625rem] font-medium">Odoo</h2>
       {lien.record_id ? (
         <div className="mt-2 rounded-lg bg-papier p-3">
-          <p className="text-[0.875rem]">
+          <p className="text-ekn-sm">
             Dossier retenu avant la transcription :{' '}
             <span className="titre font-medium">{lien.model} #{lien.record_id}</span>
           </p>
@@ -888,7 +888,7 @@ function Odoo({ fiche, jobId, surMaj, surNote, surErreur }) {
           </Bouton>
         </div>
       ) : null}
-      <p className="mt-3 text-[0.8125rem] text-fonce/55">
+      <p className="mt-3 text-ekn-sm text-ekn-text-muted">
         {lien.record_id
           ? 'Ou chercher un autre dossier.'
           : 'Déposer la transcription dans le chatter, repliée en accordéon.'}
@@ -903,14 +903,14 @@ function Odoo({ fiche, jobId, surMaj, surNote, surErreur }) {
       </div>
 
       {etape ? (
-        <p className="mt-2 flex items-center gap-2 text-[0.8125rem] text-turquoise-sombre">
+        <p className="mt-2 flex items-center gap-2 text-ekn-sm text-ekn-text-muted">
           <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-turquoise border-t-transparent" />
           {etape}
         </p>
       ) : null}
 
       {candidats?.length === 0 ? (
-        <p className="mt-2 text-[0.8125rem] text-fonce/50">Aucun dossier trouvé.</p>
+        <p className="mt-2 text-ekn-sm text-ekn-text-muted">Aucun dossier trouvé.</p>
       ) : null}
 
       {candidats?.length ? (
@@ -939,10 +939,10 @@ function Odoo({ fiche, jobId, surMaj, surNote, surErreur }) {
                   } catch (e) { surErreur(e.message); }
                   finally { setEnvoi(false); setEtape(''); }
                 }}
-                className="w-full rounded-md px-2 py-1.5 text-left text-[0.875rem] transition-colors hover:bg-white/60 disabled:opacity-40"
+                className="w-full rounded-md px-2 py-1.5 text-left text-ekn-sm transition-colors hover:bg-white/60 disabled:opacity-40"
               >
                 <span className="titre font-medium">{c.name}</span>
-                <span className="block text-[0.8125rem] text-fonce/50">
+                <span className="block text-ekn-sm text-ekn-text-muted">
                   {c.partner || c.model} · {c.updated}
                 </span>
               </button>

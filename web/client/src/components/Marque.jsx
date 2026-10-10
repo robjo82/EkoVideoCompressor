@@ -18,27 +18,33 @@ export function Entete({ vue, surVue, surAide }) {
 
   const onglets = [
     ['bibliotheque', 'Bibliothèque'],
-    ['nouveau', 'Nouvelle transcription'],
+    ['nouveau', 'Nouvelle transcription', 'Nouvelle'],
   ];
 
   return (
-    <header className="verre-sombre sticky top-0 z-20 text-clair">
-      <div className="mx-auto flex max-w-6xl items-center gap-6 px-6 py-3">
+    <header className="verre-sombre ekn-dark sticky top-0 z-20 text-clair">
+      <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3 sm:gap-6 sm:px-6">
         <img src="/marque/logo-sombre.svg" alt="Ekonum" className="h-7 w-auto shrink-0" />
 
         <nav className="flex gap-1">
-          {onglets.map(([cle, libelle]) => (
+          {onglets.map(([cle, libelle, court]) => (
             <button
               key={cle}
               onClick={() => surVue(cle)}
               aria-current={vue === cle ? 'page' : undefined}
-              className={`titre rounded-lg px-3 py-1.5 text-[0.9375rem] font-medium transition-colors ${
+              aria-label={court ? libelle : undefined}
+              className={`titre whitespace-nowrap rounded-lg px-2.5 py-1.5 text-[0.9375rem] font-medium sm:px-3 transition-colors ${
                 vue === cle
                   ? 'bg-turquoise text-fonce'
                   : 'text-clair/70 hover:bg-clair/10 hover:text-clair'
               }`}
             >
-              {libelle}
+              {court ? (
+                <>
+                  <span className="sm:hidden">{court}</span>
+                  <span className="hidden sm:inline">{libelle}</span>
+                </>
+              ) : libelle}
             </button>
           ))}
         </nav>
@@ -97,7 +103,7 @@ function Compte({ moi, surVue, surAide, actif }) {
   if (!moi?.email) return <span className="ml-auto" />;
   const initiales = moi.email.slice(0, 2).toUpperCase();
   const choisir = (action) => () => { setOuvert(false); action(); };
-  const entree = 'block w-full rounded-md px-3 py-2 text-left text-[0.875rem] text-fonce/80 transition-colors hover:bg-papier hover:text-fonce';
+  const entree = 'block w-full rounded-md px-3 py-2 text-left text-ekn-sm text-fonce/80 transition-colors hover:bg-papier hover:text-fonce';
 
   return (
     <div ref={cadre} className="relative ml-auto">
@@ -107,49 +113,50 @@ function Compte({ moi, surVue, surAide, actif }) {
         aria-haspopup="menu"
         aria-expanded={ouvert}
         title={`Connecté via ${moi.via}`}
-        className={`flex items-center gap-2.5 rounded-full py-1 pl-3 pr-1 transition-colors ${
+        className={`flex items-center gap-2.5 rounded-full p-1 transition-colors sm:pl-3 ${
           actif || ouvert ? 'bg-clair/15' : 'hover:bg-clair/10'
         }`}
       >
-        <span className="hidden text-[0.875rem] text-clair/75 sm:inline">{moi.email}</span>
+        <span className="hidden text-ekn-sm text-clair/75 sm:inline">{moi.email}</span>
         <span
           aria-hidden
-          className="titre grid h-8 w-8 place-items-center rounded-full bg-turquoise text-[0.8125rem] font-semibold text-fonce"
+          className="titre grid h-8 w-8 place-items-center rounded-full bg-turquoise text-ekn-sm font-semibold text-fonce"
         >
           {initiales}
         </span>
       </button>
       {invitation && !ouvert ? (
-        <div className="absolute right-0 top-full z-30 mt-3 w-80 rounded-xl bg-white p-4 text-fonce shadow-2xl ring-1 ring-bord">
+        <div data-ekn-theme="light" className="absolute right-0 top-full z-30 mt-3 w-80 rounded-xl bg-white p-4 text-fonce shadow-2xl ring-1 ring-bord">
           <span aria-hidden className="absolute -top-1.5 right-4 h-3 w-3 rotate-45 bg-white ring-1 ring-bord [clip-path:polygon(0_0,100%_0,0_100%)]" />
           <p className="titre text-[0.9375rem] font-medium">Retrouver tes anciens enregistrements</p>
-          <p className="mt-1 text-[0.8125rem] leading-relaxed text-fonce/65">
+          <p className="mt-1 text-ekn-sm leading-relaxed text-fonce/65">
             Des réunions enregistrées avant transcript dorment peut-être dans ton
             Drive. On peut les retrouver et les ranger ici, à leur date — et faire
             le ménage derrière.
           </p>
           <div className="mt-3 flex items-center justify-end gap-2">
             <button type="button" onClick={ecarterInvitation}
-                    className="rounded-md px-3 py-1.5 text-[0.8125rem] text-fonce/55 hover:text-fonce">
+                    className="rounded-md px-3 py-1.5 text-ekn-sm text-ekn-text-muted hover:text-fonce">
               Plus tard
             </button>
             <button
               type="button"
               onClick={() => { ecarterInvitation(); surVue('recuperation'); }}
-              className="rounded-md bg-fonce px-3 py-1.5 text-[0.8125rem] text-clair hover:bg-fonce-doux"
+              className="rounded-md bg-fonce px-3 py-1.5 text-ekn-sm text-clair hover:bg-fonce-doux"
             >
               Voir ce qu’on trouve
             </button>
           </div>
-          <p className="mt-2 text-[0.75rem] text-fonce/40">Toujours accessible depuis ce menu.</p>
+          <p className="mt-2 text-ekn-sm text-ekn-text-muted">Toujours accessible depuis ce menu.</p>
         </div>
       ) : null}
       {ouvert ? (
         <div
           role="menu"
+          data-ekn-theme="light"
           className="absolute right-0 top-full z-30 mt-2 w-60 rounded-xl bg-white p-1.5 text-fonce shadow-2xl ring-1 ring-bord"
         >
-          <p className="truncate px-3 pb-1.5 pt-1 text-[0.75rem] text-fonce/45">{moi.email}</p>
+          <p className="truncate px-3 pb-1.5 pt-1 text-ekn-xs text-ekn-text-muted">{moi.email}</p>
           <button type="button" role="menuitem" onClick={choisir(() => surVue('compte'))} className={entree}>
             Réglages
           </button>
@@ -161,7 +168,7 @@ function Compte({ moi, surVue, surAide, actif }) {
           <button type="button" role="menuitem" onClick={choisir(surAide)}
                   className={`${entree} flex items-center justify-between`}>
             Raccourcis clavier
-            <kbd className="rounded border border-bord bg-papier px-1.5 text-[0.75rem] text-fonce/55">?</kbd>
+            <kbd className="rounded border border-bord bg-papier px-1.5 text-ekn-xs text-ekn-text-muted">?</kbd>
           </button>
           <div className="my-1 h-px bg-bord/70" />
           <a role="menuitem" href={DECONNEXION} className={entree}>Se déconnecter</a>

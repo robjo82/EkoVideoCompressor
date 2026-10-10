@@ -134,7 +134,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
   };
 
   const colonne = (champ, libelle, classe = '') => (
-    <th className={`px-4 py-2 text-left text-[0.8125rem] font-medium text-fonce/60 ${classe}`}>
+    <th className={`px-4 py-2 text-left text-ekn-sm font-medium text-fonce/60 ${classe}`}>
       <button
         onClick={() => setTri((t) => {
           // Un titre se lit de A à Z ; le reste, du plus récent ou du plus gros.
@@ -165,7 +165,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
         </div>
       </div>
 
-      <div className="mt-4 flex gap-1 text-[0.875rem]">
+      <div className="mt-4 flex gap-1 text-ekn-sm">
         {[
           ['actif', 'Bibliothèque'],
           ['archive', 'Archives'],
@@ -176,7 +176,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
             type="button"
             onClick={() => setEtat(cle)}
             className={`rounded-md px-3 py-1.5 transition-colors ${
-              etat === cle ? 'bg-white/60 font-medium' : 'text-fonce/55 hover:bg-white/35'
+              etat === cle ? 'bg-white/60 font-medium' : 'text-ekn-text-muted hover:bg-white/35'
             }`}
           >
             {libelle}
@@ -185,7 +185,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
       </div>
       {etat === 'corbeille' ? (
         <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
-          <p className="text-[0.8125rem] text-fonce/50">
+          <p className="text-ekn-sm text-ekn-text-muted">
             Les réunions jetées disparaissent définitivement au bout de{' '}
             {retention} jours.
           </p>
@@ -202,7 +202,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
                 try { await api.viderCorbeille(); recharger(); }
                 catch (e) { setErreur(e.message); }
               }}
-              className="rounded-md px-3 py-1.5 text-[0.8125rem] text-violet ring-1 ring-violet/35 hover:bg-white/50"
+              className="rounded-md px-3 py-1.5 text-ekn-sm text-violet ring-1 ring-violet/35 hover:bg-white/50"
             >
               Vider la corbeille
             </button>
@@ -219,7 +219,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
       {resultats ? (
         <Resultats resultats={resultats} requete={recherche} surOuvrir={(id) => surOuvrir(id, recherche.trim())} />
       ) : jobs === null ? (
-        <p className="py-16 text-center text-fonce/50">Chargement…</p>
+        <p className="py-16 text-center text-ekn-text-muted">Chargement…</p>
       ) : jobs.length === 0 ? (
         etat === 'corbeille' ? (
           <Vide titre="Corbeille vide">Rien à récupérer.</Vide>
@@ -257,7 +257,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
                   aria-selected={choisis.has(job.job_id)}
                   className={`cursor-pointer border-b border-bord/50 last:border-0 transition-colors ${
                     choisis.has(job.job_id)
-                      ? 'bg-turquoise/25 shadow-[inset_3px_0_0_#14A87B] hover:bg-turquoise/30'
+                      ? 'bg-turquoise/25 shadow-[inset_3px_0_0_var(--color-turquoise-sombre)] hover:bg-turquoise/30'
                       : 'hover:bg-white/45'
                   }`}
                 >
@@ -267,7 +267,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
                         derrière un titre long, l'étiquette passait seule à la
                         ligne et flottait. */}
                     {job.title || job.has_versions ? (
-                      <span className="block text-[0.8125rem] text-fonce/45">
+                      <span className="block text-ekn-sm text-ekn-text-muted">
                         {job.title ? job.filename : null}
                         {job.title && job.has_versions ? ' · ' : null}
                         {job.has_versions ? (
@@ -288,7 +288,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
                             style={{ width: `${(job.progress.done / job.progress.total) * 100}%` }}
                           />
                         </span>
-                        <span className="text-[0.75rem] tabular-nums text-fonce/45">
+                        <span className="text-ekn-xs tabular-nums text-ekn-text-muted">
                           {job.progress.done}/{job.progress.total} fenêtres
                         </span>
                       </span>
@@ -381,8 +381,8 @@ function Selection({ jobs, etat, total, surTout, surVider, surFait, surErreur, s
       title={titre}
       disabled={Boolean(cours)}
       onClick={surClic}
-      className={`rounded-md px-2.5 py-1 text-[0.8125rem] transition-colors hover:bg-white/10 disabled:opacity-40 ${
-        danger ? 'text-[#ffb4ab]' : 'text-clair'
+      className={`rounded-md px-2.5 py-1 text-ekn-sm transition-colors hover:bg-white/10 disabled:opacity-40 ${
+        danger ? 'text-ekn-error-light' : 'text-clair'
       }`}
     >
       {libelle}
@@ -393,9 +393,9 @@ function Selection({ jobs, etat, total, surTout, surVider, surFait, surErreur, s
     <div
       role="toolbar"
       aria-label="Actions sur la sélection"
-      className="fixed inset-x-0 bottom-6 z-40 mx-auto flex w-fit max-w-[calc(100vw-2rem)] flex-wrap items-center gap-1 rounded-xl bg-fonce px-3 py-2 text-clair shadow-2xl"
+      className="fixed inset-x-0 bottom-6 z-40 mx-auto flex w-fit max-w-[calc(100vw-2rem)] flex-wrap items-center gap-1 rounded-xl bg-fonce ekn-dark px-3 py-2 text-clair shadow-2xl"
     >
-      <span className="px-2 text-[0.8125rem] tabular-nums text-clair/70">
+      <span className="px-2 text-ekn-sm tabular-nums text-clair/70">
         {cours
           ? `${cours.libelle} ${cours.fait}/${cours.total}…`
           : bilan || `${n} sélectionnée${pluriel}`}
@@ -482,7 +482,7 @@ function Actions({ job, etat, surFait, surErreur }) {
       title={titre}
       disabled={occupe}
       onClick={() => agir(action)}
-      className="rounded px-2 py-1 text-[0.8125rem] text-fonce/55 transition-colors hover:bg-white/60 hover:text-fonce disabled:opacity-40"
+      className="rounded px-2 py-1 text-ekn-sm text-ekn-text-muted transition-colors hover:bg-white/60 hover:text-fonce disabled:opacity-40"
     >
       {libelle}
     </button>
@@ -533,7 +533,7 @@ function Resultats({ resultats, requete, surOuvrir }) {
             onClick={() => surOuvrir(hit.job_id)}
             className="block w-full px-4 py-3 text-left transition-colors hover:bg-white/45"
           >
-            <span className="text-[0.8125rem] text-fonce/50">
+            <span className="text-ekn-sm text-ekn-text-muted">
               {hit.title || hit.filename} · {horodatage(hit.start_second)}
               {hit.speaker ? ` · ${hit.speaker}` : ''}
             </span>
@@ -557,29 +557,29 @@ function ALancer({ surLancer }) {
     <div className="verre mt-6 rounded-xl p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="titre text-[1.0625rem] font-medium">
-          À lancer <span className="tabular-nums text-fonce/45">{enAttente.length}</span>
+          À lancer <span className="tabular-nums text-ekn-text-muted">{enAttente.length}</span>
         </h2>
-        <span className="text-[0.8125rem] text-fonce/45">
+        <span className="text-ekn-sm text-ekn-text-muted">
           Restés sur ton poste : la liste se vide si tu fermes l’onglet.
         </span>
       </div>
       <ul className="mt-2 divide-y divide-bord/60">
         {enAttente.map((entree) => (
-          <li key={entree.id} className="flex items-center gap-3 py-2 text-[0.875rem]">
+          <li key={entree.id} className="flex items-center gap-3 py-2 text-ekn-sm">
             <span className="min-w-0 flex-1 truncate">{entree.file.name}</span>
-            <span className="whitespace-nowrap text-fonce/50">{jour(new Date(entree.file.lastModified).toISOString())}</span>
-            <span className="w-16 whitespace-nowrap text-right tabular-nums text-fonce/50">{fileSize(entree.file.size)}</span>
+            <span className="whitespace-nowrap text-ekn-text-muted">{jour(new Date(entree.file.lastModified).toISOString())}</span>
+            <span className="w-16 whitespace-nowrap text-right tabular-nums text-ekn-text-muted">{fileSize(entree.file.size)}</span>
             <button
               type="button"
               onClick={() => { requestLaunch(entree.id); surLancer?.(); }}
-              className="rounded-md bg-fonce px-3 py-1 text-[0.8125rem] text-clair hover:bg-fonce-doux"
+              className="rounded-md bg-fonce px-3 py-1 text-ekn-sm text-clair hover:bg-fonce-doux"
             >
               Lancer
             </button>
             <button
               type="button"
               onClick={() => removeFromQueue(entree.id)}
-              className="px-1 text-[0.8125rem] text-fonce/45 hover:text-fonce"
+              className="px-1 text-ekn-sm text-ekn-text-muted hover:text-fonce"
             >
               Retirer
             </button>
@@ -620,12 +620,12 @@ function DeposerIci() {
         >
           <div className="pointer-events-none rounded-2xl border-2 border-dashed border-turquoise bg-white/90 px-10 py-8 text-center shadow-2xl">
             <p className="titre text-[1.0625rem] font-medium">Dépose tes enregistrements</p>
-            <p className="mt-1 text-[0.875rem] text-fonce/60">Ils rejoignent « À lancer », à transcrire quand tu veux.</p>
+            <p className="mt-1 text-ekn-sm text-fonce/60">Ils rejoignent « À lancer », à transcrire quand tu veux.</p>
           </div>
         </div>
       ) : null}
       {message ? (
-        <p className="fixed bottom-6 left-0 right-0 z-40 mx-auto w-fit rounded-lg bg-fonce px-4 py-2 text-[0.875rem] text-clair shadow-xl">
+        <p className="fixed bottom-6 left-0 right-0 z-40 mx-auto w-fit rounded-lg bg-fonce px-4 py-2 text-ekn-sm text-clair shadow-xl">
           {message}
         </p>
       ) : null}
@@ -644,14 +644,14 @@ function Pagination({ page, total, parPage, surPage }) {
       type="button"
       disabled={!actif}
       onClick={() => surPage(cible)}
-      className="rounded-md px-3 py-1.5 text-[0.875rem] text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 disabled:opacity-30"
+      className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 disabled:opacity-30"
     >
       {libelle}
     </button>
   );
   return (
-    <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-[0.875rem]">
-      <span className="tabular-nums text-fonce/55">{debut}–{fin} sur {total} réunions</span>
+    <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-ekn-sm">
+      <span className="tabular-nums text-ekn-text-muted">{debut}–{fin} sur {total} réunions</span>
       <div className="flex items-center gap-2">
         {bouton('← Précédente', page - 1, page > 1)}
         <span className="px-2 tabular-nums text-fonce/60">Page {page} / {pages}</span>

@@ -51,7 +51,7 @@ export function Recovery({ connection, onOpen }) {
         Drive une fois copiés.
       </p>
       {message ? (
-        <p className={`mt-4 text-[0.875rem] ${message[0] === 'ok' ? 'text-turquoise-sombre' : 'text-[#8c1d18]'}`}>
+        <p className={`mt-4 text-ekn-sm ${message[0] === 'ok' ? 'text-ekn-success-dark' : 'text-ekn-error-dark'}`}>
           {message[1]}
         </p>
       ) : null}
@@ -66,7 +66,7 @@ export function Recovery({ connection, onOpen }) {
             onOpen={onOpen}
           />
         ) : (
-          <p className="text-fonce/50">Chargement…</p>
+          <p className="text-ekn-text-muted">Chargement…</p>
         )}
         <UpcomingSource
           title="Odoo"
@@ -86,9 +86,9 @@ function UpcomingSource({ title, text }) {
     <div className="verre rounded-xl p-5 opacity-70">
       <div className="flex items-baseline justify-between gap-3">
         <h2 className="titre text-[1.0625rem] font-medium">{title}</h2>
-        <span className="text-[0.8125rem] text-fonce/45">bientôt</span>
+        <span className="text-ekn-sm text-ekn-text-muted">bientôt</span>
       </div>
-      <p className="mt-1 text-[0.875rem] text-fonce/60">{text}</p>
+      <p className="mt-1 text-ekn-sm text-fonce/60">{text}</p>
     </div>
   );
 }
@@ -114,7 +114,7 @@ function DriveSource({ google, storage, onGoogle, onOpen }) {
       <div className="flex flex-wrap items-baseline justify-between gap-3">
         <h2 className="titre text-[1.0625rem] font-medium">Google Drive</h2>
         {google.connected ? (
-          <span className="text-[0.8125rem] text-fonce/55">
+          <span className="text-ekn-sm text-ekn-text-muted">
             {google.email} ·{' '}
             <button
               type="button"
@@ -132,12 +132,12 @@ function DriveSource({ google, storage, onGoogle, onOpen }) {
       </div>
 
       {!google.available ? (
-        <p className="mt-2 text-[0.875rem] text-fonce/60">
+        <p className="mt-2 text-ekn-sm text-fonce/60">
           La connexion à Google n’est pas encore configurée sur ce serveur.
         </p>
       ) : !google.connected ? (
         <div className="mt-2">
-          <p className="text-[0.875rem] text-fonce/60">
+          <p className="text-ekn-sm text-fonce/60">
             Ton Drive, les Drive partagés dont tu es membre, et ce qu’on t’a
             partagé. transcript ne voit que ce que tu vois, et ne déplace un
             fichier qu’en ton nom, quand tu le demandes.
@@ -150,7 +150,7 @@ function DriveSource({ google, storage, onGoogle, onOpen }) {
           </a>
         </div>
       ) : loading && !items ? (
-        <p className="mt-3 text-[0.875rem] text-fonce/55">Inventaire du Drive… cela peut prendre une minute.</p>
+        <p className="mt-3 text-ekn-sm text-ekn-text-muted">Inventaire du Drive… cela peut prendre une minute.</p>
       ) : (
         <>
           <Erreur>{error}</Erreur>
@@ -214,33 +214,33 @@ function Inventory({ items, storage, onReload, onOpen }) {
   const recoveredCount = Object.values(results).filter((r) => r.state === 'done').length;
 
   if (!items.length) {
-    return <p className="mt-3 text-[0.875rem] text-fonce/60">Aucun fichier audio ou vidéo dans ce Drive.</p>;
+    return <p className="mt-3 text-ekn-sm text-fonce/60">Aucun fichier audio ou vidéo dans ce Drive.</p>;
   }
 
   return (
     <div className="mt-4">
-      <div className="flex flex-wrap gap-1 text-[0.875rem]">
+      <div className="flex flex-wrap gap-1 text-ekn-sm">
         {KIND_FILTERS.map(([key, label]) => (
           <button
             key={key}
             type="button"
             onClick={() => setFilter(key)}
             className={`rounded-md px-3 py-1.5 transition-colors ${
-              filter === key ? 'bg-white/70 font-medium' : 'text-fonce/55 hover:bg-white/40'
+              filter === key ? 'bg-white/70 font-medium' : 'text-ekn-text-muted hover:bg-white/40'
             }`}
           >
-            {label} <span className="tabular-nums text-fonce/45">{groups[key].length}</span>
+            {label} <span className="tabular-nums text-ekn-text-muted">{groups[key].length}</span>
           </button>
         ))}
-        <button type="button" onClick={onReload} className="ml-auto px-2 text-[0.8125rem] text-fonce/50 hover:text-fonce">
+        <button type="button" onClick={onReload} className="ml-auto px-2 text-ekn-sm text-ekn-text-muted hover:text-fonce">
           Relancer l’inventaire
         </button>
       </div>
 
       {visible.length ? (
         <div className="mt-3 overflow-x-auto rounded-lg border border-bord/70 bg-white/60">
-          <table className="w-full min-w-[46rem] border-collapse text-[0.875rem]">
-            <thead className="border-b border-bord text-left text-[0.8125rem] text-fonce/55">
+          <table className="w-full min-w-[46rem] border-collapse text-ekn-sm">
+            <thead className="border-b border-bord text-left text-ekn-sm text-ekn-text-muted">
               <tr>
                 <th className="w-10 px-3 py-2" />
                 <th className="px-3 py-2 font-medium">Fichier</th>
@@ -266,11 +266,11 @@ function Inventory({ items, storage, onReload, onOpen }) {
           </table>
         </div>
       ) : (
-        <p className="mt-3 text-[0.875rem] text-fonce/50">Rien dans cette catégorie.</p>
+        <p className="mt-3 text-ekn-sm text-ekn-text-muted">Rien dans cette catégorie.</p>
       )}
 
-      <div className="sticky bottom-4 mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl bg-fonce px-4 py-3 text-clair shadow-xl">
-        <span className="text-[0.875rem] tabular-nums">
+      <div className="ekn-dark sticky bottom-4 mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl bg-fonce px-4 py-3 text-clair shadow-xl">
+        <span className="text-ekn-sm tabular-nums">
           {running
             ? `Récupération… ${recoveredCount}/${recoveredCount + chosen.length}`
             : chosen.length
@@ -279,13 +279,13 @@ function Inventory({ items, storage, onReload, onOpen }) {
                 ? `${recoveredCount} fichier${recoveredCount > 1 ? 's' : ''} rangé${recoveredCount > 1 ? 's' : ''} à leur date dans ta bibliothèque`
                 : 'Coche les fichiers à récupérer'}
         </span>
-        <label className="flex items-center gap-2 text-[0.8125rem] text-clair/80">
+        <label className="flex items-center gap-2 text-ekn-sm text-clair/80">
           <input
             type="checkbox"
             checked={trashOriginals}
             disabled={running}
             onChange={(e) => setTrashOriginals(e.target.checked)}
-            className="h-4 w-4 accent-[#2AD39F]"
+            className="h-4 w-4 accent-turquoise"
           />
           Mettre les originaux à la corbeille du Drive une fois copiés (30 jours pour se raviser)
         </label>
@@ -294,7 +294,7 @@ function Inventory({ items, storage, onReload, onOpen }) {
           disabled={running || !chosen.length || !storage}
           onClick={recover}
           title={storage ? '' : 'Le stockage vidéo n’est pas configuré'}
-          className="ml-auto rounded-lg bg-turquoise px-4 py-1.5 text-[0.875rem] font-medium text-fonce hover:bg-turquoise/90 disabled:opacity-40"
+          className="ml-auto rounded-lg bg-turquoise px-4 py-1.5 text-ekn-sm font-medium text-fonce hover:bg-turquoise/90 disabled:opacity-40"
         >
           Récupérer
         </button>
@@ -332,7 +332,7 @@ function Row({ item, checked, result, disabled, onToggle, onOpen }) {
     <tr className="border-b border-bord/50 last:border-0">
       <td className="px-3 py-2 align-top">
         {result?.state === 'done' ? (
-          <span className="text-turquoise-sombre">✓</span>
+          <span className="text-ekn-success-dark">✓</span>
         ) : result?.state === 'running' ? (
           <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-fonce/20 border-t-fonce/70" />
         ) : (
@@ -342,7 +342,7 @@ function Row({ item, checked, result, disabled, onToggle, onOpen }) {
             disabled={disabled}
             onChange={onToggle}
             aria-label={`Récupérer ${item.name}`}
-            className="mt-0.5 h-4 w-4 accent-[#14A87B] disabled:opacity-30"
+            className="mt-0.5 h-4 w-4 accent-turquoise-sombre disabled:opacity-30"
           />
         )}
       </td>
@@ -351,7 +351,7 @@ function Row({ item, checked, result, disabled, onToggle, onOpen }) {
           {item.name}
         </a>
         {status || result ? (
-          <span className={`block text-[0.75rem] ${result?.state === 'error' ? 'text-[#8c1d18]' : 'text-fonce/50'}`}>
+          <span className={`block text-ekn-sm ${result?.state === 'error' ? 'text-ekn-error-dark' : 'text-ekn-text-muted'}`}>
             {result?.message || status}
             {(result?.jobId || item.job_id) ? (
               <button
@@ -368,7 +368,7 @@ function Row({ item, checked, result, disabled, onToggle, onOpen }) {
       <td className="whitespace-nowrap px-3 py-2 text-fonce/70">
         {jour(item.recorded_at)}
         {!item.recorded_at_from_name ? (
-          <span className="block text-[0.75rem] text-fonce/40" title="Date du dépôt dans le Drive : l’enregistrement peut être un peu plus ancien.">
+          <span className="block text-ekn-xs text-ekn-text-muted" title="Date du dépôt dans le Drive : l’enregistrement peut être un peu plus ancien.">
             date du Drive
           </span>
         ) : null}

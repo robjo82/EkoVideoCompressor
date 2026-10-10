@@ -362,7 +362,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                 enCours ? 'cursor-not-allowed' : 'cursor-pointer hover:bg-white/50'
               } ${glisse ? 'opacity-0' : ''}`}
             >
-              <span className={`shrink-0 rounded-md px-3 py-1.5 text-[0.875rem] ${
+              <span className={`shrink-0 rounded-md px-3 py-1.5 text-ekn-sm ${
                 enCours ? 'bg-fonce/30 text-clair' : 'bg-fonce text-clair'
               }`}>
                 Choisir des fichiers
@@ -382,20 +382,20 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                 <span className="titre text-[0.9375rem] font-medium">
                   {surZone ? 'Lâche pour ajouter' : 'Dépose tes enregistrements ici'}
                 </span>
-                <span className="text-[0.8125rem] text-fonce/55">
+                <span className="text-ekn-sm text-ekn-text-muted">
                   {enCours ? 'ils attendront la fin de l’envoi en cours' : 'un seul, ou plusieurs à la fois'}
                 </span>
               </div>
             ) : null}
           </div>
           {ignores ? (
-            <p className="mt-2 text-[0.8125rem] text-fonce/55">
+            <p className="mt-2 text-ekn-sm text-ekn-text-muted">
               {ignores} fichier{ignores > 1 ? 's' : ''} ignoré{ignores > 1 ? 's' : ''} : ni audio ni vidéo.
             </p>
           ) : null}
           {enAttente.length ? (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[0.8125rem]">
-              <span className="text-fonce/55">Ensuite :</span>
+            <div className="mt-2 flex flex-wrap items-center gap-1.5 text-ekn-sm">
+              <span className="text-ekn-text-muted">Ensuite :</span>
               {enAttente.map((entree) => (
                 <span key={entree.id} className="inline-flex items-center gap-1 rounded-full bg-white/70 px-2.5 py-0.5 text-fonce/75 ring-1 ring-bord">
                   {entree.file.name}
@@ -403,7 +403,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                     type="button"
                     onClick={() => removeFromQueue(entree.id)}
                     aria-label={`Retirer ${entree.file.name} de la file`}
-                    className="text-fonce/40 hover:text-fonce"
+                    className="text-ekn-text-muted hover:text-fonce"
                   >
                     ×
                   </button>
@@ -411,12 +411,12 @@ export function Nouveau({ surTermine, surBibliotheque }) {
               ))}
             </div>
           ) : null}
-          {lecture ? <p className="mt-2 text-[0.875rem] text-fonce/60">{lecture}</p> : null}
+          {lecture ? <p className="mt-2 text-ekn-sm text-fonce/60">{lecture}</p> : null}
           {fichier ? (
-            <div className="mt-3 flex flex-wrap items-center gap-3 text-[0.875rem]">
+            <div className="mt-3 flex flex-wrap items-center gap-3 text-ekn-sm">
               <span className="text-fonce/70">Date de la réunion</span>
               <DateHeure valeur={dateReunion} surChange={setDateReunion} disabled={enCours} />
-              <span className="text-[0.8125rem] text-fonce/45">
+              <span className="text-ekn-sm text-ekn-text-muted">
                 {fichier.remote
                   ? 'celle de la réunion récupérée'
                   : "déduite du fichier — corrige-la s'il a été recopié"}
@@ -460,19 +460,19 @@ export function Nouveau({ surTermine, surBibliotheque }) {
             ))}
           </div>
           {mode === 'les-deux' && fichier?.remote ? (
-            <p className="mt-2 text-[0.8125rem] text-fonce/55">
+            <p className="mt-2 text-ekn-sm text-ekn-text-muted">
               La vidéo stockée ({mo(fichier.size)}) est relue, compressée sur ce
               poste — 720p, HEVC — puis remplace l’originale en stockage froid.
               Si elle n’en sort pas plus légère, on garde celle qui y est.
             </p>
           ) : mode === 'les-deux' && videoDisponible ? (
-            <p className="mt-2 text-[0.8125rem] text-fonce/55">
+            <p className="mt-2 text-ekn-sm text-ekn-text-muted">
               La vidéo est compressée sur ce poste — 720p, HEVC, environ 92 %
               plus légère — puis archivée en stockage froid avec la réunion.
               Ton fichier d'origine ne quitte pas ta machine.
             </p>
           ) : mode !== 'transcrire' ? (
-            <p className="mt-2 text-[0.8125rem] text-fonce/55">
+            <p className="mt-2 text-ekn-sm text-ekn-text-muted">
               La version compressée est enregistrée sur ton disque — 720p,
               HEVC, environ 92 % plus légère.
               {mode === 'compresser' && videoDisponible
@@ -487,7 +487,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
 
         <div className={mode === 'compresser' ? 'hidden' : undefined}>
           <h2 className="titre text-[1.0625rem] font-medium">3. Le contexte</h2>
-          <p className="mt-1 text-[0.875rem] text-fonce/60">
+          <p className="mt-1 text-ekn-sm text-fonce/60">
             Facultatif, mais c'est ce qui fait la différence entre « Réunion du
             3 juillet » et un titre utile.
           </p>
@@ -566,32 +566,32 @@ export function Nouveau({ surTermine, surBibliotheque }) {
         {dossier && mode !== 'compresser' ? (
           <div className="rounded-xl border border-turquoise/40 bg-white/80 px-4 py-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-[0.875rem]">
-                <span className="text-fonce/55">Dossier Odoo : </span>
+              <p className="text-ekn-sm">
+                <span className="text-ekn-text-muted">Dossier Odoo : </span>
                 <span className="titre font-medium">{dossier.name}</span>
-                {dossier.partner ? <span className="text-fonce/55"> · {dossier.partner}</span> : null}
+                {dossier.partner ? <span className="text-ekn-text-muted"> · {dossier.partner}</span> : null}
               </p>
               <button
                 type="button"
                 disabled={enCours}
                 onClick={retirer}
-                className="text-[0.8125rem] text-fonce/55 hover:text-fonce"
+                className="text-ekn-sm text-ekn-text-muted hover:text-fonce"
               >
                 retirer
               </button>
             </div>
-            <label className="mt-2 flex items-center gap-2 text-[0.875rem] text-fonce/80">
+            <label className="mt-2 flex items-center gap-2 text-ekn-sm text-fonce/80">
               <input
                 type="checkbox"
                 checked={Boolean(dossier.auto)}
                 disabled={enCours}
                 onChange={(e) => setDossier({ ...dossier, auto: e.target.checked })}
-                className="h-4 w-4 accent-[#2AD39F]"
+                className="h-4 w-4 accent-turquoise"
               />
               Déposer la transcription dans ce dossier à la fin, et me prévenir
             </label>
             {fichier?.remote ? (
-              <p className="mt-1 pl-6 text-[0.8125rem] text-fonce/55">
+              <p className="mt-1 pl-6 text-ekn-sm text-ekn-text-muted">
                 Réunion récupérée : sa transcription y est peut-être déjà,
                 déposée par l’ancienne app. Coche seulement si ce n’est pas le cas.
               </p>
@@ -650,7 +650,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                   : 'Lancer la transcription'}
           </Bouton>
           {pipeline.estimation !== null ? (
-            <span className="text-[0.875rem] text-fonce/60">
+            <span className="text-ekn-sm text-fonce/60">
               Coût estimé {usd(pipeline.estimation)}
             </span>
           ) : null}
@@ -660,9 +660,9 @@ export function Nouveau({ surTermine, surBibliotheque }) {
         {pipeline.reprenable ? (
           // Le fichier est encore en mémoire et la réunion existe : on
           // reprend où ça s'est arrêté, sans repayer ce qui est transcrit.
-          <div className="-mt-4 flex flex-wrap items-center gap-3 text-[0.875rem]">
+          <div className="-mt-4 flex flex-wrap items-center gap-3 text-ekn-sm">
             <Bouton onClick={() => reprendre(pipeline.cle)}>Reprendre là où ça s’est arrêté</Bouton>
-            <span className="text-fonce/55">
+            <span className="text-ekn-text-muted">
               Si le fichier est sur iCloud, attends qu’il soit entièrement téléchargé sur ce Mac.
             </span>
           </div>
@@ -681,7 +681,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
 
         {pipeline.etat === 'traitement' || pipeline.etat === 'interrompu' ? (
           <div className="verre rounded-xl p-4">
-            <p className="text-[0.875rem] text-fonce/75">
+            <p className="text-ekn-sm text-fonce/75">
               {pipeline.etat === 'interrompu'
                 ? 'Transcription interrompue. La réunion est dans la corbeille, si tu veux la récupérer.'
                 : pipeline.envoiTermine
@@ -710,7 +710,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                   if (suivant) charger(suivant);
                   window.scrollTo({ top: 0, behavior: 'smooth' });
                 }}
-                className="rounded-md px-3 py-1.5 text-[0.875rem] text-fonce/70 ring-1 ring-bord hover:bg-white/60"
+                className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord hover:bg-white/60"
               >
                 {enAttente.length
                   ? `Passer à la suivante (${enAttente.length} en attente)`
@@ -725,7 +725,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                       + 'et la réunion part à la corbeille.',
                     )) interrompre(pipeline.cle);
                   }}
-                  className="ml-auto rounded-md px-3 py-1.5 text-[0.875rem] text-[#8c1d18] ring-1 ring-[#b3261e]/30 hover:bg-[#b3261e]/5"
+                  className="ml-auto rounded-md px-3 py-1.5 text-ekn-sm text-[#8c1d18] ring-1 ring-[#b3261e]/30 hover:bg-[#b3261e]/5"
                 >
                   Interrompre
                 </button>
@@ -761,7 +761,7 @@ function Avancement({ numero, fenetres, message }) {
         {/* Le contexte est masqué en simple compression : la numérotation suit
             ce qui est affiché, sans doublon ni trou. */}
         <h2 className="titre text-[1.0625rem] font-medium">{numero}. Avancement</h2>
-        <span className="text-[0.875rem] text-fonce/60">
+        <span className="text-ekn-sm text-fonce/60">
           {finies} / {fenetres.length} fenêtres
         </span>
       </div>
@@ -772,21 +772,21 @@ function Avancement({ numero, fenetres, message }) {
           style={{ width: `${(finies / fenetres.length) * 100}%` }}
         />
       </div>
-      {message ? <p className="mt-2 text-[0.875rem] text-fonce/60">{message}</p> : null}
+      {message ? <p className="mt-2 text-ekn-sm text-fonce/60">{message}</p> : null}
 
       <ul className="verre mt-4 divide-y divide-bord/60 rounded-xl">
         {fenetres.map((f) => (
           <li key={f.index} className="flex items-center gap-4 px-4 py-2.5">
-            <span className="w-16 shrink-0 text-[0.875rem] tabular-nums text-fonce/55">
+            <span className="w-16 shrink-0 text-ekn-sm tabular-nums text-ekn-text-muted">
               {horodatage(f.start)}
             </span>
-            <span className={`flex-1 text-[0.9375rem] ${f.etat === 'erreur' ? 'text-[#8c1d18]' : ''}`}>
+            <span className={`flex-1 text-[0.9375rem] ${f.etat === 'erreur' ? 'text-ekn-error-dark' : ''}`}>
               {f.etat === 'erreur' ? f.erreur : LIBELLES[f.etat]}
               {f.etat === 'encodage' && f.progression
                 ? ` ${Math.round(f.progression * 100)} %`
                 : ''}
             </span>
-            <span className="shrink-0 text-[0.875rem] tabular-nums text-fonce/45">
+            <span className="shrink-0 text-ekn-sm tabular-nums text-ekn-text-muted">
               {f.octets ? mo(f.octets) : ''}
             </span>
           </li>
@@ -819,13 +819,13 @@ function Suggestions({ choisis, surAjout }) {
   if (termes.length === 0) return null;
   return (
     <div className="mt-2 flex flex-wrap items-center gap-1.5">
-      <span className="text-[0.8125rem] text-fonce/50">Déjà utilisés :</span>
+      <span className="text-ekn-sm text-ekn-text-muted">Déjà utilisés :</span>
       {termes.map((t) => (
         <button
           key={t.term}
           type="button"
           onClick={() => surAjout(t.term)}
-          className="rounded-md border border-bord bg-white px-2 py-0.5 text-[0.8125rem] hover:border-turquoise-sombre hover:text-turquoise-sombre"
+          className="rounded-md border border-bord bg-white px-2 py-0.5 text-ekn-sm hover:border-ekn-border-control"
         >
           {t.term}
         </button>
@@ -853,7 +853,7 @@ function Reunions({ surChoix }) {
   return (
     <div className="verre mt-4 rounded-xl p-4">
       <p className="titre text-[0.9375rem] font-medium">Réunions Odoo du moment</p>
-      <p className="mt-0.5 text-[0.8125rem] text-fonce/55">
+      <p className="mt-0.5 text-ekn-sm text-ekn-text-muted">
         En choisir une remplit les participants, la partie prenante et le
         vocabulaire depuis Odoo.
       </p>
@@ -890,13 +890,13 @@ function Reunions({ surChoix }) {
                   setChargement(false);
                 }
               }}
-              className={`w-full rounded-md px-2 py-1.5 text-left text-[0.875rem] hover:bg-papier ${
+              className={`w-full rounded-md px-2 py-1.5 text-left text-ekn-sm hover:bg-papier ${
                 choisie === r.id ? 'ring-1 ring-turquoise-sombre' : ''
               }`}
             >
               <span className="titre font-medium">{r.name}</span>
               {r.attendees.length ? (
-                <span className="block text-[0.8125rem] text-fonce/55">
+                <span className="block text-ekn-sm text-ekn-text-muted">
                   {r.attendees.join(', ')}
                 </span>
               ) : null}
@@ -919,7 +919,7 @@ export function AvancementArchivage({ tache }) {
   }[tache.etape] || 'Archivage';
   return (
     <div className="mt-2">
-      <p className="text-[0.875rem] text-fonce/70">
+      <p className="text-ekn-sm text-fonce/70">
         {libelle}
         {tache.etape === 'compression' || tache.etape === 'envoi'
           ? ` — ${Math.round((tache.progression || 0) * 100)} %. Tu peux continuer à travailler, mais garde cet onglet ouvert.`
@@ -933,8 +933,8 @@ export function AvancementArchivage({ tache }) {
           />
         </div>
       ) : null}
-      {tache.note ? <p className="mt-1 text-[0.8125rem] text-fonce/60">{tache.note}</p> : null}
-      {tache.erreur ? <p className="mt-1 text-[0.8125rem] text-violet">{tache.erreur}</p> : null}
+      {tache.note ? <p className="mt-1 text-ekn-sm text-fonce/60">{tache.note}</p> : null}
+      {tache.erreur ? <p className="mt-1 text-ekn-sm text-violet">{tache.erreur}</p> : null}
     </div>
   );
 }
@@ -954,7 +954,7 @@ function Compression({ compression }) {
       {resultat ? (
         <p className="mt-2 text-[0.9375rem]">
           {mo(resultat.source)} → <strong>{mo(resultat.bytes)}</strong>{' '}
-          <span className="text-fonce/55">
+          <span className="text-ekn-text-muted">
             ({Math.round((1 - resultat.bytes / resultat.source) * 100)} % de moins,
             en {Math.round(resultat.ms / 60000)} min) — enregistré sur ton disque.
           </span>
@@ -967,7 +967,7 @@ function Compression({ compression }) {
               style={{ width: `${compression.progression * 100}%` }}
             />
           </div>
-          <p className="mt-2 text-[0.875rem] text-fonce/60">
+          <p className="mt-2 text-ekn-sm text-fonce/60">
             Encodage sur ce poste — {Math.round(compression.progression * 100)} %.
             Garde cet onglet ouvert.
           </p>

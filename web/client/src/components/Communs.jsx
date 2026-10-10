@@ -11,7 +11,7 @@ import { useEffect, useRef, useState } from 'react';
 export function Bouton({ variante = 'primaire', className = '', ...props }) {
   const styles = {
     primaire: 'bg-fonce text-clair hover:bg-fonce-doux disabled:opacity-40',
-    accent: 'bg-turquoise text-fonce hover:bg-turquoise-sombre hover:text-clair disabled:opacity-40',
+    accent: 'bg-turquoise text-fonce hover:bg-turquoise-sombre disabled:opacity-40',
     discret: 'border border-bord/80 bg-white/70 text-fonce hover:border-fonce/40 hover:bg-white disabled:opacity-40',
   }[variante];
   return (
@@ -25,12 +25,12 @@ export function Bouton({ variante = 'primaire', className = '', ...props }) {
 export function Champ({ label, aide, ...props }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-[0.8125rem] text-fonce/65">{label}</span>
+      <span className="mb-1 block text-ekn-sm text-fonce/65">{label}</span>
       <input
         {...props}
-        className="w-full rounded-lg border border-bord/80 bg-white/70 px-3 py-2 text-fonce transition-colors placeholder:text-fonce/35 focus:bg-white"
+        className="w-full rounded-lg border border-bord/80 bg-white/70 px-3 py-2 text-fonce transition-colors placeholder:text-ekn-text-muted focus:bg-white"
       />
-      {aide ? <span className="mt-1 block text-[0.8125rem] text-fonce/50">{aide}</span> : null}
+      {aide ? <span className="mt-1 block text-ekn-sm text-ekn-text-muted">{aide}</span> : null}
     </label>
   );
 }
@@ -40,9 +40,9 @@ export function Champ({ label, aide, ...props }) {
  *  existe — un repère rare, donc précieux. */
 const ETATS = {
   en_attente: ['En attente', 'bg-fonce/8 text-fonce/70'],
-  en_cours: ['En cours', 'bg-turquoise/20 text-turquoise-sombre'],
-  a_finaliser: ['À finaliser', 'bg-turquoise/20 text-turquoise-sombre'],
-  finalisation: ['Fusion…', 'bg-turquoise/20 text-turquoise-sombre'],
+  en_cours: ['En cours', 'bg-turquoise/20 text-fonce'],
+  a_finaliser: ['À finaliser', 'bg-turquoise/20 text-fonce'],
+  finalisation: ['Fusion…', 'bg-turquoise/20 text-fonce'],
   termine: ['Terminé', 'bg-turquoise text-fonce'],
   erreur: ['Erreur', 'bg-[#b3261e]/12 text-[#8c1d18]'],
   recovered: ['Récupérée', 'bg-violet/10 text-violet'],
@@ -52,7 +52,7 @@ const ETATS = {
 export function Etat({ valeur }) {
   const [libelle, style] = ETATS[valeur] || [valeur, 'bg-fonce/8 text-fonce/70'];
   return (
-    <span className={`inline-block rounded-md px-2 py-0.5 text-[0.8125rem] font-medium ${style}`}>
+    <span className={`inline-block rounded-md px-2 py-0.5 text-ekn-sm font-medium ${style}`}>
       {libelle}
     </span>
   );
@@ -61,7 +61,7 @@ export function Etat({ valeur }) {
 export function Erreur({ children }) {
   if (!children) return null;
   return (
-    <p className="rounded-lg border border-[#b3261e]/25 bg-[#b3261e]/6 px-3 py-2 text-[0.875rem] text-[#8c1d18]">
+    <p className="rounded-lg border border-[#b3261e]/25 bg-[#b3261e]/6 px-3 py-2 text-ekn-sm text-[#8c1d18]">
       {children}
     </p>
   );
@@ -151,7 +151,7 @@ export function DateHeure({ valeur, surChange, disabled = false }) {
           setMois(new Date(date.getFullYear(), date.getMonth(), 1));
           setOuvert((o) => !o);
         }}
-        className="rounded-md border border-bord bg-white px-3 py-1.5 text-left text-[0.875rem] hover:border-fonce/40 disabled:opacity-50"
+        className="rounded-md border border-bord bg-white px-3 py-1.5 text-left text-ekn-sm hover:border-fonce/40 disabled:opacity-50"
       >
         {lireLocal(valeur)
           ? date.toLocaleString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
@@ -164,14 +164,14 @@ export function DateHeure({ valeur, surChange, disabled = false }) {
             <button type="button" aria-label="Mois précédent"
                     onClick={() => setMois(new Date(mois.getFullYear(), mois.getMonth() - 1, 1))}
                     className="rounded px-2 py-1 text-fonce/60 hover:bg-papier">‹</button>
-            <span className="titre text-[0.875rem] font-medium">
+            <span className="titre text-ekn-sm font-medium">
               {MOIS[mois.getMonth()]} {mois.getFullYear()}
             </span>
             <button type="button" aria-label="Mois suivant"
                     onClick={() => setMois(new Date(mois.getFullYear(), mois.getMonth() + 1, 1))}
                     className="rounded px-2 py-1 text-fonce/60 hover:bg-papier">›</button>
           </div>
-          <div className="mt-2 grid grid-cols-7 gap-1 text-center text-[0.75rem] text-fonce/45">
+          <div className="mt-2 grid grid-cols-7 gap-1 text-center text-ekn-xs text-ekn-text-muted">
             {JOURS.map((j, i) => <span key={i}>{j}</span>)}
           </div>
           <div className="mt-1 grid grid-cols-7 gap-1">
@@ -180,7 +180,7 @@ export function DateHeure({ valeur, surChange, disabled = false }) {
                 key={i}
                 type="button"
                 onClick={() => changer({ jour: new Date(mois.getFullYear(), mois.getMonth(), j) })}
-                className={`rounded-md py-1 text-[0.8125rem] tabular-nums ${
+                className={`rounded-md py-1 text-ekn-sm tabular-nums ${
                   memeJour(j) ? 'bg-fonce text-clair' : 'hover:bg-turquoise/15'
                 }`}
               >
@@ -188,15 +188,15 @@ export function DateHeure({ valeur, surChange, disabled = false }) {
               </button>
             ) : <span key={i} />))}
           </div>
-          <div className="mt-3 flex items-center justify-between border-t border-bord pt-3 text-[0.875rem]">
+          <div className="mt-3 flex items-center justify-between border-t border-bord pt-3 text-ekn-sm">
             <span className="text-fonce/60">Heure</span>
             <span className="flex items-center gap-1">
               {champHeure(date.getHours(), 23, 'heure')}
-              <span className="text-fonce/50">:</span>
+              <span className="text-ekn-text-muted">:</span>
               {champHeure(date.getMinutes(), 59, 'minute')}
             </span>
             <button type="button" onClick={() => setOuvert(false)}
-                    className="rounded-md bg-fonce px-3 py-1 text-[0.8125rem] text-clair">OK</button>
+                    className="rounded-md bg-fonce px-3 py-1 text-ekn-sm text-clair">OK</button>
           </div>
         </div>
       ) : null}

@@ -8,16 +8,16 @@
 @import "../vendor/ekonum-ui/tailwind.css";
 
 @theme {
-  /* Palette officielle, telle quelle. Les nuances dérivées ne servent
-     qu'aux surfaces et aux bordures : elles ne créent pas de nouvelle
-     couleur de marque. */
-  --color-fonce: #021A1A;
+  /* Palette officielle, reprise d'ekonum-ui. Les nuances dérivées ne
+     servent qu'aux surfaces et aux bordures : elles ne créent pas de
+     nouvelle couleur de marque. */
+  --color-fonce: var(--ekn-dark-green);
   --color-fonce-doux: #0A2726;
-  --color-clair: #EAEAEA;
+  --color-clair: var(--ekn-off-white);
   --color-papier: #F4F5F4;
-  --color-turquoise: #2AD39F;
+  --color-turquoise: var(--ekn-turquoise);
   --color-turquoise-sombre: #14A87B;
-  --color-violet: #9645D6;
+  --color-violet: var(--ekn-violet);
   --color-bord: #D2D8D6;
 
   --font-titre: "Chillax", -apple-system, BlinkMacSystemFont, sans-serif;
@@ -54,10 +54,10 @@ body {
 
 h1, h2, h3, .titre { font-family: var(--font-titre); }
 
-/* Le turquoise porte les actions et la continuité ; on le garde aussi
-   comme couleur de focus plutôt que le bleu par défaut du navigateur. */
+/* L'anneau de focus du design system : l'encre sur fond clair, le
+   turquoise dans une zone foncée (.ekn-dark) — au moins 3:1 partout. */
 :focus-visible {
-  outline: 2px solid var(--color-turquoise-sombre);
+  outline: 2px solid var(--ekn-focus);
   outline-offset: 2px;
 }
 

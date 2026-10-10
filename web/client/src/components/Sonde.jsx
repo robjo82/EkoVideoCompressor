@@ -36,13 +36,13 @@ export function Sonde({ etat, retenu, surChoix, surRetrait, surAjout }) {
     <div className="verre mt-4 rounded-xl p-4">
       <p className="titre text-[0.9375rem] font-medium">Ce qu'on a entendu</p>
       {indices.resume ? (
-        <p className="mt-1 text-[0.8125rem] text-fonce/70">{indices.resume}</p>
+        <p className="mt-1 text-ekn-sm text-fonce/70">{indices.resume}</p>
       ) : null}
       {entendu.length ? (
         <ul className="mt-2 flex flex-wrap gap-1.5">
           {entendu.map((terme) => (
             <li key={terme}
-                className="rounded-full bg-papier px-2 py-0.5 text-[0.75rem] text-fonce/70">
+                className="rounded-full bg-papier px-2 py-0.5 text-ekn-xs text-fonce/70">
               {terme}
             </li>
           ))}
@@ -57,12 +57,12 @@ export function Sonde({ etat, retenu, surChoix, surRetrait, surAjout }) {
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <p className="titre text-[0.9375rem] font-medium">Dossier Odoo de cette réunion</p>
             {enquete.record && estRetenu(enquete.record) ? (
-              <span className="rounded-full bg-turquoise/20 px-2 py-0.5 text-[0.75rem] font-medium text-turquoise-sombre">
+              <span className="rounded-full bg-turquoise/20 px-2 py-0.5 text-ekn-xs font-medium text-fonce">
                 {CERTITUDE[enquete.confidence] || 'Proposé'}
               </span>
             ) : null}
           </div>
-          <p className="mt-1 text-[0.8125rem] text-fonce/60">
+          <p className="mt-1 text-ekn-sm text-fonce/60">
             {!candidats.length
               ? `Aucun dossier trouvé${enquete.reason ? ` : ${enquete.reason}` : '.'}`
               : enquete.record
@@ -87,12 +87,12 @@ export function Sonde({ etat, retenu, surChoix, surRetrait, surAjout }) {
               <button
                 type="button"
                 onClick={surRetrait}
-                className="text-[0.8125rem] text-fonce/55 underline-offset-2 hover:text-fonce hover:underline"
+                className="text-ekn-sm text-ekn-text-muted underline-offset-2 hover:text-fonce hover:underline"
               >
                 Aucun de ceux-là
               </button>
             ) : (
-              <span className="text-[0.8125rem] text-fonce/45">
+              <span className="text-ekn-sm text-ekn-text-muted">
                 {candidats.length ? 'Aucun retenu : la transcription ne sera rattachée à rien.' : ''}
               </span>
             )}
@@ -100,7 +100,7 @@ export function Sonde({ etat, retenu, surChoix, surRetrait, surAjout }) {
               <button
                 type="button"
                 onClick={() => setDiscussion(true)}
-                className="inline-flex items-center gap-1.5 rounded-full border border-bord bg-white px-3 py-1 text-[0.8125rem] text-fonce/70 transition-colors hover:border-fonce/40 hover:text-fonce"
+                className="inline-flex items-center gap-1.5 rounded-full border border-bord bg-white px-3 py-1 text-ekn-sm text-fonce/70 transition-colors hover:border-fonce/40 hover:text-fonce"
               >
                 <IconeBulle />
                 {echanges.length ? 'Reprendre la recherche' : 'Pas le bon ? Guider la recherche'}
@@ -112,10 +112,10 @@ export function Sonde({ etat, retenu, surChoix, surRetrait, surAjout }) {
 
       {(enquete.trace || []).length ? (
         <details className="mt-3">
-          <summary className="cursor-pointer text-[0.75rem] text-fonce/45">
+          <summary className="cursor-pointer text-ekn-sm text-ekn-text-muted">
             Comment on est arrivé là
           </summary>
-          <ol className="mt-1 space-y-0.5 text-[0.75rem] text-fonce/55">
+          <ol className="mt-1 space-y-0.5 text-ekn-sm text-ekn-text-muted">
             {enquete.trace.map((ligne, i) => (
               <li key={i}>· {ligne}</li>
             ))}
@@ -149,11 +149,11 @@ function Carte({ dossier, choisi, surChoix, surRetrait }) {
       }`}
     >
       <div className="min-w-0 flex-1">
-        <p className="text-[0.875rem]">
+        <p className="text-ekn-sm">
           <span className="titre font-medium">{dossier.name}</span>
-          {dossier.partner ? <span className="text-fonce/55"> · {dossier.partner}</span> : null}
+          {dossier.partner ? <span className="text-ekn-text-muted"> · {dossier.partner}</span> : null}
         </p>
-        <p className="text-[0.75rem] text-fonce/50">
+        <p className="text-ekn-sm text-ekn-text-muted">
           {[dossier.kind, dossier.reason,
             dossier.matched ? `trouvé sur « ${dossier.matched} »` : '',
             dossier.updated ? `modifié le ${dossier.updated}` : '']
@@ -167,7 +167,7 @@ function Carte({ dossier, choisi, surChoix, surRetrait }) {
           type="button"
           onClick={surRetrait}
           title="Ne plus utiliser ce dossier"
-          className="group w-24 shrink-0 rounded-md px-3 py-1.5 text-[0.8125rem] font-medium text-turquoise-sombre hover:bg-fonce/5 hover:text-fonce"
+          className="group w-24 shrink-0 rounded-md px-3 py-1.5 text-ekn-sm font-medium text-ekn-success-dark hover:bg-fonce/5 hover:text-fonce"
         >
           <span className="group-hover:hidden">✓ utilisé</span>
           <span className="hidden group-hover:inline">Retirer</span>
@@ -176,7 +176,7 @@ function Carte({ dossier, choisi, surChoix, surRetrait }) {
         <button
           type="button"
           onClick={surChoix}
-          className="w-24 shrink-0 rounded-md bg-fonce px-3 py-1.5 text-[0.8125rem] text-clair hover:bg-fonce-doux"
+          className="w-24 shrink-0 rounded-md bg-fonce px-3 py-1.5 text-ekn-sm text-clair hover:bg-fonce-doux"
         >
           Utiliser
         </button>
@@ -215,9 +215,9 @@ function Attente({ phase }) {
           <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-turquoise-sombre" />
         </span>
         <p className="titre text-[0.9375rem] font-medium">Recherche du dossier Odoo</p>
-        <span className="ml-auto text-[0.75rem] tabular-nums text-fonce/40">{secondes} s</span>
+        <span className="ml-auto text-ekn-xs tabular-nums text-ekn-text-muted">{secondes} s</span>
       </div>
-      <p className="mt-1 text-[0.8125rem] text-fonce/60">
+      <p className="mt-1 text-ekn-sm text-fonce/60">
         {phase === 'recherche'
           ? 'Écoute des premières minutes, puis recherche dans ton agenda et tes dossiers…'
           : 'Préparation d’un extrait des premières minutes…'}
@@ -231,7 +231,7 @@ function Attente({ phase }) {
           />
         ))}
       </div>
-      <p className="mt-2 text-[0.75rem] text-fonce/45">
+      <p className="mt-2 text-ekn-sm text-ekn-text-muted">
         Souvent moins d'une minute. Tu peux remplir la suite en attendant.
       </p>
     </div>
@@ -309,7 +309,7 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
         <div className="flex items-start justify-between gap-3 border-b border-bord px-5 py-4">
           <div>
             <p className="titre text-[1.0625rem] font-medium">Guider la recherche</p>
-            <p className="mt-0.5 text-[0.8125rem] text-fonce/55">
+            <p className="mt-0.5 text-ekn-sm text-ekn-text-muted">
               Dis où chercher : le client, le type de dossier, une personne, un
               détail qui le distingue. Chaque message relance une recherche dans Odoo.
             </p>
@@ -318,7 +318,7 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
             type="button"
             onClick={surFermer}
             aria-label="Fermer"
-            className="-mr-1 rounded-md px-2 text-[1.25rem] leading-none text-fonce/45 hover:bg-papier hover:text-fonce"
+            className="-mr-1 rounded-md px-2 text-[1.25rem] leading-none text-ekn-text-muted hover:bg-papier hover:text-fonce"
           >
             ×
           </button>
@@ -326,12 +326,12 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
 
         <div ref={fil} className="min-h-[8rem] flex-1 space-y-3 overflow-y-auto px-5 py-4">
           {echanges.map((e, i) => (e.role === 'user' ? (
-            <p key={i} className="ml-auto w-fit max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-fonce px-3 py-2 text-[0.875rem] text-clair">
+            <p key={i} className="ml-auto w-fit max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-fonce px-3 py-2 text-ekn-sm text-clair">
               {e.texte}
             </p>
           ) : (
             <div key={i} className="max-w-[92%]">
-              <p className="w-fit whitespace-pre-wrap rounded-2xl rounded-bl-md bg-papier px-3 py-2 text-[0.875rem] text-fonce/85">
+              <p className="w-fit whitespace-pre-wrap rounded-2xl rounded-bl-md bg-papier px-3 py-2 text-ekn-sm text-fonce/85">
                 {e.texte}
               </p>
               {(e.propositions || []).length ? (
@@ -349,7 +349,7 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
             </div>
           )))}
           {attente ? (
-            <div className="flex w-fit items-center gap-2 rounded-2xl rounded-bl-md bg-papier px-3 py-2 text-[0.8125rem] text-fonce/55">
+            <div className="flex w-fit items-center gap-2 rounded-2xl rounded-bl-md bg-papier px-3 py-2 text-ekn-sm text-ekn-text-muted">
               <span className="flex gap-1">
                 {[0, 1, 2].map((i) => (
                   <span key={i} className="h-1.5 w-1.5 animate-bounce rounded-full bg-fonce/40"
@@ -360,11 +360,11 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
             </div>
           ) : null}
           {!echanges.length && !attente ? (
-            <p className="text-[0.8125rem] text-fonce/45">
+            <p className="text-ekn-sm text-ekn-text-muted">
               Les propositions déjà faites ne reviendront pas.
             </p>
           ) : null}
-          {erreur ? <p className="text-[0.8125rem] text-red-700">{erreur}</p> : null}
+          {erreur ? <p className="text-ekn-sm text-red-700">{erreur}</p> : null}
         </div>
 
         <div className="border-t border-bord px-5 py-3">
@@ -378,18 +378,18 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
                 if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); envoyer(); }
               }}
               placeholder="Ex. : ce n’est pas l’opportunité, c’est le projet de déploiement — le contact côté client est Mme Martin."
-              className="min-h-[2.75rem] flex-1 resize-none rounded-lg border border-bord px-3 py-2 text-[0.875rem] placeholder:text-fonce/35 focus:border-fonce/40 focus:outline-none"
+              className="min-h-[2.75rem] flex-1 resize-none rounded-lg border border-bord px-3 py-2 text-ekn-sm placeholder:text-ekn-text-muted focus:border-ekn-border-control"
             />
             <button
               type="button"
               onClick={envoyer}
               disabled={!saisie.trim() || attente}
-              className="rounded-lg bg-fonce px-3.5 py-2 text-[0.875rem] text-clair hover:bg-fonce-doux disabled:opacity-30"
+              className="rounded-lg bg-fonce px-3.5 py-2 text-ekn-sm text-clair hover:bg-fonce-doux disabled:opacity-30"
             >
               Envoyer
             </button>
           </div>
-          <p className="mt-1.5 text-[0.75rem] text-fonce/40">
+          <p className="mt-1.5 text-ekn-sm text-ekn-text-muted">
             Entrée pour envoyer · Maj+Entrée pour aller à la ligne
           </p>
         </div>
