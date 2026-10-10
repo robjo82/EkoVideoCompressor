@@ -202,7 +202,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
                 try { await api.viderCorbeille(); recharger(); }
                 catch (e) { setErreur(e.message); }
               }}
-              className="rounded-md px-3 py-1.5 text-ekn-sm text-violet ring-1 ring-violet/35 hover:bg-white/50"
+              className="ekn-button ekn-button--danger ekn-button--compact"
             >
               Vider la corbeille
             </button>
@@ -572,7 +572,7 @@ function ALancer({ surLancer }) {
             <button
               type="button"
               onClick={() => { requestLaunch(entree.id); surLancer?.(); }}
-              className="rounded-md bg-fonce px-3 py-1 text-ekn-sm text-clair hover:bg-fonce-doux"
+              className="ekn-button ekn-button--compact"
             >
               Lancer
             </button>
@@ -644,7 +644,7 @@ function Pagination({ page, total, parPage, surPage }) {
       type="button"
       disabled={!actif}
       onClick={() => surPage(cible)}
-      className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord transition-colors hover:bg-white/60 disabled:opacity-30"
+      className="ekn-button ekn-button--subtle ekn-button--compact"
     >
       {libelle}
     </button>

@@ -144,7 +144,7 @@ function DriveSource({ google, storage, onGoogle, onOpen }) {
           </p>
           <a
             href="/api/google/connect"
-            className="mt-3 inline-block rounded-lg bg-fonce px-4 py-2 text-[0.9375rem] text-clair hover:bg-fonce-doux"
+            className="ekn-button mt-3"
           >
             Connecter mon Google Drive
           </a>

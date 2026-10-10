@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 
 /** Le peu de vocabulaire visuel partagé.
  *
@@ -8,70 +8,63 @@ import { useEffect, useRef, useState } from 'react';
  *  l'alignement et à l'espacement.
  */
 
+/** Les classes viennent d'ekonum-ui : le bouton principal prend la couleur
+ *  la plus contrastée avec son fond (vert foncé sur clair, turquoise dans
+ *  une zone foncée). L'ancienne variante « accent » turquoise sur fond clair
+ *  s'y range : le design system l'a écartée, trop proche d'un point d'état. */
 export function Bouton({ variante = 'primaire', className = '', ...props }) {
-  const styles = {
-    primaire: 'bg-fonce text-clair hover:bg-fonce-doux disabled:opacity-40',
-    accent: 'bg-turquoise text-fonce hover:bg-turquoise-sombre disabled:opacity-40',
-    discret: 'border border-bord/80 bg-white/70 text-fonce hover:border-fonce/40 hover:bg-white disabled:opacity-40',
-  }[variante];
+  const variantes = {
+    primaire: 'ekn-button',
+    accent: 'ekn-button',
+    discret: 'ekn-button ekn-button--subtle',
+    danger: 'ekn-button ekn-button--danger',
+  };
+  return <button {...props} className={`${variantes[variante]} ${className}`} />;
+}
+
+/** Le libellé à côté du champ plutôt qu'autour : enveloppé dans
+ *  .ekn-label, le champ en hériterait la graisse (signalé à ekonum-ui). */
+export function Champ({ label, aide, id, ...props }) {
+  const auto = useId();
+  const cle = id || auto;
   return (
-    <button
-      {...props}
-      className={`titre rounded-lg px-4 py-2 text-[0.9375rem] font-medium transition-colors disabled:cursor-not-allowed ${styles} ${className}`}
-    />
+    <div className="flex flex-col gap-1">
+      <label htmlFor={cle} className="ekn-label">{label}</label>
+      <input {...props} id={cle} aria-describedby={aide ? `${cle}-aide` : undefined} className="ekn-input" />
+      {aide ? <span id={`${cle}-aide`} className="ekn-help">{aide}</span> : null}
+    </div>
   );
 }
 
-export function Champ({ label, aide, ...props }) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-ekn-sm text-fonce/65">{label}</span>
-      <input
-        {...props}
-        className="w-full rounded-lg border border-bord/80 bg-white/70 px-3 py-2 text-fonce transition-colors placeholder:text-ekn-text-muted focus:bg-white"
-      />
-      {aide ? <span className="mt-1 block text-ekn-sm text-ekn-text-muted">{aide}</span> : null}
-    </label>
-  );
-}
-
-/** États d'un traitement. Le violet est un accent, pas un second
- *  turquoise : il ne sert qu'à signaler qu'une version antérieure
- *  existe — un repère rare, donc précieux. */
+/** États d'un traitement : un point et un libellé, jamais la couleur seule.
+ *  « En cours » et « Fusion… » gardent le ton du succès sous forme d'anneau ;
+ *  « À finaliser » demande un geste, d'où l'attention. */
 const ETATS = {
-  en_attente: ['En attente', 'bg-fonce/8 text-fonce/70'],
-  en_cours: ['En cours', 'bg-turquoise/20 text-fonce'],
-  a_finaliser: ['À finaliser', 'bg-turquoise/20 text-fonce'],
-  finalisation: ['Fusion…', 'bg-turquoise/20 text-fonce'],
-  termine: ['Terminé', 'bg-turquoise text-fonce'],
-  erreur: ['Erreur', 'bg-[#b3261e]/12 text-[#8c1d18]'],
-  recovered: ['Récupérée', 'bg-violet/10 text-violet'],
-  cancelled: ['Interrompue', 'bg-fonce/8 text-fonce/60'],
+  en_attente: ['En attente', ''],
+  en_cours: ['En cours', 'ekn-status--running'],
+  a_finaliser: ['À finaliser', 'ekn-status--warning'],
+  finalisation: ['Fusion…', 'ekn-status--running'],
+  termine: ['Terminé', 'ekn-status--success'],
+  erreur: ['Erreur', 'ekn-status--error'],
+  recovered: ['Récupérée', ''],
+  cancelled: ['Interrompue', ''],
 };
 
 export function Etat({ valeur }) {
-  const [libelle, style] = ETATS[valeur] || [valeur, 'bg-fonce/8 text-fonce/70'];
-  return (
-    <span className={`inline-block rounded-md px-2 py-0.5 text-ekn-sm font-medium ${style}`}>
-      {libelle}
-    </span>
-  );
+  const [libelle, ton] = ETATS[valeur] || [valeur, ''];
+  return <span className={`ekn-status ${ton}`}>{libelle}</span>;
 }
 
 export function Erreur({ children }) {
   if (!children) return null;
-  return (
-    <p className="rounded-lg border border-[#b3261e]/25 bg-[#b3261e]/6 px-3 py-2 text-ekn-sm text-[#8c1d18]">
-      {children}
-    </p>
-  );
+  return <p role="alert" className="ekn-alert ekn-alert--error">{children}</p>;
 }
 
 export function Vide({ titre, children }) {
   return (
-    <div className="py-16 text-center">
-      <p className="titre text-[1.0625rem] font-medium text-fonce">{titre}</p>
-      <p className="mx-auto mt-2 max-w-md text-fonce/60">{children}</p>
+    <div className="ekn-empty">
+      <strong>{titre}</strong>
+      <p>{children}</p>
     </div>
   );
 }
@@ -196,7 +189,7 @@ export function DateHeure({ valeur, surChange, disabled = false }) {
               {champHeure(date.getMinutes(), 59, 'minute')}
             </span>
             <button type="button" onClick={() => setOuvert(false)}
-                    className="rounded-md bg-fonce px-3 py-1 text-ekn-sm text-clair">OK</button>
+                    className="ekn-button ekn-button--compact">OK</button>
           </div>
         </div>
       ) : null}

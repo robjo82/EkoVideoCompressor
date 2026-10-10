@@ -176,7 +176,7 @@ function Carte({ dossier, choisi, surChoix, surRetrait }) {
         <button
           type="button"
           onClick={surChoix}
-          className="w-24 shrink-0 rounded-md bg-fonce px-3 py-1.5 text-ekn-sm text-clair hover:bg-fonce-doux"
+          className="ekn-button ekn-button--compact w-24 shrink-0"
         >
           Utiliser
         </button>
@@ -364,7 +364,7 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
               Les propositions déjà faites ne reviendront pas.
             </p>
           ) : null}
-          {erreur ? <p className="text-ekn-sm text-red-700">{erreur}</p> : null}
+          {erreur ? <p role="alert" className="ekn-error">{erreur}</p> : null}
         </div>
 
         <div className="border-t border-bord px-5 py-3">
@@ -384,7 +384,7 @@ function Discussion({ indices, moment, dejaVus, echanges, setEchanges, surChoix,
               type="button"
               onClick={envoyer}
               disabled={!saisie.trim() || attente}
-              className="rounded-lg bg-fonce px-3.5 py-2 text-ekn-sm text-clair hover:bg-fonce-doux disabled:opacity-30"
+              className="ekn-button ekn-button--compact"
             >
               Envoyer
             </button>

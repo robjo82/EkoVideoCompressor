@@ -75,7 +75,7 @@ function Compte({ moi, surVue, surAide, actif }) {
   // jusqu'à ce qu'on la suive ou qu'on l'écarte. Ensuite, le menu.
   const [invitation, setInvitation] = useState(false);
   const [recuperation, setRecuperation] = useState(false);
-  const cadre = useRef(null);
+  const menu = useRef(null);
 
   useEffect(() => {
     api.recoveryState()
@@ -88,30 +88,15 @@ function Compte({ moi, surVue, surAide, actif }) {
     api.recoveryDismiss().catch(() => {});
   };
 
-  useEffect(() => {
-    if (!ouvert) return undefined;
-    const dehors = (e) => { if (!cadre.current?.contains(e.target)) setOuvert(false); };
-    const echap = (e) => { if (e.key === 'Escape') setOuvert(false); };
-    document.addEventListener('mousedown', dehors);
-    window.addEventListener('keydown', echap);
-    return () => {
-      document.removeEventListener('mousedown', dehors);
-      window.removeEventListener('keydown', echap);
-    };
-  }, [ouvert]);
-
   if (!moi?.email) return <span className="ml-auto" />;
   const initiales = moi.email.slice(0, 2).toUpperCase();
-  const choisir = (action) => () => { setOuvert(false); action(); };
-  const entree = 'block w-full rounded-md px-3 py-2 text-left text-ekn-sm text-fonce/80 transition-colors hover:bg-papier hover:text-fonce';
+  const choisir = (action) => () => { menu.current?.hidePopover(); action(); };
 
   return (
-    <div ref={cadre} className="relative ml-auto">
+    <div className="relative ml-auto">
       <button
         type="button"
-        onClick={() => setOuvert((o) => !o)}
-        aria-haspopup="menu"
-        aria-expanded={ouvert}
+        popoverTarget="menu-compte"
         title={`Connecté via ${moi.via}`}
         className={`flex items-center gap-2.5 rounded-full p-1 transition-colors sm:pl-3 ${
           actif || ouvert ? 'bg-clair/15' : 'hover:bg-clair/10'
@@ -136,13 +121,13 @@ function Compte({ moi, surVue, surAide, actif }) {
           </p>
           <div className="mt-3 flex items-center justify-end gap-2">
             <button type="button" onClick={ecarterInvitation}
-                    className="rounded-md px-3 py-1.5 text-ekn-sm text-ekn-text-muted hover:text-fonce">
+                    className="ekn-button ekn-button--subtle ekn-button--compact">
               Plus tard
             </button>
             <button
               type="button"
               onClick={() => { ecarterInvitation(); surVue('recuperation'); }}
-              className="rounded-md bg-fonce px-3 py-1.5 text-ekn-sm text-clair hover:bg-fonce-doux"
+              className="ekn-button ekn-button--compact"
             >
               Voir ce qu’on trouve
             </button>
@@ -150,30 +135,31 @@ function Compte({ moi, surVue, surAide, actif }) {
           <p className="mt-2 text-ekn-sm text-ekn-text-muted">Toujours accessible depuis ce menu.</p>
         </div>
       ) : null}
-      {ouvert ? (
-        <div
-          role="menu"
-          data-ekn-theme="light"
-          className="absolute right-0 top-full z-30 mt-2 w-60 rounded-xl bg-white p-1.5 text-fonce shadow-2xl ring-1 ring-bord"
-        >
-          <p className="truncate px-3 pb-1.5 pt-1 text-ekn-xs text-ekn-text-muted">{moi.email}</p>
-          <button type="button" role="menuitem" onClick={choisir(() => surVue('compte'))} className={entree}>
-            Réglages
-          </button>
-          {recuperation ? (
-            <button type="button" role="menuitem" onClick={choisir(() => surVue('recuperation'))} className={entree}>
-              Récupérer mon historique
-            </button>
-          ) : null}
-          <button type="button" role="menuitem" onClick={choisir(surAide)}
-                  className={`${entree} flex items-center justify-between`}>
-            Raccourcis clavier
-            <kbd className="rounded border border-bord bg-papier px-1.5 text-ekn-xs text-ekn-text-muted">?</kbd>
-          </button>
-          <div className="my-1 h-px bg-bord/70" />
-          <a role="menuitem" href={DECONNEXION} className={entree}>Se déconnecter</a>
+      {/* Un popover natif : le navigateur le ferme sur Échap ou sur un clic
+          ailleurs, et le place sous l'avatar. Îlot clair dans l'en-tête foncé. */}
+      <div
+        ref={menu}
+        id="menu-compte"
+        popover="auto"
+        data-ekn-theme="light"
+        className="ekn-menu"
+        onToggle={(e) => setOuvert(e.newState === 'open')}
+      >
+        <div className="ekn-menu__header">
+          <span>{moi.email}</span>
         </div>
-      ) : null}
+        <button type="button" onClick={choisir(() => surVue('compte'))}>Réglages</button>
+        {recuperation ? (
+          <button type="button" onClick={choisir(() => surVue('recuperation'))}>
+            Récupérer mon historique
+          </button>
+        ) : null}
+        <button type="button" onClick={choisir(surAide)}>
+          Raccourcis clavier <kbd className="ekn-key">?</kbd>
+        </button>
+        <hr />
+        <a href={DECONNEXION}>Se déconnecter</a>
+      </div>
     </div>
   );
 }
