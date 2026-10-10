@@ -53,14 +53,14 @@ export function Enroler({ code, surFini }) {
     <section className="mx-auto max-w-xl px-6 py-16">
       <h1 className="titre text-[1.5rem] font-semibold">Autoriser cet appareil ?</h1>
       <div className="verre mt-6 rounded-xl p-5">
-        <p className="text-[0.8125rem] text-fonce/55">Appareil</p>
+        <p className="text-ekn-sm text-ekn-text-muted">Appareil</p>
         <p className="titre text-[1.0625rem] font-medium">
           {demande?.appareil || 'appareil inconnu'}
         </p>
-        <p className="mt-3 text-[0.8125rem] text-fonce/55">Code</p>
+        <p className="mt-3 text-ekn-sm text-ekn-text-muted">Code</p>
         <p className="titre text-[1.0625rem] font-medium tracking-wider">{code}</p>
       </div>
-      <p className="mt-4 text-[0.875rem] text-fonce/70">
+      <p className="mt-4 text-ekn-sm text-fonce/70">
         Vérifie que ce code est bien celui affiché sur ton Mac. En autorisant,
         cet appareil obtient son propre accès à ton compte — révocable à tout
         moment depuis « Mon compte ».

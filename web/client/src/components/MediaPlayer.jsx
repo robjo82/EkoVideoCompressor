@@ -119,7 +119,7 @@ export const MediaPlayer = forwardRef(function MediaPlayer({ src, autoPlay = fal
           }}
           onPointerMove={(e) => { if (dragging) seek(timeUnder(e.clientX)); }}
           onPointerUp={() => { setDragging(false); onTime?.(position); }}
-          className="relative h-8 flex-1 cursor-pointer select-none focus:outline-none focus-visible:ring-2 focus-visible:ring-turquoise"
+          className="relative h-8 flex-1 cursor-pointer select-none focus:outline-none focus-visible:ring-2 focus-visible:ring-ekn-focus"
         >
           <div className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-fonce/10" />
           <div className="absolute left-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-turquoise" style={{ width: pct }} />
@@ -129,20 +129,20 @@ export const MediaPlayer = forwardRef(function MediaPlayer({ src, autoPlay = fal
           />
         </div>
 
-        <span className="shrink-0 text-[0.8125rem] tabular-nums text-fonce/60">
+        <span className="shrink-0 text-ekn-sm tabular-nums text-fonce/60">
           {horodatage(position)} / {horodatage(duration)}
         </span>
         <button
           type="button"
           onClick={nextSpeed}
           title="Vitesse de lecture"
-          className="w-12 shrink-0 rounded-md py-1 text-[0.8125rem] tabular-nums text-fonce/60 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
+          className="w-12 shrink-0 rounded-md py-1 text-ekn-sm tabular-nums text-fonce/60 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
         >
           {speed}×
         </button>
       </div>
       {!readable ? (
-        <p className="mt-2 text-[0.75rem] text-fonce/50">Format non lisible par ce navigateur.</p>
+        <p className="mt-2 text-ekn-sm text-ekn-text-muted">Format non lisible par ce navigateur.</p>
       ) : null}
     </div>
   );

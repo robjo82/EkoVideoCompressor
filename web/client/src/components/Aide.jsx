@@ -41,16 +41,16 @@ export function Aide({ surFermer }) {
         <div className="flex items-center justify-between">
           <p className="titre text-[1.0625rem] font-medium">Raccourcis clavier</p>
           <button type="button" onClick={surFermer} aria-label="Fermer"
-                  className="rounded-md px-2 text-[1.25rem] leading-none text-fonce/45 hover:bg-papier hover:text-fonce">
+                  className="rounded-md px-2 text-[1.25rem] leading-none text-ekn-text-muted hover:bg-papier hover:text-fonce">
             ×
           </button>
         </div>
         {RACCOURCIS.map(([groupe, lignes]) => (
           <div key={groupe} className="mt-4">
-            <p className="text-[0.75rem] font-medium uppercase tracking-wide text-fonce/45">{groupe}</p>
+            <p className="text-ekn-xs font-medium uppercase tracking-wide text-ekn-text-muted">{groupe}</p>
             <ul className="mt-1.5 space-y-1.5">
               {lignes.map(([touches, libelle]) => (
-                <li key={libelle + touches.join()} className="flex items-center justify-between gap-4 text-[0.875rem]">
+                <li key={libelle + touches.join()} className="flex items-center justify-between gap-4 text-ekn-sm">
                   <span className="text-fonce/75">{libelle}</span>
                   <span className="flex shrink-0 gap-1">
                     {touches.map((t) => <Touche key={t}>{t}</Touche>)}
@@ -67,7 +67,7 @@ export function Aide({ surFermer }) {
 
 export function Touche({ children }) {
   return (
-    <kbd className="rounded border border-bord bg-papier px-1.5 py-0.5 font-sans text-[0.75rem] text-fonce/70">
+    <kbd className="rounded border border-bord bg-papier px-1.5 py-0.5 font-sans text-ekn-xs text-fonce/70">
       {children}
     </kbd>
   );

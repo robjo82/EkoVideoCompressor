@@ -29,36 +29,36 @@ export function Compte() {
       <div className="mt-2 flex flex-wrap items-center justify-between gap-3">
         <p className="text-fonce/70">
           {moi?.email}
-          {moi ? <span className="text-fonce/45"> · connecté via {moi.via}</span> : null}
+          {moi ? <span className="text-ekn-text-muted"> · connecté via {moi.via}</span> : null}
         </p>
         <a
           href={DECONNEXION}
-          className="rounded-md px-3 py-1.5 text-[0.875rem] text-fonce/70 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
+          className="rounded-md px-3 py-1.5 text-ekn-sm text-fonce/70 ring-1 ring-bord hover:bg-white/60 hover:text-fonce"
         >
           Se déconnecter
         </a>
       </div>
 
       <Erreur>{erreur}</Erreur>
-      {note ? <p className="mt-4 text-[0.875rem] text-turquoise-sombre">{note}</p> : null}
+      {note ? <p className="mt-4 text-ekn-sm text-ekn-success-dark">{note}</p> : null}
 
       <div className="verre mt-8 rounded-xl p-5">
         <h2 className="titre text-[1.0625rem] font-medium">Odoo</h2>
         {odoo?.server ? (
-          <p className="mt-1 text-[0.875rem] text-fonce/60">{odoo.server}</p>
+          <p className="mt-1 text-ekn-sm text-fonce/60">{odoo.server}</p>
         ) : (
-          <p className="mt-1 text-[0.875rem] text-fonce/60">
+          <p className="mt-1 text-ekn-sm text-fonce/60">
             Aucun serveur Odoo configuré côté application.
           </p>
         )}
 
-        <p className="mt-3 text-[0.875rem] leading-relaxed text-fonce/70">
+        <p className="mt-3 text-ekn-sm leading-relaxed text-fonce/70">
           Ta clé est <strong>personnelle</strong> : la transcription déposée dans
           le chatter porte ton nom. Une clé partagée signerait tout du même
           compte, et l'attribution — ce pour quoi le chatter existe — serait
           perdue.
         </p>
-        <p className="mt-1 text-[0.8125rem] text-fonce/55">
+        <p className="mt-1 text-ekn-sm text-ekn-text-muted">
           Dans Odoo : ton avatar → <em>Mon profil</em> → <em>Sécurité du compte</em>{' '}
           → <em>Nouvelle clé API</em>. Elle ne s'affiche qu'une fois.
         </p>
@@ -104,7 +104,7 @@ function FormulaireOdoo({ possible, surPose }) {
 
   if (!possible) {
     return (
-      <p className="mt-4 rounded-lg bg-[#b3261e]/6 px-3 py-2 text-[0.875rem] text-[#8c1d18]">
+      <p className="mt-4 rounded-lg bg-[#b3261e]/6 px-3 py-2 text-ekn-sm text-[#8c1d18]">
         Le serveur n'a pas de clé de chiffrement configurée, et refuse donc
         d'enregistrer une clé API en clair. À régler côté déploiement.
       </p>

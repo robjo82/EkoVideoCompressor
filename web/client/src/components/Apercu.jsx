@@ -108,14 +108,14 @@ export function Apercu({ fichier, duree, debut, fin, surDebut, surFin, actif }) 
         if (e.key === 'ArrowRight') placer(bord, valeur + pas);
       }}
       style={{ left: pct(valeur) }}
-      className={`absolute top-1/2 z-10 h-7 w-4 -translate-x-1/2 -translate-y-1/2 cursor-ew-resize rounded-md border-2 border-white shadow focus:outline-none focus:ring-2 focus:ring-turquoise disabled:cursor-not-allowed ${
+      className={`absolute top-1/2 z-10 h-7 w-4 -translate-x-1/2 -translate-y-1/2 cursor-ew-resize rounded-md border-2 border-white shadow focus:outline-none focus:ring-2 focus:ring-ekn-focus disabled:cursor-not-allowed ${
         dernier === bord ? 'bg-fonce' : 'bg-turquoise-sombre'
       } ${prise === bord ? 'scale-110' : ''}`}
     />
   );
 
   const champTemps = (libelle, valeur, bord) => (
-    <label className="flex items-center gap-2 text-[0.8125rem] text-fonce/60">
+    <label className="flex items-center gap-2 text-ekn-sm text-fonce/60">
       {libelle}
       <input
         key={`${bord}-${Math.round(valeur)}`}
@@ -140,17 +140,17 @@ export function Apercu({ fichier, duree, debut, fin, surDebut, surFin, actif }) 
         {/* « tout reprendre » vit ici, dans l'en-tête : placé entre les
             champs, il faisait passer la ligne à la ligne et remonter la
             frise sous le curseur — au pire moment, en pleine prise. */}
-        <p className="text-[0.8125rem] tabular-nums text-fonce/60">
+        <p className="text-ekn-sm tabular-nums text-fonce/60">
           {rogne ? (
             <>
-              <span className="text-turquoise-sombre">
+              <span className="text-ekn-text">
                 {horodatage(fin - debut)} gardées sur {horodatage(duree)}
               </span>
               <button
                 type="button"
                 disabled={actif}
                 onClick={() => { surDebut(0); surFin(duree); }}
-                className="ml-3 text-fonce/55 underline-offset-2 hover:text-fonce hover:underline"
+                className="ml-3 text-ekn-text-muted underline-offset-2 hover:text-fonce hover:underline"
               >
                 tout reprendre
               </button>
@@ -228,14 +228,14 @@ export function Apercu({ fichier, duree, debut, fin, surDebut, surFin, actif }) 
 
           <div className="mt-2 flex flex-wrap items-center justify-between gap-3 pl-12">
             {champTemps('Début', debut, 'debut')}
-            <span className="text-[0.75rem] tabular-nums text-fonce/45">
+            <span className="text-ekn-xs tabular-nums text-ekn-text-muted">
               {joue || position > 0 ? horodatage(position) : ''}
             </span>
             {champTemps('Fin', fin, 'fin')}
           </div>
         </div>
       </div>
-      <p className="mt-2 text-[0.75rem] text-fonce/45">
+      <p className="mt-2 text-ekn-sm text-ekn-text-muted">
         {lisible
           ? 'Seule la partie surlignée sera transcrite — et payée. La lecture part de la dernière poignée touchée.'
           : 'Format non lisible par ce navigateur : le rognage reste possible, à l’aveugle.'}
