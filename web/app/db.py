@@ -366,6 +366,50 @@ class Database:
             )
             return job_id
 
+    def reprocess_job(
+        self,
+        job_id: int,
+        *,
+        duration_seconds: float,
+        model: str,
+        language: str,
+        context: dict[str, Any],
+        chunks: list[tuple[float, float]],
+    ) -> None:
+        """Repart de zéro sur une réunion qui n'a pas de transcription — une
+        récupérée, ou une qui a échoué.
+
+        Sur place plutôt qu'une réunion neuve : sa vidéo, sa date et ce qui
+        dit d'où elle vient restent attachés, et le navigateur lit sa vidéo
+        à la même adresse pendant tout le traitement. Le contexte s'ajoute
+        à l'ancien, qui garde par exemple `recovered_from`."""
+        job = self.get_job(job_id) or {}
+        ancien = json.loads(job.get("context_json") or "{}")
+        with self.connect() as conn:
+            conn.execute("DELETE FROM job_chunks WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM transcription_segments WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM segments_fts WHERE job_id = ?", (job_id,))
+            conn.execute(
+                "UPDATE jobs SET duration_seconds = ?, model = ?, language = ?, "
+                "chunk_count = ?, context_json = ?, status = 'en_attente', "
+                "error_message = NULL, title = NULL, transcript = NULL, "
+                "uncertain_json = NULL, updated_at = ? WHERE id = ?",
+                (
+                    float(duration_seconds),
+                    model,
+                    language,
+                    len(chunks),
+                    json.dumps({**ancien, **context}, ensure_ascii=False),
+                    datetime.now().isoformat(timespec="seconds"),
+                    job_id,
+                ),
+            )
+            conn.executemany(
+                "INSERT INTO job_chunks (job_id, idx, start_second, end_second) "
+                "VALUES (?, ?, ?, ?)",
+                [(job_id, i, start, end) for i, (start, end) in enumerate(chunks)],
+            )
+
     def import_job(self, *, owner_id: int, payload: dict[str, Any]) -> tuple[int, bool]:
         """Reprend une réunion déjà transcrite ailleurs.
 
@@ -515,20 +559,27 @@ class Database:
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
     def ouvrir_envoi_video(self, job_id: int, session: str, taille: int) -> None:
+        """La vidéo déjà là, s'il y en a une, reste lisible jusqu'à ce que
+        la nouvelle soit entière : un envoi abandonné ne la perd pas."""
         with self.connect() as conn:
             conn.execute(
-                "UPDATE jobs SET video_session = ?, video_bytes = ?, "
-                "video_file_id = NULL, video_uploaded_at = NULL WHERE id = ?",
+                "UPDATE jobs SET video_session = ?, video_bytes = ? WHERE id = ?",
                 (session, int(taille), job_id),
             )
 
-    def terminer_envoi_video(self, job_id: int, fichier_id: str) -> None:
+    def terminer_envoi_video(self, job_id: int, fichier_id: str) -> str | None:
+        """Rend l'identifiant de la vidéo remplacée, à effacer du stockage."""
         with self.connect() as conn:
+            ancienne = conn.execute(
+                "SELECT video_file_id FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
             conn.execute(
                 "UPDATE jobs SET video_file_id = ?, video_session = NULL, "
                 "video_uploaded_at = ? WHERE id = ?",
                 (fichier_id, datetime.now().isoformat(timespec="seconds"), job_id),
             )
+        precedente = ancienne["video_file_id"] if ancienne else None
+        return precedente if precedente and precedente != fichier_id else None
 
     def compter_lecture_video(self, job_id: int) -> None:
         """Chaque lecture est comptée : en stockage froid, c'est elle qui

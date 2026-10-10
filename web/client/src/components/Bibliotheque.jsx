@@ -7,7 +7,7 @@ import { surlignerMots } from '../surlignage.jsx';
 import { Welcome } from './Welcome.jsx';
 import { interrompreReunion } from '../usePipeline.js';
 import {
-  enqueue, isMedia, removeFromQueue, requestLaunch, useFileDrag, useFileQueue,
+  enqueue, isMedia, launch, remoteFile, removeFromQueue, requestLaunch, useFileDrag, useFileQueue,
 } from '../fileQueue.js';
 
 /** La bibliothèque : une table, pas une grille de cartes.
@@ -329,6 +329,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
           surVider={vider}
           surFait={recharger}
           surErreur={setErreur}
+          surLancer={surLancer}
         />
       ) : null}
     </section>
@@ -341,7 +342,7 @@ export function Bibliotheque({ surOuvrir, surLancer, surVue }) {
  *  gestes que sur une ligne, appliqués à toutes. Les réunions partent
  *  une à une, et l'avancement se voit.
  */
-function Selection({ jobs, etat, total, surTout, surVider, surFait, surErreur }) {
+function Selection({ jobs, etat, total, surTout, surVider, surFait, surErreur, surLancer }) {
   const [cours, setCours] = useState(null); // { libelle, fait, total }
   const [bilan, setBilan] = useState('');
 
@@ -362,6 +363,17 @@ function Selection({ jobs, etat, total, surTout, surVider, surFait, surErreur })
   const n = jobs.length;
   const pluriel = n > 1 ? 's' : '';
   const terminees = jobs.filter((j) => j.status === 'termine');
+  const aRetraiter = jobs.filter((j) => j.reprocessable && j.video_bytes);
+
+  // Retraiter en lot : tout passe par la file de « Nouvelle
+  // transcription », une réunion après l'autre, comme des fichiers déposés.
+  const retraiter = () => {
+    const [premiere, ...suite] = aRetraiter.map(remoteFile);
+    enqueue(suite);
+    launch(premiere);
+    surVider();
+    surLancer?.();
+  };
 
   const bouton = (libelle, surClic, titre, danger = false) => (
     <button
@@ -403,6 +415,13 @@ function Selection({ jobs, etat, total, surTout, surVider, surFait, surErreur })
               ? `Relit le texte déjà transcrit — seules les ${terminees.length} réunion(s) terminées sont concernées.`
               : 'Relit le texte déjà transcrit pour refaire titre, noms et corrections — moins d’un centime chacune.',
           )}
+          {aRetraiter.length
+            ? bouton(
+              aRetraiter.length < n ? `Retraiter (${aRetraiter.length})` : 'Retraiter',
+              retraiter,
+              'Transcrire les réunions qui n’ont que leur vidéo, depuis la vidéo stockée — sans dépôt Odoo d’office.',
+            )
+            : null}
         </>
       ) : null}
       {etat === 'archive' ? (

@@ -107,6 +107,11 @@ MAX_SONDE_BYTES = 8 * 1024 * 1024
 # indolore.
 MODELE_ENRICHISSEMENT = "gemini-3.1-flash-lite"
 
+# Ce qui se retraite : une réunion qui n'a jamais eu de transcription.
+# Une en cours appartient au navigateur qui l'encode. Une interrompue qui
+# n'est pas à la corbeille, c'est un retraitement arrêté en route.
+REPROCESSABLE = {"recovered", "erreur", "cancelled"}
+
 # Du plus sûr au moins sûr. Lier sans demander à partir de « probable »
 # est un réglage possible ; ce n'est pas le défaut.
 ECHELLE = ["certaine", "probable", "incertaine"]
@@ -127,6 +132,9 @@ class JobRequest(BaseModel):
     # Quand la réunion a eu lieu — pas quand on l'a déposée. Proposée
     # d'après la date du fichier, corrigeable à la main.
     meeting_date: str | None = Field(default=None, max_length=40)
+    # Retraiter une réunion qui n'a pas de transcription — récupérée ou
+    # en échec — plutôt que d'en créer une seconde.
+    reprocess_job_id: int | None = None
 
 
 class ImportedSegment(BaseModel):
@@ -232,6 +240,9 @@ class GuidedInvestigation(BaseModel):
 class EnvoiVideo(BaseModel):
     taille: int = Field(gt=0, le=20 * 1024**3)
     type: str = Field(default="video/mp4", max_length=64)
+    # Remplacer la vidéo déjà stockée — une récupérée qui n'avait jamais
+    # été compressée, par exemple.
+    remplacer: bool = False
 
 
 class DemandeAppareil(BaseModel):
@@ -551,15 +562,36 @@ def create_app(
         windows = plan_audio_chunks(
             payload.duration_seconds, chunk_seconds_for_model(model)
         )
-        job_id = db.create_job(
-            owner_id=owner_id,
-            filename=payload.filename,
-            duration_seconds=payload.duration_seconds,
-            model=model,
-            language=payload.language,
-            context=payload.context,
-            chunks=windows,
-        )
+        if payload.reprocess_job_id is not None:
+            job_id = payload.reprocess_job_id
+            existant = owned_job(job_id, owner_id)
+            if existant["deleted_at"]:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Traitement introuvable.")
+            # Une réunion en cours n'est pas retraitée sous les pieds du
+            # navigateur qui l'encode ; une transcrite, on la relance.
+            if existant["status"] not in REPROCESSABLE or existant["transcript"]:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "Seule une réunion sans transcription — récupérée ou en échec — se retraite.",
+                )
+            db.reprocess_job(
+                job_id,
+                duration_seconds=payload.duration_seconds,
+                model=model,
+                language=payload.language,
+                context={**payload.context, "reprocessed": True},
+                chunks=windows,
+            )
+        else:
+            job_id = db.create_job(
+                owner_id=owner_id,
+                filename=payload.filename,
+                duration_seconds=payload.duration_seconds,
+                model=model,
+                language=payload.language,
+                context=payload.context,
+                chunks=windows,
+            )
         if payload.meeting_date:
             db.set_meeting_date(job_id, _date_reunion(payload.meeting_date))
         # Le dossier choisi avant la transcription est retenu maintenant :
@@ -714,12 +746,16 @@ def create_app(
         qui encode encore s'arrête au prochain envoi, et la réunion part à
         la corbeille — récupérable, comme tout ce qu'on jette. Une
         transcription terminée ne s'interrompt plus : elle se jette.
+
+        Un retraitement interrompu, lui, reste dans la bibliothèque : la
+        réunion existait avant, avec sa vidéo, et peut se relancer.
         """
         job = owned_job(job_id, owner_id)
         if job["status"] in {"termine", "finalisation"}:
             raise HTTPException(status.HTTP_409_CONFLICT, "Transcription déjà terminée.")
         db.set_job_status(job_id, "cancelled", error="Interrompue à la demande.")
-        db.jeter_job(job_id)
+        if not json.loads(job["context_json"] or "{}").get("reprocessed"):
+            db.jeter_job(job_id)
         return {"cancelled": True}
 
     @app.post("/api/client-errors", status_code=status.HTTP_204_NO_CONTENT,
@@ -897,7 +933,7 @@ def create_app(
         morceaux à transcript, qui les relaie.
         """
         job = owned_job(job_id, owner_id)
-        if job["video_file_id"]:
+        if job["video_file_id"] and not payload.remplacer:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "Cette réunion a déjà sa vidéo."
             )
@@ -934,7 +970,16 @@ def create_app(
         except StockageIndisponible as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
         if fichier_id:
-            db.terminer_envoi_video(job_id, fichier_id)
+            remplacee = db.terminer_envoi_video(job_id, fichier_id)
+            # L'ancienne n'est effacée qu'une fois la nouvelle entière. Si
+            # le stockage refuse, la réunion est à jour quand même : on le
+            # note pour la retrouver, sans faire échouer l'envoi.
+            if remplacee:
+                try:
+                    await asyncio.to_thread(stockage().supprimer, remplacee)
+                except StockageIndisponible as exc:
+                    log.warning("vidéo %s remplacée mais gardée (réunion %s) : %s",
+                                remplacee, job_id, exc)
         return {"recu": debut + len(octets), "total": total, "termine": bool(fichier_id)}
 
     @app.get("/api/jobs/{job_id}/video")
@@ -956,7 +1001,13 @@ def create_app(
             reponse = stockage().lire(str(job["video_file_id"]), plage)
         except StockageIndisponible as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-        if plage in ("", "bytes=0-"):
+        # Le navigateur qui la retraite la lit aussi : ce n'est pas une
+        # lecture, et il en ouvrirait une par fenêtre. L'aperçu de l'écran
+        # de lancement, une balise <video>, ne peut que le dire dans l'URL.
+        traitement = "processing" in (
+            request.headers.get("x-video-purpose"), request.query_params.get("purpose"),
+        )
+        if plage in ("", "bytes=0-") and not traitement:
             db.compter_lecture_video(job_id)
         return StreamingResponse(
             reponse.flux, status_code=reponse.statut, headers=reponse.entetes,
@@ -1017,6 +1068,10 @@ def create_app(
                 "archived_at": job["archived_at"],
                 "deleted_at": job["deleted_at"],
                 "meeting_date": job["meeting_date"],
+                # De quoi retraiter depuis la liste : la vidéo stockée est
+                # relue par le navigateur, qui doit en connaître le poids.
+                "video_bytes": job["video_bytes"] if job["video_file_id"] else None,
+                "reprocessable": job["status"] in REPROCESSABLE and not job["transcript"],
                 # Seulement pour ce qui tourne encore : la bibliothèque
                 # montre une réunion en cours progresser pendant qu'on en
                 # lance une autre.
@@ -1067,6 +1122,7 @@ def create_app(
             "filename": job["filename"],
             "title": job["title"],
             "status": job["status"],
+            "reprocessable": job["status"] in REPROCESSABLE and not job["transcript"],
             "model": job["model"],
             "duration_seconds": job["duration_seconds"],
             "cost_usd": job["cloud_cost_usd"],

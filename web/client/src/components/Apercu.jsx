@@ -36,11 +36,16 @@ export function Apercu({ fichier, duree, debut, fin, surDebut, surFin, actif }) 
 
   useEffect(() => {
     if (!fichier) return undefined;
-    const objet = URL.createObjectURL(fichier);
-    setUrl(objet);
     setLisible(true);
     setImage(false);
     setJoue(false);
+    // Une réunion qu'on retraite se lit là où sa vidéo est stockée.
+    if (fichier.remote) {
+      setUrl(`${fichier.remote.url}?purpose=processing`);
+      return undefined;
+    }
+    const objet = URL.createObjectURL(fichier);
+    setUrl(objet);
     // Sans révocation, chaque changement de fichier laisse le précédent
     // épinglé en mémoire par le navigateur.
     return () => URL.revokeObjectURL(objet);

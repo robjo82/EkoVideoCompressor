@@ -2286,6 +2286,96 @@ class VideoTestCase(_Fixture):
         self.assertEqual(vue["deleted"], [])
         self.assertIsNotNone(self.db.get_job(job_id))
 
+    def _recuperee(self, owner_id=None) -> int:
+        """Une réunion récupérée : sa vidéo, rien d'autre."""
+        job_id = self.db.create_job(
+            owner_id=owner_id or self.db.user_id_for_email(self.settings.dev_user_email),
+            filename="Enregistrement de l'écran 2026-03-04 à 14.12.47.mov",
+            duration_seconds=0, model="", language="fr",
+            context={"recovered_from": "drive"}, chunks=[],
+        )
+        self.db.set_meeting_date(job_id, "2026-03-04T14:12:47")
+        self.db.set_job_status(job_id, "recovered")
+        return job_id
+
+    def test_retraiter_une_reunion_recuperee_la_transcrit_sur_place(self):
+        """Pas de seconde réunion : la même, avec sa vidéo et sa date."""
+        job_id = self._recuperee()
+        self._envoyer(job_id, b"0123456789")
+        self.assertTrue(self.client.get(f"/api/jobs/{job_id}/detail").json()["reprocessable"])
+
+        cree = self._create(duration=600.0, reprocess_job_id=job_id)
+        self.assertEqual(cree["job_id"], job_id)
+        for fenetre in cree["chunks"]:
+            self.client.put(f"/api/jobs/{job_id}/chunks/{fenetre['index']}", content=b"audio")
+        self.assertEqual(self._attendre_termine(job_id)["status"], "termine")
+
+        fiche = self.client.get(f"/api/jobs/{job_id}/detail").json()
+        self.assertTrue(fiche["video"]["presente"])
+        self.assertTrue(fiche["segments"])
+        self.assertFalse(fiche["reprocessable"])
+        self.assertTrue(fiche["meeting_date"].startswith("2026-03-04"))
+        contexte = json.loads(self.db.get_job(job_id)["context_json"])
+        self.assertEqual(contexte["recovered_from"], "drive")
+        self.assertEqual(contexte["client_company"], "Acritec")
+        liste = self.client.get("/api/jobs")
+        self.assertEqual(liste.headers["x-total-count"], "1")
+        self.assertEqual(liste.json()[0]["video_bytes"], 10)
+
+    def test_un_retraitement_interrompu_reste_dans_la_bibliotheque(self):
+        """La réunion existait avant le retraitement : l'arrêter ne la jette pas."""
+        job_id = self._recuperee()
+        self._envoyer(job_id, b"0123456789")
+        self._create(duration=600.0, reprocess_job_id=job_id)
+        self.assertEqual(self.client.post(f"/api/jobs/{job_id}/cancel").status_code, 200)
+
+        job = self.db.get_job(job_id)
+        self.assertEqual(job["status"], "cancelled")
+        self.assertIsNone(job["deleted_at"])
+        liste = self.client.get("/api/jobs").json()
+        self.assertEqual([j["job_id"] for j in liste], [job_id])
+        self.assertTrue(liste[0]["reprocessable"])
+        self.assertEqual(self._create(duration=600.0, reprocess_job_id=job_id)["job_id"], job_id)
+
+    def test_une_reunion_transcrite_ne_se_retraite_pas(self):
+        vue = self.client.post("/api/jobs", json={
+            "filename": "reunion.mov", "duration_seconds": 600, "model": "gemini-3.8-flash",
+            "reprocess_job_id": self._reunion(),
+        })
+        self.assertEqual(vue.status_code, 409)
+
+    def test_on_ne_retraite_pas_la_reunion_d_un_autre(self):
+        job_id = self._recuperee(owner_id=self.db.user_id_for_email("luka@ekonum.fr"))
+        vue = self.client.post("/api/jobs", json={
+            "filename": "reunion.mov", "duration_seconds": 600, "model": "gemini-3.8-flash",
+            "reprocess_job_id": job_id,
+        })
+        self.assertEqual(vue.status_code, 404)
+        self.assertEqual(self.db.get_job(job_id)["status"], "recovered")
+
+    def test_remplacer_la_video_n_efface_l_ancienne_qu_une_fois_la_nouvelle_entiere(self):
+        job_id = self._recuperee()
+        self._envoyer(job_id, b"0123456789")
+        vue = self.client.post(f"/api/jobs/{job_id}/video", json={"taille": 4, "remplacer": True})
+        self.assertEqual(vue.status_code, 200, vue.text)
+        self.client.put(f"/api/jobs/{job_id}/video?debut=0", content=b"ab")
+        # À mi-chemin, l'ancienne se lit toujours.
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}/video").content, b"0123456789")
+        self.assertEqual(self.drive.supprimes, [])
+        self.client.put(f"/api/jobs/{job_id}/video?debut=2", content=b"cd")
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}/video").content, b"abcd")
+        self.assertEqual(self.drive.supprimes, ["drive-1"])
+
+    def test_le_navigateur_qui_retraite_ne_compte_pas_de_lecture(self):
+        job_id = self._recuperee()
+        self._envoyer(job_id, b"0123456789")
+        self.client.get(f"/api/jobs/{job_id}/video",
+                        headers={"Range": "bytes=0-", "X-Video-Purpose": "processing"})
+        # L'aperçu avant lancement : une balise <video>, sans en-tête possible.
+        self.client.get(f"/api/jobs/{job_id}/video?purpose=processing",
+                        headers={"Range": "bytes=0-"})
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}/detail").json()["video"]["lectures"], 0)
+
     def test_sans_stockage_configure_rien_n_est_propose(self):
         self.assertFalse(
             TestClient(create_app(

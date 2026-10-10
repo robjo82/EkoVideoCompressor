@@ -66,11 +66,11 @@ async function compresserVers(fichier, trim, poignee, surProgression) {
   });
 }
 
-async function envoyer(jobId, blob, surProgression) {
+async function envoyer(jobId, blob, surProgression, remplacer) {
   const ouverture = await fetch(`/api/jobs/${jobId}/video`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ taille: blob.size, type: 'video/mp4' }),
+    body: JSON.stringify({ taille: blob.size, type: 'video/mp4', remplacer }),
   });
   if (!ouverture.ok) throw new Error((await ouverture.json()).detail || 'Envoi refusé.');
   const { morceau } = await ouverture.json();
@@ -117,7 +117,19 @@ export async function archiver({ fichier, trim = null, cible }) {
     taches.delete(cle);
     publier(cible.jobId, { etape: 'envoi', progression: 0, erreur: '' });
     const compresse = await poignee.getFile();
-    await envoyer(cible.jobId, compresse, (p) => publier(cible.jobId, { progression: p }));
+    // Retraiter une réunion récupérée : sa vidéo stockée n'est remplacée
+    // que si la nouvelle est vraiment plus légère.
+    if (fichier.remote && compresse.size >= fichier.size) {
+      publier(cible.jobId, {
+        etape: 'termine', progression: 1,
+        note: 'La vidéo stockée était déjà plus légère : gardée telle quelle.',
+      });
+      return;
+    }
+    await envoyer(
+      cible.jobId, compresse, (p) => publier(cible.jobId, { progression: p }),
+      Boolean(fichier.remote),
+    );
     publier(cible.jobId, { etape: 'termine', progression: 1, octets: compresse.size });
   } catch (erreur) {
     publier(cible.jobId ?? cle, { etape: 'erreur', erreur: erreur.message });

@@ -7,6 +7,7 @@ import { AvancementArchivage } from './Nouveau.jsx';
 import { MOD, useRaccourcis } from '../raccourcis.js';
 import { MediaPlayer } from './MediaPlayer.jsx';
 import { plier, surligner } from '../surlignage.jsx';
+import { launch, remoteFile } from '../fileQueue.js';
 
 /** Fiche d'une transcription : la lire, la corriger, la relancer.
  *
@@ -14,7 +15,7 @@ import { plier, surligner } from '../surlignage.jsx';
  *  fenêtre modale : corriger un nom d'interlocuteur se fait en le
  *  lisant, pas de mémoire.
  */
-export function Detail({ jobId, recherche = '', surRetour }) {
+export function Detail({ jobId, recherche = '', surRetour, surRetraiter }) {
   const [fiche, setFiche] = useState(null);
   const [erreur, setErreur] = useState('');
   const [note, setNote] = useState('');
@@ -180,7 +181,11 @@ export function Detail({ jobId, recherche = '', surRetour }) {
           ) : null}
           <div className="verre mt-3 max-h-[34rem] overflow-y-auto rounded-xl">
             {fiche.segments.length === 0 ? (
-              <p className="px-4 py-6 text-fonce/50">Pas encore de segment.</p>
+              fiche.reprocessable && fiche.video?.presente ? (
+                <Retraiter fiche={fiche} jobId={jobId} surRetraiter={surRetraiter} />
+              ) : (
+                <p className="px-4 py-6 text-fonce/50">Pas encore de segment.</p>
+              )
             ) : (
               <ol>
                 {fiche.segments.map((s, rang) => (
@@ -244,6 +249,36 @@ export function Detail({ jobId, recherche = '', surRetour }) {
         </aside>
       </div>
     </section>
+  );
+}
+
+/** Transcrire une réunion qui n'a que sa vidéo — récupérée, ou dont la
+ *  transcription a échoué. La vidéo stockée est lue à distance : rien à
+ *  retrouver sur le poste. */
+function Retraiter({ fiche, jobId, surRetraiter }) {
+  const lancer = () => {
+    launch(remoteFile({
+      job_id: jobId,
+      filename: fiche.filename,
+      video_bytes: fiche.video.octets,
+      meeting_date: fiche.meeting_date,
+    }));
+    surRetraiter?.();
+  };
+  return (
+    <div className="px-4 py-6">
+      <p className="text-fonce/70">
+        {{
+          recovered: 'Réunion récupérée : la vidéo est là, mais pas encore de transcription.',
+          cancelled: 'Transcription interrompue : la vidéo est toujours stockée.',
+        }[fiche.status] || 'La transcription a échoué, mais la vidéo est stockée.'}
+      </p>
+      <p className="mt-1 text-[0.8125rem] text-fonce/55">
+        Le traitement relit la vidéo stockée, sans rien déposer dans Odoo
+        d'office ; une vidéo lourde peut être allégée au passage.
+      </p>
+      <Bouton className="mt-3" onClick={lancer}>Retraiter</Bouton>
+    </div>
   );
 }
 

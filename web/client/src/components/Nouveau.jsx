@@ -28,6 +28,11 @@ function versChampLocal(date) {
   return decale.toISOString().slice(0, 16);
 }
 
+/** Au-delà de ce débit, la vidéo stockée d'une réunion récupérée n'a
+ *  jamais été compressée : la retraiter propose de la remplacer par sa
+ *  version légère (environ 0,2 Mbit/s). */
+const DEBIT_A_COMPRESSER = 1_000_000;
+
 /** Au-dessous de ce poids, le fichier est copié en mémoire dès qu'on le
  *  choisit. Un mémo vocal synchronisé par iCloud peut être réécrit sur le
  *  disque entre le dépôt et l'encodage ; Chrome refuse alors de le relire,
@@ -36,7 +41,9 @@ function versChampLocal(date) {
 const COPIE_MAX = 400 * 1024 * 1024;
 
 async function copieEnMemoire(fichier) {
-  if (fichier.size > COPIE_MAX) return fichier;
+  // Une réunion qu'on retraite n'est pas sur ce poste : elle se relit
+  // depuis le stockage, qui ne bouge pas.
+  if (fichier.remote || fichier.size > COPIE_MAX) return fichier;
   const octets = await fichier.arrayBuffer();
   return new File([octets], fichier.name, { type: fichier.type, lastModified: fichier.lastModified });
 }
@@ -58,6 +65,9 @@ export function Nouveau({ surTermine, surBibliotheque }) {
   // L'archivage démarre avant que le traitement existe : la compression
   // n'attend pas la création du job, l'envoi si.
   const cibleRef = useRef(null);
+  // Le mode choisi pour les fichiers du poste, qu'une réunion retraitée
+  // ne doit pas changer pour les suivants.
+  const modeChoisi = useRef(null);
   // Le champ fichier garde sa sélection tant qu'on ne le vide pas : sans
   // cela, « Lancer une autre transcription » montrait encore l'ancien.
   const champFichier = useRef(null);
@@ -145,7 +155,9 @@ export function Nouveau({ surTermine, surBibliotheque }) {
       if (!actuelle()) return;
       setSonde({ ...vue, enCours: false, moment: instant });
       const retenu = vue.investigation?.record;
-      if (retenu) retenir({ ...retenu, auto: Boolean(vue.investigation.auto) });
+      // Une réunion récupérée a souvent déjà sa transcription dans Odoo,
+      // déposée par l'ancienne app : le dépôt ne s'y fait qu'à la main.
+      if (retenu) retenir({ ...retenu, auto: Boolean(vue.investigation.auto) && !choisi.remote });
     } catch {
       if (actuelle()) setSonde(null);
     }
@@ -206,8 +218,21 @@ export function Nouveau({ surTermine, surBibliotheque }) {
       setDebut(0);
       setFin(total);
       setLecture(`${mo(choisi.size)} · ${duree(total)}`);
-      const debutReunion = new Date((choisi.lastModified || Date.now()) - total * 1000);
+      const datee = choisi.remote?.meetingDate
+        ? new Date(choisi.remote.meetingDate.replace(' ', 'T'))
+        : null;
+      const debutReunion = datee && !Number.isNaN(datee.getTime())
+        ? datee
+        : new Date((choisi.lastModified || Date.now()) - total * 1000);
       setDateReunion(versChampLocal(debutReunion));
+      if (choisi.remote) {
+        if (modeChoisi.current === null) modeChoisi.current = mode;
+        setMode(choisi.size * 8 > total * DEBIT_A_COMPRESSER ? 'les-deux' : 'transcrire');
+        setLecture(`${mo(choisi.size)} · ${duree(total)} · vidéo déjà stockée avec la réunion`);
+      } else if (modeChoisi.current !== null) {
+        setMode(modeChoisi.current);
+        modeChoisi.current = null;
+      }
       if (mode !== 'compresser') ecouter(choisi, total, debutReunion.toISOString());
     } catch (e) {
       setFichier(null);
@@ -392,7 +417,9 @@ export function Nouveau({ surTermine, surBibliotheque }) {
               <span className="text-fonce/70">Date de la réunion</span>
               <DateHeure valeur={dateReunion} surChange={setDateReunion} disabled={enCours} />
               <span className="text-[0.8125rem] text-fonce/45">
-                déduite du fichier — corrige-la s'il a été recopié
+                {fichier.remote
+                  ? 'celle de la réunion récupérée'
+                  : "déduite du fichier — corrige-la s'il a été recopié"}
               </span>
             </div>
           ) : null}
@@ -412,8 +439,10 @@ export function Nouveau({ surTermine, surBibliotheque }) {
           <div className="mt-3 flex flex-wrap gap-2">
             {[
               ['transcrire', 'Transcrire'],
-              ['compresser', 'Compresser'],
-              ['les-deux', 'Les deux'],
+              // La vidéo d'une réunion retraitée est déjà stockée : la
+              // compresser n'a de sens que pour l'y remplacer.
+              ...(fichier?.remote ? [] : [['compresser', 'Compresser']]),
+              ['les-deux', fichier?.remote ? 'Transcrire et alléger la vidéo' : 'Les deux'],
             ].map(([cle, libelle]) => (
               <button
                 key={cle}
@@ -430,7 +459,13 @@ export function Nouveau({ surTermine, surBibliotheque }) {
               </button>
             ))}
           </div>
-          {mode === 'les-deux' && videoDisponible ? (
+          {mode === 'les-deux' && fichier?.remote ? (
+            <p className="mt-2 text-[0.8125rem] text-fonce/55">
+              La vidéo stockée ({mo(fichier.size)}) est relue, compressée sur ce
+              poste — 720p, HEVC — puis remplace l’originale en stockage froid.
+              Si elle n’en sort pas plus légère, on garde celle qui y est.
+            </p>
+          ) : mode === 'les-deux' && videoDisponible ? (
             <p className="mt-2 text-[0.8125rem] text-fonce/55">
               La vidéo est compressée sur ce poste — 720p, HEVC, environ 92 %
               plus légère — puis archivée en stockage froid avec la réunion.
@@ -464,7 +499,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
             retenu={dossier}
             // Choisir un dossier, c'est le valider : la transcription y
             // sera déposée à la fin, sauf à décocher la case plus bas.
-            surChoix={(choisi) => retenir({ ...choisi, auto: true })}
+            surChoix={(choisi) => retenir({ ...choisi, auto: !fichier?.remote })}
             surRetrait={retirer}
             surAjout={(trouve) => {
               // Trouvé en guidant la recherche : il rejoint la liste,
@@ -480,7 +515,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                   ajoute,
                 ],
               }));
-              retenir({ ...ajoute, auto: true });
+              retenir({ ...ajoute, auto: !fichier?.remote });
             }}
           />
           <Reunions
@@ -489,7 +524,7 @@ export function Nouveau({ surTermine, surBibliotheque }) {
               // La réunion d'agenda pointe souvent déjà un dossier : le
               // choisir doit le retenir, sinon la liaison se perdait et
               // rien n'était déposé à la fin.
-              if (choix.dossier) setDossier({ ...choix.dossier, auto: true });
+              if (choix.dossier) setDossier({ ...choix.dossier, auto: !fichier?.remote });
             }}
           />
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
@@ -555,6 +590,12 @@ export function Nouveau({ surTermine, surBibliotheque }) {
               />
               Déposer la transcription dans ce dossier à la fin, et me prévenir
             </label>
+            {fichier?.remote ? (
+              <p className="mt-1 pl-6 text-[0.8125rem] text-fonce/55">
+                Réunion récupérée : sa transcription y est peut-être déjà,
+                déposée par l’ancienne app. Coche seulement si ce n’est pas le cas.
+              </p>
+            ) : null}
           </div>
         ) : null}
 
@@ -567,7 +608,9 @@ export function Nouveau({ surTermine, surBibliotheque }) {
                 ? { start: debut, end: fin || secondes }
                 : null;
               if (mode === 'les-deux' && videoDisponible) {
-                const cible = { cle: `nouveau-${Date.now()}`, jobId: null };
+                // Retraitée, la réunion existe déjà : l'envoi n'a pas à
+                // attendre sa création.
+                const cible = { cle: `nouveau-${Date.now()}`, jobId: fichier.remote?.jobId ?? null };
                 cibleRef.current = cible;
                 archiver({ fichier, trim: borne, cible });
               } else if (mode !== 'transcrire') {
@@ -871,7 +914,7 @@ export function AvancementArchivage({ tache }) {
   const libelle = {
     compression: 'Compression sur ce poste',
     envoi: 'Envoi vers le stockage froid',
-    termine: 'Vidéo archivée',
+    termine: tache.note ? 'Vidéo conservée' : 'Vidéo archivée',
     erreur: 'Archivage interrompu',
   }[tache.etape] || 'Archivage';
   return (
@@ -890,6 +933,7 @@ export function AvancementArchivage({ tache }) {
           />
         </div>
       ) : null}
+      {tache.note ? <p className="mt-1 text-[0.8125rem] text-fonce/60">{tache.note}</p> : null}
       {tache.erreur ? <p className="mt-1 text-[0.8125rem] text-violet">{tache.erreur}</p> : null}
     </div>
   );

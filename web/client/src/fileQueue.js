@@ -28,6 +28,29 @@ export function isMedia(file) {
   return /^(audio|video)\//.test(file.type || '') || MEDIA_EXTENSIONS.test(file.name || '');
 }
 
+/** Une réunion à retraiter, comme un fichier de la file.
+ *
+ *  Sa vidéo est déjà en stockage froid : le navigateur la relit de là,
+ *  par plages, au lieu de demander le fichier d'origine — souvent jeté
+ *  depuis. L'objet a le nom, le poids et la date d'un `File`, et dit en
+ *  plus où lire, et quelle réunion il retraite. */
+export function remoteFile(job) {
+  const date = Date.parse(String(job.meeting_date || '').replace(' ', 'T'));
+  return {
+    name: job.filename,
+    size: job.video_bytes,
+    type: '',
+    // La date sert à distinguer deux réunions de même nom ; c'est
+    // `meetingDate` qui date la réunion à l'écran de lancement.
+    lastModified: Number.isNaN(date) ? 0 : date,
+    remote: {
+      jobId: job.job_id,
+      url: `/api/jobs/${job.job_id}/video`,
+      meetingDate: job.meeting_date || null,
+    },
+  };
+}
+
 /** Ajoute des fichiers, sans doublon : le même fichier déposé deux fois
  *  n'attend qu'une fois. */
 export function enqueue(files, { front = false } = {}) {
@@ -55,6 +78,14 @@ export function takeNext(id = null) {
  *  en s'ouvrant. */
 export function requestLaunch(id) {
   launchRequest = id;
+}
+
+/** Ouvre tout de suite dans l'écran de lancement, devant la file. */
+export function launch(file) {
+  enqueue([file], { front: true });
+  const entry = queue.find((e) => e.file.name === file.name && e.file.size === file.size
+    && e.file.lastModified === file.lastModified);
+  if (entry) requestLaunch(entry.id);
 }
 
 export function consumeLaunchRequest() {

@@ -11,7 +11,7 @@
  * fil principal juste pour les poster n'apporterait que des copies.
  */
 import {
-  Input, Output, Conversion, ALL_FORMATS, BlobSource,
+  Input, Output, Conversion, ALL_FORMATS, BlobSource, UrlSource,
   BufferTarget, StreamTarget, Mp3OutputFormat, Mp4OutputFormat,
   OggOutputFormat, Quality,
 } from 'mediabunny';
@@ -23,6 +23,19 @@ import { registerMp3Encoder } from '@mediabunny/mp3-encoder';
 registerMp3Encoder();
 
 const say = (message) => self.postMessage(message);
+
+/** D'où lire le média : le fichier choisi sur ce poste, ou la vidéo déjà
+ *  stockée d'une réunion qu'on retraite. Celle-ci se lit par plages, en
+ *  flux comme un fichier local — plusieurs gigaoctets ne se téléchargent
+ *  pas d'abord. L'en-tête dit au serveur que ce n'est pas une lecture. */
+function sourceOf(file) {
+  if (file?.remote) {
+    return new UrlSource(file.remote.url, {
+      requestInit: { headers: { 'X-Video-Purpose': 'processing' } },
+    });
+  }
+  return new BlobSource(file);
+}
 
 function outputFormat(profile) {
   // Le conteneur suit le codec : le MP3 est nu, l'Opus a besoin d'un
@@ -39,7 +52,7 @@ self.onmessage = async (event) => {
   // pèse plus que tout le reste de l'interface réunie.
   if (event.data.kind === 'probe') {
     try {
-      const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(event.data.file) });
+      const input = new Input({ formats: ALL_FORMATS, source: sourceOf(event.data.file) });
       say({ kind: 'probed', duration: await input.computeDuration() });
     } catch (error) {
       say({ kind: 'probe-error', message: error?.message || String(error) });
@@ -56,7 +69,7 @@ self.onmessage = async (event) => {
       const { format, type } = outputFormat(audio);
       const target = new BufferTarget();
       const conversion = await Conversion.init({
-        input: new Input({ formats: ALL_FORMATS, source: new BlobSource(file) }),
+        input: new Input({ formats: ALL_FORMATS, source: sourceOf(file) }),
         output: new Output({ format, target }),
         trim: { start, end },
         video: { discard: true },
@@ -95,7 +108,7 @@ self.onmessage = async (event) => {
       const target = new BufferTarget();
       try {
         const conversion = await Conversion.init({
-          input: new Input({ formats: ALL_FORMATS, source: new BlobSource(file) }),
+          input: new Input({ formats: ALL_FORMATS, source: sourceOf(file) }),
           output: new Output({ format, target }),
           // Le plan de découpage est exprimé dans le temps *retenu* ;
           // l'offset le ramène sur la source quand l'utilisateur a rogné.
@@ -182,7 +195,7 @@ async function compresser({ file, handle, profile, trim }) {
   try {
     const writable = await handle.createWritable();
     const conversion = await Conversion.init({
-      input: new Input({ formats: ALL_FORMATS, source: new BlobSource(file) }),
+      input: new Input({ formats: ALL_FORMATS, source: sourceOf(file) }),
       output: new Output({
         format: new Mp4OutputFormat(),
         target: new StreamTarget(writable),

@@ -99,6 +99,8 @@ async function demarrer(cle, { fichier, duree, contexte, modele, offset = 0, mee
       language: 'fr',
       context: contexte,
       meeting_date: meetingDate || null,
+      // Une réunion récupérée se transcrit sur place, sous le même numéro.
+      reprocess_job_id: fichier.remote?.jobId ?? null,
     });
   } catch (e) {
     // Le garde-fou budget répond ici, avant le premier octet envoyé.

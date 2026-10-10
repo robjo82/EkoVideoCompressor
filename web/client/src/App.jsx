@@ -58,7 +58,13 @@ export default function App() {
         {enrolement ? (
           <Enroler code={enrolement} surFini={quitterEnrolement} />
         ) : ouvert !== null ? (
-          <Detail key={ouvert} jobId={ouvert} recherche={cherche} surRetour={() => setOuvert(null)} />
+          <Detail
+            key={ouvert}
+            jobId={ouvert}
+            recherche={cherche}
+            surRetour={() => setOuvert(null)}
+            surRetraiter={() => { setOuvert(null); setVue('nouveau'); }}
+          />
         ) : vue === 'compte' ? (
           <Compte />
         ) : vue === 'recuperation' ? (
